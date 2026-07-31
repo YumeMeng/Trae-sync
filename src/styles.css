@@ -1,0 +1,274 @@
+:root {
+  --bg: #f5f6f8;
+  --fg: #1f2328;
+  --muted: #57606a;
+  --border: #d0d7de;
+  --accent: #0969da;
+  --accent-fg: #ffffff;
+  --off: #bf8700;
+  --error: #cf222e;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.app-loading,
+.app-error {
+  padding: 24px;
+}
+
+.app-error {
+  color: var(--error);
+}
+
+.app-main {
+  display: grid;
+  grid-template-columns: 1fr 320px 280px;
+  gap: 16px;
+  padding: 16px;
+  flex: 1;
+}
+
+@media (max-width: 1024px) {
+  .app-main {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 标题栏 */
+.title-bar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 16px;
+  background: #ffffff;
+  border-bottom: 1px solid var(--border);
+}
+
+.title-bar__brand {
+  font-weight: 600;
+  font-size: 16px;
+}
+
+.title-bar__context {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.title-bar__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.badge--off {
+  background: #fff8c5;
+  color: var(--off);
+  border: 1px solid #d4a72c;
+}
+
+/* 历史库工作台 */
+.workbench {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.workbench__header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.workbench__header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.workbench__summary {
+  display: flex;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  flex: 1;
+}
+
+.workbench__body {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 1024px) {
+  .workbench__body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.workbench__tree {
+  padding: 16px;
+  border-right: 1px solid var(--border);
+  overflow: auto;
+}
+
+.workbench__empty {
+  color: var(--muted);
+  margin: 0;
+}
+
+.workbench__plan {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.workbench__plan h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.plan-summary {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-size: 13px;
+}
+
+.plan-summary dt {
+  color: var(--muted);
+}
+
+.plan-summary dd {
+  margin: 0;
+  font-weight: 500;
+}
+
+.workbench__honest-status {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  background: #fff8c5;
+  color: var(--off);
+  font-size: 13px;
+  margin: 0;
+}
+
+/* 操作与备份 */
+.operations-panel {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.operations-panel h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.operations-panel__empty {
+  color: var(--muted);
+  margin: 0;
+  font-size: 13px;
+}
+
+.operations-panel__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 设置 */
+.settings-panel {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-panel h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.settings-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.settings-item label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 按钮 */
+.btn {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #ffffff;
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.btn--primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+.btn--primary:disabled {
+  background: #b3d4f0;
+  border-color: #b3d4f0;
+}

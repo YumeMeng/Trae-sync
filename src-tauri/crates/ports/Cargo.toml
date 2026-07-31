@@ -1,0 +1,8 @@
+[package]
+name = "traesync-ports"
+version = "0.1.0"
+edition = "2021"
+
+# ports 只依赖 domain，不依赖 application/infrastructure/commands/tauri。
+[dependencies]
+traesync-domain = { path = "../domain" }

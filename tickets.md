@@ -14,18 +14,18 @@
 
 ## T01 受保护的桌面应用骨架
 
-**Status:** ready-for-agent
+**Status:** done
 
 **What to build:** 用户可以启动一个空的 Trae Sync Windows 桌面应用，看到方案 D 的历史库骨架；开发者可以重复构建、测试和打包，同时测试环境无法把真实 TRAE 路径作为写入目标。
 
 **Blocked by:** None — can start immediately.
 
-- [ ] Tauri 2、Rust、React、TypeScript 和 Vite 的最小生产骨架可在全新 checkout 构建。
-- [ ] Domain、application services、ports、infrastructure 和 Tauri command 的依赖方向符合实现规格。
-- [ ] Rust、TypeScript、前端测试、格式检查和 Windows 安装包构建均有单一文档化命令且通过。
-- [ ] `fixture_root` 只能位于测试根；默认 TRAE 路径、测试根外路径和路径别名写入均被自动测试拒绝。
-- [ ] 结构化日志包含 `operation_id`，且测试证明不会记录认证正文或密钥。
-- [ ] 空工作台可启动，真实数据能力保持禁用，并生成 Gate 0 PASS 证据。
+- [x] Tauri 2、Rust、React、TypeScript 和 Vite 的最小生产骨架可在全新 checkout 构建。
+- [x] Domain、application services、ports、infrastructure 和 Tauri command 的依赖方向符合实现规格。
+- [x] Rust、TypeScript、前端测试、格式检查和 Windows 安装包构建均有单一文档化命令且通过。
+- [x] `fixture_root` 只能位于测试根；默认 TRAE 路径、测试根外路径和路径别名写入均被自动测试拒绝。
+- [x] 结构化日志包含 `operation_id`，且测试证明不会记录认证正文或密钥。
+- [x] 空工作台可启动，真实数据能力保持禁用，并生成 Gate 0 PASS 证据。
 
 ## T02 Work CN 只读入口
 

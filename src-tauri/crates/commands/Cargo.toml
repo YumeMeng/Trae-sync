@@ -1,0 +1,12 @@
+[package]
+name = "traesync-commands"
+version = "0.1.0"
+edition = "2021"
+
+# commands 依赖 application + domain，不直接依赖 infrastructure。
+# 这保证 Tauri command 只通过应用服务访问业务逻辑，不绕过端口直接操作文件/数据库。
+[dependencies]
+traesync-domain = { path = "../domain" }
+traesync-application = { path = "../application" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

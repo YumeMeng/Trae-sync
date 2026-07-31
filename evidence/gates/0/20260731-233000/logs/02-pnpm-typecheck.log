@@ -1,0 +1,9 @@
+﻿
+> trae-sync@0.1.0 typecheck D:\work\Trae-sync
+> tsc -b --noEmit
+
+Command: pnpm typecheck
+ExitCode: 0
+StartedAt: 08/01/2026 00:23:29
+EndedAt: 08/01/2026 00:23:34
+DurationSec: 5.028449

@@ -1,0 +1,25 @@
+﻿{
+  "run_id": "20260731-233000",
+  "gate": "Gate 0",
+  "ticket": "T01",
+  "repair_round": 7,
+  "conclusion": "PASS",
+  "evidence_level": "Implemented",
+  "acceptance_criteria": {
+    "AC1": { "status": "PASS", "evidence": "pnpm tauri build exit=0; screenshot shows workbench" },
+    "AC2": { "status": "PASS", "evidence": "dependency_direction 6 tests pass" },
+    "AC3": { "status": "PASS", "evidence": "App.test.tsx 8 tests pass" },
+    "AC4": { "status": "PASS", "evidence": "fixture_paths_integration 13 tests pass" },
+    "AC5": { "status": "PASS", "evidence": "20 rounds fixture_paths_integration all pass" },
+    "AC6": { "status": "PASS", "evidence": "logging 22 + logging_integration 8 + compile_fail 4 tests pass" },
+    "AC7": { "status": "PASS", "evidence": "pnpm typecheck + cargo fmt --check pass" },
+    "AC8": { "status": "PASS", "evidence": "sample-redacted-log.json generated" },
+    "AC9": { "status": "PASS", "evidence": "clean copy 6 commands pass" }
+  },
+  "repair_fixes": {
+    "R1": { "status": "PASS", "evidence": "from_validated removed; 4 trybuild compile-fail tests pass" },
+    "R2": { "status": "PASS", "evidence": "script generates report/assertions/environment; two-phase closure" },
+    "R3": { "status": "PASS", "evidence": "Client-area capture via GetClientRect + GetDC(hWnd) + BitBlt from (0,0); 1280x800; pixel assertions pass" },
+    "R4": { "status": "PASS", "evidence": "Name-level /XD excludes node_modules/dist/target/.git/gen at any depth; pre-install recursive scan asserts src-tauri\\target absent; FORBIDDEN ARTIFACT COUNT=0; 6 clean commands pass" }
+  }
+}

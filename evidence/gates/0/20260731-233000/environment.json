@@ -1,0 +1,30 @@
+﻿{
+  "run_id": "20260731-233000",
+  "gate": "Gate 0",
+  "ticket": "T01",
+  "baseline": "f9eda71",
+  "repair_round": 7,
+  "timestamp_utc": "2026-08-01T00:40:16Z",
+  "os": {
+    "name": "Microsoft Windows NT 10.0.26200.0",
+    "version": "10.0.26200.0",
+    "architecture": "AMD64"
+  },
+  "powershell": {
+    "version": "5.1.26100.8875",
+    "edition": "Desktop"
+  },
+  "toolchain": {
+    "node": "v22.23.1",
+    "pnpm": "9.15.9",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+  },
+  "evidence_level": "Implemented",
+  "r1_fix_summary": {
+    "from_validated_removed": "OperationId::from_validated() removed - only new() is public",
+    "operation_id_error_removed": "OperationIdError enum removed (only served from_validated)",
+    "compile_fail_tests": "4 trybuild compile-fail tests in tests/ui/ verify boundaries",
+    "external_counterexample_tests": "8 tests in logging_integration.rs verify from external perspective"
+  }
+}

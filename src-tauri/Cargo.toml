@@ -1,0 +1,49 @@
+# Trae Sync Tauri 二进制包 + Cargo workspace 根
+# 通过 workspace 成员 crate 的依赖声明在编译期强制分层依赖方向：
+#   domain -> (无内部依赖)
+#   ports -> domain
+#   application -> domain, ports
+#   infrastructure -> domain, ports
+#   commands -> application, domain
+# 任何反向依赖会被 cargo 直接拒绝编译，构成 AC2 的自动检查。
+[package]
+name = "trae-sync"
+version = "0.1.0"
+description = "Trae Sync V1 受保护的桌面应用骨架"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "trae_sync_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "trae-sync"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+traesync-domain = { path = "crates/domain" }
+traesync-application = { path = "crates/application" }
+traesync-infrastructure = { path = "crates/infrastructure" }
+traesync-commands = { path = "crates/commands" }
+
+[dev-dependencies]
+tempfile = "3"
+trybuild = "1"
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

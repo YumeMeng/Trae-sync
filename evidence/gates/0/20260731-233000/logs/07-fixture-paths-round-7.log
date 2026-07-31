@@ -1,0 +1,38 @@
+﻿cargo.exe : [1m[93mwarning[0m[1m[97m: linker stdout: 正在创建库 D:\work\Trae-sync\src-tauri\target\debug\deps\trae_sync
+_lib.dll.lib 和对象 D:\work\Trae-sync\src-tauri\target\debug\deps\trae_sync_lib.dll.exp[0m
+At D:\work\Trae-sync\evidence\gates\0\20260731-233000\commands.ps1:127 char:23
++ ...   $output = & cargo test --manifest-path src-tauri/Cargo.toml --test  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1m[93mwarnin...lib.dll.exp[0m:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  [1m[96m|[0m
+  [1m[96m= [0m[1m[97mnote[0m: `#[warn(linker_messages)]` on by default
+
+[1m[93mwarning[0m: `trae-sync` (lib) generated 1 warning
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.49s
+[1m[92m     Running[0m tests\fixture_paths_integration.rs (src-tauri\target\debug\deps\fixture_paths_integration-d15
+3b277c8f916d0.exe)
+
+running 13 tests
+test from_env_fails_closed_when_appdata_missing ... ok
+test disk_root_as_fixture_root_rejected ... ok
+test arbitrary_user_dir_as_fixture_root_rejected ... ok
+test external_caller_cannot_inject_synthetic_roots ... ok
+test fixture_root_must_exist ... ok
+test no_hidden_bypass_via_env_var ... ok
+test from_env_fails_closed_when_test_root_missing ... ok
+test write_target_inside_fixture_root_accepted ... ok
+test parent_dir_escape_rejected ... ok
+test from_env_fails_closed_when_localappdata_missing ... ok
+test default_work_cn_directory_rejected ... ok
+test write_target_outside_fixture_root_rejected ... ok
+test default_work_cn_path_rejected ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+Command: cargo test --test fixture_paths_integration (round 7)
+ExitCode: 0
+StartedAt: 08/01/2026 00:24:26
+EndedAt: 08/01/2026 00:24:28
+DurationSec: 1.7201486

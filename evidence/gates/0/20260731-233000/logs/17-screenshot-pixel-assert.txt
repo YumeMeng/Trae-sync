@@ -1,0 +1,5 @@
+﻿Screenshot pixel assertion
+ColorCount: 85 (require > 10)
+NonWhitePixels: 1245 / 10240 (12.16%) (require > 5%)
+SHA256: BF57EE5ECEAC05DD23A8FE845607A5598991E345B4BFD9C015F2EEC35D63F66D
+Dimensions: 1280x800

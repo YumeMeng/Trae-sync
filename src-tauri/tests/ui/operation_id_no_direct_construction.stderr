@@ -1,0 +1,16 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/operation_id_no_direct_construction.rs:8:13
+  |
+8 |     let _ = OperationId("op-evil-secret".to_string());
+  |             ^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> crates/domain/src/lib.rs
+  |
+  | pub struct OperationId(String);
+  |                        ^^^^^^ private field
+help: you might have meant to use the `new` associated function
+  |
+8 -     let _ = OperationId("op-evil-secret".to_string());
+8 +     let _ = OperationId::new();
+  |

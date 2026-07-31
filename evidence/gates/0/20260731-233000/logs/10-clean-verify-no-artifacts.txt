@@ -1,0 +1,23 @@
+﻿Pre-install recursive scan of clean copy:
+Scan time: 08/01/2026 00:28:12
+Clean copy root: C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000
+
+[Explicit path assertions]
+OK: C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000\node_modules does not exist
+OK: C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000\dist does not exist
+OK: C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000\src-tauri\target does not exist
+OK: C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000\src-tauri\gen does not exist
+OK: C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000\.git does not exist
+OK: C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000\target does not exist
+
+[Recursive scan by directory name]
+OK: no directory named 'node_modules' at any depth
+OK: no directory named 'dist' at any depth
+OK: no directory named 'target' at any depth
+OK: no directory named '.git' at any depth
+OK: no directory named 'gen' at any depth
+
+[Recursive scan for *.tsbuildinfo]
+OK: no *.tsbuildinfo files
+
+FORBIDDEN ARTIFACT COUNT: 0 (require = 0)

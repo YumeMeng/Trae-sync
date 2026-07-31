@@ -1,0 +1,10 @@
+[package]
+name = "traesync-application"
+version = "0.1.0"
+edition = "2021"
+
+# application 依赖 domain + ports，不依赖 infrastructure/commands/tauri。
+# 这保证 application 不会绕过端口直接访问文件/数据库/Tauri。
+[dependencies]
+traesync-domain = { path = "../domain" }
+traesync-ports = { path = "../ports" }

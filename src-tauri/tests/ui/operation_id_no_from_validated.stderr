@@ -1,0 +1,11 @@
+error[E0599]: no associated function or constant named `from_validated` found for struct `OperationId` in the current scope
+  --> tests/ui/operation_id_no_from_validated.rs:11:26
+   |
+11 |     let _ = OperationId::from_validated("op-a1b2c3d4e5f6789012345abcdef");
+   |                          ^^^^^^^^^^^^^^ associated function or constant not found in `OperationId`
+   |
+note: if you're trying to build a new `OperationId`, consider using `OperationId::new` which returns `OperationId`
+  --> crates/domain/src/lib.rs
+   |
+   |     pub fn new() -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,9 @@
+﻿
+> trae-sync@0.1.0 typecheck C:\Users\12732\AppData\Local\Temp\trae-sync-clean-copy-20260731-233000
+> tsc -b --noEmit
+
+Command: Clean: pnpm typecheck
+ExitCode: 0
+StartedAt: 08/01/2026 00:28:19
+EndedAt: 08/01/2026 00:28:24
+DurationSec: 4.1900941

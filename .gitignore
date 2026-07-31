@@ -1,0 +1,21 @@
+# Trae Sync 根级 .gitignore
+# 仅排除生成物与依赖目录，绝不忽略源码、锁文件或 Gate 证据
+
+# ---- Node / Vite ----
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+
+# ---- Rust / Tauri ----
+src-tauri/target/
+src-tauri/gen/
+
+# ---- 本地开发环境 ----
+.env
+.env.local
+.env.*.local
+
+# ---- 操作系统杂项 ----
+.DS_Store
+Thumbs.db

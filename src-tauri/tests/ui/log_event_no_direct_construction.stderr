@@ -1,0 +1,13 @@
+error[E0451]: fields `operation_id`, `level`, `message` and `fields` of struct `LogEvent` are private
+  --> tests/ui/log_event_no_direct_construction.rs:9:9
+   |
+ 8 |     let _event = LogEvent {
+   |                  -------- in this type
+ 9 |         operation_id: "evil".to_string(),
+   |         ^^^^^^^^^^^^ private field
+10 |         level: LogLevel::Info,
+   |         ^^^^^ private field
+11 |         message: "secret".to_string(),
+   |         ^^^^^^^ private field
+12 |         fields: Value::Null,
+   |         ^^^^^^ private field

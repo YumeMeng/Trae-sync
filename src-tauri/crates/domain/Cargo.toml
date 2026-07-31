@@ -1,0 +1,9 @@
+[package]
+name = "traesync-domain"
+version = "0.1.0"
+edition = "2021"
+
+# domain 不依赖任何其他内部 crate，也不依赖 tauri。
+# 这条规则由 workspace 的 Cargo 依赖图在编译期强制保证。
+[dependencies]
+serde = { version = "1", features = ["derive"] }

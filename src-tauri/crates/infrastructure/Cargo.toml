@@ -1,0 +1,15 @@
+[package]
+name = "traesync-infrastructure"
+version = "0.1.0"
+edition = "2021"
+
+# infrastructure 依赖 domain + ports，不依赖 application/commands/tauri。
+# 这保证基础设施实现不会反向调用应用服务或 Tauri command。
+[dependencies]
+traesync-domain = { path = "../domain" }
+traesync-ports = { path = "../ports" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

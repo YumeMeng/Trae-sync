@@ -1,0 +1,626 @@
+//! Fixture 路径保护：强制 fixture_root 位于独立测试根内，写目标只能位于 fixture_root 内部。
+//!
+//! 对应 AC4、AC5 与 R1（第二次修复）要求：
+//! - 生产公开 API 只接受 `fixture_root`；可信测试根与默认受保护路径由内部唯一
+//!   locator（`SystemRoots::from_env`）解析并失败关闭。
+//! - `SystemRoots`、`PathPolicy` 不出现在公开 API；外部调用者无法构造、注入或
+//!   修改"可信测试根"或"默认受保护路径"。
+//! - 合成构造器仅在 `#[cfg(test)]` 模块内可见，仅用于单元测试纯逻辑核心。
+//! - 集成测试通过唯一生产入口 `FixturePathGuard::new(fixture_root)` 验证，
+//!   通过 RAII guard 临时设置 APPDATA/LOCALAPPDATA 构造可信测试根。
+//!
+//! 【AC5 强制声明】本模块不包含任何 `#[cfg(test)]` 旁路、feature flag、
+//! 环境变量开关或条件编译跳过生产验证逻辑。`#[cfg(test)]` 仅隔离测试辅助
+//! 构造器，不改变或跳过生产验证路径。任何尝试添加旁路都应被视为规格违反。
+
+use std::path::{Component, Path, PathBuf};
+
+/// 默认 Work CN 活动数据库相对 APPDATA 的路径片段
+const DEFAULT_WORK_CN_REL: &[&str] = &["TRAE SOLO CN", "ModularData", "ai-agent", "database.db"];
+
+/// 测试根相对 LOCALAPPDATA 的路径片段
+const TEST_ROOT_REL: &[&str] = &["Trae Sync", "tests"];
+
+/// 系统根解析错误：失败关闭，绝不静默放行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemRootsError {
+    /// APPDATA 环境变量未设置，无法解析默认 Work CN 父目录
+    AppdataMissing,
+    /// LOCALAPPDATA 未设置或测试根不存在
+    TestRootUnavailable { raw: String, source: String },
+}
+
+impl std::fmt::Display for SystemRootsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AppdataMissing => {
+                write!(f, "APPDATA 环境变量未设置，无法解析默认 Work CN 父目录")
+            }
+            Self::TestRootUnavailable { raw, source } => {
+                write!(f, "测试根不可用: {raw} ({source})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SystemRootsError {}
+
+/// 系统根配置：描述可信测试根与默认 Work CN 父目录。
+///
+/// 【R1 修复】字段私有，仅由内部 `from_env` locator 构造。
+/// 外部调用者无法构造、注入或修改信任输入。
+#[derive(Debug, Clone)]
+pub(crate) struct SystemRoots {
+    /// 可信测试根：fixture_root 必须严格位于其内部（规范化后）
+    test_root: PathBuf,
+    /// 默认 Work CN 活动数据库的父目录（如 `%APPDATA%\TRAE SOLO CN\ModularData\ai-agent`）。
+    /// None 表示该平台无默认路径（如非 Windows）。
+    default_work_cn_dir: Option<PathBuf>,
+}
+
+impl SystemRoots {
+    /// 从进程环境变量解析系统根（唯一生产构造入口）。
+    ///
+    /// Windows 上 APPDATA/LOCALAPPDATA 缺失或测试根不可达时返回 Err（失败关闭）。
+    /// 测试根默认为 `%LOCALAPPDATA%\Trae Sync\tests`，必须存在且可规范化。
+    fn from_env() -> Result<Self, SystemRootsError> {
+        // APPDATA 必须存在——缺失即失败关闭
+        let appdata = std::env::var_os("APPDATA").ok_or(SystemRootsError::AppdataMissing)?;
+
+        let mut default_dir = PathBuf::from(appdata);
+        for segment in DEFAULT_WORK_CN_REL {
+            default_dir.push(segment);
+        }
+        // default_work_cn_dir 是 database.db 的父目录（ai-agent 目录）
+        let default_work_cn_dir = default_dir.parent().map(Path::to_path_buf);
+
+        // LOCALAPPDATA 必须存在——缺失即失败关闭
+        let local_appdata = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+            SystemRootsError::TestRootUnavailable {
+                raw: "%LOCALAPPDATA%".to_string(),
+                source: "LOCALAPPDATA 环境变量未设置".to_string(),
+            }
+        })?;
+
+        let mut test_root = PathBuf::from(local_appdata);
+        for segment in TEST_ROOT_REL {
+            test_root.push(segment);
+        }
+
+        // 测试根必须存在且可规范化——失败关闭
+        let canonical_test_root =
+            test_root
+                .canonicalize()
+                .map_err(|e| SystemRootsError::TestRootUnavailable {
+                    raw: test_root.to_string_lossy().into_owned(),
+                    source: e.to_string(),
+                })?;
+
+        Ok(Self {
+            test_root: canonical_test_root,
+            default_work_cn_dir,
+        })
+    }
+}
+
+/// 路径验证错误
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixturePathError {
+    /// 候选路径命中默认 Work CN 活动路径
+    DefaultWorkCnPath {
+        raw: String,
+        default_pattern: String,
+    },
+    /// 候选路径位于 fixture_root 之外
+    OutsideFixtureRoot { raw: String },
+    /// fixture_root 位于可信测试根之外
+    FixtureRootOutsideTestRoot { raw: String },
+    /// 候选路径或其父目录不存在，无法规范化
+    CannotCanonicalize { raw: String, source: String },
+    /// 候选路径没有父目录
+    NoParent,
+    /// 候选路径没有文件名
+    NoFileName,
+    /// fixture_root 自身命中默认 Work CN 路径
+    FixtureRootIsDefaultWorkCnPath { raw: String },
+    /// 系统根解析失败
+    SystemRoots(SystemRootsError),
+}
+
+impl std::fmt::Display for FixturePathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefaultWorkCnPath {
+                raw,
+                default_pattern,
+            } => {
+                write!(
+                    f,
+                    "候选路径命中默认 Work CN 活动路径: {raw} 命中 {default_pattern}"
+                )
+            }
+            Self::OutsideFixtureRoot { raw } => {
+                write!(f, "候选路径位于 fixture_root 之外: {raw}")
+            }
+            Self::FixtureRootOutsideTestRoot { raw } => {
+                write!(f, "fixture_root 位于可信测试根之外: {raw}")
+            }
+            Self::CannotCanonicalize { raw, source } => {
+                write!(f, "无法规范化路径: {raw} ({source})")
+            }
+            Self::NoParent => write!(f, "候选路径没有父目录"),
+            Self::NoFileName => write!(f, "候选路径没有文件名"),
+            Self::FixtureRootIsDefaultWorkCnPath { raw } => {
+                write!(f, "fixture_root 自身命中默认 Work CN 路径: {raw}")
+            }
+            Self::SystemRoots(e) => write!(f, "系统根解析失败: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FixturePathError {}
+
+impl From<SystemRootsError> for FixturePathError {
+    fn from(e: SystemRootsError) -> Self {
+        Self::SystemRoots(e)
+    }
+}
+
+/// 路径策略：纯逻辑核心，无进程全局副作用。
+///
+/// 【R1 修复】改为 `pub(crate)`，不公开。外部调用者无法构造此结构
+/// 注入伪造的信任输入。
+#[derive(Debug, Clone)]
+pub(crate) struct PathPolicy {
+    system_roots: SystemRoots,
+}
+
+impl PathPolicy {
+    /// 用给定系统根构造策略。
+    fn new(system_roots: SystemRoots) -> Self {
+        Self { system_roots }
+    }
+
+    /// 返回可信测试根的规范化路径。
+    fn canonical_test_root(&self) -> Result<PathBuf, FixturePathError> {
+        // system_roots.test_root 应已规范化；这里防御性再规范化一次
+        self.system_roots.test_root.canonicalize().map_err(|e| {
+            FixturePathError::CannotCanonicalize {
+                raw: self.system_roots.test_root.to_string_lossy().into_owned(),
+                source: format!("test_root 规范化失败: {e}"),
+            }
+        })
+    }
+
+    /// 验证 fixture_root 是否安全：必须位于可信测试根内部，且不命中默认 Work CN 路径。
+    ///
+    /// 返回规范化后的 fixture_root。
+    fn validate_fixture_root(&self, fixture_root: &Path) -> Result<PathBuf, FixturePathError> {
+        // 1. 拒绝 fixture_root 命中默认 Work CN 路径（词法检查）
+        if is_default_work_cn_path(
+            fixture_root,
+            self.system_roots.default_work_cn_dir.as_deref(),
+        ) {
+            return Err(FixturePathError::FixtureRootIsDefaultWorkCnPath {
+                raw: fixture_root.to_string_lossy().into_owned(),
+            });
+        }
+
+        // 2. 规范化 fixture_root（要求路径存在，跟随符号链接）
+        let canonical_fixture_root =
+            fixture_root
+                .canonicalize()
+                .map_err(|e| FixturePathError::CannotCanonicalize {
+                    raw: fixture_root.to_string_lossy().into_owned(),
+                    source: e.to_string(),
+                })?;
+
+        // 3. 二次检查：规范化后的路径也不得命中默认 Work CN 路径
+        if is_default_work_cn_path(
+            &canonical_fixture_root,
+            self.system_roots.default_work_cn_dir.as_deref(),
+        ) {
+            return Err(FixturePathError::FixtureRootIsDefaultWorkCnPath {
+                raw: canonical_fixture_root.to_string_lossy().into_owned(),
+            });
+        }
+
+        // 4. 必须严格位于可信测试根内部
+        let canonical_test_root = self.canonical_test_root()?;
+        if !path_strictly_inside(&canonical_fixture_root, &canonical_test_root) {
+            return Err(FixturePathError::FixtureRootOutsideTestRoot {
+                raw: canonical_fixture_root.to_string_lossy().into_owned(),
+            });
+        }
+
+        Ok(canonical_fixture_root)
+    }
+
+    /// 验证候选写目标是否安全：必须位于 fixture_root 内部，且不命中默认 Work CN 路径。
+    ///
+    /// `fixture_root` 必须是已规范化的路径（通常由 `validate_fixture_root` 返回）。
+    fn validate_write_target(
+        &self,
+        fixture_root: &Path,
+        candidate: &Path,
+    ) -> Result<PathBuf, FixturePathError> {
+        let raw = candidate.to_string_lossy().into_owned();
+
+        // 1. 拒绝默认 Work CN 活动路径（词法检查，不依赖路径存在）
+        if is_default_work_cn_path(candidate, self.system_roots.default_work_cn_dir.as_deref()) {
+            return Err(FixturePathError::DefaultWorkCnPath {
+                raw,
+                default_pattern: default_work_cn_display(
+                    self.system_roots.default_work_cn_dir.as_deref(),
+                ),
+            });
+        }
+
+        // 2. 规范化候选路径（跟随符号链接、解析 `..`、统一大小写与分隔符）
+        let canonical_candidate = canonicalize_or_parent(candidate)?;
+
+        // 3. 拒绝规范化后位于 fixture_root 之外的路径
+        if !path_strictly_inside(&canonical_candidate, fixture_root) {
+            return Err(FixturePathError::OutsideFixtureRoot { raw });
+        }
+
+        // 4. 防御性二次检查：规范化后的路径也不得命中默认 Work CN 路径
+        if is_default_work_cn_path(
+            &canonical_candidate,
+            self.system_roots.default_work_cn_dir.as_deref(),
+        ) {
+            return Err(FixturePathError::DefaultWorkCnPath {
+                raw,
+                default_pattern: default_work_cn_display(
+                    self.system_roots.default_work_cn_dir.as_deref(),
+                ),
+            });
+        }
+
+        Ok(canonical_candidate)
+    }
+}
+
+/// Fixture 路径守卫：构造时固定 fixture_root，后续验证写目标。
+///
+/// 【R1 修复】唯一生产公开构造入口只接受 `fixture_root`。
+/// 可信测试根与默认受保护路径由内部 `SystemRoots::from_env` locator 解析，
+/// 外部调用者无法注入或修改。
+pub struct FixturePathGuard {
+    policy: PathPolicy,
+    canonical_fixture_root: PathBuf,
+}
+
+impl std::fmt::Debug for FixturePathGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FixturePathGuard")
+            .field("canonical_fixture_root", &self.canonical_fixture_root)
+            .finish()
+    }
+}
+
+impl FixturePathGuard {
+    /// 创建守卫（唯一生产公开入口）。
+    ///
+    /// `fixture_root` 必须存在、可规范化、严格位于内部 locator 解析的可信测试根内部，
+    /// 且不命中默认 Work CN 路径。可信测试根与默认受保护路径由内部 locator 从
+    /// APPDATA/LOCALAPPDATA 解析；APPDATA/LOCALAPPDATA 缺失或测试根不可达时失败关闭。
+    ///
+    /// 外部调用者无法传入伪造的信任输入——只传入 fixture_root。
+    pub fn new(fixture_root: &Path) -> Result<Self, FixturePathError> {
+        let system_roots = SystemRoots::from_env()?;
+        let policy = PathPolicy::new(system_roots);
+        let canonical_fixture_root = policy.validate_fixture_root(fixture_root)?;
+        Ok(Self {
+            policy,
+            canonical_fixture_root,
+        })
+    }
+
+    /// 验证候选写目标是否安全。
+    pub fn validate_write_target(&self, candidate: &Path) -> Result<PathBuf, FixturePathError> {
+        self.policy
+            .validate_write_target(&self.canonical_fixture_root, candidate)
+    }
+
+    /// 返回规范化后的 fixture_root（仅供诊断使用）
+    pub fn canonical_root(&self) -> &Path {
+        &self.canonical_fixture_root
+    }
+}
+
+/// 判断 `inner` 是否严格位于 `outer` 内部（不含 outer 自身）。
+fn path_strictly_inside(inner: &Path, outer: &Path) -> bool {
+    let outer_components: Vec<_> = outer
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+            Component::RootDir => Some(String::from("\\")),
+            Component::Prefix(p) => Some(p.as_os_str().to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let inner_components: Vec<_> = inner
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+            Component::RootDir => Some(String::from("\\")),
+            Component::Prefix(p) => Some(p.as_os_str().to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+
+    if inner_components.len() <= outer_components.len() {
+        return false;
+    }
+    outer_components
+        .iter()
+        .zip(inner_components.iter())
+        .all(|(o, i)| o == i)
+}
+
+/// 规范化候选路径：若路径存在则直接规范化；若不存在则规范化父目录后拼接文件名。
+fn canonicalize_or_parent(candidate: &Path) -> Result<PathBuf, FixturePathError> {
+    if let Ok(canon) = candidate.canonicalize() {
+        return Ok(canon);
+    }
+
+    let parent = candidate.parent().ok_or(FixturePathError::NoParent)?;
+    let file_name = candidate.file_name().ok_or(FixturePathError::NoFileName)?;
+
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|e| FixturePathError::CannotCanonicalize {
+            raw: candidate.to_string_lossy().into_owned(),
+            source: format!("父目录规范化失败: {e}"),
+        })?;
+
+    Ok(canon_parent.join(file_name))
+}
+
+/// 默认 Work CN 路径的可读展示（用于错误消息）
+fn default_work_cn_display(default_work_cn_dir: Option<&Path>) -> String {
+    match default_work_cn_dir {
+        Some(dir) => dir.join("database.db").to_string_lossy().into_owned(),
+        None => "%APPDATA%\\TRAE SOLO CN\\ModularData\\ai-agent\\database.db".to_string(),
+    }
+}
+
+/// 判断候选路径是否命中默认 Work CN 活动路径或其祖先目录。
+fn is_default_work_cn_path(candidate: &Path, default_work_cn_dir: Option<&Path>) -> bool {
+    let Some(default_dir) = default_work_cn_dir else {
+        return false;
+    };
+    let default_db = default_dir.join("database.db");
+
+    let candidate_norm = normalize_for_compare(candidate);
+    let default_norm = normalize_for_compare(&default_db);
+    let default_dir_norm = normalize_for_compare(default_dir);
+
+    candidate_norm == default_norm || candidate_norm.starts_with(&default_dir_norm)
+}
+
+/// 词法规范化路径用于比较：小写化、统一分隔符为 `\`、去除 `\\?\` 前缀、去除尾分隔符。
+fn normalize_for_compare(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy().replace('/', "\\");
+
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+
+    let s = s.trim_end_matches('\\');
+    let s = if s.len() == 2 && s.as_bytes()[1] == b':' {
+        format!("{s}\\")
+    } else {
+        s.to_string()
+    };
+
+    PathBuf::from(s.to_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// 辅助：在给定 root 下创建子目录并返回其路径
+    fn make_subdir(root: &Path, name: &str) -> PathBuf {
+        let p = root.join(name);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// 辅助：构造合成系统根（仅 `#[cfg(test)]` 可见，不公开到 crate 外）。
+    /// `test_root` 用 tempdir，`default_work_cn_dir` 用另一个 tempdir。
+    fn synthetic_roots() -> (tempfile::TempDir, tempfile::TempDir, SystemRoots) {
+        let test_root = tempdir().unwrap();
+        let appdata = tempdir().unwrap();
+        let default_dir = appdata
+            .path()
+            .join("TRAE SOLO CN")
+            .join("ModularData")
+            .join("ai-agent");
+        fs::create_dir_all(&default_dir).unwrap();
+        let roots = SystemRoots {
+            test_root: test_root.path().to_path_buf(),
+            default_work_cn_dir: Some(default_dir),
+        };
+        (test_root, appdata, roots)
+    }
+
+    #[test]
+    fn accept_path_inside_fixture_root_inside_test_root() {
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let candidate = fixture_root.join("data").join("file.db");
+        make_subdir(&fixture_root, "data");
+        let result = policy
+            .validate_write_target(&canonical_fixture_root, &candidate)
+            .unwrap();
+        assert!(result.starts_with(&canonical_fixture_root));
+    }
+
+    #[test]
+    fn reject_fixture_root_outside_test_root() {
+        let (_test_root, _appdata, roots) = synthetic_roots();
+        let outside = tempdir().unwrap();
+        let policy = PathPolicy::new(roots);
+        let err = policy.validate_fixture_root(outside.path()).unwrap_err();
+        assert!(matches!(
+            err,
+            FixturePathError::FixtureRootOutsideTestRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_disk_root_as_fixture_root() {
+        let (_test_root, _appdata, roots) = synthetic_roots();
+        let policy = PathPolicy::new(roots);
+        let err = policy.validate_fixture_root(Path::new("C:\\")).unwrap_err();
+        assert!(matches!(
+            err,
+            FixturePathError::FixtureRootOutsideTestRoot { .. }
+                | FixturePathError::CannotCanonicalize { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_arbitrary_user_dir_as_fixture_root() {
+        let (_test_root, _appdata, roots) = synthetic_roots();
+        let user_dir = tempdir().unwrap();
+        let policy = PathPolicy::new(roots);
+        let err = policy.validate_fixture_root(user_dir.path()).unwrap_err();
+        assert!(matches!(
+            err,
+            FixturePathError::FixtureRootOutsideTestRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_path_outside_fixture_root() {
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let outside = tempdir().unwrap();
+        let err = policy
+            .validate_write_target(&canonical_fixture_root, outside.path())
+            .unwrap_err();
+        assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+    }
+
+    #[test]
+    fn reject_parent_dir_escape() {
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let candidate = fixture_root.join("..").join("escape.db");
+        let err = policy
+            .validate_write_target(&canonical_fixture_root, &candidate)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FixturePathError::OutsideFixtureRoot { .. }
+                | FixturePathError::CannotCanonicalize { .. }
+        ));
+    }
+
+    #[test]
+    fn accept_safe_parent_dir_usage() {
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        make_subdir(&fixture_root, "sub");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let candidate = fixture_root.join("sub").join("..").join("inside.db");
+        let result = policy
+            .validate_write_target(&canonical_fixture_root, &candidate)
+            .unwrap();
+        assert!(result.starts_with(&canonical_fixture_root));
+    }
+
+    #[test]
+    fn reject_default_work_cn_path_with_synthetic_roots() {
+        let (test_root, appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+
+        let default_dir = appdata
+            .path()
+            .join("TRAE SOLO CN")
+            .join("ModularData")
+            .join("ai-agent");
+        let default_db = default_dir.join("database.db");
+        fs::write(&default_db, b"").unwrap();
+
+        let err = policy
+            .validate_write_target(&canonical_fixture_root, &default_db)
+            .unwrap_err();
+        assert!(matches!(err, FixturePathError::DefaultWorkCnPath { .. }));
+    }
+
+    #[test]
+    fn reject_default_work_cn_directory_with_synthetic_roots() {
+        let (test_root, appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+
+        let default_dir = appdata
+            .path()
+            .join("TRAE SOLO CN")
+            .join("ModularData")
+            .join("ai-agent");
+        fs::create_dir_all(&default_dir).unwrap();
+
+        let err = policy
+            .validate_write_target(&canonical_fixture_root, &default_dir)
+            .unwrap_err();
+        assert!(matches!(err, FixturePathError::DefaultWorkCnPath { .. }));
+    }
+
+    #[test]
+    fn reject_fixture_root_equal_to_default_work_cn_path() {
+        let (_test_root, appdata, roots) = synthetic_roots();
+        let default_dir = appdata
+            .path()
+            .join("TRAE SOLO CN")
+            .join("ModularData")
+            .join("ai-agent");
+        fs::create_dir_all(&default_dir).unwrap();
+
+        let policy = PathPolicy::new(roots);
+        let err = policy.validate_fixture_root(&default_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            FixturePathError::FixtureRootIsDefaultWorkCnPath { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_symlink_escape() {
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("secret.db");
+        fs::write(&outside_file, b"").unwrap();
+
+        #[cfg(windows)]
+        {
+            let link_path = fixture_root.join("escape_link");
+            let create_result = std::os::windows::fs::symlink_file(&outside_file, &link_path);
+            if create_result.is_err() {
+                return;
+            }
+            let policy = PathPolicy::new(roots);
+            let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+            let err = policy
+                .validate_write_target(&canonical_fixture_root, &link_path)
+                .unwrap_err();
+            assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+        }
+    }
+}
