@@ -1,0 +1,21 @@
+﻿
+running 11 tests
+test fixture_paths::tests::reject_disk_root_as_fixture_root ... ok
+test fixture_paths::tests::reject_fixture_root_equal_to_default_work_cn_path ... ok
+test fixture_paths::tests::reject_default_work_cn_path_with_synthetic_roots ... ok
+test fixture_paths::tests::reject_default_work_cn_directory_with_synthetic_roots ... ok
+test fixture_paths::tests::accept_path_inside_fixture_root_inside_test_root ... ok
+test fixture_paths::tests::reject_parent_dir_escape ... ok
+test fixture_paths::tests::accept_safe_parent_dir_usage ... ok
+test fixture_paths::tests::reject_path_outside_fixture_root ... ok
+test fixture_paths::tests::reject_arbitrary_user_dir_as_fixture_root ... ok
+test fixture_paths::tests::reject_fixture_root_outside_test_root ... ok
+test fixture_paths::tests::reject_symlink_escape ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.18s
+
+Command: Gate A: FixturePathGuard regression (R2-1 junction escape)
+ExitCode: 0
+StartedAt: 08/02/2026 22:27:28
+EndedAt: 08/02/2026 22:29:56
+DurationSec: 147.0710946

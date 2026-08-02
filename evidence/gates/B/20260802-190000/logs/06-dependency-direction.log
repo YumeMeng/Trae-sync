@@ -1,0 +1,16 @@
+﻿
+running 6 tests
+test application_only_depends_on_domain_and_ports ... ok
+test infrastructure_only_depends_on_domain_and_ports ... ok
+test domain_has_no_internal_deps_and_no_tauri ... ok
+test workspace_compiles_proving_direction_enforced ... ok
+test commands_only_depends_on_application_and_domain ... ok
+test ports_only_depends_on_domain ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Command: Gate B: T01 dependency_direction regression
+ExitCode: 0
+StartedAt: 08/02/2026 18:52:04
+EndedAt: 08/02/2026 18:55:41
+DurationSec: 216.6844053

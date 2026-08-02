@@ -1,0 +1,60 @@
+﻿
+running 50 tests
+test account_evidence::tests::extract_plain_user_id_rejects_userid_substring_in_concatenated_field ... ok
+test account_evidence::tests::extract_user_id_for_event_ignores_concatenated_device_id_field ... ok
+test account_evidence::tests::extract_user_id_rejects_event_substring_in_non_whitelist_event ... ok
+test account_evidence::tests::extract_user_id_rejects_event_suffix_in_non_whitelist_event ... ok
+test account_evidence::tests::extract_user_id_rejects_non_whitelist_event ... ok
+test account_evidence::tests::extract_user_id_supports_json_nested_form ... ok
+test account_evidence::tests::extract_plain_user_id_accepts_word_boundary_prefixes ... ok
+test account_evidence::tests::extract_user_id_accepts_event_with_word_boundary_prefix ... ok
+test account_evidence::tests::extract_user_id_supports_multiple_separators ... ok
+test account_evidence::tests::local_storage_logical_read_returns_none_when_file_absent ... ok
+test account_evidence::tests::local_storage_logical_read_returns_none_when_missing ... ok
+test account_evidence::tests::missing_returns_missing ... ok
+test account_evidence::tests::device_id_never_becomes_user_id ... ok
+test account_evidence::tests::fingerprint_changes_when_storage_value_differs ... ok
+test account_evidence::tests::expired_when_latest_session_too_old ... ok
+test account_evidence::tests::local_storage_logical_read_returns_user_id ... ok
+test account_evidence::tests::conflict_in_log_events_yields_conflict_even_with_plaintext_user_id ... ok
+test account_evidence::tests::conflict_in_single_source_kind_yields_conflict ... ok
+test account_evidence::tests::conflict_state_user_id_is_none_even_with_plaintext_user_id ... ok
+test account_evidence::tests::expired_session_with_log_events_conflict_returns_conflict ... ok
+test account_evidence::tests::not_expired_when_session_within_threshold ... ok
+test account_evidence::tests::parse_log_file_extracts_updateuserinfo_and_getuserinfo ... ok
+test account_evidence::tests::latest_session_overrides_historical_sessions ... ok
+test account_evidence::tests::parse_log_file_extracts_fetchlogtask_json_form ... ok
+test account_evidence::tests::conflict_returns_conflict_when_local_storage_differs ... ok
+test account_evidence::tests::parse_log_file_extracts_user_info_loaded_json_form ... ok
+test account_evidence::tests::parse_storage_extracts_plaintext_user_id_from_icube_cloudide ... ok
+test account_evidence::tests::parse_storage_fingerprint_deterministic_for_same_content ... ok
+test account_evidence::tests::pick_latest_session_returns_none_when_logs_absent ... ok
+test account_evidence::tests::parse_storage_generates_fingerprint_without_persisting_content ... ok
+test account_evidence::tests::parse_log_file_ignores_non_whitelist_events ... ok
+test account_evidence::tests::parse_storage_fingerprint_changes_with_different_value ... ok
+test account_evidence::tests::pick_latest_session_returns_newest_mtime_dir ... ok
+test account_evidence::tests::plaintext_user_id_consistent_with_ls_returns_single_source ... ok
+test account_evidence::tests::parse_storage_no_plaintext_uid_for_ciphertext ... ok
+test account_evidence::tests::parse_storage_returns_none_when_no_icube_field ... ok
+test account_evidence::tests::plaintext_user_id_yields_single_source_when_no_logs ... ok
+test account_evidence::tests::plaintext_user_id_with_ls_uid_mismatch_returns_conflict ... ok
+test account_evidence::tests::user_id_from_verified_rejects_too_short_device_id_format ... ok
+test account_evidence::tests::r2_1_normal_fixture_read_not_regressed ... ok
+test account_evidence::tests::plaintext_user_id_format_error_returns_none ... ok
+test account_evidence::tests::single_source_returns_single_source ... ok
+test account_evidence::tests::single_source_with_ls_uid_mismatch_returns_conflict ... ok
+test account_evidence::tests::two_source_consistent_returns_verified_with_fingerprint ... ok
+test account_evidence::tests::two_source_consistent_without_fingerprint_returns_single_source ... ok
+test account_evidence::tests::re_read_after_close_returns_fresh_evidence ... ok
+test account_evidence::tests::r2_1_local_storage_symlink_escape_is_ignored ... ok
+test account_evidence::tests::r2_1_latest_session_symlink_escape_is_ignored ... ok
+test account_evidence::tests::r2_1_log_file_symlink_escape_is_ignored ... ok
+test account_evidence::tests::r2_1_storage_json_symlink_escape_is_ignored ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.56s
+
+Command: Gate B: account_evidence matrix (R2/R3/R4 + R2-1 symlink/junction escape)
+ExitCode: 0
+StartedAt: 08/02/2026 22:30:20
+EndedAt: 08/02/2026 22:31:51
+DurationSec: 91.5528515

@@ -1,0 +1,31 @@
+﻿{
+    "evidence_level":  "Implemented",
+    "repair":  "R3",
+    "gate":  "Gate A",
+    "working_tree":  {
+                         "git_diff_binary_sha256":  "66df344a98ce598d53b714386eb81fb95f75f4fddaceb2f7491146da128e3653",
+                         "t02_source_files":  12,
+                         "head":  "f560abdf851d5af78041922c889a0719f8a75221",
+                         "t02_source_combined_sha256":  "5980bd5fbb38229000cebd28b92e879e468d1379f6c42455566653d93c4ed999"
+                     },
+    "os":  {
+               "architecture":  "AMD64",
+               "name":  "Microsoft Windows NT 10.0.26200.0",
+               "version":  "10.0.26200.0"
+           },
+    "scope":  "Embedded SQLCipher read-only probe (T02 Repair 3: evidence-only rebuild, binds post-review-2 working tree)",
+    "baseline":  "f560abd",
+    "timestamp_utc":  "2026-08-02T10:20:59.0942127Z",
+    "run_id":  "20260802-181000",
+    "powershell":  {
+                       "version":  "5.1.26100.8875",
+                       "edition":  "Desktop"
+                   },
+    "ticket":  "T02",
+    "toolchain":  {
+                      "node":  "v24.14.1",
+                      "cargo":  "cargo 1.97.1 (c980f4866 2026-06-30)",
+                      "pnpm":  "9.15.9",
+                      "rustc":  "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+                  }
+}

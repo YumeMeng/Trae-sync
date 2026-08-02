@@ -1,0 +1,18 @@
+﻿
+running 8 tests
+test auth_ciphertext_cannot_enter_operation_id ... ok
+test log_event_implements_serialize ... ok
+test redacting_sink_preserves_new_generated_operation_id ... ok
+test operation_id_new_is_the_only_public_constructor ... ok
+test normal_event_preserved_through_sink ... ok
+test random_hex_key_cannot_enter_operation_id ... ok
+test log_event_serializes_correctly ... ok
+test recovery_passphrase_cannot_enter_operation_id ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Command: Gate B: T01 logging_integration regression
+ExitCode: 0
+StartedAt: 08/02/2026 19:21:37
+EndedAt: 08/02/2026 19:24:18
+DurationSec: 160.928936

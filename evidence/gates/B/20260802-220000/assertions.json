@@ -1,0 +1,106 @@
+﻿{
+    "evidence_level":  "Implemented",
+    "repair":  "R4",
+    "gate":  "Gate B",
+    "boundary":  {
+                     "real_baseline_key_in_source":  false,
+                     "source_files_scanned":  12,
+                     "real_trae_data_accessed":  false,
+                     "historical_gate_runs_preserved":  true,
+                     "write_capability_enabled":  false,
+                     "sensitive_keyword_in_evidence":  false,
+                     "raw_key_leaked":  false,
+                     "fixture_only":  true,
+                     "real_trae_started_or_closed":  false
+                 },
+    "conclusion":  "PASS",
+    "acceptance_criteria":  {
+                                "B4":  {
+                                           "evidence":  "parse_storage_fingerprint_deterministic + fingerprint_changes_* PASS: SHA-256 fingerprint irreversible",
+                                           "status":  "PASS"
+                                       },
+                                "B3":  {
+                                           "evidence":  "parse_storage_extracts_plaintext_user_id_from_icube_cloudide + plaintext_user_id_* PASS: R4 plaintext compat only extracts userId",
+                                           "status":  "PASS"
+                                       },
+                                "B7_R3_fingerprint_changed":  {
+                                                                  "evidence":  "fingerprint_changed_yields_fingerprint_changed_reason + re_verify_after_close_* PASS",
+                                                                  "status":  "PASS"
+                                                              },
+                                "C3":  {
+                                           "evidence":  "App.test.tsx: error state only shows structured kind, no raw_key/auth body PASS",
+                                           "status":  "PASS"
+                                       },
+                                "C5":  {
+                                           "evidence":  "T01 fixture_paths_integration + dependency_direction + logging_integration + compile_fail all regression pass",
+                                           "status":  "PASS"
+                                       },
+                                "B7_R2_latest_session":  {
+                                                             "evidence":  "pick_latest_session_returns_newest_mtime_dir + _returns_none_when_logs_absent PASS",
+                                                             "status":  "PASS"
+                                                         },
+                                "B6":  {
+                                           "evidence":  "local_storage_logical_read_returns_user_id + _returns_none_* PASS: logical read interface",
+                                           "status":  "PASS"
+                                       },
+                                "R2-3_serde_contract":  {
+                                                            "evidence":  "domain r2_3_user_id/auth_fingerprint/schema_fingerprint_serializes_as_json_string + r2_3_workbench_read_state_full_json_shape_matches_frontend_dto + r2_3_account_evidence_missing_state_json_shape PASS",
+                                                            "status":  "PASS"
+                                                        },
+                                "B5":  {
+                                           "evidence":  "user_id_from_verified_rejects_too_short_device_id_format PASS: deviceId/userId strictly separated",
+                                           "status":  "PASS"
+                                       },
+                                "B7_R1_path_guard":  {
+                                                         "evidence":  "build_read_state_rejects_* PASS: R1 final path closure",
+                                                         "status":  "PASS"
+                                                     },
+                                "R4_pure_diff_hash":  {
+                                                          "evidence":  "git diff --binary --output=\u003ctempfile\u003e; Get-FileHash on tempfile (no stderr contamination)",
+                                                          "status":  "PASS"
+                                                      },
+                                "C2":  {
+                                           "evidence":  "App.test.tsx: Work CN read-only entry shows fixture mode hint and read button PASS",
+                                           "status":  "PASS"
+                                       },
+                                "R4_closure_marker":  {
+                                                          "evidence":  "=== PHASE1_COMPLETE === emitted before Stop-Transcript; logs/closure.log contains ALL_STEPS_PASSED",
+                                                          "status":  "PASS"
+                                                      },
+                                "R2-2_dto_string":  {
+                                                        "evidence":  "TypeScript DTO schema_fingerprint: string, auth_fingerprint: string | null, evidence_state: snake_case; pnpm typecheck/test/build exit=0",
+                                                        "status":  "PASS"
+                                                    },
+                                "R2-4_working_tree_binding":  {
+                                                                  "evidence":  "working-tree-hashes.sha256 (12 files) + pure git diff --binary SHA-256 (via --output tempfile) recorded; combined=5980bd5fbb38229000cebd28b92e879e468d1379f6c42455566653d93c4ed999 gitdiff=2ce682fde5f6de7334b6435275896695777c06f57fd85fe5eb32ecf3201b3d8e",
+                                                                  "status":  "PASS"
+                                                              },
+                                "C4":  {
+                                           "evidence":  "App.test.tsx: readonly-notice shows all write capabilities disabled, manual account selection cannot dismiss readonly PASS",
+                                           "status":  "PASS"
+                                       },
+                                "B1":  {
+                                           "evidence":  "parse_log_file_extracts_* + extract_user_id_rejects_non_whitelist_event PASS: whitelist events parsed, non-whitelist rejected",
+                                           "status":  "PASS"
+                                       },
+                                "B7_R3_expired":  {
+                                                      "evidence":  "expired_when_latest_session_too_old + not_expired_when_session_within_threshold + expired_account_yields_expired_reason_through_service PASS",
+                                                      "status":  "PASS"
+                                                  },
+                                "B2":  {
+                                           "evidence":  "two_source_consistent_* + missing_returns_missing + conflict_returns_conflict_when_local_storage_differs PASS",
+                                           "status":  "PASS"
+                                       },
+                                "R2-1_symlink_junction_escape":  {
+                                                                     "evidence":  "r2_1_latest_session/log_file/storage_json/local_storage_symlink_escape_is_ignored + r2_1_normal_fixture_read_not_regressed PASS: all 4 read paths sealed via canonical containment, junction-based, no silent skip",
+                                                                     "status":  "PASS"
+                                                                 },
+                                "C1":  {
+                                           "evidence":  "App.test.tsx: no auto read_work_cn_state on init PASS",
+                                           "status":  "PASS"
+                                       }
+                            },
+    "run_id":  "20260802-220000",
+    "ticket":  "T02",
+    "qualification":  "NOT_QUALIFIED"
+}

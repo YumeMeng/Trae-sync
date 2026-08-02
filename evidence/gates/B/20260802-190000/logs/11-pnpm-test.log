@@ -1,0 +1,19 @@
+﻿
+> trae-sync@0.1.0 test D:\work\Trae-sync
+> vitest run
+
+
+[1m[7m[36m RUN [39m[27m[22m [36mv2.1.9 [39m[90mD:/work/Trae-sync[39m
+
+ [32m✓[39m tests/App.test.tsx [2m([22m[2m13 tests[22m[2m)[22m[33m 399[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m13 passed[39m[22m[90m (13)[39m
+[2m   Start at [22m 19:01:52
+[2m   Duration [22m 3.64s[2m (transform 173ms, setup 589ms, collect 339ms, tests 399ms, environment 1.30s, prepare 407ms)[22m
+
+Command: pnpm test
+ExitCode: 0
+StartedAt: 08/02/2026 19:01:50
+EndedAt: 08/02/2026 19:01:57
+DurationSec: 6.5251485

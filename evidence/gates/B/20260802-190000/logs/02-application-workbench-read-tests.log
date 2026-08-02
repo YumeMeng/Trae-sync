@@ -1,0 +1,26 @@
+﻿
+running 16 tests
+test workbench_read::tests::build_read_state_rejects_absolute_db_path ... ok
+test workbench_read::tests::build_read_state_rejects_device_prefix ... ok
+test workbench_read::tests::re_verify_after_close_preserves_conflict_even_when_fingerprint_changed ... ok
+test workbench_read::tests::build_read_state_rejects_parent_dir_escape ... ok
+test workbench_read::tests::re_verify_after_close_preserves_state_when_fingerprint_unchanged ... ok
+test workbench_read::tests::build_read_state_returns_platform_work_cn ... ok
+test workbench_read::tests::expired_account_yields_expired_reason_through_service ... ok
+test workbench_read::tests::conflict_account_yields_conflict_reason ... ok
+test workbench_read::tests::re_verify_after_close_returns_fingerprint_changed_on_diff ... ok
+test workbench_read::tests::build_read_state_rejects_empty_db_relative_path ... ok
+test workbench_read::tests::unknown_schema_yields_readonly_reason ... ok
+test workbench_read::tests::build_read_state_rejects_missing_db_file ... ok
+test workbench_read::tests::missing_account_yields_account_unavailable_reason ... ok
+test workbench_read::tests::fingerprint_changed_yields_fingerprint_changed_reason ... ok
+test workbench_read::tests::wrong_key_yields_readonly_reason ... ok
+test workbench_read::tests::verified_account_and_db_yield_no_readonly_reason ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+Command: Gate B: application workbench_read (R3 FingerprintChanged + R1 path guard)
+ExitCode: 0
+StartedAt: 08/02/2026 18:47:52
+EndedAt: 08/02/2026 18:47:53
+DurationSec: 1.3347982

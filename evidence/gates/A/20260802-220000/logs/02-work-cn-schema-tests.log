@@ -1,0 +1,16 @@
+﻿
+running 6 tests
+test work_cn_schema::tests::check_schema_rejects_missing_table ... ok
+test work_cn_schema::tests::check_schema_rejects_missing_column ... ok
+test work_cn_schema::tests::check_schema_accepts_valid_work_cn_db ... ok
+test work_cn_schema::tests::read_table_counts_returns_correct_counts ... ok
+test work_cn_schema::tests::schema_fingerprint_changes_with_different_schema ... ok
+test work_cn_schema::tests::schema_fingerprint_deterministic_for_same_schema ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 0.35s
+
+Command: Gate A: Work CN schema constraint tests
+ExitCode: 0
+StartedAt: 08/02/2026 22:25:27
+EndedAt: 08/02/2026 22:27:28
+DurationSec: 120.99496

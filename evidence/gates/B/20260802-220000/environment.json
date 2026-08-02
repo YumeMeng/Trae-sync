@@ -1,0 +1,32 @@
+﻿{
+    "evidence_level":  "Implemented",
+    "repair":  "R4",
+    "gate":  "Gate B",
+    "working_tree":  {
+                         "git_diff_binary_sha256":  "2ce682fde5f6de7334b6435275896695777c06f57fd85fe5eb32ecf3201b3d8e",
+                         "git_diff_hash_method":  "git diff --binary --output=\u003ctempfile\u003e; Get-FileHash on tempfile (pure, no stderr contamination)",
+                         "head":  "f560abdf851d5af78041922c889a0719f8a75221",
+                         "t02_source_files":  12,
+                         "t02_source_combined_sha256":  "5980bd5fbb38229000cebd28b92e879e468d1379f6c42455566653d93c4ed999"
+                     },
+    "os":  {
+               "architecture":  "AMD64",
+               "name":  "Microsoft Windows NT 10.0.26200.0",
+               "version":  "10.0.26200.0"
+           },
+    "scope":  "Account evidence matrix + UI boundary (T02 Repair 4: evidence closure, pure git diff hash + closure marker)",
+    "baseline":  "f560abd",
+    "timestamp_utc":  "2026-08-02T14:45:55.8499511Z",
+    "run_id":  "20260802-220000",
+    "powershell":  {
+                       "version":  "5.1.26100.8875",
+                       "edition":  "Desktop"
+                   },
+    "ticket":  "T02",
+    "toolchain":  {
+                      "node":  "v24.14.1",
+                      "cargo":  "cargo 1.97.1 (c980f4866 2026-06-30)",
+                      "pnpm":  "9.15.9",
+                      "rustc":  "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+                  }
+}

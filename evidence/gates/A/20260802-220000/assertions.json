@@ -1,0 +1,77 @@
+﻿{
+    "evidence_level":  "Implemented",
+    "repair":  "R4",
+    "gate":  "Gate A",
+    "boundary":  {
+                     "raw_key_leaked":  false,
+                     "real_baseline_key_in_source":  false,
+                     "write_capability_enabled":  false,
+                     "source_files_scanned":  12,
+                     "fixture_only":  true,
+                     "real_trae_data_accessed":  false,
+                     "real_trae_started_or_closed":  false,
+                     "historical_gate_runs_preserved":  true
+                 },
+    "conclusion":  "PASS",
+    "acceptance_criteria":  {
+                                "AC4":  {
+                                            "evidence":  "probe_truncated_file_returns_truncated_file + probe_unknown_schema_returns_unknown_schema PASS",
+                                            "status":  "PASS"
+                                        },
+                                "R2-4_working_tree_binding":  {
+                                                                  "evidence":  "working-tree-hashes.sha256 + pure git diff --binary SHA-256 (via --output tempfile) recorded; combined=5980bd5fbb38229000cebd28b92e879e468d1379f6c42455566653d93c4ed999 gitdiff=2ce682fde5f6de7334b6435275896695777c06f57fd85fe5eb32ecf3201b3d8e",
+                                                                  "status":  "PASS"
+                                                              },
+                                "AC3":  {
+                                            "evidence":  "backup_to_logical_copy_preserves_wal_content PASS",
+                                            "status":  "PASS"
+                                        },
+                                "AC5":  {
+                                            "evidence":  "verify_transaction_rollback_passes_on_fixture_copy PASS",
+                                            "status":  "PASS"
+                                        },
+                                "R4_pure_diff_hash":  {
+                                                          "evidence":  "git diff --binary --output=\u003ctempfile\u003e; Get-FileHash on tempfile (no stderr contamination)",
+                                                          "status":  "PASS"
+                                                      },
+                                "R5_schema_constraints":  {
+                                                              "evidence":  "work_cn_schema::tests PASS",
+                                                              "status":  "PASS"
+                                                          },
+                                "AC6":  {
+                                            "evidence":  "run_integrity_checks_pass_on_verified_db PASS",
+                                            "status":  "PASS"
+                                        },
+                                "R5_cipher_version":  {
+                                                          "evidence":  "probe_work_cn_db_returns_cipher_version_compatible PASS",
+                                                          "status":  "PASS"
+                                                      },
+                                "AC1":  {
+                                            "evidence":  "bundled-sqlcipher-vendored-openssl compiled; cargo build exit=0",
+                                            "status":  "PASS"
+                                        },
+                                "R2-1_junction_escape":  {
+                                                             "evidence":  "fixture_paths::reject_symlink_escape PASS via directory junction (mklink /J), no silent skip",
+                                                             "status":  "PASS"
+                                                         },
+                                "AC2":  {
+                                            "evidence":  "R1 zero-write: probe_with_correct_key_has_zero_writes_to_db_trio + probe_with_wrong_key_has_zero_writes_to_db_trio PASS",
+                                            "status":  "PASS"
+                                        },
+                                "R4_closure_marker":  {
+                                                          "evidence":  "=== PHASE1_COMPLETE === emitted before Stop-Transcript; logs/closure.log contains ALL_STEPS_PASSED",
+                                                          "status":  "PASS"
+                                                      },
+                                "AC7":  {
+                                            "evidence":  "create_random_key_catalog_creates_and_reopens PASS",
+                                            "status":  "PASS"
+                                        },
+                                "R2-3_serde_contract":  {
+                                                            "evidence":  "domain workbench_read::tests incl r2_3_*_serializes_as_json_string + full_json_shape_matches_frontend_dto PASS",
+                                                            "status":  "PASS"
+                                                        }
+                            },
+    "run_id":  "20260802-220000",
+    "ticket":  "T02",
+    "qualification":  "NOT_QUALIFIED"
+}

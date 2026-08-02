@@ -1,0 +1,6 @@
+﻿Working-tree binding
+HEAD: f560abdf851d5af78041922c889a0719f8a75221
+T02 source combined SHA-256: 5980bd5fbb38229000cebd28b92e879e468d1379f6c42455566653d93c4ed999
+git diff --binary SHA-256: 66df344a98ce598d53b714386eb81fb95f75f4fddaceb2f7491146da128e3653
+T02 source file count: 12
+Per-file SHA-256 list: working-tree-hashes.sha256
