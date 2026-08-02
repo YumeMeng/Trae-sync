@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod history;
 pub mod workbench_read;
 
 // 重导出 T02 工作台只读入口的核心值对象
@@ -16,6 +17,17 @@ pub use workbench_read::{
     AccountEvidence, AuthFingerprint, CompatibilityState, DataLocationId, EvidenceState,
     IncompatibleReason, ReadonlyReason, SchemaFingerprint, SourceEventSummary, TableCounts, UserId,
     UserIdError, WorkbenchReadState,
+};
+
+// 重导出 T03/T04 历史库核心值对象
+pub use history::{
+    AuthorizationState, BrowseAccountNode, BrowseProjectNode, BrowseResult, BrowseSessionNode,
+    CatalogGenerationId, ContentGraphHash, ConversationPreview, DiagnosticIntegrityAssertion,
+    FileIdentity, HistoryBrowseSummary, MessageProjection, OwnerObservation, ProcessRunningState,
+    ProjectIdentity, ProjectObservation, ProjectSourceAssignment, ScanFailureReason, ScanOutcome,
+    ScanRequest, SearchHit, SeenAccount, SessionIdentity, SessionProjection, SessionVersion,
+    SnapshotFileEntry, SnapshotFileKind, SnapshotFingerprint, SnapshotId, SoftDeletionEntityKind,
+    SoftDeletionMarker, SourceSnapshotMeta, StorageRootId, VersionClassification,
 };
 
 /// 操作 ID：贯穿结构化日志、命令、应用服务与操作 manifest 的稳定标识。

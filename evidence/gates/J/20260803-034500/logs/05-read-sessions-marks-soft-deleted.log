@@ -1,0 +1,9 @@
+﻿
+running 1 test
+test work_cn_normalizer::tests::read_session_projections_marks_soft_deleted ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.14s
+
+ExitCode: 0
+StartedAt: 08/03/2026 03:56:10
+EndedAt: 08/03/2026 03:56:11

@@ -50,7 +50,6 @@ export default function App() {
       />
       <main className="app-main">
         <HistoryWorkbench
-          history={state.history}
           capabilities={state.capabilities}
           honestStatus={state.honest_status}
         />

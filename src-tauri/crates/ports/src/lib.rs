@@ -7,8 +7,12 @@
 
 use traesync_domain::WorkspaceState;
 
+pub mod history;
 pub mod workbench_read;
 
+pub use history::{
+    CatalogRepository, ContentGraphHasher, FileIdentityProvider, SnapshotStore, SourceNormalizer,
+};
 pub use workbench_read::{AccountEvidenceReaderPort, DatabaseProbePort};
 
 /// 工作台状态提供者：application 通过此 port 获取状态，不直接依赖 infrastructure。

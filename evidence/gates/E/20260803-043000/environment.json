@@ -1,0 +1,32 @@
+﻿{
+    "evidence_level":  "Implemented",
+    "gate":  "Gate E",
+    "toolchain":  {
+                      "node":  "v24.14.1",
+                      "cargo":  "cargo 1.97.1 (c980f4866 2026-06-30)",
+                      "pnpm":  "9.15.9",
+                      "rustc":  "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+                  },
+    "working_tree":  {
+                         "git_diff_binary_sha256":  "7e3d50f57a36a0e38566e7c070bffd0a1e83ce750e527dc966b514828febff15",
+                         "git_diff_hash_method":  "git diff --binary --output=\u003ctempfile\u003e; Get-FileHash on tempfile (pure, no stderr contamination)",
+                         "t03t04_source_files":  17,
+                         "head":  "74c87f329a9059e8e11c175f07968bb7ca54c9cd",
+                         "t03t04_source_combined_sha256":  "85259f1515d2970c5dbf0b5c53fdf3e54ba3384f43334ba1384002b59540d0f6"
+                     },
+    "os":  {
+               "architecture":  "AMD64",
+               "name":  "Microsoft Windows NT 10.0.26200.0",
+               "version":  "10.0.26200.0"
+           },
+    "scope":  "来源账号与往返观察 (T03/T04 fixture-only)",
+    "baseline":  "74c87f3",
+    "timestamp_utc":  "2026-08-02T20:26:47.6375063Z",
+    "run_id":  "20260803-043000",
+    "powershell":  {
+                       "version":  "5.1.26100.8875",
+                       "edition":  "Desktop"
+                   },
+    "ticket":  "T04",
+    "qualification":  "NOT_QUALIFIED"
+}

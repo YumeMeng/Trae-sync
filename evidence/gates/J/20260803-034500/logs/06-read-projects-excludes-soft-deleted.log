@@ -1,0 +1,9 @@
+﻿
+running 1 test
+test work_cn_normalizer::tests::read_projects_excludes_soft_deleted ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.13s
+
+ExitCode: 0
+StartedAt: 08/03/2026 03:56:11
+EndedAt: 08/03/2026 03:56:12

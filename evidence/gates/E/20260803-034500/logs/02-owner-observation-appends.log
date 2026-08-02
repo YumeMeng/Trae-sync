@@ -1,0 +1,9 @@
+﻿
+running 1 test
+test catalog::tests::owner_observation_appends_and_first_observed_owner_unchanged ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.53s
+
+ExitCode: 0
+StartedAt: 08/03/2026 03:55:51
+EndedAt: 08/03/2026 03:55:52

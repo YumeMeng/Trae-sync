@@ -2,8 +2,11 @@
 //!
 //! T01 骨架阶段只实现 `WorkspaceStateService`——返回空工作台的诚实状态。
 //! T02 新增 `WorkbenchReadService`——组合 SQLCipher 探测与账号证据，
-//! 产生只读工作台状态。不预建 ScanHistory、BuildSyncPlan 等未来用例。
+//! 产生只读工作台状态。
+//! T03/T04 新增 `history` 模块：`ScanHistoryService`、`BrowseHistoryService`、
+//! `AssignProjectSourceService`，承载 P1 历史基础用例。
 
+pub mod history;
 pub mod workbench_read;
 
 use traesync_domain::WorkspaceState;
@@ -12,7 +15,12 @@ use traesync_domain::WorkspaceState;
 pub use traesync_ports::WorkspaceStateProvider;
 // 重导出 T02 工作台只读 port，供 commands 层构造测试 fake 使用
 pub use traesync_ports::{AccountEvidenceReaderPort, DatabaseProbePort};
+// 重导出 T03/T04 历史库 port，供 commands 层构造测试 fake 使用
+pub use traesync_ports::{
+    CatalogRepository, ContentGraphHasher, FileIdentityProvider, SnapshotStore, SourceNormalizer,
+};
 
+pub use history::{AssignProjectSourceService, BrowseHistoryService, ScanHistoryService};
 pub use workbench_read::WorkbenchReadService;
 
 /// 工作台状态服务：T01 阶段返回固定的空状态，所有真实能力禁用。

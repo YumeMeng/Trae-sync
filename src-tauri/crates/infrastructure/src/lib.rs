@@ -12,16 +12,26 @@
 //! 外部可接收 `&LogEvent` 实现 `LogSink`，但无法通过 serde 反序列化或直接构造。
 
 pub mod account_evidence;
+pub mod catalog;
+pub mod content_graph;
+pub mod file_identity;
 pub mod fixture_paths;
 pub mod logging;
+pub mod snapshot_store;
 pub mod sqlcipher;
+pub mod work_cn_normalizer;
 pub mod work_cn_schema;
 pub mod workspace;
 
 pub use account_evidence::AccountEvidenceReader;
+pub use catalog::SqlCipherCatalogRepository;
+pub use content_graph::DeterministicContentGraphHasher;
+pub use file_identity::PlatformFileIdentityProvider;
 pub use fixture_paths::{FixturePathError, FixturePathGuard, SystemRootsError};
 pub use logging::{
     LogEvent, LogEventCode, LogLevel, LogSink, RedactingLogSink, SafeLogEventBuilder, SafeLogField,
 };
+pub use snapshot_store::FilesystemSnapshotStore;
 pub use sqlcipher::SqlCipherProbe;
+pub use work_cn_normalizer::WorkCnSourceNormalizer;
 pub use workspace::StaticWorkspaceStateProvider;

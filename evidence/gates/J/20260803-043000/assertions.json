@@ -1,0 +1,44 @@
+﻿{
+    "run_id":  "20260803-043000",
+    "gate":  "Gate J",
+    "acceptance_criteria":  {
+                                "AC1_soft_deleted_retained_excluded":  {
+                                                                           "evidence":  "soft_deleted_items_retained_but_excluded_from_browse_search PASS",
+                                                                           "status":  "PASS"
+                                                                       },
+                                "AC3_diagnostic_counts":  {
+                                                              "evidence":  "diagnostic_integrity_returns_visible_and_retained_counts PASS",
+                                                              "status":  "PASS"
+                                                          },
+                                "AC2_browse_excludes":  {
+                                                            "evidence":  "browse_excludes_soft_deleted PASS",
+                                                            "status":  "PASS"
+                                                        },
+                                "AC5_sessions_marked":  {
+                                                            "evidence":  "read_session_projections_marks_soft_deleted PASS",
+                                                            "status":  "PASS"
+                                                        },
+                                "AC6_projects_excluded":  {
+                                                              "evidence":  "read_projects_excludes_soft_deleted PASS",
+                                                              "status":  "PASS"
+                                                          },
+                                "AC4_messages_marked":  {
+                                                            "evidence":  "read_messages_marks_soft_deleted PASS",
+                                                            "status":  "PASS"
+                                                        }
+                            },
+    "evidence_level":  "Implemented",
+    "conclusion":  "PASS",
+    "boundary":  {
+                     "raw_key_leaked":  false,
+                     "real_baseline_key_in_source":  false,
+                     "write_capability_enabled":  false,
+                     "source_files_scanned":  17,
+                     "fixture_only":  true,
+                     "real_trae_data_accessed":  false,
+                     "real_trae_started_or_closed":  false,
+                     "historical_gate_runs_preserved":  true
+                 },
+    "ticket":  "T04",
+    "qualification":  "NOT_QUALIFIED"
+}

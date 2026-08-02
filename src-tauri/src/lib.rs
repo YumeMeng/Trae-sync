@@ -8,23 +8,38 @@
 //! - 用 `FixturePathGuard` 验证 fixture_root（拒绝真实 TRAE 路径）
 //! - 从环境变量 `TRAE_SYNC_FIXTURE_RAW_KEY` 读取 raw_key 并注入 service
 //!   raw_key 不进入 commands 层、UI 或日志
+//!
+//! T03 新增 `scan_history` / `browse_history` / `search_history` / `read_conversation`
+//! / `assign_source` 命令：组合根负责
+//! - 从环境变量 `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取存储根
+//! - 按命令构造 application service（注入 raw_key 与 normalizer）
+//! - raw_key 不进入 commands 层、UI 或日志
 
 use std::path::Path;
 use std::sync::Arc;
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::{
-    AccountEvidenceReaderPort, DatabaseProbePort, WorkbenchReadService, WorkspaceStateProvider,
+    AssignProjectSourceService, BrowseHistoryService, CatalogRepository, ScanHistoryService,
+    WorkbenchReadService, WorkspaceStateProvider,
 };
 use traesync_commands as commands;
-use traesync_domain::{WorkbenchReadState, WorkspaceState};
+use traesync_domain::{
+    BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome, SearchHit,
+    SessionIdentity, WorkbenchReadState, WorkspaceState,
+};
 use traesync_infrastructure::{
-    AccountEvidenceReader, FixturePathGuard, SqlCipherProbe, StaticWorkspaceStateProvider,
+    AccountEvidenceReader, FilesystemSnapshotStore, FixturePathGuard, PlatformFileIdentityProvider,
+    SqlCipherCatalogRepository, SqlCipherProbe, StaticWorkspaceStateProvider,
+    WorkCnSourceNormalizer,
 };
 
 /// 应用共享状态：在 Tauri command 之间共享的依赖。
 ///
 /// T02 新增 workbench_probe / workbench_reader / raw_key——这些在 fixture 模式下
 /// 用于构造 `WorkbenchReadService`。raw_key 从 env 读取，不进入 UI/日志。
+///
+/// T03 新增 storage_root——从 env `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取，
+/// 作为快照发布与目录库存储根。各命令按需构造 service，不在 AppState 持有连接。
 struct AppState {
     provider: Arc<dyn WorkspaceStateProvider>,
     /// T02 嵌入式 SQLCipher 探测器（空 struct，无状态）
@@ -34,6 +49,10 @@ struct AppState {
     /// SQLCipher raw key hex，从 env `TRAE_SYNC_FIXTURE_RAW_KEY` 读取。
     /// 空字符串表示未配置——命令返回错误，不泄露 key 状态。
     raw_key: String,
+    /// 存储根路径，从 env `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取。
+    /// 快照发布到 `<storage_root>/snapshots/`，目录库位于 `<storage_root>/catalog.db`。
+    /// 空字符串表示未配置——扫描命令返回错误。
+    storage_root: String,
 }
 
 /// `get_workspace_state` Tauri command。
@@ -78,6 +97,135 @@ fn read_work_cn_state(
         .map_err(|e| e.to_string())
 }
 
+/// `scan_history` Tauri command：执行首次扫描。
+///
+/// 前端通过 `invoke("scan_history", { fixtureRoot, dbRelativePath, processState })` 调用。
+/// 组合根负责：
+/// 1. 验证 raw_key 与 storage_root 已配置（storage_root 来自 env，不接受前端注入）
+/// 2. 用 `FixturePathGuard` 验证 fixture_root
+/// 3. 构造 SnapshotStore / Catalog / Normalizer / Service 并注入 raw_key
+/// 4. 调用 `catalog.ensure_initialized()` 确保目录库表存在（首次扫描前初始化）
+/// 5. 调用 commands 层纯函数
+///
+/// raw_key 不进入 commands 层、UI 或日志。
+/// storage_root 从 env `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取，与 browse/search 等命令一致，
+/// 不接受前端注入，避免路径注入面。
+#[tauri::command]
+fn scan_history(
+    fixture_root: String,
+    db_relative_path: String,
+    process_state: ProcessRunningState,
+    state: tauri::State<AppState>,
+) -> Result<ScanOutcome, String> {
+    // 1. raw_key 或 storage_root 未配置时返回错误——不泄露 key 是否存在
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+
+    // 2. 用 FixturePathGuard 验证 fixture_root——拒绝真实 TRAE 路径
+    let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
+
+    // 3. 构造 infrastructure 组件——raw_key 仅在此注入，不进入 commands 层
+    let file_identity = PlatformFileIdentityProvider::new();
+    let snapshot_store = FilesystemSnapshotStore::new(Box::new(file_identity));
+    let catalog_path = Path::new(&state.storage_root).join("catalog.db");
+    let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
+    let normalizer = WorkCnSourceNormalizer::new(state.raw_key.clone());
+
+    // 4. 确保目录库表已初始化（首次扫描前必须完成，否则 project_snapshot 会失败）
+    catalog.ensure_initialized();
+
+    // 5. 构造 application service
+    let service = ScanHistoryService::new(
+        &snapshot_store,
+        &catalog,
+        &state.workbench_probe,
+        &state.workbench_reader,
+        &normalizer,
+        &state.raw_key,
+    );
+
+    // 6. 调用 commands 层纯函数——now 显式传入，storage_root 来自 state
+    let now = std::time::SystemTime::now();
+    commands::scan_history(
+        guard.canonical_root(),
+        &db_relative_path,
+        process_state,
+        Path::new(&state.storage_root),
+        now,
+        &service,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// `browse_history` Tauri command：浏览全部历史。
+///
+/// 前端通过 `invoke("browse_history")` 调用。
+/// 组合根构造 catalog（注入 raw_key）并委托 BrowseHistoryService。
+#[tauri::command]
+fn browse_history(state: tauri::State<AppState>) -> Result<BrowseResult, String> {
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+    let catalog_path = Path::new(&state.storage_root).join("catalog.db");
+    let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
+    let service = BrowseHistoryService::new(&catalog);
+    commands::browse_history(&service).map_err(|e| e.to_string())
+}
+
+/// `search_history` Tauri command：搜索消息内容。
+///
+/// 前端通过 `invoke("search_history", { query })` 调用。
+#[tauri::command]
+fn search_history(query: String, state: tauri::State<AppState>) -> Result<Vec<SearchHit>, String> {
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+    let catalog_path = Path::new(&state.storage_root).join("catalog.db");
+    let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
+    let service = BrowseHistoryService::new(&catalog);
+    commands::search_history(&query, &service).map_err(|e| e.to_string())
+}
+
+/// `read_conversation` Tauri command：读取完整对话预览。
+///
+/// 前端通过 `invoke("read_conversation", { session })` 调用。
+/// session 为 SessionIdentity { product_history_namespace, original_session_id }。
+#[tauri::command]
+fn read_conversation(
+    session: SessionIdentity,
+    state: tauri::State<AppState>,
+) -> Result<Option<ConversationPreview>, String> {
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+    let catalog_path = Path::new(&state.storage_root).join("catalog.db");
+    let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
+    let service = BrowseHistoryService::new(&catalog);
+    commands::read_conversation(&session, &service).map_err(|e| e.to_string())
+}
+
+/// `assign_source` Tauri command：分配项目来源（Gate E）。
+///
+/// 前端通过 `invoke("assign_source", { projectId, userAssignedOwner })` 调用。
+/// user_assigned_owner 为 null 表示清除用户分配。
+#[tauri::command]
+fn assign_source(
+    project_id: String,
+    user_assigned_owner: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<bool, String> {
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+    let catalog_path = Path::new(&state.storage_root).join("catalog.db");
+    let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
+    let service = AssignProjectSourceService::new(&catalog);
+    let now = std::time::SystemTime::now();
+    commands::assign_source(&project_id, user_assigned_owner.as_deref(), now, &service)
+        .map_err(|e| e.to_string())
+}
+
 /// 启动 Tauri 应用。
 pub fn run() {
     let provider = Arc::new(StaticWorkspaceStateProvider::new());
@@ -86,6 +234,9 @@ pub fn run() {
     // raw_key 从环境变量读取——T02 fixture 模式专用，生产环境不设
     // 不进入 UI、日志或证据
     let raw_key = std::env::var("TRAE_SYNC_FIXTURE_RAW_KEY").unwrap_or_default();
+    // storage_root 从环境变量读取——T03 fixture 模式专用
+    // 快照发布到 <storage_root>/snapshots/，目录库位于 <storage_root>/catalog.db
+    let storage_root = std::env::var("TRAE_SYNC_FIXTURE_STORAGE_ROOT").unwrap_or_default();
 
     tauri::Builder::default()
         .manage(AppState {
@@ -93,10 +244,16 @@ pub fn run() {
             workbench_probe,
             workbench_reader,
             raw_key,
+            storage_root,
         })
         .invoke_handler(tauri::generate_handler![
             get_workspace_state,
-            read_work_cn_state
+            read_work_cn_state,
+            scan_history,
+            browse_history,
+            search_history,
+            read_conversation,
+            assign_source
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用时出错");

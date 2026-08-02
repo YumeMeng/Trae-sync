@@ -1,0 +1,40 @@
+﻿{
+    "run_id":  "20260803-043000",
+    "gate":  "Gate E",
+    "acceptance_criteria":  {
+                                "AC2_observation_appends":  {
+                                                                "evidence":  "owner_observation_appends_and_first_observed_owner_unchanged PASS",
+                                                                "status":  "PASS"
+                                                            },
+                                "AC1_first_observed_owner_immutable":  {
+                                                                           "evidence":  "a_b_a_ownership_preserves_first_observed_owner PASS",
+                                                                           "status":  "PASS"
+                                                                       },
+                                "AC5_no_duplicate_rows":  {
+                                                              "evidence":  "repeated_scan_does_not_create_duplicate_rows PASS",
+                                                              "status":  "PASS"
+                                                          },
+                                "AC4_distinct_sessions":  {
+                                                              "evidence":  "same_title_different_session_ids_remain_distinct PASS",
+                                                              "status":  "PASS"
+                                                          },
+                                "AC3_user_assignment_isolation":  {
+                                                                      "evidence":  "assign_project_source_does_not_modify_project_observation PASS",
+                                                                      "status":  "PASS"
+                                                                  }
+                            },
+    "evidence_level":  "Implemented",
+    "conclusion":  "PASS",
+    "boundary":  {
+                     "raw_key_leaked":  false,
+                     "real_baseline_key_in_source":  false,
+                     "write_capability_enabled":  false,
+                     "source_files_scanned":  17,
+                     "fixture_only":  true,
+                     "real_trae_data_accessed":  false,
+                     "real_trae_started_or_closed":  false,
+                     "historical_gate_runs_preserved":  true
+                 },
+    "ticket":  "T04",
+    "qualification":  "NOT_QUALIFIED"
+}

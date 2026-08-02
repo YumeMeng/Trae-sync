@@ -101,6 +101,8 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .workbench__header {
@@ -125,27 +127,255 @@ body {
 }
 
 .workbench__body {
+  /* 三栏布局：账号/项目树 + 对话列表 + 对话预览 */
   display: grid;
-  grid-template-columns: 1fr 280px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1.4fr);
   flex: 1;
   min-height: 0;
+  min-width: 0;
 }
 
 @media (max-width: 1024px) {
+  /* 紧凑视口：单列堆叠，避免水平溢出 */
   .workbench__body {
     grid-template-columns: 1fr;
   }
 }
 
-.workbench__tree {
+.workbench__tree,
+.workbench__sessions,
+.workbench__preview {
   padding: 16px;
   border-right: 1px solid var(--border);
   overflow: auto;
+  min-width: 0;
 }
 
-.workbench__empty {
+.workbench__preview {
+  border-right: none;
+}
+
+.workbench__tree ul,
+.workbench__sessions ul,
+.workbench__search-results ul {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workbench__node {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.workbench__node:hover {
+  background: #f0f3f6;
+}
+
+.workbench__node--child {
+  padding-left: 20px;
+  font-size: 12px;
   color: var(--muted);
+}
+
+.workbench__subtree {
+  margin-top: 4px;
+}
+
+.workbench__sessions h3,
+.workbench__preview h3,
+.workbench__tree h3 {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+}
+
+.workbench__search {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.workbench__search input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.workbench__search-results {
+  margin-bottom: 12px;
+  padding: 8px;
+  background: #f6f8fa;
+  border-radius: 4px;
+}
+
+.workbench__search-results h4 {
+  margin: 0 0 6px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.workbench__search-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.workbench__hit-title {
+  font-weight: 500;
+}
+
+.workbench__hit-context {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.workbench__session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workbench__session {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.workbench__session--active {
+  border-color: var(--accent);
+  background: #f0f6ff;
+}
+
+.workbench__session-title {
+  font-weight: 500;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.workbench__session-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workbench__preview-meta {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 8px 0;
+}
+
+.workbench__messages {
+  list-style: none;
+  padding: 0;
   margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workbench__message {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  background: #f6f8fa;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+
+.workbench__message-role {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.workbench__message-content {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.workbench__auth,
+.workbench__scanning,
+.workbench__failure,
+.workbench__empty {
+  padding: 24px;
+}
+
+.workbench__auth h3 {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+}
+
+.workbench__form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 480px;
+}
+
+.workbench__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.workbench__field input {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.workbench__check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.workbench__hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 12px 0;
+}
+
+.workbench__error {
+  color: var(--error);
+  font-size: 13px;
+  margin: 8px 0;
+}
+
+.workbench__failure {
+  color: var(--error);
 }
 
 .workbench__plan {
