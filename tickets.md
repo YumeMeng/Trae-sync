@@ -29,18 +29,18 @@
 
 ## T02 Work CN 只读入口
 
-**Status:** ready-for-agent
+**Status:** done
 
 **What to build:** 用户可以选择 Work CN 数据位置并看到数据库兼容状态和当前账号；错误密钥、未知 schema、证据冲突或认证漂移只会进入明确的只读状态。
 
 **Blocked by:** T01 受保护的桌面应用骨架。
 
-- [ ] 打包后端使用嵌入式 SQLCipher 打开 Work CN 副本和随机密钥目录库，不依赖外部 CLI、系统 SQLCipher 或 TRAE DLL。
-- [ ] 未 checkpoint WAL、错误 key、截断文件、未知 schema、事务提交/回滚和两层完整性检查均有真实 fixture 测试。
-- [ ] 账号解析器只读取白名单证据，区分 `userId` 与 `deviceId`，只持久化不可逆指纹。
-- [ ] 日志缺失、单来源、冲突、过期、Local Storage 冲突和指纹变化均返回结构化只读原因。
-- [ ] UI 始终显示平台、数据位置、当前账号或不可写原因，手工账号选择不能提升写权限。
-- [ ] Gate A 与 Gate B 均有 PASS 报告，诊断和持久化数据不含 Token、cookies 或认证正文。
+- [x] 打包后端使用嵌入式 SQLCipher 打开 Work CN 副本和随机密钥目录库，不依赖外部 CLI、系统 SQLCipher 或 TRAE DLL。
+- [x] 未 checkpoint WAL、错误 key、截断文件、未知 schema、事务提交/回滚和两层完整性检查均有真实 fixture 测试。
+- [x] 账号解析器只读取白名单证据，区分 `userId` 与 `deviceId`，只持久化不可逆指纹。
+- [x] 日志缺失、单来源、冲突、过期、Local Storage 冲突和指纹变化均返回结构化只读原因。
+- [x] UI 始终显示平台、数据位置、当前账号或不可写原因，手工账号选择不能提升写权限。
+- [x] Gate A 与 Gate B 均有 PASS 报告，诊断和持久化数据不含 Token、cookies 或认证正文。
 
 ## T03 授权扫描与首屏历史
 
