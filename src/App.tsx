@@ -5,9 +5,11 @@ import { TitleBar } from "./components/TitleBar";
 import { HistoryWorkbench } from "./components/HistoryWorkbench";
 import { OperationsPanel } from "./components/OperationsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { WorkbenchReadPanel } from "./components/WorkbenchReadPanel";
 
 // 应用根组件：负责拉取工作台状态并分发到各功能区。
 // T01 阶段所有真实能力禁用，UI 只展示空工作台的诚实状态。
+// T02 新增 WorkbenchReadPanel：fixture 模式只读入口，初始不自动扫描。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -53,6 +55,7 @@ export default function App() {
           honestStatus={state.honest_status}
         />
         <OperationsPanel capabilities={state.capabilities} />
+        <WorkbenchReadPanel />
         <SettingsPanel />
       </main>
     </div>

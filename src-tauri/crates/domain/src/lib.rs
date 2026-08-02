@@ -2,8 +2,21 @@
 //!
 //! T01 骨架阶段只定义工作台状态所需的最小值对象。
 //! 不预建未来模块（CatalogRepository、ProductAdapter 等）的空 trait。
+//!
+//! T02 新增 `workbench_read` 模块：数据位置身份、schema 兼容状态、
+//! 账号证据与结构化只读原因。仅承载 T02 需要的纯值对象。
 
 use serde::{Deserialize, Serialize};
+
+pub mod workbench_read;
+
+// 重导出 T02 工作台只读入口的核心值对象
+// `DataLocationState` 复用 T01 已有定义，不重复导出
+pub use workbench_read::{
+    AccountEvidence, AuthFingerprint, CompatibilityState, DataLocationId, EvidenceState,
+    IncompatibleReason, ReadonlyReason, SchemaFingerprint, SourceEventSummary, TableCounts, UserId,
+    UserIdError, WorkbenchReadState,
+};
 
 /// 操作 ID：贯穿结构化日志、命令、应用服务与操作 manifest 的稳定标识。
 /// T01 阶段用于证明日志具备 operation_id 字段。

@@ -1,10 +1,15 @@
 //! Trae Sync 端口层：application 定义、infrastructure 实现的 trait 边界。
 //!
 //! T01 骨架阶段只定义工作台状态查询所需的最小 port。
+//! T02 新增 `workbench_read` 模块：数据库探测与账号证据读取 port。
 //! 不预建 ProductAdapter、CatalogRepository、SnapshotStore 等未来 port——
-//! 那些在对应 ticket（T02+）实现时再增加。
+//! 那些在对应 ticket（T03+）实现时再增加。
 
 use traesync_domain::WorkspaceState;
+
+pub mod workbench_read;
+
+pub use workbench_read::{AccountEvidenceReaderPort, DatabaseProbePort};
 
 /// 工作台状态提供者：application 通过此 port 获取状态，不直接依赖 infrastructure。
 ///

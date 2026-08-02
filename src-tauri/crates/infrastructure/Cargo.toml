@@ -10,6 +10,19 @@ traesync-domain = { path = "../domain" }
 traesync-ports = { path = "../ports" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 嵌入式 SQLCipher：bundled-sqlcipher-vendored-openssl 把 SQLCipher + OpenSSL
+# 编译进 Rust 静态库，打包后端无需外部 CLI、系统 SQLCipher 或 TRAE DLL。
+# 对应 Gate A 停止规则：无法固定兼容构建时阻止所有 DB 功能。
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+# SHA-256 用于 schema 指纹和认证字段不可逆指纹
+sha2 = "0.10"
+# hex 编码
+hex = "0.4"
+# Base64 解码 storage.json 中的 iCubeAuthInfo 字段
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+# filetime 用于在测试中设置会话目录 mtime——Windows 上需要 FILE_FLAG_BACKUP_SEMANTICS
+# 才能打开目录并设置时间戳，std::fs::File::options().write(true).open(&dir) 会失败
+filetime = "0.2"

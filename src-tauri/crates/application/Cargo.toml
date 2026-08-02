@@ -8,3 +8,6 @@ edition = "2021"
 [dependencies]
 traesync-domain = { path = "../domain" }
 traesync-ports = { path = "../ports" }
+
+[dev-dependencies]
+tempfile = "3"

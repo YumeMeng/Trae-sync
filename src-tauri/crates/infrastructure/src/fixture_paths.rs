@@ -330,7 +330,11 @@ impl FixturePathGuard {
 }
 
 /// 判断 `inner` 是否严格位于 `outer` 内部（不含 outer 自身）。
-fn path_strictly_inside(inner: &Path, outer: &Path) -> bool {
+///
+/// R2-1：改为 `pub(crate)` 以便同 crate 内的 `account_evidence` 模块复用，
+/// 封闭账号证据读取路径的 symlink/junction fixture 逃逸。
+/// 仍不公开到 crate 外，避免外部调用者依赖此内部比较逻辑。
+pub(crate) fn path_strictly_inside(inner: &Path, outer: &Path) -> bool {
     let outer_components: Vec<_> = outer
         .components()
         .filter_map(|c| match c {
@@ -602,25 +606,75 @@ mod tests {
 
     #[test]
     fn reject_symlink_escape() {
+        // R2-1 修复（handoff 第 62 行）：原测试在 symlink 创建失败时静默 `return`
+        // 后宣称 PASS，违反"symlink/junction 测试不得在创建失败后静默跳过"。
+        // 新设计：Windows 无开发者模式时文件 symlink 不可靠，改用目录 junction
+        // （`mklink /J`，无需提升权限）作为逃逸载体；创建失败时 panic 报告 BLOCKED。
         let (test_root, _appdata, roots) = synthetic_roots();
         let fixture_root = make_subdir(test_root.path(), "fixture");
         let outside = tempdir().unwrap();
-        let outside_file = outside.path().join("secret.db");
-        fs::write(&outside_file, b"").unwrap();
+        // outside 作为目录，junction 指向它
+        let outside_dir = outside.path().to_path_buf();
 
-        #[cfg(windows)]
-        {
-            let link_path = fixture_root.join("escape_link");
-            let create_result = std::os::windows::fs::symlink_file(&outside_file, &link_path);
-            if create_result.is_err() {
-                return;
-            }
-            let policy = PathPolicy::new(roots);
-            let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
-            let err = policy
-                .validate_write_target(&canonical_fixture_root, &link_path)
-                .unwrap_err();
-            assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+        let link_path = fixture_root.join("escape_link");
+        let create_result = symlink_file_best_effort(&outside_dir, &link_path);
+        if !create_result {
+            // 创建 symlink/junction 失败时明确报告 BLOCKED，不让测试静默 PASS
+            panic!(
+                "BLOCKED: cannot create symlink/junction for reject_symlink_escape; symlink support unavailable"
+            );
         }
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err = policy
+            .validate_write_target(&canonical_fixture_root, &link_path)
+            .unwrap_err();
+        assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+    }
+}
+
+/// 测试辅助：尽力创建文件 symlink。
+///
+/// Windows 上优先尝试 `symlink_file`；权限不足或开发者模式未开启时
+/// 退回到创建 junction（用于目录）。两者均失败时返回 false。
+///
+/// R2-1：不再静默 return；调用方需根据返回值决定是 panic 还是 continue。
+/// junction 通过 `cmd /c mklink /J` 创建，无需开发者模式或提升权限。
+#[cfg(test)]
+#[allow(dead_code)]
+fn symlink_file_best_effort(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // 文件 symlink：Windows 上需要开发者模式或管理员权限
+        if std::os::windows::fs::symlink_file(target, link).is_ok() {
+            return true;
+        }
+        // 退回到 junction（目录 junction，不需要开发者模式）
+        // 仅当 target 是目录时才尝试
+        if target.is_dir() {
+            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+                return true;
+            }
+            // 通过 cmd mklink /J 创建 junction（参数分立传递，避免组合字符串的引号问题）
+            let out = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output();
+            if let Ok(o) = out {
+                if o.status.success() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
     }
 }

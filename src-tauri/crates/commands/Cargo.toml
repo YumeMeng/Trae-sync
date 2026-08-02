@@ -10,3 +10,8 @@ traesync-domain = { path = "../domain" }
 traesync-application = { path = "../application" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# tempfile 用于在测试中创建真实存在的 fixture_root 目录，
+# 满足 R1 路径封闭检查（路径必须存在，否则返回 DataLocationUnavailable）
+tempfile = "3"

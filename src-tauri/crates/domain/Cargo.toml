@@ -7,3 +7,7 @@ edition = "2021"
 # 这条规则由 workspace 的 Cargo 依赖图在编译期强制保证。
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# 仅测试用：序列化断言不需要进入生产依赖
+serde_json = "1"

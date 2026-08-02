@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, within, fireEvent } from "@testing-library/react";
+import { invoke } from "@tauri-apps/api/core";
 import type { WorkspaceStateDto } from "../src/types/workspace";
+import type { WorkbenchReadStateDto } from "../src/types/workbench_read";
 
 // 默认 mock：模拟后端返回的空工作台状态（T01 全部能力禁用）
 const mockEmptyWorkspace: WorkspaceStateDto = {
@@ -99,6 +101,147 @@ describe("空工作台 UI（T01 骨架）", () => {
     // 扫描按钮在历史库区域
     expect(screen.getByRole("button", { name: /查找新历史/ })).toBeDisabled();
     // 同步按钮
+    expect(screen.getByRole("button", { name: /检查并安全同步/ })).toBeDisabled();
+  });
+});
+
+// T02 切片 C：Work CN 只读入口 UI 边界
+describe("Work CN 只读入口（T02 切片 C）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("初始不自动调用 read_work_cn_state（切片 C AC1）", async () => {
+    const invokeSpy = vi.mocked(invoke);
+    render(<App />);
+    // 等待 T01 工作台加载
+    await screen.findByText(/TRAE Work CN/);
+    // read_work_cn_state 不应在初始渲染时被调用
+    const readCalls = invokeSpy.mock.calls.filter(
+      ([cmd]) => cmd === "read_work_cn_state",
+    );
+    expect(readCalls.length).toBe(0);
+  });
+
+  it("Work CN 只读入口区域显示 fixture 模式提示与读按钮（切片 C AC2）", async () => {
+    render(<App />);
+    expect(await screen.findByRole("region", { name: /Work CN 只读入口/ })).toBeInTheDocument();
+    expect(screen.getByTestId("workbench-read-hint")).toHaveTextContent(
+      /T02 阶段仅支持 fixture 路径/,
+    );
+    // 读取按钮初始存在
+    expect(screen.getByTestId("read-workbench-button")).toBeInTheDocument();
+  });
+
+  it("点击读取按钮调用 read_work_cn_state 并显示状态（切片 C AC2）", async () => {
+    const invokeSpy = vi.mocked(invoke);
+    // R2/R6：使用合成账号 ID（不复制真实基线 ID），UI 显示明确摘要而非“已检测”
+    const mockReadState: WorkbenchReadStateDto = {
+      platform: {
+        platform_id: "work_cn",
+        display_name: "TRAE Work CN",
+        adapter_implemented: true,
+      },
+      data_location: {
+        selected: true,
+        display_name: "C:\\fixture",
+        unavailable_reason: null,
+      },
+      compatibility: {
+        kind: "Verified",
+        schema_fingerprint: "abc123",
+        counts: {
+          project_count: 1,
+          chat_session_count: 2,
+          chat_message_count: 3,
+        },
+      },
+      current_account: {
+        user_id: "1000000000000001",
+        source_events: [],
+        auth_fingerprint: "fp",
+        local_storage_user_id: "1000000000000001",
+        product_version: "1.107.1",
+        observed_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
+        evidence_state: "verified",
+      },
+      readonly_reason: null,
+    };
+    invokeSpy.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_workspace_state") return mockEmptyWorkspace;
+      if (cmd === "read_work_cn_state") return mockReadState;
+      throw new Error(`未模拟的命令: ${cmd}`);
+    });
+    render(<App />);
+    await screen.findByText(/TRAE Work CN/);
+    // 输入 fixture 路径
+    const input = screen.getByTestId("fixture-root-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "C:\\fixture" } });
+    // 点击读取按钮
+    const button = screen.getByTestId("read-workbench-button")!;
+    fireEvent.click(button);
+    // 状态应显示
+    expect(await screen.findByTestId("workbench-read-state")).toBeInTheDocument();
+    expect(screen.getByTestId("wr-compatibility")).toHaveTextContent("Verified");
+    // R6：UI 显示 user_id 摘要（首尾 4 位），而非模糊的“已检测”
+    expect(screen.getByTestId("wr-account")).toHaveTextContent(/1000…0001/);
+  });
+
+  it("错误状态不展示 raw_key/认证正文（切片 C AC3）", async () => {
+    const invokeSpy = vi.mocked(invoke);
+    // 模拟错误 key 状态——只读原因为 wrong_key
+    const mockWrongKeyState: WorkbenchReadStateDto = {
+      platform: {
+        platform_id: "work_cn",
+        display_name: "TRAE Work CN",
+        adapter_implemented: true,
+      },
+      data_location: {
+        selected: true,
+        display_name: "C:\\fixture",
+        unavailable_reason: null,
+      },
+      compatibility: {
+        kind: "Incompatible",
+        reason: "wrong_key",
+      },
+      current_account: {
+        user_id: null,
+        source_events: [],
+        auth_fingerprint: null,
+        local_storage_user_id: null,
+        product_version: null,
+        observed_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
+        evidence_state: "missing",
+      },
+      readonly_reason: "wrong_key",
+    };
+    invokeSpy.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_workspace_state") return mockEmptyWorkspace;
+      if (cmd === "read_work_cn_state") return mockWrongKeyState;
+      throw new Error(`未模拟的命令: ${cmd}`);
+    });
+    render(<App />);
+    await screen.findByText(/TRAE Work CN/);
+    const input = screen.getByTestId("fixture-root-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "C:\\fixture" } });
+    fireEvent.click(screen.getByTestId("read-workbench-button")!);
+    const state = await screen.findByTestId("workbench-read-state");
+    // 显示结构化只读原因
+    expect(screen.getByTestId("wr-readonly-reason")).toHaveTextContent("wrong_key");
+    expect(screen.getByTestId("wr-incompatible-reason")).toHaveTextContent("wrong_key");
+    // 不展示 raw_key 原文（mockReadState 不含 raw_key 字段）
+    expect(state.textContent).not.toContain("3605f669");
+    expect(state.textContent).not.toContain("rawkey");
+  });
+
+  it("只读提示明确手工账号选择不能解除只读（切片 C AC4）", async () => {
+    render(<App />);
+    expect(await screen.findByTestId("readonly-notice")).toHaveTextContent(
+      /手工账号选择不能解除只读/,
+    );
+    // 所有真实写能力按钮仍禁用
+    expect(screen.getByRole("button", { name: /查找新历史/ })).toBeDisabled();
     expect(screen.getByRole("button", { name: /检查并安全同步/ })).toBeDisabled();
   });
 });

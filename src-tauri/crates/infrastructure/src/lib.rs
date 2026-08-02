@@ -11,12 +11,17 @@
 //! 【R1 修复（第三次）】`LogEvent` 公开类型但字段私有且不派生 `Deserialize`——
 //! 外部可接收 `&LogEvent` 实现 `LogSink`，但无法通过 serde 反序列化或直接构造。
 
+pub mod account_evidence;
 pub mod fixture_paths;
 pub mod logging;
+pub mod sqlcipher;
+pub mod work_cn_schema;
 pub mod workspace;
 
+pub use account_evidence::AccountEvidenceReader;
 pub use fixture_paths::{FixturePathError, FixturePathGuard, SystemRootsError};
 pub use logging::{
     LogEvent, LogEventCode, LogLevel, LogSink, RedactingLogSink, SafeLogEventBuilder, SafeLogField,
 };
+pub use sqlcipher::SqlCipherProbe;
 pub use workspace::StaticWorkspaceStateProvider;
