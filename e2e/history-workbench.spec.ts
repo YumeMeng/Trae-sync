@@ -373,3 +373,144 @@ test.describe("R7 前端授权调用链", () => {
     await expect(page.getByTestId("scan-history-button")).toBeDisabled();
   });
 });
+
+// ============================================================================
+// R12：授权异步竞态——pending grant 期间路径变化后 stale 响应被丢弃
+// ============================================================================
+
+test.describe("R12 授权异步竞态", () => {
+  test("R12：pending grant 期间路径变化后 stale 响应被丢弃并 revoke", async ({ page }) => {
+    await setup(page, { scanOutcome: "success", browseMode: "full" });
+    // 注入调用记录器 + deferred grant 控制器
+    // R12：grant_scan_authorization 返回 pending promise，测试通过
+    // window.__grantDeferred.resolve 控制 resolve 时机，模拟异步竞态
+    await page.addInitScript(() => {
+      (window as any).__invokeCalls = [];
+      (window as any).__grantDeferred = null;
+      const orig = (window as any).__TAURI_INTERNALS__.invoke;
+      (window as any).__TAURI_INTERNALS__.invoke = async function (
+        cmd: string,
+        args?: any,
+      ) {
+        (window as any).__invokeCalls.push({ cmd, args });
+        if (cmd === "grant_scan_authorization") {
+          // R12：grant 返回 pending promise——测试通过 resolve 控制
+          return new Promise((resolve) => {
+            (window as any).__grantDeferred = { resolve, args };
+          });
+        }
+        return orig(cmd, args);
+      };
+    });
+    // 重新加载以使记录器与 deferred 控制器生效
+    await page.reload();
+    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+
+    // 1. 输入 A 并点击授权——grant(A) 保持 pending
+    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture-A");
+    // 使用 click 而非 check——pending 时 checkbox 会回弹为未选中，
+    // check() 会反复重试导致多次触发 grant
+    await page.getByTestId("authorize-check").click();
+    // 等待 grant 被调用（pending promise 已建立）
+    await page.waitForFunction(
+      () => (window as any).__grantDeferred !== null,
+    );
+
+    // 2. 将 fixtureRoot 改为 B——应触发路径变化使旧授权失效
+    await page.getByTestId("history-fixture-root-input").fill("D:\\fixture-B");
+
+    // 3. resolve grant(A)——返回 canonical A（stale 响应）
+    await page.evaluate(() => {
+      (window as any).__grantDeferred.resolve("C:\\canonical-A");
+    });
+
+    // 4. 等待 stale 响应处理完成——revoke 应被调用
+    await page.waitForFunction(
+      () =>
+        (window as any).__invokeCalls.some(
+          (c: any) => c.cmd === "revoke_scan_authorization",
+        ),
+    );
+
+    // 5. 断言 checkbox 仍未选中——stale 响应不得设置已授权
+    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
+    // 6. 断言扫描按钮仍禁用
+    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+
+    // 7. 断言调用了 revoke_scan_authorization
+    const calls = await page.evaluate(() => (window as any).__invokeCalls);
+    const revokeCalls = calls.filter(
+      (c: any) => c.cmd === "revoke_scan_authorization",
+    );
+    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+    // 8. 断言没有调用 scan_history——stale 授权不得触发扫描
+    const scanCalls = calls.filter((c: any) => c.cmd === "scan_history");
+    expect(scanCalls.length).toBe(0);
+  });
+
+  test("R12-A：pending 时用户点击 checkbox 取消会丢弃旧授权结果", async ({ page }) => {
+    await setup(page, { scanOutcome: "success", browseMode: "full" });
+    // 注入调用记录器 + deferred grant 控制器
+    await page.addInitScript(() => {
+      (window as any).__invokeCalls = [];
+      (window as any).__grantDeferred = null;
+      const orig = (window as any).__TAURI_INTERNALS__.invoke;
+      (window as any).__TAURI_INTERNALS__.invoke = async function (
+        cmd: string,
+        args?: any,
+      ) {
+        (window as any).__invokeCalls.push({ cmd, args });
+        if (cmd === "grant_scan_authorization") {
+          return new Promise((resolve) => {
+            (window as any).__grantDeferred = { resolve, args };
+          });
+        }
+        return orig(cmd, args);
+      };
+    });
+    await page.reload();
+    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+
+    // 1. 输入 A 并点击授权——grant(A) 保持 pending
+    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture-A");
+    await page.getByTestId("authorize-check").click();
+    // 等待 grant 被调用
+    await page.waitForFunction(
+      () => (window as any).__grantDeferred !== null,
+    );
+
+    // R12-A：pending 时 checkbox 应选中——用户可点击取消
+    await expect(page.getByTestId("authorize-check")).toBeChecked();
+
+    // 2. 用户点击 checkbox 取消 pending 授权
+    await page.getByTestId("authorize-check").click();
+
+    // 3. 取消应立即生效——checkbox 未选中，扫描按钮禁用
+    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
+    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+
+    // 4. 应调用 revoke 清除后端可能已建立的授权
+    await page.waitForFunction(
+      () =>
+        (window as any).__invokeCalls.some(
+          (c: any) => c.cmd === "revoke_scan_authorization",
+        ),
+    );
+
+    // 5. resolve grant(A)——stale，不应恢复授权
+    await page.evaluate(() => {
+      (window as any).__grantDeferred.resolve("C:\\canonical-A");
+    });
+    // 等待微任务
+    await page.waitForTimeout(50);
+
+    // 6. 仍为未授权状态
+    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
+    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+
+    // 7. scan_history 未被调用
+    const calls = await page.evaluate(() => (window as any).__invokeCalls);
+    const scanCalls = calls.filter((c: any) => c.cmd === "scan_history");
+    expect(scanCalls.length).toBe(0);
+  });
+});

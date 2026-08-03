@@ -113,6 +113,10 @@ function makePreview(sessionId: string): ConversationPreviewDto {
 describe("T03 历史库工作台", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // R12：默认 mock 返回已 resolve 的 Promise——组件卸载清理会调用
+    // revoke_scan_authorization，未设置实现的测试需返回 Promise 避免 .catch 崩溃。
+    // 各测试内部可用 mockImplementation 覆盖具体命令的返回值。
+    mockInvoke.mockResolvedValue(undefined);
   });
 
   // ============== TDD #1：初始不自动扫描 ==============
@@ -650,5 +654,397 @@ describe("T03 历史库工作台", () => {
     expect(screen.getByTestId("scan-history-button")).toBeDisabled();
     // scan_history 不应被调用
     expect(scanCalled).toBe(false);
+  });
+
+  // ============== R12：pending 授权异步竞态反例测试 ==============
+
+  // 辅助：构造可控 deferred 的 grant_scan_authorization mock
+  function makeDeferredGrant() {
+    let resolveFn!: (value: string) => void;
+    let rejectFn!: (reason: unknown) => void;
+    const promise = new Promise<string>((resolve, reject) => {
+      resolveFn = resolve;
+      rejectFn = reject;
+    });
+    return { promise, resolve: resolveFn, reject: rejectFn };
+  }
+
+  it("R12：授权 pending 时 fixtureRoot 变化会丢弃旧授权结果", async () => {
+    const grantA = makeDeferredGrant();
+    let scanCalled = false;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return grantA.promise;
+      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "scan_history") {
+        scanCalled = true;
+        return {} as ScanOutcomeDto;
+      }
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    // 输入 A 并点击授权——保持 pending
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture-A" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待 grant 被调用
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
+      ).toBe(true);
+    });
+
+    // 在 pending 期间将 fixtureRoot 改为 B
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "D:\\fixture-B" },
+    });
+
+    // 现在 resolve grant(A)——返回 canonical A
+    grantA.resolve("C:\\canonical-A");
+
+    // 等待 stale response 处理完成
+    await waitFor(() => {
+      // 应调用 revoke 清除后端过期授权
+      const revokeCalls = mockInvoke.mock.calls.filter(
+        ([cmd]) => cmd === "revoke_scan_authorization",
+      );
+      expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // checkbox 仍未选中——过期结果不应设置已授权状态
+    expect(screen.getByTestId("authorize-check")).not.toBeChecked();
+    // 扫描按钮仍禁用
+    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
+    // scan_history 未被调用
+    expect(scanCalled).toBe(false);
+  });
+
+  it("R12：授权 pending 时 dbRelativePath 变化会丢弃旧授权结果", async () => {
+    const grantA = makeDeferredGrant();
+    let scanCalled = false;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return grantA.promise;
+      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "scan_history") {
+        scanCalled = true;
+        return {} as ScanOutcomeDto;
+      }
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
+      ).toBe(true);
+    });
+
+    // pending 期间修改 dbRelativePath
+    fireEvent.change(screen.getByTestId("history-db-path-input"), {
+      target: { value: "other.db" },
+    });
+
+    grantA.resolve("C:\\canonical");
+
+    await waitFor(() => {
+      const revokeCalls = mockInvoke.mock.calls.filter(
+        ([cmd]) => cmd === "revoke_scan_authorization",
+      );
+      expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    expect(screen.getByTestId("authorize-check")).not.toBeChecked();
+    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
+    expect(scanCalled).toBe(false);
+  });
+
+  it("R12-A：pending 时用户点击 checkbox 取消会丢弃旧授权结果", async () => {
+    const grantA = makeDeferredGrant();
+    let scanCalled = false;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return grantA.promise;
+      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "scan_history") {
+        scanCalled = true;
+        return {} as ScanOutcomeDto;
+      }
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
+      ).toBe(true);
+    });
+
+    // R12-A：pending 时 checkbox 选中——用户点击 checkbox 取消
+    // checkbox checked={authorized || authorizationPending}，pending 时为 true
+    expect(screen.getByTestId("authorize-check")).toBeChecked();
+    // 点击取消——触发 checked=false
+    fireEvent.click(screen.getByTestId("authorize-check"));
+
+    // 取消应立即生效——checkbox 未选中，扫描按钮禁用
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).not.toBeChecked();
+    });
+    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
+
+    // 应调用 revoke 清除后端可能已建立的授权
+    const revokeCalls = mockInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "revoke_scan_authorization",
+    );
+    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+
+    // resolve grant(A)——stale，不应恢复授权
+    grantA.resolve("C:\\canonical-A");
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 仍为未授权状态
+    expect(screen.getByTestId("authorize-check")).not.toBeChecked();
+    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
+    expect(scanCalled).toBe(false);
+  });
+
+  it("R12：A、B 两次授权乱序返回，只有 B 可以生效", async () => {
+    const grantA = makeDeferredGrant();
+    const grantB = makeDeferredGrant();
+    let grantCallCount = 0;
+    let scanCalled = false;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") {
+        grantCallCount += 1;
+        // 第一次返回 grantA.promise，第二次返回 grantB.promise
+        return grantCallCount === 1 ? grantA.promise : grantB.promise;
+      }
+      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "scan_history") {
+        scanCalled = true;
+        return {} as ScanOutcomeDto;
+      }
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    // 输入 A 并点击授权
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\A" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(grantCallCount).toBe(1);
+    });
+
+    // 改路径为 B——应触发 revoke + 旧 grant 失效
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "D:\\B" },
+    });
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([cmd]) => cmd === "revoke_scan_authorization"),
+      ).toBe(true);
+    });
+
+    // 再次点击授权——发起 grant(B)
+    // checkbox 当前未选中，点击触发 checked=true
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(grantCallCount).toBe(2);
+    });
+
+    // 乱序返回：先 resolve A（stale），再 resolve B（最新）
+    grantA.resolve("C:\\canonical-A");
+    grantB.resolve("D:\\canonical-B");
+
+    // 等待处理完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
+
+    // 最终生效的应是 B
+    expect(screen.getByTestId("authorize-check")).toBeChecked();
+    // 验证 scan_history 调用时使用 B 的 canonical
+    // 触发扫描
+    fireEvent.click(screen.getByTestId("scan-history-button"));
+    await waitFor(() => {
+      expect(scanCalled).toBe(true);
+    });
+    const scanCall = mockInvoke.mock.calls.find(
+      ([cmd]) => cmd === "scan_history",
+    );
+    const scanArgs = scanCall?.[1] as { fixtureRoot: string };
+    expect(scanArgs.fixtureRoot).toBe("D:\\canonical-B");
+  });
+
+  it("R12：组件卸载后旧响应不得更新状态，并应撤销可能建立的后端授权", async () => {
+    const grantA = makeDeferredGrant();
+    const { unmount } = render(<HistoryWorkbench {...defaultProps} />);
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return grantA.promise;
+      if (cmd === "revoke_scan_authorization") return null;
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
+      ).toBe(true);
+    });
+
+    // 卸载组件
+    unmount();
+
+    // resolve grant(A)——不应有状态更新（无 React 警告），应调用 revoke
+    grantA.resolve("C:\\canonical-A");
+
+    // 等待微任务
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 应调用 revoke 清除后端过期授权
+    const revokeCalls = mockInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "revoke_scan_authorization",
+    );
+    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // ============== R12-B：stale revoke 不得误伤新授权 ==============
+
+  it("R12-B：B 先返回建立授权后 A stale 返回不得 revoke B 的授权", async () => {
+    const grantA = makeDeferredGrant();
+    const grantB = makeDeferredGrant();
+    let grantCallCount = 0;
+    let scanCalled = false;
+    let scanFixtureRoot: string | null = null;
+    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "grant_scan_authorization") {
+        grantCallCount += 1;
+        return grantCallCount === 1 ? grantA.promise : grantB.promise;
+      }
+      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "scan_history") {
+        scanCalled = true;
+        const a = args as { fixtureRoot: string };
+        scanFixtureRoot = a.fixtureRoot;
+        return {} as ScanOutcomeDto;
+      }
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    // 输入 A 并点击授权——grant(A) pending
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\A" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(grantCallCount).toBe(1);
+    });
+
+    // 改路径为 B——触发 revoke + 旧 grant 失效
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "D:\\B" },
+    });
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([cmd]) => cmd === "revoke_scan_authorization"),
+      ).toBe(true);
+    });
+
+    // 再次点击授权——发起 grant(B)
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(grantCallCount).toBe(2);
+    });
+
+    // R12-B 关键时序：先 resolve B（建立授权），再 resolve A（stale）
+    grantB.resolve("D:\\canonical-B");
+    // 等待 B 被接受
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
+
+    // 记录此时 revoke 调用次数——A stale 返回前的基线
+    const revokeCountBeforeA = mockInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "revoke_scan_authorization",
+    ).length;
+
+    // resolve A——stale，不应 revoke B 的授权
+    grantA.resolve("C:\\canonical-A");
+    await new Promise((r) => setTimeout(r, 10));
+
+    // A stale 返回后不应新增 revoke 调用——B 授权保持有效
+    const revokeCountAfterA = mockInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "revoke_scan_authorization",
+    ).length;
+    expect(revokeCountAfterA).toBe(revokeCountBeforeA);
+
+    // B 仍已授权——checkbox 选中，扫描按钮启用
+    expect(screen.getByTestId("authorize-check")).toBeChecked();
+    expect(screen.getByTestId("scan-history-button")).toBeEnabled();
+
+    // 触发扫描——应使用 B 的 canonical
+    fireEvent.click(screen.getByTestId("scan-history-button"));
+    await waitFor(() => {
+      expect(scanCalled).toBe(true);
+    });
+    expect(scanFixtureRoot).toBe("D:\\canonical-B");
+  });
+
+  // ============== R12-C：卸载后异步失败不得更新 React 状态 ==============
+
+  it("R12-C：卸载后 stale grant 返回时 revoke 失败不触发 setState", async () => {
+    const grantA = makeDeferredGrant();
+    const { unmount } = render(<HistoryWorkbench {...defaultProps} />);
+    // revoke 故意 reject——模拟后端 revoke 失败
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return grantA.promise;
+      if (cmd === "revoke_scan_authorization") {
+        throw new Error("revoke 后端失败");
+      }
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
+      ).toBe(true);
+    });
+
+    // 卸载组件
+    unmount();
+
+    // resolve grant(A)——stale，组件已卸载
+    // 卸载 cleanup 会调用 revoke（失败），stale 分支也会跳过（mountedRef=false）
+    // 不应产生任何 React setState 警告
+    grantA.resolve("C:\\canonical-A");
+
+    // 等待微任务和 revoke reject 传播
+    await new Promise((r) => setTimeout(r, 50));
+
+    // 验证：revoke 被调用（卸载 cleanup + 可能的 stale 分支）
+    const revokeCalls = mockInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "revoke_scan_authorization",
+    );
+    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+    // 无 React act 警告即表示未对已卸载组件 setState
+    // React 18 不再打印警告，但若 setState 被调用会有 console.error
+    // 此测试主要验证不抛出未捕获异常
   });
 });
