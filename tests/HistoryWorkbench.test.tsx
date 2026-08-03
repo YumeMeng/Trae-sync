@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { HistoryWorkbench } from "../src/components/HistoryWorkbench";
 import type {
@@ -928,18 +929,42 @@ describe("T03 历史库工作台", () => {
     let grantCallCount = 0;
     let scanCalled = false;
     let scanFixtureRoot: string | null = null;
+    let backendGeneration = 0;
+    let backendAuthorizedRoot: string | null = null;
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "grant_scan_authorization") {
         grantCallCount += 1;
-        return grantCallCount === 1 ? grantA.promise : grantB.promise;
+        backendGeneration += 1;
+        const generation = backendGeneration;
+        const pending = grantCallCount === 1 ? grantA.promise : grantB.promise;
+        return pending.then((canonical) => {
+          // 模拟后端服务端代次：旧 grant 晚完成时不得提交。
+          if (generation !== backendGeneration) {
+            throw new Error("授权请求已失效");
+          }
+          backendAuthorizedRoot = canonical;
+          return canonical;
+        });
       }
-      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "revoke_scan_authorization") {
+        backendGeneration += 1;
+        backendAuthorizedRoot = null;
+        return null;
+      }
       if (cmd === "scan_history") {
         scanCalled = true;
         const a = args as { fixtureRoot: string };
         scanFixtureRoot = a.fixtureRoot;
-        return {} as ScanOutcomeDto;
+        if (a.fixtureRoot !== backendAuthorizedRoot) {
+          return { kind: "failed", reason: "not_authorized" } as ScanOutcomeDto;
+        }
+        return {
+          kind: "deduplicated",
+          existing_snapshot_id: "snapshot-r12-b",
+          fingerprint: "fingerprint-r12-b",
+        } as ScanOutcomeDto;
       }
+      if (cmd === "browse_history") return makeBrowseResult();
       throw new Error(`未模拟: ${cmd}`);
     });
 
@@ -1001,6 +1026,42 @@ describe("T03 历史库工作台", () => {
       expect(scanCalled).toBe(true);
     });
     expect(scanFixtureRoot).toBe("D:\\canonical-B");
+    expect(backendAuthorizedRoot).toBe("D:\\canonical-B");
+  });
+
+  it("R12-B：新 grant 必须等待路径变化产生的旧 revoke 完成", async () => {
+    const grantA = makeDeferredGrant();
+    const revoke = makeDeferredGrant();
+    let grantCallCount = 0;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") {
+        grantCallCount += 1;
+        if (grantCallCount === 1) return grantA.promise;
+        return "D:\\canonical-B";
+      }
+      if (cmd === "revoke_scan_authorization") return revoke.promise.then(() => undefined);
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\A" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => expect(grantCallCount).toBe(1));
+
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "D:\\B" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+
+    // revoke 未完成前，B grant 不得进入后端。
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(grantCallCount).toBe(1);
+
+    revoke.resolve("");
+    await waitFor(() => expect(grantCallCount).toBe(2));
+    await waitFor(() => expect(screen.getByTestId("authorize-check")).toBeChecked());
   });
 
   // ============== R12-C：卸载后异步失败不得更新 React 状态 ==============
@@ -1042,9 +1103,30 @@ describe("T03 历史库工作台", () => {
     const revokeCalls = mockInvoke.mock.calls.filter(
       ([cmd]) => cmd === "revoke_scan_authorization",
     );
-    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
-    // 无 React act 警告即表示未对已卸载组件 setState
-    // React 18 不再打印警告，但若 setState 被调用会有 console.error
-    // 此测试主要验证不抛出未捕获异常
+    // 只能有卸载 cleanup 的一次 revoke；grant 返回后不得再次进入 stale revoke 分支。
+    expect(revokeCalls).toHaveLength(1);
+  });
+
+  it("R12-C：StrictMode effect 重放后仍可完成授权", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return "C:\\canonical-fixture";
+      if (cmd === "revoke_scan_authorization") return null;
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(
+      <StrictMode>
+        <HistoryWorkbench {...defaultProps} />
+      </StrictMode>,
+    );
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+      expect(screen.getByTestId("scan-history-button")).toBeEnabled();
+    });
   });
 });

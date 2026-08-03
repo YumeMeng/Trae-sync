@@ -35,6 +35,43 @@ use traesync_infrastructure::{
     WorkCnSourceNormalizer,
 };
 
+/// 扫描授权槽：服务端生成代次，确保晚完成的旧 grant/revoke 不能覆盖新意图。
+struct AuthorizationSlot {
+    generation: u64,
+    state: AuthorizationState,
+}
+
+impl AuthorizationSlot {
+    fn new(state: AuthorizationState) -> Self {
+        Self {
+            generation: 0,
+            state,
+        }
+    }
+
+    /// 开始一次授权请求，并立即使旧授权失效。
+    fn begin_grant(&mut self) -> u64 {
+        self.generation = self.generation.checked_add(1).expect("扫描授权代次溢出");
+        self.state = AuthorizationState::NotAuthorized;
+        self.generation
+    }
+
+    /// 仅最新授权请求可提交；旧请求晚返回时保持当前状态不变。
+    fn commit_grant(&mut self, generation: u64, state: AuthorizationState) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.state = state;
+        true
+    }
+
+    /// 撤销属于新的用户意图：递增代次，使所有更早的 pending grant 失效。
+    fn revoke(&mut self) {
+        self.generation = self.generation.checked_add(1).expect("扫描授权代次溢出");
+        self.state = AuthorizationState::NotAuthorized;
+    }
+}
+
 /// 应用共享状态：在 Tauri command 之间共享的依赖。
 ///
 /// T02 新增 workbench_probe / workbench_reader / raw_key——这些在 fixture 模式下
@@ -58,7 +95,7 @@ struct AppState {
     /// R1：扫描授权状态——由后端持有，不接受前端注入。
     /// 用户通过 `grant_scan_authorization` 显式授权后设为 Authorized，
     /// 默认 NotAuthorized。scan_history 在任何 FS/DB 访问前检查此状态。
-    authorization: Mutex<AuthorizationState>,
+    authorization: Mutex<AuthorizationSlot>,
 }
 
 /// `get_workspace_state` Tauri command。
@@ -123,14 +160,24 @@ fn grant_scan_authorization(
     if db_relative_path.is_empty() {
         return Err("数据库相对路径不能为空".to_string());
     }
+    // R12-B：先登记服务端代次，再做路径验证。后发请求/撤销会使本次提交失效。
+    let generation = state.authorization.lock().unwrap().begin_grant();
     // R1：用 FixturePathGuard 验证 fixture_root——拒绝真实 TRAE 路径与 disk root
     let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
     let canonical = guard.canonical_root().to_string_lossy().into_owned();
-    // 存储授权状态——绑定到 canonical fixture_root + db_relative_path
-    *state.authorization.lock().unwrap() = AuthorizationState::Authorized {
+    let authorization = AuthorizationState::Authorized {
         canonical_fixture_root: canonical.clone(),
         db_relative_path,
     };
+    // 只有仍为最新代次时才能发布授权；旧请求不得覆盖后来的授权或撤销。
+    if !state
+        .authorization
+        .lock()
+        .unwrap()
+        .commit_grant(generation, authorization)
+    {
+        return Err("授权请求已失效".to_string());
+    }
     Ok(canonical)
 }
 
@@ -139,7 +186,7 @@ fn grant_scan_authorization(
 /// R1：撤销后 scan_history 会立即拒绝。用于扫描完成或用户取消时清除授权。
 #[tauri::command]
 fn revoke_scan_authorization(state: tauri::State<AppState>) -> Result<(), String> {
-    *state.authorization.lock().unwrap() = AuthorizationState::NotAuthorized;
+    state.authorization.lock().unwrap().revoke();
     Ok(())
 }
 
@@ -190,7 +237,7 @@ fn scan_history_inner(
     }
 
     // 2. R8：先锁定授权状态进行检查——在任何 FS/DB 访问、guard 构造、canonicalize 之前
-    let authorization = state.authorization.lock().unwrap().clone();
+    let authorization = state.authorization.lock().unwrap().state.clone();
     let canonical_root_str = match &authorization {
         AuthorizationState::NotAuthorized => {
             // 未授权：立即拒绝，不构造 guard、不访问文件系统
@@ -347,7 +394,7 @@ pub fn run() {
             raw_key,
             storage_root,
             // R1：默认未授权——必须由 grant_scan_authorization 显式授权后才能扫描
-            authorization: Mutex::new(AuthorizationState::NotAuthorized),
+            authorization: Mutex::new(AuthorizationSlot::new(AuthorizationState::NotAuthorized)),
         })
         .invoke_handler(tauri::generate_handler![
             get_workspace_state,
@@ -383,8 +430,42 @@ mod r8_order_tests {
             workbench_reader: AccountEvidenceReader::new(),
             raw_key: "0".repeat(64),
             storage_root: "/nonexistent/storage-root".to_string(),
-            authorization: Mutex::new(authorization),
+            authorization: Mutex::new(AuthorizationSlot::new(authorization)),
         }
+    }
+
+    #[test]
+    fn r12_b_late_old_grant_cannot_overwrite_new_grant() {
+        let mut slot = AuthorizationSlot::new(AuthorizationState::NotAuthorized);
+        let generation_a = slot.begin_grant();
+        let generation_b = slot.begin_grant();
+
+        let authorization_b = AuthorizationState::Authorized {
+            canonical_fixture_root: "D:/fixture-B".to_string(),
+            db_relative_path: "database.db".to_string(),
+        };
+        assert!(slot.commit_grant(generation_b, authorization_b.clone()));
+
+        let authorization_a = AuthorizationState::Authorized {
+            canonical_fixture_root: "C:/fixture-A".to_string(),
+            db_relative_path: "database.db".to_string(),
+        };
+        assert!(!slot.commit_grant(generation_a, authorization_a));
+        assert_eq!(slot.state, authorization_b);
+    }
+
+    #[test]
+    fn r12_b_revoke_invalidates_older_pending_grant() {
+        let mut slot = AuthorizationSlot::new(AuthorizationState::NotAuthorized);
+        let generation_a = slot.begin_grant();
+        slot.revoke();
+
+        let authorization_a = AuthorizationState::Authorized {
+            canonical_fixture_root: "C:/fixture-A".to_string(),
+            db_relative_path: "database.db".to_string(),
+        };
+        assert!(!slot.commit_grant(generation_a, authorization_a));
+        assert_eq!(slot.state, AuthorizationState::NotAuthorized);
     }
 
     #[test]

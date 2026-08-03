@@ -83,10 +83,9 @@ export function HistoryWorkbench({
     dbRelativePath: string;
   } | null>(null);
 
-  // R12-B：authorizedFixtureRoot 的 ref 镜像——grant 返回后 await 之后的 closure
-  // 中读取的 state 是发起时的旧值，无法感知新授权是否已建立。
-  // 用 ref 跟踪最新值，stale revoke 时判断当前是否已有新授权，避免误伤。
-  const authorizedFixtureRootRef = useRef<string | null>(null);
+  // R12-B：串行保存 revoke。新的 grant 必须等待此前撤销完成，
+  // 避免旧 revoke 晚完成后清除新授权。
+  const authorizationMutationRef = useRef<Promise<void>>(Promise.resolve());
 
   // R12-C：mounted guard——组件卸载后所有异步回调（grant 返回、stale revoke、
   // revoke 失败）均不得调用 React setter，否则触发"对已卸载组件 setState"警告。
@@ -117,13 +116,18 @@ export function HistoryWorkbench({
   // R12-B：撤销后端授权的辅助——调用 revoke 并处理失败状态。
   // revoke 失败时本地仍保持未授权，并显示结构化失败状态；不静默恢复旧授权。
   // R12-C：revoke 失败的 setScanError 通过 mountedRef guard 保护。
-  const revokeBackendAuth = useCallback((reason: string) => {
-    invoke<void>("revoke_scan_authorization").catch((e) => {
-      // R12-C：revoke 失败——仅在组件仍挂载时记录结构化失败状态
-      if (mountedRef.current) {
-        setScanError(`${reason}: revoke 失败 ${String(e)}`);
-      }
-    });
+  const revokeBackendAuth = useCallback((reason: string, reportFailure = true) => {
+    const revoke = authorizationMutationRef.current
+      .catch(() => undefined)
+      .then(() => invoke<void>("revoke_scan_authorization"))
+      .catch((e) => {
+        // R12-C：卸载清理失败不更新状态；交互触发的失败仍显示诊断。
+        if (reportFailure && mountedRef.current) {
+          setScanError(`${reason}: revoke 失败 ${String(e)}`);
+        }
+      });
+    authorizationMutationRef.current = revoke;
+    return revoke;
   }, []);
 
   // R7：用户勾选授权时调用后端 grant_scan_authorization，建立后端授权状态机
@@ -149,6 +153,15 @@ export function HistoryWorkbench({
         setAuthorizationPending(true);
         setScanError(null);
         try {
+          // R12-B：等待此前路径变化/取消产生的 revoke 完成，再建立新授权。
+          await authorizationMutationRef.current;
+          if (
+            !mountedRef.current ||
+            generation !== authGenerationRef.current ||
+            pendingAuthSnapshotRef.current !== snapshot
+          ) {
+            return;
+          }
           const canonical = await invoke<string>("grant_scan_authorization", {
             fixtureRoot,
             dbRelativePath,
@@ -160,12 +173,7 @@ export function HistoryWorkbench({
             generation !== authGenerationRef.current ||
             pendingAuthSnapshotRef.current !== snapshot
           ) {
-            // R12-B：stale response——只在当前没有有效新授权时才 revoke。
-            // 如果新授权（B）已建立（authorizedFixtureRootRef 非空），
-            // 则 stale 的旧授权（A）revoke 会误伤 B，因此跳过。
-            if (authorizedFixtureRootRef.current === null) {
-              revokeBackendAuth("stale grant 响应");
-            }
+            // R12-B：后端服务端代次保证 stale grant 无法提交；此前撤销也已串行完成。
             return;
           }
           // R12：再次校验当前输入与发起时一致
@@ -177,8 +185,7 @@ export function HistoryWorkbench({
             revokeBackendAuth("grant 返回时输入已变化");
             return;
           }
-          // 接受授权结果——同步更新 ref 镜像
-          authorizedFixtureRootRef.current = canonical;
+          // 接受最新授权结果
           setAuthorizedFixtureRoot(canonical);
           setAuthorizationPending(false);
           pendingAuthSnapshotRef.current = null;
@@ -186,7 +193,6 @@ export function HistoryWorkbench({
         } catch (e) {
           // R12-C：授权失败——仅在组件仍挂载且仍是当前 generation 时更新状态
           if (mountedRef.current && generation === authGenerationRef.current) {
-            authorizedFixtureRootRef.current = null;
             setAuthorizedFixtureRoot(null);
             setAuthorizationPending(false);
             pendingAuthSnapshotRef.current = null;
@@ -199,7 +205,6 @@ export function HistoryWorkbench({
         // 再撤销后端授权，清空本地状态。pending 时后端可能已建立授权，必须 revoke。
         // revoke 失败时由 revokeBackendAuth 设置结构化失败状态，本地保持未授权
         invalidatePendingAuth();
-        authorizedFixtureRootRef.current = null;
         setAuthorizedFixtureRoot(null);
         revokeBackendAuth("用户取消授权");
       }
@@ -216,14 +221,12 @@ export function HistoryWorkbench({
 
   // R7：路径变化时撤销旧授权——旧授权不得继续有效
   // R12：pending 请求也必须失效——递增 generation 使 stale response 被丢弃
-  // R12-B：同步更新 ref 镜像，stale grant 返回时据此判断是否跳过 revoke
   const handleFixtureRootChange = useCallback(
     (value: string) => {
       setFixtureRoot(value);
       // R12：无论 pending 还是已授权，路径变化都使当前授权上下文失效
       if (authorizationPending || authorizedFixtureRoot !== null) {
         invalidatePendingAuth();
-        authorizedFixtureRootRef.current = null;
         setAuthorizedFixtureRoot(null);
         revokeBackendAuth("fixtureRoot 变化");
       }
@@ -237,7 +240,6 @@ export function HistoryWorkbench({
       // R12：无论 pending 还是已授权，路径变化都使当前授权上下文失效
       if (authorizationPending || authorizedFixtureRoot !== null) {
         invalidatePendingAuth();
-        authorizedFixtureRootRef.current = null;
         setAuthorizedFixtureRoot(null);
         revokeBackendAuth("dbRelativePath 变化");
       }
@@ -248,18 +250,16 @@ export function HistoryWorkbench({
   // R12-C：组件卸载时标记 mounted=false，使所有异步回调不再更新 React 状态。
   // 同时递增 generation 使 pending grant 返回时被识别为 stale，并 revoke 后端授权。
   useEffect(() => {
+    // React StrictMode 开发模式会执行 setup-cleanup-setup；每次 setup 必须恢复挂载标记。
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       authGenerationRef.current += 1;
       pendingAuthSnapshotRef.current = null;
-      authorizedFixtureRootRef.current = null;
-      // 撤销后端可能已建立的授权（pending 返回后端可能已建立授权）
-      // 注意：卸载后不能 setState，但 invoke 仍可调用
-      invoke<void>("revoke_scan_authorization").catch(() => {
-        // 卸载后 revoke 失败无法显示——静默处理
-      });
+      // 卸载清理加入同一串行队列；失败不得触发 React setter。
+      void revokeBackendAuth("组件卸载", false);
     };
-  }, []);
+  }, [revokeBackendAuth]);
 
   // 执行扫描：显式用户动作，不自动触发
   const handleScan = useCallback(async () => {
