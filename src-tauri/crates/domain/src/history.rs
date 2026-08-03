@@ -313,6 +313,9 @@ pub struct ProjectIdentity {
     pub biz_project_id: String,
     /// 显示名
     pub display_name: String,
+    /// R6：软删除标记——软删除项目作为证据保留，但从 browse/search/count 排除
+    #[serde(default)]
+    pub soft_deleted: bool,
 }
 
 /// 单次 owner 观察：扫描时记录的活动库归属。
@@ -438,12 +441,18 @@ pub struct MessageProjection {
     pub session_id: String,
     /// 消息角色（user/assistant/tool 等）
     pub role: String,
-    /// 消息正文摘要（FTS 索引源）
+    /// 消息正文（完整内容，R4 修复：不再截断为 500 字符摘要；
+    /// 内容图哈希使用完整正文，确保第 500 字符之后的变化也能影响版本分类）
     pub content_excerpt: String,
     /// 是否软删除
     pub soft_deleted: bool,
     /// 消息序号（按时间排序）
     pub seq: u64,
+    /// R4：消息所属的 turn ID（可选关系字段）。
+    /// 来自源 DB 的 turn_id 列（如存在）；不存在时为 None。
+    /// 参与内容图哈希，确保 turn 关系变化影响版本分类。
+    #[serde(default)]
+    pub turn_id: Option<String>,
 }
 
 /// 对话预览：完整对话的消息序列。
@@ -642,6 +651,7 @@ mod tests {
                 project_id: "p1".to_string(),
                 biz_project_id: "biz-1".to_string(),
                 display_name: "Project 1".to_string(),
+                soft_deleted: false,
             },
             first_observed_owner: "user-A".to_string(),
             first_observed_at: SystemTime::UNIX_EPOCH,

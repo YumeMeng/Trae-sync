@@ -23,6 +23,23 @@ use traesync_ports::{ContentGraphHasher, SourceNormalizer};
 
 use crate::content_graph::DeterministicContentGraphHasher;
 
+/// R4：检测 SQLite 表中是否存在指定列。
+/// 用于条件性读取 turn_id 等可选关系列。
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({})", table);
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    let names: Vec<String> = match stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => return false,
+    };
+    names.iter().any(|name| name == column)
+}
+
 /// Work CN 来源 normalizer。
 ///
 /// 持有 SQLCipher raw key（私有），实现 `SourceNormalizer` port。
@@ -82,11 +99,11 @@ impl SourceNormalizer for WorkCnSourceNormalizer {
             Some(c) => c,
             None => return Vec::new(),
         };
-        // 排除软删除项目（deleted_at IS NULL 或 deleted_at = 0）
-        let mut stmt = match conn.prepare(
-            "SELECT project_id, biz_project_id, user_id FROM project \
-             WHERE deleted_at IS NULL OR deleted_at = 0",
-        ) {
+        // R6：读取全部项目（含软删除），用 deleted_at 标记 soft_deleted。
+        // 软删除项目作为证据保留进入 catalog，但 browse/search/count 排除。
+        let mut stmt = match conn
+            .prepare("SELECT project_id, biz_project_id, user_id, deleted_at FROM project")
+        {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -94,6 +111,7 @@ impl SourceNormalizer for WorkCnSourceNormalizer {
             let project_id: String = row.get(0)?;
             let biz_project_id: String = row.get(1)?;
             let _user_id: String = row.get(2)?;
+            let deleted_at: i64 = row.get(3).unwrap_or(0);
             // display_name 优先用 biz_project_id，为空时回退 project_id
             let display_name = if biz_project_id.is_empty() {
                 project_id.clone()
@@ -104,6 +122,7 @@ impl SourceNormalizer for WorkCnSourceNormalizer {
                 project_id,
                 biz_project_id,
                 display_name,
+                soft_deleted: deleted_at != 0,
             })
         }) {
             Ok(r) => r,
@@ -147,11 +166,19 @@ impl SourceNormalizer for WorkCnSourceNormalizer {
             Some(c) => c,
             None => return Vec::new(),
         };
-        // 按 message_id 排序，seq 用排序后递增序号
-        let mut stmt = match conn.prepare(
-            "SELECT message_id, session_id, role, content, deleted_at \
-             FROM chat_message ORDER BY message_id ASC",
-        ) {
+        // R4：检测 chat_message 表是否有 turn_id 列
+        let has_turn_id = column_exists(&conn, "chat_message", "turn_id");
+
+        // R4：统一使用 6 列 SQL（无 turn_id 列时用 NULL as turn_id），保证闭包类型一致
+        // 不再截断 content——存储完整内容用于内容图哈希
+        let sql = if has_turn_id {
+            "SELECT message_id, session_id, role, content, deleted_at, turn_id \
+             FROM chat_message ORDER BY message_id ASC"
+        } else {
+            "SELECT message_id, session_id, role, content, deleted_at, NULL AS turn_id \
+             FROM chat_message ORDER BY message_id ASC"
+        };
+        let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -161,14 +188,14 @@ impl SourceNormalizer for WorkCnSourceNormalizer {
             let role: String = row.get(2).unwrap_or_default();
             let content: String = row.get(3).unwrap_or_default();
             let deleted_at: i64 = row.get(4).unwrap_or(0);
-            // content_excerpt 取前 500 字符
-            let content_excerpt: String = content.chars().take(500).collect();
+            let turn_id: Option<String> = row.get(5).ok();
             Ok((
                 message_id,
                 session_id,
                 role,
-                content_excerpt,
+                content,
                 deleted_at != 0,
+                turn_id,
             ))
         }) {
             Ok(r) => r,
@@ -178,14 +205,16 @@ impl SourceNormalizer for WorkCnSourceNormalizer {
         let mut seq: u64 = 0;
         rows.filter_map(|r| {
             r.ok().map(
-                |(message_id, session_id, role, content_excerpt, soft_deleted)| {
+                |(message_id, session_id, role, content, soft_deleted, turn_id)| {
                     let m = MessageProjection {
                         message_id,
                         session_id,
                         role,
-                        content_excerpt,
+                        // R4：存储完整内容，不截断
+                        content_excerpt: content,
                         soft_deleted,
                         seq,
+                        turn_id,
                     };
                     seq += 1;
                     m
@@ -276,17 +305,25 @@ mod tests {
     }
 
     #[test]
-    fn read_projects_excludes_soft_deleted() {
+    fn r6_read_projects_includes_soft_deleted_with_flag() {
         let dir = tempdir().unwrap();
         make_plaintext_fixture(dir.path());
         let normalizer = WorkCnSourceNormalizer::new(TEST_RAW_KEY.to_string());
         let projects = normalizer.read_projects(dir.path());
-        // p1 保留，p2 软删除排除
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].project_id, "p1");
-        assert_eq!(projects[0].biz_project_id, "biz-1");
+        // R6：全部项目都返回（含软删除 p2），用 soft_deleted 标记区分
+        assert_eq!(projects.len(), 2, "应返回全部 2 个项目（含软删除）");
+        let p1 = projects
+            .iter()
+            .find(|p| p.project_id == "p1")
+            .expect("应有 p1");
+        let p2 = projects
+            .iter()
+            .find(|p| p.project_id == "p2")
+            .expect("应有 p2");
+        assert!(!p1.soft_deleted, "p1 未删除");
+        assert!(p2.soft_deleted, "p2 应标记为软删除");
         // display_name 用 biz_project_id
-        assert_eq!(projects[0].display_name, "biz-1");
+        assert_eq!(p1.display_name, "biz-1");
     }
 
     #[test]
@@ -386,7 +423,8 @@ mod tests {
     }
 
     #[test]
-    fn content_excerpt_truncates_to_500_chars() {
+    fn r4_content_not_truncated_full_content_preserved() {
+        // R4：内容不再截断为 500 字符——完整内容被保留
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("database.db");
         {
@@ -409,7 +447,35 @@ mod tests {
         let normalizer = WorkCnSourceNormalizer::new(TEST_RAW_KEY.to_string());
         let messages = normalizer.read_messages(dir.path());
         assert_eq!(messages.len(), 1);
-        // content_excerpt 截断到 500 字符
-        assert_eq!(messages[0].content_excerpt.chars().count(), 500);
+        // R4：content_excerpt 保留完整内容（1000 字符），不再截断为 500
+        assert_eq!(messages[0].content_excerpt.chars().count(), 1000);
+        // turn_id 为 None（表无此列）
+        assert_eq!(messages[0].turn_id, None);
+    }
+
+    #[test]
+    fn r4_turn_id_read_when_column_exists() {
+        // R4：当 chat_message 表有 turn_id 列时，读取 turn_id
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("database.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT, biz_project_id TEXT, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_message (message_id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0, turn_id TEXT);
+                INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello', 0, 'turn-1');
+                INSERT INTO chat_message VALUES ('m2', 's1', 'assistant', 'hi', 0, NULL);
+                "#,
+            ).unwrap();
+        }
+        let normalizer = WorkCnSourceNormalizer::new(TEST_RAW_KEY.to_string());
+        let messages = normalizer.read_messages(dir.path());
+        assert_eq!(messages.len(), 2);
+        // m1 有 turn_id
+        assert_eq!(messages[0].turn_id.as_deref(), Some("turn-1"));
+        // m2 turn_id 为 NULL -> None
+        assert_eq!(messages[1].turn_id, None);
     }
 }

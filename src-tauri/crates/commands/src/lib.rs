@@ -18,7 +18,8 @@ use traesync_application::WorkspaceStateProvider;
 // T03/T04 历史命令所需的 application 服务与 domain 值对象
 use traesync_application::{AssignProjectSourceService, BrowseHistoryService, ScanHistoryService};
 use traesync_domain::{
-    BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome, SearchHit, SessionIdentity,
+    AuthorizationState, BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome,
+    SearchHit, SessionIdentity,
 };
 
 /// `get_workspace_state` 命令：返回空工作台状态。
@@ -95,6 +96,16 @@ pub enum HistoryCommandError {
     EmptyQuery,
     /// 项目 ID 为空
     EmptyProjectId,
+    /// R1：未授权扫描——后端未持有显式用户授权
+    NotAuthorized,
+    /// R1：授权不匹配——请求的 fixture_root/db_relative_path 与授权范围不一致
+    AuthorizationMismatch,
+    /// R1：TRAE 进程运行中——在任何 DB/账号证据访问前早拒
+    ProcessRunning,
+    /// R2：数据库相对路径是绝对路径
+    DbRelativePathAbsolute,
+    /// R2：数据库相对路径包含父目录遍历 (`..`)
+    DbRelativePathParentTraversal,
 }
 
 impl std::fmt::Display for HistoryCommandError {
@@ -105,13 +116,87 @@ impl std::fmt::Display for HistoryCommandError {
             Self::EmptyStorageRoot => write!(f, "存储根不能为空"),
             Self::EmptyQuery => write!(f, "搜索查询不能为空"),
             Self::EmptyProjectId => write!(f, "项目 ID 不能为空"),
+            Self::NotAuthorized => write!(f, "未授权扫描：后端未持有显式用户授权"),
+            Self::AuthorizationMismatch => write!(f, "授权不匹配：请求范围与授权范围不一致"),
+            Self::ProcessRunning => write!(f, "TRAE 进程运行中：拒绝扫描"),
+            Self::DbRelativePathAbsolute => write!(f, "数据库相对路径是绝对路径"),
+            Self::DbRelativePathParentTraversal => {
+                write!(f, "数据库相对路径包含父目录遍历 (`..`)")
+            }
         }
     }
 }
 
 impl std::error::Error for HistoryCommandError {}
 
+/// R1：检查扫描授权与进程边界——在任何 DB/账号证据/FS 访问之前执行。
+///
+/// 纯函数，可在不启动 Tauri 运行时的情况下测试反例：
+/// - 未授权（NotAuthorized）→ 拒绝
+/// - 授权范围不匹配（AuthorizationMismatch）→ 拒绝
+/// - TRAE 运行中（ProcessRunning）→ 拒绝
+///
+/// 返回 Ok(()) 表示通过授权与进程边界检查，可进入 DB 探测阶段。
+pub fn check_scan_authorization(
+    fixture_root: &Path,
+    db_relative_path: &str,
+    process_state: ProcessRunningState,
+    authorization: &AuthorizationState,
+) -> Result<(), HistoryCommandError> {
+    match authorization {
+        AuthorizationState::NotAuthorized => Err(HistoryCommandError::NotAuthorized),
+        AuthorizationState::Authorized {
+            canonical_fixture_root,
+            db_relative_path: authorized_db_path,
+        } => {
+            // 验证请求范围与授权范围一致——防止授权 A 路径后扫描 B 路径
+            if fixture_root.to_string_lossy() != *canonical_fixture_root
+                || db_relative_path != *authorized_db_path
+            {
+                return Err(HistoryCommandError::AuthorizationMismatch);
+            }
+            // R1：运行中早拒——在任何 DB probing/account-evidence 读之前
+            if process_state == ProcessRunningState::Running {
+                return Err(HistoryCommandError::ProcessRunning);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// R2：词法检查 `db_relative_path` 是否安全——拒绝绝对路径与父目录遍历。
+///
+/// 纯函数，不依赖文件系统状态，可在任何层调用。返回 `Ok(())` 表示词法安全。
+/// 完整的封闭证明（含符号链接/junction 解析）由 infrastructure 层的
+/// `FixturePathGuard::validate_db_relative_path` 完成；此处只做早拒，避免
+/// 不安全的路径字符串进入 application/infrastructure 调用链。
+pub fn check_db_relative_path_lexical(db_relative_path: &str) -> Result<(), HistoryCommandError> {
+    if db_relative_path.is_empty() {
+        return Err(HistoryCommandError::EmptyDbRelativePath);
+    }
+    let p = Path::new(db_relative_path);
+    if p.is_absolute() {
+        return Err(HistoryCommandError::DbRelativePathAbsolute);
+    }
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(HistoryCommandError::DbRelativePathParentTraversal);
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(HistoryCommandError::DbRelativePathAbsolute);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// `scan_history` 命令：调用应用服务执行首次扫描。
+///
+/// R1 修复：`authorization` 由后端持有，在此函数最先检查——
+/// 未授权或运行中时在任何 DB/账号证据/FS 访问之前返回错误。
+/// 不接受调用方控制的 process_state 作为权威——仅作为早拒信号。
 ///
 /// 输入校验：fixture_root、db_relative_path、storage_root 非空。
 /// raw_key 在服务构造时已注入，不通过此函数暴露。
@@ -124,17 +209,19 @@ pub fn scan_history(
     process_state: ProcessRunningState,
     storage_root: &Path,
     now: SystemTime,
+    authorization: &AuthorizationState,
     service: &ScanHistoryService,
 ) -> Result<ScanOutcome, HistoryCommandError> {
     if fixture_root.as_os_str().is_empty() {
         return Err(HistoryCommandError::EmptyFixtureRoot);
     }
-    if db_relative_path.is_empty() {
-        return Err(HistoryCommandError::EmptyDbRelativePath);
-    }
     if storage_root.as_os_str().is_empty() {
         return Err(HistoryCommandError::EmptyStorageRoot);
     }
+    // R2：词法检查 db_relative_path——在任何 DB 探测/FS 访问之前拒绝绝对路径与 `..`
+    check_db_relative_path_lexical(db_relative_path)?;
+    // R1：授权与进程边界检查——在任何 DB 探测之前
+    check_scan_authorization(fixture_root, db_relative_path, process_state, authorization)?;
     Ok(service.scan(
         fixture_root,
         db_relative_path,
@@ -597,7 +684,7 @@ mod tests {
 
     #[test]
     fn scan_history_normal_path() {
-        // scan_history 正常路径：Verified + Success -> 返回 Ok(Success)
+        // scan_history 正常路径：已授权 + Verified + Success -> 返回 Ok(Success)
         let probe = FakeDbProbe {
             state: CompatibilityState::Verified {
                 schema_fingerprint: SchemaFingerprint("fp".to_string()),
@@ -613,12 +700,17 @@ mod tests {
         let catalog = FakeCatalog::default();
         let normalizer = FakeNormalizer;
         let svc = ScanHistoryService::new(&store, &catalog, &probe, &reader, &normalizer, "rawkey");
+        let auth = AuthorizationState::Authorized {
+            canonical_fixture_root: "/tmp/fixture".to_string(),
+            db_relative_path: "database.db".to_string(),
+        };
         let result = scan_history(
             Path::new("/tmp/fixture"),
             "database.db",
             ProcessRunningState::NotRunning,
             Path::new("/tmp/storage"),
             std::time::SystemTime::UNIX_EPOCH,
+            &auth,
             &svc,
         );
         assert!(result.is_ok());
@@ -632,7 +724,7 @@ mod tests {
 
     #[test]
     fn scan_history_rejects_empty_inputs() {
-        // 空 fixture_root / db_relative_path / storage_root 被拒绝
+        // 空 fixture_root / db_relative_path / storage_root 被拒绝（在授权检查之前）
         let probe = FakeDbProbe {
             state: CompatibilityState::Verified {
                 schema_fingerprint: SchemaFingerprint("fp".to_string()),
@@ -648,6 +740,7 @@ mod tests {
         let catalog = FakeCatalog::default();
         let normalizer = FakeNormalizer;
         let svc = ScanHistoryService::new(&store, &catalog, &probe, &reader, &normalizer, "rawkey");
+        let auth = AuthorizationState::NotAuthorized;
         // 空 fixture_root
         assert_eq!(
             scan_history(
@@ -656,6 +749,7 @@ mod tests {
                 ProcessRunningState::NotRunning,
                 Path::new("/tmp/storage"),
                 std::time::SystemTime::UNIX_EPOCH,
+                &auth,
                 &svc,
             ),
             Err(HistoryCommandError::EmptyFixtureRoot)
@@ -668,6 +762,7 @@ mod tests {
                 ProcessRunningState::NotRunning,
                 Path::new("/tmp/storage"),
                 std::time::SystemTime::UNIX_EPOCH,
+                &auth,
                 &svc,
             ),
             Err(HistoryCommandError::EmptyDbRelativePath)
@@ -680,9 +775,234 @@ mod tests {
                 ProcessRunningState::NotRunning,
                 Path::new(""),
                 std::time::SystemTime::UNIX_EPOCH,
+                &auth,
                 &svc,
             ),
             Err(HistoryCommandError::EmptyStorageRoot)
+        );
+    }
+
+    // ========================================================================
+    // R1 反例测试：后端授权与进程边界
+    // ========================================================================
+
+    /// 记录 DB probe 是否被调用的 FakeDbProbe——用于验证授权检查在 DB 访问之前
+    struct ProbeCallTracker {
+        probed: Mutex<bool>,
+        state: CompatibilityState,
+    }
+
+    impl DatabaseProbePort for ProbeCallTracker {
+        fn probe_database(&self, _db_path: &Path, _raw_key: &str) -> CompatibilityState {
+            *self.probed.lock().unwrap() = true;
+            self.state.clone()
+        }
+        fn backup_to_logical_copy(&self, _source_db: &Path, _raw_key: &str) -> Option<PathBuf> {
+            None
+        }
+        fn verify_transaction_rollback(&self, _copy_db: &Path, _raw_key: &str) -> bool {
+            true
+        }
+        fn run_integrity_checks(&self, _db_path: &Path, _raw_key: &str) -> (bool, bool) {
+            (true, true)
+        }
+        fn create_random_key_catalog(&self, _fixture_root: &Path) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    /// 记录 account evidence 是否被读取的 FakeAccountReader
+    struct AccountReadTracker {
+        read: Mutex<bool>,
+    }
+
+    impl AccountEvidenceReaderPort for AccountReadTracker {
+        fn read_account_evidence(
+            &self,
+            _fixture_root: &Path,
+            _now: std::time::SystemTime,
+        ) -> traesync_domain::AccountEvidence {
+            *self.read.lock().unwrap() = true;
+            traesync_domain::AccountEvidence::default()
+        }
+        fn re_read_after_close(
+            &self,
+            _fixture_root: &Path,
+            _now: std::time::SystemTime,
+        ) -> traesync_domain::AccountEvidence {
+            traesync_domain::AccountEvidence::default()
+        }
+    }
+
+    #[test]
+    fn r1_direct_invoke_without_authorization_rejected_before_db_access() {
+        // R1 反例：直接调用 scan_history 不携带授权 -> 在 DB probe 之前被拒绝
+        let probe = ProbeCallTracker {
+            probed: Mutex::new(false),
+            state: CompatibilityState::Verified {
+                schema_fingerprint: SchemaFingerprint("fp".to_string()),
+                counts: TableCounts::default(),
+            },
+        };
+        let reader = AccountReadTracker {
+            read: Mutex::new(false),
+        };
+        let store = FakeSnapshotStore {
+            outcome: scan_success_outcome(),
+        };
+        let catalog = FakeCatalog::default();
+        let normalizer = FakeNormalizer;
+        let svc = ScanHistoryService::new(&store, &catalog, &probe, &reader, &normalizer, "rawkey");
+        let result = scan_history(
+            Path::new("/tmp/fixture"),
+            "database.db",
+            ProcessRunningState::NotRunning,
+            Path::new("/tmp/storage"),
+            std::time::SystemTime::UNIX_EPOCH,
+            &AuthorizationState::NotAuthorized,
+            &svc,
+        );
+        assert_eq!(result, Err(HistoryCommandError::NotAuthorized));
+        // DB probe 不应被调用
+        assert!(!*probe.probed.lock().unwrap(), "未授权时不应访问数据库");
+        // 账号证据不应被读取
+        assert!(!*reader.read.lock().unwrap(), "未授权时不应读取账号证据");
+    }
+
+    #[test]
+    fn r1_running_state_rejected_before_db_access() {
+        // R1 反例：已授权但 TRAE 运行中 -> 在 DB probe 之前被拒绝
+        let probe = ProbeCallTracker {
+            probed: Mutex::new(false),
+            state: CompatibilityState::Verified {
+                schema_fingerprint: SchemaFingerprint("fp".to_string()),
+                counts: TableCounts::default(),
+            },
+        };
+        let reader = AccountReadTracker {
+            read: Mutex::new(false),
+        };
+        let store = FakeSnapshotStore {
+            outcome: scan_success_outcome(),
+        };
+        let catalog = FakeCatalog::default();
+        let normalizer = FakeNormalizer;
+        let svc = ScanHistoryService::new(&store, &catalog, &probe, &reader, &normalizer, "rawkey");
+        let auth = AuthorizationState::Authorized {
+            canonical_fixture_root: "/tmp/fixture".to_string(),
+            db_relative_path: "database.db".to_string(),
+        };
+        let result = scan_history(
+            Path::new("/tmp/fixture"),
+            "database.db",
+            ProcessRunningState::Running,
+            Path::new("/tmp/storage"),
+            std::time::SystemTime::UNIX_EPOCH,
+            &auth,
+            &svc,
+        );
+        assert_eq!(result, Err(HistoryCommandError::ProcessRunning));
+        assert!(!*probe.probed.lock().unwrap(), "运行中时不应访问数据库");
+        assert!(!*reader.read.lock().unwrap(), "运行中时不应读取账号证据");
+    }
+
+    #[test]
+    fn r1_authorization_mismatch_rejected() {
+        // R1 反例：授权 A 路径但请求 B 路径 -> AuthorizationMismatch
+        let probe = FakeDbProbe {
+            state: CompatibilityState::Verified {
+                schema_fingerprint: SchemaFingerprint("fp".to_string()),
+                counts: TableCounts::default(),
+            },
+        };
+        let reader = FakeAccountReader {
+            evidence: verified_account(),
+        };
+        let store = FakeSnapshotStore {
+            outcome: scan_success_outcome(),
+        };
+        let catalog = FakeCatalog::default();
+        let normalizer = FakeNormalizer;
+        let svc = ScanHistoryService::new(&store, &catalog, &probe, &reader, &normalizer, "rawkey");
+        let auth = AuthorizationState::Authorized {
+            canonical_fixture_root: "/tmp/authorized-fixture".to_string(),
+            db_relative_path: "database.db".to_string(),
+        };
+        // 请求不同 fixture_root
+        let result = scan_history(
+            Path::new("/tmp/different-fixture"),
+            "database.db",
+            ProcessRunningState::NotRunning,
+            Path::new("/tmp/storage"),
+            std::time::SystemTime::UNIX_EPOCH,
+            &auth,
+            &svc,
+        );
+        assert_eq!(result, Err(HistoryCommandError::AuthorizationMismatch));
+    }
+
+    #[test]
+    fn r1_check_scan_authorization_pure_function() {
+        // R1：纯函数测试——不依赖 service，验证授权边界逻辑
+        let auth_authorized = AuthorizationState::Authorized {
+            canonical_fixture_root: "/tmp/fixture".to_string(),
+            db_relative_path: "database.db".to_string(),
+        };
+        // 未授权
+        assert_eq!(
+            check_scan_authorization(
+                Path::new("/tmp/fixture"),
+                "database.db",
+                ProcessRunningState::NotRunning,
+                &AuthorizationState::NotAuthorized,
+            ),
+            Err(HistoryCommandError::NotAuthorized)
+        );
+        // 授权匹配 + 未运行 -> Ok
+        assert!(check_scan_authorization(
+            Path::new("/tmp/fixture"),
+            "database.db",
+            ProcessRunningState::NotRunning,
+            &auth_authorized,
+        )
+        .is_ok());
+        // 授权匹配 + Unknown -> Ok（fixture 模式下 Unknown 可接受）
+        assert!(check_scan_authorization(
+            Path::new("/tmp/fixture"),
+            "database.db",
+            ProcessRunningState::Unknown,
+            &auth_authorized,
+        )
+        .is_ok());
+        // 授权匹配 + 运行中 -> 拒绝
+        assert_eq!(
+            check_scan_authorization(
+                Path::new("/tmp/fixture"),
+                "database.db",
+                ProcessRunningState::Running,
+                &auth_authorized,
+            ),
+            Err(HistoryCommandError::ProcessRunning)
+        );
+        // fixture_root 不匹配
+        assert_eq!(
+            check_scan_authorization(
+                Path::new("/tmp/other"),
+                "database.db",
+                ProcessRunningState::NotRunning,
+                &auth_authorized,
+            ),
+            Err(HistoryCommandError::AuthorizationMismatch)
+        );
+        // db_relative_path 不匹配
+        assert_eq!(
+            check_scan_authorization(
+                Path::new("/tmp/fixture"),
+                "other.db",
+                ProcessRunningState::NotRunning,
+                &auth_authorized,
+            ),
+            Err(HistoryCommandError::AuthorizationMismatch)
         );
     }
 
@@ -731,5 +1051,139 @@ mod tests {
         let calls = catalog.project_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].project_id, "p1");
+    }
+
+    // ============== R2：db_relative_path 逃逸反例测试 ==============
+
+    #[test]
+    fn r2_check_db_relative_path_lexical_rejects_empty() {
+        assert_eq!(
+            check_db_relative_path_lexical(""),
+            Err(HistoryCommandError::EmptyDbRelativePath)
+        );
+    }
+
+    #[test]
+    fn r2_check_db_relative_path_lexical_rejects_absolute_windows() {
+        // `C:\windows\system32\evil.db` 是绝对路径，必须被词法拒绝
+        assert_eq!(
+            check_db_relative_path_lexical("C:\\windows\\system32\\evil.db"),
+            Err(HistoryCommandError::DbRelativePathAbsolute)
+        );
+    }
+
+    #[test]
+    fn r2_check_db_relative_path_lexical_rejects_absolute_unix_style() {
+        // `/etc/passwd` 包含 RootDir 组件——必须被拒绝
+        assert_eq!(
+            check_db_relative_path_lexical("/etc/passwd"),
+            Err(HistoryCommandError::DbRelativePathAbsolute)
+        );
+    }
+
+    #[test]
+    fn r2_check_db_relative_path_lexical_rejects_parent_traversal() {
+        // `../secret.db` 必须被词法拒绝
+        assert_eq!(
+            check_db_relative_path_lexical("../secret.db"),
+            Err(HistoryCommandError::DbRelativePathParentTraversal)
+        );
+    }
+
+    #[test]
+    fn r2_check_db_relative_path_lexical_rejects_nested_parent_traversal() {
+        // `sub/../../escape.db` 含 `..` 组件——必须拒绝
+        assert_eq!(
+            check_db_relative_path_lexical("sub/../../escape.db"),
+            Err(HistoryCommandError::DbRelativePathParentTraversal)
+        );
+    }
+
+    #[test]
+    fn r2_check_db_relative_path_lexical_accepts_safe_relative_path() {
+        // 安全路径：纯相对路径，无绝对前缀，无 `..`
+        assert!(check_db_relative_path_lexical("database.db").is_ok());
+        assert!(check_db_relative_path_lexical("sub/database.db").is_ok());
+        assert!(check_db_relative_path_lexical("a/b/c/database.db").is_ok());
+    }
+
+    /// R2 反例：scan_history 在任何 service 调用前必须拒绝绝对路径与父目录遍历。
+    /// 使用 ProbeCallTracker 验证：拒绝时不应触发任何 DB probing。
+    #[test]
+    fn r2_scan_history_rejects_absolute_path_before_db_access() {
+        let probe = ProbeCallTracker {
+            probed: Mutex::new(false),
+            state: CompatibilityState::Verified {
+                schema_fingerprint: SchemaFingerprint("fp".to_string()),
+                counts: TableCounts::default(),
+            },
+        };
+        let reader = FakeAccountReader {
+            evidence: verified_account(),
+        };
+        let store = FakeSnapshotStore {
+            outcome: scan_success_outcome(),
+        };
+        let catalog = FakeCatalog::default();
+        let normalizer = FakeNormalizer;
+        let svc = ScanHistoryService::new(&store, &catalog, &probe, &reader, &normalizer, "rawkey");
+
+        let authorization = AuthorizationState::Authorized {
+            canonical_fixture_root: "/tmp/fixture".to_string(),
+            db_relative_path: "C:\\windows\\evil.db".to_string(),
+        };
+        let result = scan_history(
+            Path::new("/tmp/fixture"),
+            "C:\\windows\\evil.db",
+            ProcessRunningState::NotRunning,
+            Path::new("/tmp/storage"),
+            SystemTime::UNIX_EPOCH,
+            &authorization,
+            &svc,
+        );
+        // 词法检查在授权检查之前——返回绝对路径错误
+        assert_eq!(result, Err(HistoryCommandError::DbRelativePathAbsolute));
+        // 不应触发任何 DB probing
+        assert!(!*probe.probed.lock().unwrap());
+    }
+
+    /// R2 反例：scan_history 拒绝父目录遍历，且不触发 DB probing。
+    #[test]
+    fn r2_scan_history_rejects_parent_traversal_before_db_access() {
+        let probe = ProbeCallTracker {
+            probed: Mutex::new(false),
+            state: CompatibilityState::Verified {
+                schema_fingerprint: SchemaFingerprint("fp".to_string()),
+                counts: TableCounts::default(),
+            },
+        };
+        let reader = FakeAccountReader {
+            evidence: verified_account(),
+        };
+        let store = FakeSnapshotStore {
+            outcome: scan_success_outcome(),
+        };
+        let catalog = FakeCatalog::default();
+        let normalizer = FakeNormalizer;
+        let svc = ScanHistoryService::new(&store, &catalog, &probe, &reader, &normalizer, "rawkey");
+
+        let authorization = AuthorizationState::Authorized {
+            canonical_fixture_root: "/tmp/fixture".to_string(),
+            db_relative_path: "../escape.db".to_string(),
+        };
+        let result = scan_history(
+            Path::new("/tmp/fixture"),
+            "../escape.db",
+            ProcessRunningState::NotRunning,
+            Path::new("/tmp/storage"),
+            SystemTime::UNIX_EPOCH,
+            &authorization,
+            &svc,
+        );
+        assert_eq!(
+            result,
+            Err(HistoryCommandError::DbRelativePathParentTraversal)
+        );
+        assert!(!*probe.probed.lock().unwrap());
     }
 }

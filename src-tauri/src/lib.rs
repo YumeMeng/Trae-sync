@@ -16,7 +16,7 @@
 //! - raw_key 不进入 commands 层、UI 或日志
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::{
     AssignProjectSourceService, BrowseHistoryService, CatalogRepository, ScanHistoryService,
@@ -24,8 +24,8 @@ use traesync_application::{
 };
 use traesync_commands as commands;
 use traesync_domain::{
-    BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome, SearchHit,
-    SessionIdentity, WorkbenchReadState, WorkspaceState,
+    AuthorizationState, BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome,
+    SearchHit, SessionIdentity, WorkbenchReadState, WorkspaceState,
 };
 use traesync_infrastructure::{
     AccountEvidenceReader, FilesystemSnapshotStore, FixturePathGuard, PlatformFileIdentityProvider,
@@ -53,6 +53,10 @@ struct AppState {
     /// 快照发布到 `<storage_root>/snapshots/`，目录库位于 `<storage_root>/catalog.db`。
     /// 空字符串表示未配置——扫描命令返回错误。
     storage_root: String,
+    /// R1：扫描授权状态——由后端持有，不接受前端注入。
+    /// 用户通过 `grant_scan_authorization` 显式授权后设为 Authorized，
+    /// 默认 NotAuthorized。scan_history 在任何 FS/DB 访问前检查此状态。
+    authorization: Mutex<AuthorizationState>,
 }
 
 /// `get_workspace_state` Tauri command。
@@ -97,15 +101,58 @@ fn read_work_cn_state(
         .map_err(|e| e.to_string())
 }
 
+/// `grant_scan_authorization` Tauri command：用户显式授权扫描指定 fixture 路径。
+///
+/// R1 修复：后端拥有并验证显式用户授权。前端不能直接扫描——
+/// 必须先调用此命令获得后端授权，授权绑定到 canonical fixture_root + db_relative_path。
+/// 组合根负责用 `FixturePathGuard` 验证 fixture_root（拒绝真实 TRAE 路径），
+/// 然后存储授权状态供后续 scan_history 检查。
+///
+/// 返回授权后的 canonical fixture_root（供前端显示与确认）。
+#[tauri::command]
+fn grant_scan_authorization(
+    fixture_root: String,
+    db_relative_path: String,
+    state: tauri::State<AppState>,
+) -> Result<String, String> {
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+    if db_relative_path.is_empty() {
+        return Err("数据库相对路径不能为空".to_string());
+    }
+    // R1：用 FixturePathGuard 验证 fixture_root——拒绝真实 TRAE 路径与 disk root
+    let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
+    let canonical = guard.canonical_root().to_string_lossy().into_owned();
+    // 存储授权状态——绑定到 canonical fixture_root + db_relative_path
+    *state.authorization.lock().unwrap() = AuthorizationState::Authorized {
+        canonical_fixture_root: canonical.clone(),
+        db_relative_path,
+    };
+    Ok(canonical)
+}
+
+/// `revoke_scan_authorization` Tauri command：撤销扫描授权。
+///
+/// R1：撤销后 scan_history 会立即拒绝。用于扫描完成或用户取消时清除授权。
+#[tauri::command]
+fn revoke_scan_authorization(state: tauri::State<AppState>) -> Result<(), String> {
+    *state.authorization.lock().unwrap() = AuthorizationState::NotAuthorized;
+    Ok(())
+}
+
 /// `scan_history` Tauri command：执行首次扫描。
 ///
+/// R1 修复：后端在任何 FS/DB 访问之前检查显式用户授权与进程边界。
 /// 前端通过 `invoke("scan_history", { fixtureRoot, dbRelativePath, processState })` 调用。
 /// 组合根负责：
 /// 1. 验证 raw_key 与 storage_root 已配置（storage_root 来自 env，不接受前端注入）
 /// 2. 用 `FixturePathGuard` 验证 fixture_root
-/// 3. 构造 SnapshotStore / Catalog / Normalizer / Service 并注入 raw_key
-/// 4. 调用 `catalog.ensure_initialized()` 确保目录库表存在（首次扫描前初始化）
-/// 5. 调用 commands 层纯函数
+/// 3. R1：检查授权状态——未授权或范围不匹配时在任何 FS/DB 访问前拒绝
+/// 4. R1：检查 process_state == Running——运行中时在任何 DB probing 前拒绝
+/// 5. 构造 SnapshotStore / Catalog / Normalizer / Service 并注入 raw_key
+/// 6. 调用 `catalog.ensure_initialized()` 确保目录库表存在
+/// 7. 调用 commands 层纯函数（内含二次授权检查——defense in depth）
 ///
 /// raw_key 不进入 commands 层、UI 或日志。
 /// storage_root 从 env `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取，与 browse/search 等命令一致，
@@ -124,18 +171,40 @@ fn scan_history(
 
     // 2. 用 FixturePathGuard 验证 fixture_root——拒绝真实 TRAE 路径
     let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
+    let canonical_root = guard.canonical_root();
 
-    // 3. 构造 infrastructure 组件——raw_key 仅在此注入，不进入 commands 层
+    // 3. R1：锁定授权状态进行检查——在任何 FS/DB 访问之前
+    let authorization = state.authorization.lock().unwrap().clone();
+    {
+        use traesync_commands::check_scan_authorization;
+        // 在构造任何 infrastructure 组件之前验证授权与进程边界
+        check_scan_authorization(
+            canonical_root,
+            &db_relative_path,
+            process_state,
+            &authorization,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    // 4. R2：用 FixturePathGuard 验证 db_relative_path 与派生 WAL/SHM 全部封闭在 fixture_root 内
+    //    在任何 DB probing / 文件复制之前完成，拒绝绝对路径、父目录遍历与 symlink/junction 逃逸
+    //    返回的规范化 DB 路径严格位于 canonical_root 内部——后续 infrastructure 调用可信任此路径
+    let _canonical_db_path = guard
+        .validate_db_relative_path(&db_relative_path)
+        .map_err(|e| e.to_string())?;
+
+    // 5. 构造 infrastructure 组件——raw_key 仅在此注入，不进入 commands 层
     let file_identity = PlatformFileIdentityProvider::new();
     let snapshot_store = FilesystemSnapshotStore::new(Box::new(file_identity));
     let catalog_path = Path::new(&state.storage_root).join("catalog.db");
     let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
     let normalizer = WorkCnSourceNormalizer::new(state.raw_key.clone());
 
-    // 4. 确保目录库表已初始化（首次扫描前必须完成，否则 project_snapshot 会失败）
+    // 6. 确保目录库表已初始化（首次扫描前必须完成，否则 project_snapshot 会失败）
     catalog.ensure_initialized();
 
-    // 5. 构造 application service
+    // 7. 构造 application service
     let service = ScanHistoryService::new(
         &snapshot_store,
         &catalog,
@@ -145,14 +214,15 @@ fn scan_history(
         &state.raw_key,
     );
 
-    // 6. 调用 commands 层纯函数——now 显式传入，storage_root 来自 state
+    // 8. 调用 commands 层纯函数——内含二次授权检查（defense in depth）
     let now = std::time::SystemTime::now();
     commands::scan_history(
-        guard.canonical_root(),
+        canonical_root,
         &db_relative_path,
         process_state,
         Path::new(&state.storage_root),
         now,
+        &authorization,
         &service,
     )
     .map_err(|e| e.to_string())
@@ -245,10 +315,15 @@ pub fn run() {
             workbench_reader,
             raw_key,
             storage_root,
+            // R1：默认未授权——必须由 grant_scan_authorization 显式授权后才能扫描
+            authorization: Mutex::new(AuthorizationState::NotAuthorized),
         })
         .invoke_handler(tauri::generate_handler![
             get_workspace_state,
             read_work_cn_state,
+            // R1：授权命令——前端必须先调用 grant_scan_authorization 才能 scan_history
+            grant_scan_authorization,
+            revoke_scan_authorization,
             scan_history,
             browse_history,
             search_history,

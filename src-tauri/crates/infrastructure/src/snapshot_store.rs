@@ -29,6 +29,9 @@ use traesync_domain::{
 };
 use traesync_ports::{FileIdentityProvider, SnapshotStore};
 
+// R2：复用同 crate 的封闭证明——避免在 snapshot_store 内重复实现较弱校验
+use crate::fixture_paths::validate_db_relative_path_inside;
+
 /// 文件系统快照存储。
 ///
 /// 持有 `FileIdentityProvider` 用于读取文件身份。
@@ -86,7 +89,16 @@ fn capture_snapshot_inner(
     let fixture_root = Path::new(&request.canonical_fixture_root);
     let storage_root = Path::new(&request.storage_root);
 
-    // 2. 验证 database.db 存在
+    // 2. R2：defense-in-depth——在任何文件访问前再次验证 db_relative_path 封闭在 fixture_root 内
+    //    组合根已用 FixturePathGuard 验证过；此处的二次校验防止 commands/application 层
+    //    绕过组合根直接调用 infrastructure 时仍能拒绝逃逸路径
+    if validate_db_relative_path_inside(fixture_root, &request.db_relative_path).is_err() {
+        return ScanOutcome::Failed {
+            reason: ScanFailureReason::DatabaseMissing,
+        };
+    }
+
+    // 3. 验证 database.db 存在
     let db_path = fixture_root.join(&request.db_relative_path);
     if !db_path.is_file() {
         return ScanOutcome::Failed {
@@ -94,7 +106,7 @@ fn capture_snapshot_inner(
         };
     }
 
-    // 3. 读取捕获前文件集
+    // 4. 读取捕获前文件集
     let pre_capture = match read_file_set(fixture_root, &request.db_relative_path, file_identity) {
         Some(entries) => entries,
         None => {
@@ -104,7 +116,7 @@ fn capture_snapshot_inner(
         }
     };
 
-    // 4. 创建 staging 目录
+    // 5. 创建 staging 目录
     let staging_dir = storage_root.join("staging");
     if let Err(_) = std::fs::create_dir_all(&staging_dir) {
         return ScanOutcome::Failed {
@@ -112,7 +124,7 @@ fn capture_snapshot_inner(
         };
     }
 
-    // 5. 复制文件到 staging
+    // 6. 复制文件到 staging
     let snapshot_id = SnapshotId::new();
     let staging_snapshot_dir = staging_dir.join(snapshot_id.as_str());
     if let Err(_) = std::fs::create_dir_all(&staging_snapshot_dir) {
@@ -136,8 +148,31 @@ fn capture_snapshot_inner(
         }
     }
 
-    // 6. 读取捕获后文件集（从 staging 读取，验证复制完整性）
-    let post_capture = match read_file_set(
+    // 7. R3：复制后重读源文件集（fixture_root）——检测捕获期间源漂移。
+    //    规格第 15 节：捕获前后存在性、大小或身份变化时废弃本次快照。
+    //    旧实现读取 staging 副本，无法发现源在复制期间被修改的情况。
+    let post_source = match read_file_set(fixture_root, &request.db_relative_path, file_identity) {
+        Some(entries) => entries,
+        None => {
+            let _ = std::fs::remove_dir_all(&staging_snapshot_dir);
+            return ScanOutcome::Failed {
+                reason: ScanFailureReason::SourceSetDrift,
+            };
+        }
+    };
+
+    // 8. R3：源稳定性比较——pre_capture vs post_source
+    //    比较 presence、size、file_identity（规格要求的"存在性、大小或身份"）
+    if !file_sets_source_stable(&pre_capture, &post_source) {
+        let _ = std::fs::remove_dir_all(&staging_snapshot_dir);
+        return ScanOutcome::Failed {
+            reason: ScanFailureReason::SourceSetDrift,
+        };
+    }
+
+    // 9. R3：独立验证 staging 内容完整性——pre_capture vs staging 副本
+    //    比较 size + SHA-256，确保复制过程未损坏（文件身份在 staging 中不同，不比较）
+    let staging_post = match read_file_set(
         &staging_snapshot_dir,
         &request.db_relative_path,
         file_identity,
@@ -150,19 +185,17 @@ fn capture_snapshot_inner(
             };
         }
     };
-
-    // 7. 比较捕获前后文件集（大小 + SHA-256，文件身份在 staging 中会不同，不比较）
-    if !file_sets_content_equal(&pre_capture, &post_capture) {
+    if !file_sets_content_equal(&pre_capture, &staging_post) {
         let _ = std::fs::remove_dir_all(&staging_snapshot_dir);
         return ScanOutcome::Failed {
             reason: ScanFailureReason::SourceSetDrift,
         };
     }
 
-    // 8. 计算数据指纹
-    let fingerprint = compute_fingerprint(&post_capture);
+    // 10. 计算数据指纹（来自经过完整性验证的 staging 副本）
+    let fingerprint = compute_fingerprint(&staging_post);
 
-    // 9. 查询已有快照是否同指纹
+    // 11. 查询已有快照是否同指纹
     let snapshots_dir = storage_root.join("snapshots");
     if let Some(existing_id) = find_snapshot_by_fingerprint(&snapshots_dir, &fingerprint) {
         // 去重：删除 staging，返回 Deduplicated
@@ -173,7 +206,7 @@ fn capture_snapshot_inner(
         };
     }
 
-    // 10. 构造快照元数据
+    // 12. 构造快照元数据
     let meta = SourceSnapshotMeta {
         snapshot_id: snapshot_id.clone(),
         platform_id: "work_cn".to_string(),
@@ -183,11 +216,11 @@ fn capture_snapshot_inner(
         mapping_version: request.mapping_version.clone(),
         account_evidence_ref: request.account_evidence_ref.clone(),
         captured_at: request.now,
-        files: post_capture.clone(),
+        files: staging_post.clone(),
         fingerprint: fingerprint.clone(),
     };
 
-    // 11. 写入 snapshot.json 到 staging
+    // 13. 写入 snapshot.json 到 staging
     let snapshot_json_path = staging_snapshot_dir.join("snapshot.json");
     let json = match serde_json::to_string_pretty(&meta) {
         Ok(s) => s,
@@ -205,7 +238,7 @@ fn capture_snapshot_inner(
         };
     }
 
-    // 12. 原子发布：rename staging → snapshots/<snapshot_id>/
+    // 14. 原子发布：rename staging → snapshots/<snapshot_id>/
     let _ = std::fs::create_dir_all(&snapshots_dir);
     let publish_dir = snapshots_dir.join(snapshot_id.as_str());
     if publish_dir.exists() {
@@ -324,6 +357,44 @@ fn file_sets_content_equal(a: &[SnapshotFileEntry], b: &[SnapshotFileEntry]) -> 
         }
         if ae.present {
             if ae.size != be.size || ae.sha256 != be.sha256 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// R3：源稳定性比较——比较捕获前后源文件集的 presence、size、file_identity。
+///
+/// 规格第 15 节要求"捕获前后存在性、大小或身份变化时废弃本次快照"。
+/// 与 `file_sets_content_equal` 的区别：
+/// - 比较 `file_identity`（同一物理文件的稳定身份，源文件不变时应一致）
+/// - 不比较 `sha256`（SHA-256 已隐含在 size + identity 稳定性中，且 identity 更精准）
+///
+/// 任一文件 presence/size/identity 变化即判定为漂移。
+fn file_sets_source_stable(pre: &[SnapshotFileEntry], post: &[SnapshotFileEntry]) -> bool {
+    if pre.len() != post.len() {
+        return false;
+    }
+    for (pe, ae) in pre.iter().zip(post.iter()) {
+        if pe.relative_path != ae.relative_path {
+            return false;
+        }
+        // presence 变化 -> 漂移
+        if pe.present != ae.present {
+            return false;
+        }
+        if pe.present {
+            // size 变化 -> 漂移
+            if pe.size != ae.size {
+                return false;
+            }
+            // file_identity 变化 -> 漂移
+            // 注意：identity 为 None 时（读取失败）保守视为稳定，避免误报
+            if pe.file_identity.is_some()
+                && ae.file_identity.is_some()
+                && pe.file_identity != ae.file_identity
+            {
                 return false;
             }
         }
@@ -702,5 +773,318 @@ mod tests {
             }
             other => panic!("期望 Success，实际 {:?}", other),
         }
+    }
+
+    // ============== R3：源稳定性捕获前后验证反例测试 ==============
+
+    /// 辅助：构造可变 FileIdentityProvider——在首次 read_file_identity 调用时
+    /// 对源 DB 文件追加字节，模拟捕获期间源被修改。
+    /// read_file_identity 在 read_file_entry 中最后调用（size/sha 已读取），
+    /// 因此 pre_capture 的 DB entry 保留旧 size，post_source 读到新 size → 漂移。
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct DriftDbSizeProvider {
+        fixture_db_path: std::path::PathBuf,
+        mutated: AtomicBool,
+    }
+
+    impl FileIdentityProvider for DriftDbSizeProvider {
+        fn read_file_identity(&self, _path: &Path) -> Option<FileIdentity> {
+            if !self.mutated.swap(true, Ordering::SeqCst) {
+                // 追加字节 → size 变化
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.fixture_db_path)
+                {
+                    let _ = f.write_all(b"DRIFT-SUFFIX");
+                }
+            }
+            Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            })
+        }
+    }
+
+    /// 辅助：在第 3 次 read_file_identity 调用（post_source 的 DB 读取）时
+    /// 删除 WAL 文件，使 post_source 读到 WAL 不存在 → presence 漂移。
+    /// 调用顺序：pre_capture DB(0) → pre_capture WAL(1) → [复制完成] →
+    /// post_source DB(2，此时删除 WAL) → post_source WAL(3，已不存在)
+    struct DriftWalDisappearProvider {
+        fixture_wal_path: std::path::PathBuf,
+        call_count: AtomicUsize,
+    }
+
+    impl FileIdentityProvider for DriftWalDisappearProvider {
+        fn read_file_identity(&self, _path: &Path) -> Option<FileIdentity> {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            // 第 3 次调用（索引 2）= post_source 的 DB 读取时删除 WAL
+            // 此时 pre_capture 已完成且复制已完成，WAL 在 pre_capture 中存在、在 post_source 中不存在
+            if n == 2 {
+                let _ = std::fs::remove_file(&self.fixture_wal_path);
+            }
+            Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            })
+        }
+    }
+
+    /// 辅助：pre_capture 和 post_source 返回不同 file_identity，模拟文件被替换。
+    struct DriftIdentityProvider {
+        call_count: AtomicUsize,
+    }
+
+    impl FileIdentityProvider for DriftIdentityProvider {
+        fn read_file_identity(&self, _path: &Path) -> Option<FileIdentity> {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            // 偶数调用（pre_capture 的 DB，索引 0）返回 identity A
+            // 奇数调用（post_source 的 DB，索引 1）返回 identity B
+            let low = if n == 0 { 1 } else { 2 };
+            Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: low,
+            })
+        }
+    }
+
+    #[test]
+    fn r3_source_drift_db_size_change_rejects_publish() {
+        // 反例：捕获期间 DB 文件被追加字节 → size 漂移 → 废弃快照
+        let fixture = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("database.db"), b"db-content").unwrap();
+
+        let provider = DriftDbSizeProvider {
+            fixture_db_path: fixture.path().join("database.db"),
+            mutated: AtomicBool::new(false),
+        };
+        let store = FilesystemSnapshotStore::new(Box::new(provider));
+        let request = make_scan_request(fixture.path(), storage.path());
+        let outcome = store.capture_snapshot(&request);
+
+        match outcome {
+            ScanOutcome::Failed { reason } => {
+                assert_eq!(
+                    reason,
+                    ScanFailureReason::SourceSetDrift,
+                    "DB size 漂移应废弃快照"
+                );
+            }
+            other => panic!("期望 Failed(SourceSetDrift)，实际 {:?}", other),
+        }
+        // staging 应被清理
+        let staging = storage.path().join("staging");
+        assert!(
+            !staging.exists()
+                || std::fs::read_dir(&staging)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "漂移后 staging 应被清理"
+        );
+        // snapshots 目录不应有已发布快照
+        let snapshots = storage.path().join("snapshots");
+        assert!(
+            !snapshots.exists()
+                || std::fs::read_dir(&snapshots)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn r3_source_drift_wal_disappears_rejects_publish() {
+        // 反例：捕获期间 WAL 文件消失 → presence 漂移 → 废弃快照
+        let fixture = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("database.db"), b"db-content").unwrap();
+        std::fs::write(fixture.path().join("database.db-wal"), b"wal-content").unwrap();
+
+        let provider = DriftWalDisappearProvider {
+            fixture_wal_path: fixture.path().join("database.db-wal"),
+            call_count: AtomicUsize::new(0),
+        };
+        let store = FilesystemSnapshotStore::new(Box::new(provider));
+        let request = make_scan_request(fixture.path(), storage.path());
+        let outcome = store.capture_snapshot(&request);
+
+        match outcome {
+            ScanOutcome::Failed { reason } => {
+                assert_eq!(
+                    reason,
+                    ScanFailureReason::SourceSetDrift,
+                    "WAL 消失应废弃快照"
+                );
+            }
+            other => panic!("期望 Failed(SourceSetDrift)，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn r3_source_drift_identity_change_rejects_publish() {
+        // 反例：file_identity 变化（文件被替换）→ 漂移 → 废弃快照
+        let fixture = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("database.db"), b"db-content").unwrap();
+
+        let provider = DriftIdentityProvider {
+            call_count: AtomicUsize::new(0),
+        };
+        let store = FilesystemSnapshotStore::new(Box::new(provider));
+        let request = make_scan_request(fixture.path(), storage.path());
+        let outcome = store.capture_snapshot(&request);
+
+        match outcome {
+            ScanOutcome::Failed { reason } => {
+                assert_eq!(
+                    reason,
+                    ScanFailureReason::SourceSetDrift,
+                    "file_identity 变化应废弃快照"
+                );
+            }
+            other => panic!("期望 Failed(SourceSetDrift)，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn r3_source_stable_accepts_unchanged_source() {
+        // 正例：源文件不变 → 正常捕获
+        let fixture = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("database.db"), b"db-content").unwrap();
+        std::fs::write(fixture.path().join("database.db-wal"), b"wal-content").unwrap();
+
+        let store = FilesystemSnapshotStore::new(Box::new(MockFileIdentityProvider));
+        let request = make_scan_request(fixture.path(), storage.path());
+        let outcome = store.capture_snapshot(&request);
+
+        match outcome {
+            ScanOutcome::Success { snapshot_meta, .. } => {
+                assert_eq!(snapshot_meta.files.len(), 3);
+                assert!(snapshot_meta.files[0].present); // DB
+                assert!(snapshot_meta.files[1].present); // WAL
+            }
+            other => panic!("期望 Success，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn r3_file_sets_source_stable_detects_size_mismatch() {
+        let pre = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            }),
+        }];
+        let post = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 200,
+            sha256: "abc".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            }),
+        }];
+        assert!(!file_sets_source_stable(&pre, &post));
+    }
+
+    #[test]
+    fn r3_file_sets_source_stable_detects_identity_mismatch() {
+        let pre = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            }),
+        }];
+        let post = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 2,
+            }),
+        }];
+        assert!(!file_sets_source_stable(&pre, &post));
+    }
+
+    #[test]
+    fn r3_file_sets_source_stable_detects_presence_mismatch() {
+        let pre = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Wal,
+            relative_path: "database.db-wal".to_string(),
+            present: true,
+            size: 50,
+            sha256: "def".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 2,
+            }),
+        }];
+        let post = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Wal,
+            relative_path: "database.db-wal".to_string(),
+            present: false,
+            size: 0,
+            sha256: String::new(),
+            file_identity: None,
+        }];
+        assert!(!file_sets_source_stable(&pre, &post));
+    }
+
+    #[test]
+    fn r3_file_sets_source_stable_accepts_identical_sets() {
+        let pre = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            }),
+        }];
+        let post = pre.clone();
+        assert!(file_sets_source_stable(&pre, &post));
+    }
+
+    #[test]
+    fn r3_file_sets_source_stable_accepts_none_identity() {
+        // identity 为 None 时不判定漂移（保守，避免误报）
+        let pre = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: None,
+        }];
+        let post = pre.clone();
+        assert!(file_sets_source_stable(&pre, &post));
     }
 }

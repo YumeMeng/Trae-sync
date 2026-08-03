@@ -96,6 +96,7 @@ fn str_to_classification(s: &str) -> VersionClassification {
 }
 
 /// 读取会话消息投影（可配置是否排除软删除）。
+/// R4：读取 turn_id 列（可为 NULL）。
 fn read_messages_for_session(
     conn: &Connection,
     namespace: &str,
@@ -103,11 +104,11 @@ fn read_messages_for_session(
     exclude_soft_deleted: bool,
 ) -> Vec<MessageProjection> {
     let sql = if exclude_soft_deleted {
-        "SELECT message_id, session_id, role, content_excerpt, soft_deleted, seq \
+        "SELECT message_id, session_id, role, content_excerpt, soft_deleted, seq, turn_id \
          FROM message_projection WHERE namespace = ?1 AND session_id = ?2 AND soft_deleted = 0 \
          ORDER BY seq ASC"
     } else {
-        "SELECT message_id, session_id, role, content_excerpt, soft_deleted, seq \
+        "SELECT message_id, session_id, role, content_excerpt, soft_deleted, seq, turn_id \
          FROM message_projection WHERE namespace = ?1 AND session_id = ?2 \
          ORDER BY seq ASC"
     };
@@ -123,6 +124,7 @@ fn read_messages_for_session(
             content_excerpt: row.get(3)?,
             soft_deleted: row.get::<_, i64>(4)? != 0,
             seq: row.get::<_, i64>(5)? as u64,
+            turn_id: row.get(6).ok(),
         })
     }) {
         Ok(r) => r,
@@ -158,7 +160,8 @@ impl CatalogRepository for SqlCipherCatalogRepository {
             snapshot_id TEXT PRIMARY KEY, fingerprint TEXT, captured_at INTEGER, data_location_id TEXT
         );
         CREATE TABLE IF NOT EXISTS project_identity (
-            project_id TEXT PRIMARY KEY, biz_project_id TEXT, display_name TEXT
+            project_id TEXT PRIMARY KEY, biz_project_id TEXT, display_name TEXT,
+            soft_deleted INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS project_observation (
             project_id TEXT PRIMARY KEY,
@@ -191,7 +194,8 @@ impl CatalogRepository for SqlCipherCatalogRepository {
         );
         CREATE TABLE IF NOT EXISTS message_projection (
             message_id TEXT, session_id TEXT, role TEXT,
-            content_excerpt TEXT, soft_deleted INTEGER, seq INTEGER, namespace TEXT
+            content_excerpt TEXT, soft_deleted INTEGER, seq INTEGER, namespace TEXT,
+            turn_id TEXT
         );
         CREATE TABLE IF NOT EXISTS soft_deletion_marker (
             entity_kind TEXT, entity_id TEXT, deleted_at INTEGER
@@ -386,16 +390,18 @@ impl CatalogRepository for SqlCipherCatalogRepository {
 
     fn read_project_observation(&self, project_id: &str) -> Option<ProjectObservation> {
         let conn = self.open_catalog()?;
-        // project_identity
+        // project_identity（R6：含 soft_deleted）
         let identity: ProjectIdentity = conn
             .query_row(
-                "SELECT project_id, biz_project_id, display_name FROM project_identity WHERE project_id = ?1",
+                "SELECT project_id, biz_project_id, display_name, soft_deleted \
+                 FROM project_identity WHERE project_id = ?1",
                 rusqlite::params![project_id],
                 |row| {
                     Ok(ProjectIdentity {
                         project_id: row.get(0)?,
                         biz_project_id: row.get(1)?,
                         display_name: row.get(2)?,
+                        soft_deleted: row.get::<_, i64>(3)? != 0,
                     })
                 },
             )
@@ -566,8 +572,15 @@ impl CatalogRepository for SqlCipherCatalogRepository {
                 }
             }
         };
-        // 项目：project_identity 不含软删除（normalizer 已排除），visible == retained
-        let project_count: i64 = conn
+        // R6：项目 visible 排除 soft_deleted，retained 含全部（含软删除证据）
+        let visible_projects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let retained_projects: i64 = conn
             .query_row("SELECT COUNT(*) FROM project_identity", [], |row| {
                 row.get(0)
             })
@@ -600,8 +613,8 @@ impl CatalogRepository for SqlCipherCatalogRepository {
             .unwrap_or(0);
 
         DiagnosticIntegrityAssertion {
-            visible_projects: project_count as u64,
-            retained_projects: project_count as u64,
+            visible_projects: visible_projects as u64,
+            retained_projects: retained_projects as u64,
             visible_sessions: visible_sessions as u64,
             retained_sessions: retained_sessions as u64,
             visible_messages: visible_messages as u64,
@@ -617,10 +630,20 @@ impl CatalogRepository for SqlCipherCatalogRepository {
         let account_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM seen_account", [], |row| row.get(0))
             .unwrap_or(0);
-        let project_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM project_identity", [], |row| {
-                row.get(0)
-            })
+        // R6：visible 排除 soft_deleted，soft_deleted 单独计数
+        let visible_projects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let soft_deleted_projects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 1",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
         let visible_sessions: i64 = conn
             .query_row(
@@ -646,10 +669,9 @@ impl CatalogRepository for SqlCipherCatalogRepository {
 
         HistoryBrowseSummary {
             visible_account_count: account_count as u64,
-            visible_project_count: project_count as u64,
+            visible_project_count: visible_projects as u64,
             visible_session_count: visible_sessions as u64,
-            // 项目软删除不进入 catalog，soft_deleted_project_count 恒为 0
-            soft_deleted_project_count: 0,
+            soft_deleted_project_count: soft_deleted_projects as u64,
             soft_deleted_session_count: soft_deleted_sessions as u64,
             soft_deleted_message_count: soft_deleted_messages as u64,
         }
@@ -685,11 +707,17 @@ fn project_snapshot_tx(
 
     // 2. 写入项目相关
     for p in projects {
-        // project_identity
+        // project_identity（R6：含 soft_deleted 标记）
         conn.execute(
-            "INSERT OR REPLACE INTO project_identity (project_id, biz_project_id, display_name) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![p.project_id, p.biz_project_id, p.display_name],
+            "INSERT OR REPLACE INTO project_identity \
+             (project_id, biz_project_id, display_name, soft_deleted) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                p.project_id,
+                p.biz_project_id,
+                p.display_name,
+                p.soft_deleted as i64
+            ],
         )
         .map_err(fail)?;
 
@@ -742,6 +770,16 @@ fn project_snapshot_tx(
             )
             .map_err(fail)?;
         }
+
+        // R6：软删除项目记录删除证据（soft_deletion_marker）
+        if p.soft_deleted {
+            conn.execute(
+                "INSERT OR REPLACE INTO soft_deletion_marker (entity_kind, entity_id, deleted_at) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["project", p.project_id, now_secs],
+            )
+            .map_err(fail)?;
+        }
     }
 
     // 3. 写入会话相关（含版本分类）
@@ -770,43 +808,6 @@ fn project_snapshot_tx(
             .collect();
         let new_hash = hasher.hash_session_content(&new_messages, &s.session_identity);
 
-        // 删除旧 message_projection + FTS（按 namespace + session_id）
-        conn.execute(
-            "DELETE FROM message_projection WHERE namespace = ?1 AND session_id = ?2",
-            rusqlite::params![namespace, original_session_id],
-        )
-        .map_err(fail)?;
-        conn.execute(
-            "DELETE FROM message_fts WHERE namespace = ?1 AND session_id = ?2",
-            rusqlite::params![namespace, original_session_id],
-        )
-        .map_err(fail)?;
-
-        // 写入新 message_projection + FTS
-        for m in &new_messages {
-            conn.execute(
-                "INSERT INTO message_projection \
-                 (message_id, session_id, role, content_excerpt, soft_deleted, seq, namespace) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    m.message_id,
-                    m.session_id,
-                    m.role,
-                    m.content_excerpt,
-                    m.soft_deleted as i64,
-                    m.seq as i64,
-                    namespace
-                ],
-            )
-            .map_err(fail)?;
-            conn.execute(
-                "INSERT INTO message_fts (message_id, session_id, content_excerpt, namespace) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![m.message_id, m.session_id, m.content_excerpt, namespace],
-            )
-            .map_err(fail)?;
-        }
-
         // 版本分类：首次扫描无旧消息 -> Unclassified
         let classification = if old_messages.is_empty() {
             VersionClassification::Unclassified
@@ -814,7 +815,67 @@ fn project_snapshot_tx(
             hasher.classify(&old_messages, &new_messages)
         };
 
+        // 检查 session_projection 是否已存在（决定是否首次扫描）
+        let proj_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM session_projection WHERE namespace = ?1 AND original_session_id = ?2",
+                rusqlite::params![namespace, original_session_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        // R5：只有首次扫描、Identical、FastForward 推进活跃浏览投影。
+        // Forked/Unclassified 保留旧 message_projection + FTS 不变，
+        // 新版本数据通过下方 session_version INSERT 保留，供后续选择。
+        // 这样 search 和 preview 解析的是活跃版本内容，而非最新导入行。
+        let advance_projection = !proj_exists
+            || matches!(
+                classification,
+                VersionClassification::Identical | VersionClassification::FastForward
+            );
+
+        if advance_projection {
+            // 删除旧 message_projection + FTS（按 namespace + session_id）
+            conn.execute(
+                "DELETE FROM message_projection WHERE namespace = ?1 AND session_id = ?2",
+                rusqlite::params![namespace, original_session_id],
+            )
+            .map_err(fail)?;
+            conn.execute(
+                "DELETE FROM message_fts WHERE namespace = ?1 AND session_id = ?2",
+                rusqlite::params![namespace, original_session_id],
+            )
+            .map_err(fail)?;
+
+            // 写入新 message_projection + FTS
+            for m in &new_messages {
+                conn.execute(
+                    "INSERT INTO message_projection \
+                     (message_id, session_id, role, content_excerpt, soft_deleted, seq, namespace, turn_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        m.message_id,
+                        m.session_id,
+                        m.role,
+                        m.content_excerpt,
+                        m.soft_deleted as i64,
+                        m.seq as i64,
+                        namespace,
+                        m.turn_id
+                    ],
+                )
+                .map_err(fail)?;
+                conn.execute(
+                    "INSERT INTO message_fts (message_id, session_id, content_excerpt, namespace) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![m.message_id, m.session_id, m.content_excerpt, namespace],
+                )
+                .map_err(fail)?;
+            }
+        }
+
         // session_version（INSERT OR IGNORE 防重复——Gate I：UNIQUE 约束）
+        // R5：始终保留版本元数据，即使不推进活跃投影——供后续选择/重建
         conn.execute(
             "INSERT OR IGNORE INTO session_version \
              (namespace, original_session_id, source_snapshot_id, content_graph_hash, \
@@ -833,13 +894,6 @@ fn project_snapshot_tx(
         .map_err(fail)?;
 
         // session_projection
-        let proj_exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM session_projection WHERE namespace = ?1 AND original_session_id = ?2",
-                rusqlite::params![namespace, original_session_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
         if !proj_exists {
             conn.execute(
                 "INSERT INTO session_projection \
@@ -933,6 +987,7 @@ fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<BrowseSessionNode> {
 }
 
 /// 读取项目节点。filter_account 为 Some 时按 display_owner 过滤。
+/// R6：排除 soft_deleted = 1 的项目（ browse 不显示软删除项目）。
 fn read_all_browse_projects(
     conn: &Connection,
     filter_account: Option<&str>,
@@ -946,7 +1001,8 @@ fn read_all_browse_projects(
              FROM project_identity pi \
              LEFT JOIN project_observation po ON po.project_id = pi.project_id \
              LEFT JOIN project_source_assignment psa ON psa.project_id = pi.project_id \
-             WHERE COALESCE(psa.user_assigned_owner, po.first_observed_owner) = ?1 \
+             WHERE pi.soft_deleted = 0 \
+               AND COALESCE(psa.user_assigned_owner, po.first_observed_owner) = ?1 \
              ORDER BY pi.display_name ASC"
         }
         None => {
@@ -957,6 +1013,7 @@ fn read_all_browse_projects(
              FROM project_identity pi \
              LEFT JOIN project_observation po ON po.project_id = pi.project_id \
              LEFT JOIN project_source_assignment psa ON psa.project_id = pi.project_id \
+             WHERE pi.soft_deleted = 0 \
              ORDER BY pi.display_name ASC"
         }
     };
@@ -1035,12 +1092,14 @@ fn build_account_nodes(conn: &Connection) -> Vec<BrowseAccountNode> {
         .iter()
         .map(|uid| {
             // 统计该账号拥有的项目数（display_owner = uid）
+            // R6：排除软删除项目
             let project_count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM project_identity pi \
                      LEFT JOIN project_observation po ON po.project_id = pi.project_id \
                      LEFT JOIN project_source_assignment psa ON psa.project_id = pi.project_id \
-                     WHERE COALESCE(psa.user_assigned_owner, po.first_observed_owner) = ?1",
+                     WHERE pi.soft_deleted = 0 \
+                       AND COALESCE(psa.user_assigned_owner, po.first_observed_owner) = ?1",
                     rusqlite::params![uid],
                     |row| row.get(0),
                 )
@@ -1075,10 +1134,20 @@ fn compute_history_summary(conn: &Connection) -> HistoryBrowseSummary {
     let account_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM seen_account", [], |row| row.get(0))
         .unwrap_or(0);
-    let project_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM project_identity", [], |row| {
-            row.get(0)
-        })
+    // R6：visible 排除 soft_deleted，soft_deleted 单独计数
+    let visible_projects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let soft_deleted_projects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 1",
+            [],
+            |row| row.get(0),
+        )
         .unwrap_or(0);
     let visible_sessions: i64 = conn
         .query_row(
@@ -1103,9 +1172,9 @@ fn compute_history_summary(conn: &Connection) -> HistoryBrowseSummary {
         .unwrap_or(0);
     HistoryBrowseSummary {
         visible_account_count: account_count as u64,
-        visible_project_count: project_count as u64,
+        visible_project_count: visible_projects as u64,
         visible_session_count: visible_sessions as u64,
-        soft_deleted_project_count: 0,
+        soft_deleted_project_count: soft_deleted_projects as u64,
         soft_deleted_session_count: soft_deleted_sessions as u64,
         soft_deleted_message_count: soft_deleted_messages as u64,
     }
@@ -1206,7 +1275,7 @@ mod tests {
         let result = repo.project_snapshot(&meta, &snapshot_dir, &normalizer);
         assert!(result.is_ok(), "project_snapshot 应成功");
 
-        // browse 应返回 1 个项目（p2 软删除排除，fixture 只有 p1）
+        // browse 应返回 1 个项目（fixture 只有 p1，未软删除）
         let browse = repo.browse();
         assert_eq!(browse.projects.len(), 1);
         assert_eq!(browse.projects[0].project_id, "p1");
@@ -1716,13 +1785,407 @@ mod tests {
         repo.project_snapshot(&make_snapshot_meta(), &snap2, &normalizer)
             .unwrap();
 
-        // Gate I：Unclassified 应保留旧投影
+        // Gate I/R5：Unclassified 应保留旧投影
         let proj2 = repo
             .read_session_projection(&SessionIdentity::new("work_cn", "s1"))
             .expect("应有投影");
         assert_eq!(
             proj2.active_content_graph_hash, hash_after_first,
             "Unclassified 应保留旧 active_content_graph_hash"
+        );
+
+        // R5：preview 必须解析活跃版本内容（旧消息），而非最新导入行
+        let preview = repo
+            .read_conversation_preview(&SessionIdentity::new("work_cn", "s1"))
+            .expect("应有预览");
+        let contents: Vec<&str> = preview
+            .messages
+            .iter()
+            .map(|m| m.content_excerpt.as_str())
+            .collect();
+        assert!(
+            contents.contains(&"hello"),
+            "Unclassified 后预览应返回旧内容 'hello'，实际: {:?}",
+            contents
+        );
+        assert!(
+            !contents.iter().any(|c| c.contains("changed")),
+            "Unclassified 后预览不应包含新内容 'changed'，实际: {:?}",
+            contents
+        );
+
+        // R5：search 必须解析活跃版本内容——搜到旧 'hello'，搜不到新 'changed'
+        let hits_hello = repo.search_messages("hello");
+        assert!(
+            !hits_hello.is_empty(),
+            "Unclassified 后应仍能搜到旧内容 'hello'"
+        );
+        let hits_changed = repo.search_messages("changed");
+        assert!(
+            hits_changed.is_empty(),
+            "Unclassified 后不应搜到新内容 'changed'，实际命中: {}",
+            hits_changed.len()
+        );
+    }
+
+    // ============== R5：Forked 保留旧活跃内容可浏览/可搜索 ==============
+
+    #[test]
+    fn r5_forked_preserves_old_content_browseable_and_searchable() {
+        // 第一次扫描：m1="hello", m2="hi"
+        // 第二次扫描：m1="hello FORKED", m2="hi" → 内容修改 → Forked
+        // R5：Forked 后 preview/search 必须返回旧内容，新版本保留在 session_version
+        let dir = tempdir().unwrap();
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+
+        // 第一次扫描
+        let snap1 = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snap1).unwrap();
+        {
+            let conn = Connection::open(snap1.join("database.db")).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, biz_project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_message (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0);
+                INSERT INTO project VALUES ('p1', 'user-A', 'biz-1', 0);
+                INSERT INTO chat_session VALUES ('s1', 'p1', 0);
+                INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello', 0);
+                INSERT INTO chat_message VALUES ('m2', 's1', 'assistant', 'hi', 0);
+                "#,
+            ).unwrap();
+        }
+        repo.project_snapshot(&make_snapshot_meta(), &snap1, &normalizer)
+            .unwrap();
+
+        // 记录第一次的活跃哈希
+        let proj1 = repo
+            .read_session_projection(&SessionIdentity::new("work_cn", "s1"))
+            .expect("应有投影");
+        let hash_after_first = proj1.active_content_graph_hash.clone();
+
+        // 第二次扫描：m1 内容修改 → Forked
+        let snap2 = dir.path().join("snap-2");
+        std::fs::create_dir_all(&snap2).unwrap();
+        {
+            let conn = Connection::open(snap2.join("database.db")).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, biz_project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_message (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0);
+                INSERT INTO project VALUES ('p1', 'user-A', 'biz-1', 0);
+                INSERT INTO chat_session VALUES ('s1', 'p1', 0);
+                INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello FORKED', 0);
+                INSERT INTO chat_message VALUES ('m2', 's1', 'assistant', 'hi', 0);
+                "#,
+            ).unwrap();
+        }
+        repo.project_snapshot(&make_snapshot_meta(), &snap2, &normalizer)
+            .unwrap();
+
+        // R5：session_projection 活跃哈希应保持旧值
+        let proj2 = repo
+            .read_session_projection(&SessionIdentity::new("work_cn", "s1"))
+            .expect("应有投影");
+        assert_eq!(
+            proj2.active_content_graph_hash, hash_after_first,
+            "Forked 应保留旧 active_content_graph_hash"
+        );
+
+        // R5：preview 必须返回旧内容 'hello'，而非新内容 'hello FORKED'
+        let preview = repo
+            .read_conversation_preview(&SessionIdentity::new("work_cn", "s1"))
+            .expect("应有预览");
+        let contents: Vec<&str> = preview
+            .messages
+            .iter()
+            .map(|m| m.content_excerpt.as_str())
+            .collect();
+        assert!(
+            contents.contains(&"hello"),
+            "Forked 后预览应返回旧内容 'hello'，实际: {:?}",
+            contents
+        );
+        assert!(
+            !contents.iter().any(|c| c.contains("FORKED")),
+            "Forked 后预览不应包含新内容 'hello FORKED'，实际: {:?}",
+            contents
+        );
+
+        // R5：search 应搜到旧 'hello'，搜不到 'FORKED'
+        let hits_hello = repo.search_messages("hello");
+        assert!(!hits_hello.is_empty(), "Forked 后应仍能搜到旧内容 'hello'");
+        let hits_forked = repo.search_messages("FORKED");
+        assert!(
+            hits_forked.is_empty(),
+            "Forked 后不应搜到新内容 'FORKED'，实际命中: {}",
+            hits_forked.len()
+        );
+
+        // R5：session_version 应保留两个版本（旧 + 新 Forked）
+        let versions = repo.read_all_session_versions();
+        let s1_versions: Vec<_> = versions
+            .iter()
+            .filter(|v| v.session_identity.original_session_id == "s1")
+            .collect();
+        assert_eq!(
+            s1_versions.len(),
+            2,
+            "Forked 后应保留 2 个会话版本（旧 + 新），实际: {}",
+            s1_versions.len()
+        );
+        // 至少有一个 Forked 分类
+        assert!(
+            s1_versions
+                .iter()
+                .any(|v| v.classification == VersionClassification::Forked),
+            "应有 Forked 分类版本"
+        );
+    }
+
+    #[test]
+    fn r5_fast_forward_advances_active_projection() {
+        // R5 反例验证：FastForward 应推进活跃投影（删除旧 + 写入新）
+        // 第一次扫描：m1="hello"
+        // 第二次扫描：m1="hello", m2="hi"（追加）→ FastForward
+        // preview/search 应返回新内容
+        let dir = tempdir().unwrap();
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+
+        // 第一次扫描
+        let snap1 = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snap1).unwrap();
+        {
+            let conn = Connection::open(snap1.join("database.db")).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, biz_project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_message (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0);
+                INSERT INTO project VALUES ('p1', 'user-A', 'biz-1', 0);
+                INSERT INTO chat_session VALUES ('s1', 'p1', 0);
+                INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello', 0);
+                "#,
+            ).unwrap();
+        }
+        repo.project_snapshot(&make_snapshot_meta(), &snap1, &normalizer)
+            .unwrap();
+
+        // 第二次扫描：追加 m2 → FastForward
+        let snap2 = dir.path().join("snap-2");
+        std::fs::create_dir_all(&snap2).unwrap();
+        {
+            let conn = Connection::open(snap2.join("database.db")).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, biz_project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_message (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0);
+                INSERT INTO project VALUES ('p1', 'user-A', 'biz-1', 0);
+                INSERT INTO chat_session VALUES ('s1', 'p1', 0);
+                INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello', 0);
+                INSERT INTO chat_message VALUES ('m2', 's1', 'assistant', 'hi', 0);
+                "#,
+            ).unwrap();
+        }
+        repo.project_snapshot(&make_snapshot_meta(), &snap2, &normalizer)
+            .unwrap();
+
+        // R5：FastForward 应推进活跃投影——preview 返回新内容（含 m2 'hi'）
+        let preview = repo
+            .read_conversation_preview(&SessionIdentity::new("work_cn", "s1"))
+            .expect("应有预览");
+        let contents: Vec<&str> = preview
+            .messages
+            .iter()
+            .map(|m| m.content_excerpt.as_str())
+            .collect();
+        assert!(
+            contents.contains(&"hi"),
+            "FastForward 后预览应包含新消息 'hi'，实际: {:?}",
+            contents
+        );
+        assert_eq!(preview.messages.len(), 2, "FastForward 后应有 2 条消息");
+
+        // R5：search 应能搜到新内容 'hi'
+        let hits_hi = repo.search_messages("hi");
+        assert!(!hits_hi.is_empty(), "FastForward 后应能搜到新内容 'hi'");
+    }
+
+    // ============== R6：软删除项目保留为证据但排除出 browse/search/count ==============
+
+    /// R6 fixture：含一个正常项目 p1 和一个软删除项目 p2
+    fn make_snapshot_fixture_with_soft_deleted_project(dir: &Path, owner: &str) {
+        let db_path = dir.join("database.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (
+                project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                biz_project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0
+            );
+            CREATE TABLE chat_session (
+                session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                deleted_at INTEGER DEFAULT 0
+            );
+            CREATE TABLE chat_message (
+                message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0
+            );
+            "#,
+        )
+        .unwrap();
+        // p1 正常，p2 软删除（deleted_at = 500）
+        conn.execute("INSERT INTO project VALUES ('p1', ?1, 'biz-1', 0)", [owner])
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO project VALUES ('p2', 'user-B', 'biz-2', 500); \
+             INSERT INTO chat_session VALUES ('s1', 'p1', 0); \
+             INSERT INTO chat_session VALUES ('s2', 'p2', 0); \
+             INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello', 0); \
+             INSERT INTO chat_message VALUES ('m2', 's2', 'user', 'soft-deleted-project-msg', 0);",
+        )
+        .unwrap();
+        drop(conn);
+    }
+
+    #[test]
+    fn r6_soft_deleted_project_retained_but_excluded_from_browse() {
+        let dir = tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture_with_soft_deleted_project(&snapshot_dir, "user-A");
+
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .unwrap();
+
+        // R6：browse 只返回 p1（未软删除），p2 被排除
+        let browse = repo.browse();
+        assert_eq!(browse.projects.len(), 1, "browse 应只返回 1 个未软删除项目");
+        assert_eq!(browse.projects[0].project_id, "p1");
+
+        // R6：summary 的 soft_deleted_project_count 应为 1
+        assert_eq!(browse.summary.visible_project_count, 1);
+        assert_eq!(browse.summary.soft_deleted_project_count, 1);
+
+        // R6：账号树中 user-B 不应有可见项目（p2 软删除）
+        let accounts_b = repo.browse_projects_by_account("user-B");
+        assert!(accounts_b.is_empty(), "user-B 不应有可见项目（p2 软删除）");
+    }
+
+    #[test]
+    fn r6_soft_deleted_project_in_diagnostic_retained_counts() {
+        let dir = tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture_with_soft_deleted_project(&snapshot_dir, "user-A");
+
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .unwrap();
+
+        // R6：诊断完整性——visible_projects 排除软删除，retained_projects 含全部
+        let diag = repo.diagnostic_integrity();
+        assert_eq!(diag.visible_projects, 1, "可见项目应为 1（排除软删除 p2）");
+        assert_eq!(
+            diag.retained_projects, 2,
+            "保留项目应为 2（含软删除 p2 作为证据）"
+        );
+
+        // R6：read_project_observation 仍能读取软删除项目（证据保留）
+        let obs = repo.read_project_observation("p2");
+        assert!(obs.is_some(), "软删除项目 p2 的观察记录应保留");
+        let obs = obs.unwrap();
+        assert!(
+            obs.project_identity.soft_deleted,
+            "p2 应标记为 soft_deleted"
+        );
+    }
+
+    #[test]
+    fn r6_soft_deleted_project_deletion_transition_retained() {
+        // R6：第一次扫描 p1 未删除，第二次扫描 p1 被软删除
+        // 软删除变化应作为证据保留，而非丢弃实体
+        let dir = tempdir().unwrap();
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+
+        // 第一次扫描：p1 未删除
+        let snap1 = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snap1).unwrap();
+        {
+            let conn = Connection::open(snap1.join("database.db")).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, biz_project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_message (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0);
+                INSERT INTO project VALUES ('p1', 'user-A', 'biz-1', 0);
+                INSERT INTO chat_session VALUES ('s1', 'p1', 0);
+                INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello', 0);
+                "#,
+            ).unwrap();
+        }
+        repo.project_snapshot(&make_snapshot_meta(), &snap1, &normalizer)
+            .unwrap();
+
+        // 第一次后：p1 可见
+        let diag1 = repo.diagnostic_integrity();
+        assert_eq!(diag1.visible_projects, 1);
+        assert_eq!(diag1.retained_projects, 1);
+
+        // 第二次扫描：p1 被软删除（deleted_at = 999）
+        let snap2 = dir.path().join("snap-2");
+        std::fs::create_dir_all(&snap2).unwrap();
+        {
+            let conn = Connection::open(snap2.join("database.db")).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, biz_project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, deleted_at INTEGER DEFAULT 0);
+                CREATE TABLE chat_message (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, content TEXT, deleted_at INTEGER DEFAULT 0);
+                INSERT INTO project VALUES ('p1', 'user-A', 'biz-1', 999);
+                INSERT INTO chat_session VALUES ('s1', 'p1', 0);
+                INSERT INTO chat_message VALUES ('m1', 's1', 'user', 'hello', 0);
+                "#,
+            ).unwrap();
+        }
+        repo.project_snapshot(&make_snapshot_meta(), &snap2, &normalizer)
+            .unwrap();
+
+        // R6：第二次后——p1 软删除，visible=0，retained=1（证据保留）
+        let diag2 = repo.diagnostic_integrity();
+        assert_eq!(diag2.visible_projects, 0, "p1 软删除后可见项目应为 0");
+        assert_eq!(
+            diag2.retained_projects, 1,
+            "p1 软删除后保留项目应为 1（证据保留，不丢弃）"
+        );
+
+        // R6：browse 不再显示 p1
+        let browse = repo.browse();
+        assert!(browse.projects.is_empty(), "p1 软删除后 browse 应为空");
+
+        // R6：read_project_observation 仍能读取 p1（含软删除标记 + owner 历史）
+        let obs = repo.read_project_observation("p1").expect("p1 应保留");
+        assert!(
+            obs.project_identity.soft_deleted,
+            "p1 应标记为 soft_deleted"
+        );
+        assert_eq!(
+            obs.first_observed_owner, "user-A",
+            "first_observed_owner 应保留"
+        );
+        // owner_observations 应有 2 条（两次扫描）
+        assert_eq!(
+            obs.owner_observations.len(),
+            2,
+            "应有 2 条 owner 观察（删除前后各一次）"
         );
     }
 }

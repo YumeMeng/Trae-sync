@@ -1,0 +1,6 @@
+﻿Working-tree binding (REPAIR run - R1-R6 post-fix)
+HEAD: 8a0631cdf6bbf0939fc69cde66a85c8daabea94e
+T03/T04 source combined SHA-256: 49c59859b6581ff5da3f487dd2d55700271776ff0041092bf52decdbe4dcdd65
+git diff --binary SHA-256 (pure, via --output tempfile): f98d64baa278bcb7adb26cdf48db1baa47d59aa884fd0f710453d94ecdeeaac5
+T03/T04 source file count: 18
+Per-file SHA-256 list: working-tree-hashes.sha256

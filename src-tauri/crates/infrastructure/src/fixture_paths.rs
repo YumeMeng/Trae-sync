@@ -125,6 +125,12 @@ pub enum FixturePathError {
     FixtureRootIsDefaultWorkCnPath { raw: String },
     /// 系统根解析失败
     SystemRoots(SystemRootsError),
+    /// R2：相对路径为空
+    EmptyRelativePath,
+    /// R2：相对路径是绝对路径（如 `C:\` 或 `/etc/passwd`）
+    AbsolutePathRejected { raw: String },
+    /// R2：相对路径包含 `..` 父目录遍历组件
+    ParentTraversalRejected { raw: String },
 }
 
 impl std::fmt::Display for FixturePathError {
@@ -154,6 +160,13 @@ impl std::fmt::Display for FixturePathError {
                 write!(f, "fixture_root 自身命中默认 Work CN 路径: {raw}")
             }
             Self::SystemRoots(e) => write!(f, "系统根解析失败: {e}"),
+            Self::EmptyRelativePath => write!(f, "数据库相对路径为空"),
+            Self::AbsolutePathRejected { raw } => {
+                write!(f, "数据库相对路径是绝对路径: {raw}")
+            }
+            Self::ParentTraversalRejected { raw } => {
+                write!(f, "数据库相对路径包含父目录遍历 (`..`): {raw}")
+            }
         }
     }
 }
@@ -327,6 +340,136 @@ impl FixturePathGuard {
     pub fn canonical_root(&self) -> &Path {
         &self.canonical_fixture_root
     }
+
+    /// R2：验证 `db_relative_path` 与派生的 WAL/SHM 路径全部封闭在 fixture_root 内部。
+    ///
+    /// 强制规则（对应 handoff R2）：
+    /// - `db_relative_path` 不能为空
+    /// - `db_relative_path` 不能是绝对路径（词法检查拒绝 `C:\`、`/`、`\\?\` 前缀等）
+    /// - `db_relative_path` 不能包含 `..` 组件（词法检查拒绝父目录遍历）
+    /// - 规范化 `fixture_root.join(db_relative_path)` 必须严格位于 fixture_root 内部
+    /// - 同样的封闭证明应用到 `db_relative_path-wal` 与 `db_relative_path-shm`
+    /// - 跟随符号链接/junction 后逃逸 fixture_root 的路径必须被拒绝
+    ///
+    /// DB 文件必须存在（用于规范化跟随符号链接）；WAL/SHM 可能不存在，
+    /// 不存在时跳过封闭校验，存在时必须通过封闭校验。
+    ///
+    /// 返回 DB 的规范化绝对路径。WAL/SHM 路径可由调用方通过 `db_path.with_extension(...)`
+    /// 或字符串拼接派生——它们已经过同样的封闭证明。
+    pub fn validate_db_relative_path(
+        &self,
+        db_relative_path: &str,
+    ) -> Result<PathBuf, FixturePathError> {
+        validate_db_relative_path_inside(&self.canonical_fixture_root, db_relative_path)
+    }
+}
+
+/// R2：纯词法检查——拒绝空、绝对路径、包含 `..` 组件的相对路径。
+///
+/// 不依赖文件系统状态，可在任何层（commands/application/infrastructure）调用。
+/// 返回 `Ok(())` 表示路径词法安全；`Err(_)` 表示必须拒绝。
+///
+/// 公开为 `pub(crate)` 以便同 crate 的 `snapshot_store`、`account_evidence` 等模块复用，
+/// 不暴露到 crate 外，避免外部调用者依赖此内部规则。
+pub(crate) fn reject_unsafe_relative_path(relative_path: &str) -> Result<(), FixturePathError> {
+    if relative_path.is_empty() {
+        return Err(FixturePathError::EmptyRelativePath);
+    }
+    let p = Path::new(relative_path);
+    if p.is_absolute() {
+        return Err(FixturePathError::AbsolutePathRejected {
+            raw: relative_path.to_string(),
+        });
+    }
+    for component in p.components() {
+        match component {
+            Component::ParentDir => {
+                return Err(FixturePathError::ParentTraversalRejected {
+                    raw: relative_path.to_string(),
+                });
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(FixturePathError::AbsolutePathRejected {
+                    raw: relative_path.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// R2：验证 `db_relative_path` 与派生 WAL/SHM 全部封闭在已规范化的 fixture_root 内部。
+///
+/// `canonical_fixture_root` 应为已规范化的绝对路径（由 `FixturePathGuard::new` 保证）。
+/// 此函数为 defense-in-depth，会再次规范化 `canonical_fixture_root`——
+/// 即使调用方传入非规范化路径（如测试 fixture 的 tempdir 路径）也能正确比较。
+///
+/// 此函数为 `pub(crate)`，供同 crate 的 `snapshot_store` 等模块在 defense-in-depth 路径
+/// 上复用同一份封闭证明，避免在 `snapshot_store` 内重复实现较弱校验。
+///
+/// 返回 DB 的规范化绝对路径。WAL/SHM 不存在时跳过；存在时必须通过封闭校验。
+pub(crate) fn validate_db_relative_path_inside(
+    canonical_fixture_root: &Path,
+    db_relative_path: &str,
+) -> Result<PathBuf, FixturePathError> {
+    // 1. 词法检查 DB 路径
+    reject_unsafe_relative_path(db_relative_path)?;
+
+    // 2. 派生 WAL/SHM 相对路径并执行同样的词法检查——
+    //    防止 `db_relative_path` 本身安全但派生路径逃逸（如 `db-wal` 在父目录）
+    let wal_relative_path = format!("{}-wal", db_relative_path);
+    let shm_relative_path = format!("{}-shm", db_relative_path);
+    reject_unsafe_relative_path(&wal_relative_path)?;
+    reject_unsafe_relative_path(&shm_relative_path)?;
+
+    // 3. defense-in-depth：再次规范化 fixture_root——
+    //    调用方应传入已规范化路径，但此函数不信任调用方，独立完成规范化以保证比较正确
+    let canonical_root = canonical_fixture_root.canonicalize().map_err(|e| {
+        FixturePathError::CannotCanonicalize {
+            raw: canonical_fixture_root.to_string_lossy().into_owned(),
+            source: format!("fixture_root 规范化失败: {e}"),
+        }
+    })?;
+
+    // 4. DB 必须存在——canonicalize 会跟随符号链接，暴露 symlink/junction 逃逸
+    let db_candidate = canonical_root.join(db_relative_path);
+    let canonical_db =
+        db_candidate
+            .canonicalize()
+            .map_err(|e| FixturePathError::CannotCanonicalize {
+                raw: db_candidate.to_string_lossy().into_owned(),
+                source: e.to_string(),
+            })?;
+
+    // 5. DB 规范化后必须严格位于 fixture_root 内部——
+    //    即使词法检查通过，符号链接/junction 仍可能让规范化路径逃逸
+    if !path_strictly_inside(&canonical_db, &canonical_root) {
+        return Err(FixturePathError::OutsideFixtureRoot {
+            raw: db_relative_path.to_string(),
+        });
+    }
+
+    // 6. WAL/SHM 可能不存在；若存在则规范化并验证封闭性
+    for rel in [&wal_relative_path, &shm_relative_path] {
+        let candidate = canonical_root.join(rel);
+        if candidate.exists() {
+            let canonical =
+                candidate
+                    .canonicalize()
+                    .map_err(|e| FixturePathError::CannotCanonicalize {
+                        raw: candidate.to_string_lossy().into_owned(),
+                        source: e.to_string(),
+                    })?;
+            if !path_strictly_inside(&canonical, &canonical_root) {
+                return Err(FixturePathError::OutsideFixtureRoot {
+                    raw: rel.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(canonical_db)
 }
 
 /// 判断 `inner` 是否严格位于 `outer` 内部（不含 outer 自身）。
@@ -630,6 +773,196 @@ mod tests {
             .validate_write_target(&canonical_fixture_root, &link_path)
             .unwrap_err();
         assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+    }
+
+    // ============== R2：db_relative_path 逃逸反例测试 ==============
+
+    #[test]
+    fn r2_rejects_empty_db_relative_path() {
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err = validate_db_relative_path_inside(&canonical_fixture_root, "").unwrap_err();
+        assert!(matches!(err, FixturePathError::EmptyRelativePath));
+    }
+
+    #[test]
+    fn r2_rejects_absolute_db_relative_path_windows() {
+        // 绝对路径如 `C:\windows\system32\evil.db` 必须被词法拒绝——
+        // 不应触发任何文件系统访问
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err = validate_db_relative_path_inside(
+            &canonical_fixture_root,
+            "C:\\windows\\system32\\evil.db",
+        )
+        .unwrap_err();
+        assert!(matches!(err, FixturePathError::AbsolutePathRejected { .. }));
+    }
+
+    #[test]
+    fn r2_rejects_absolute_db_relative_path_unix_style() {
+        // Unix 风格绝对路径 `/etc/passwd` 在 Windows 上不是绝对路径，
+        // 但仍应被拒绝——它包含 RootDir 组件
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err =
+            validate_db_relative_path_inside(&canonical_fixture_root, "/etc/passwd").unwrap_err();
+        assert!(matches!(err, FixturePathError::AbsolutePathRejected { .. }));
+    }
+
+    #[test]
+    fn r2_rejects_parent_traversal_db_relative_path() {
+        // `../secret.db` 必须被词法拒绝——不应触发任何文件系统访问
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err =
+            validate_db_relative_path_inside(&canonical_fixture_root, "../secret.db").unwrap_err();
+        assert!(matches!(
+            err,
+            FixturePathError::ParentTraversalRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn r2_rejects_nested_parent_traversal_db_relative_path() {
+        // `sub/../../escape.db` 也必须被拒绝——含 `..` 组件
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err = validate_db_relative_path_inside(&canonical_fixture_root, "sub/../../escape.db")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FixturePathError::ParentTraversalRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn r2_accepts_safe_db_relative_path() {
+        // 安全路径：`sub/database.db`，DB 文件存在且封闭在 fixture_root 内
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let sub_dir = make_subdir(&fixture_root, "sub");
+        let db_path = sub_dir.join("database.db");
+        fs::write(&db_path, b"db-content").unwrap();
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let canonical_db =
+            validate_db_relative_path_inside(&canonical_fixture_root, "sub/database.db").unwrap();
+        assert!(canonical_db.starts_with(&canonical_fixture_root));
+        assert!(canonical_db.ends_with("database.db"));
+    }
+
+    #[test]
+    fn r2_accepts_db_with_wal_shm_present() {
+        // DB + WAL + SHM 都存在且全部封闭在 fixture_root 内 -> 通过
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        fs::write(fixture_root.join("database.db"), b"db").unwrap();
+        fs::write(fixture_root.join("database.db-wal"), b"wal").unwrap();
+        fs::write(fixture_root.join("database.db-shm"), b"shm").unwrap();
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let canonical_db =
+            validate_db_relative_path_inside(&canonical_fixture_root, "database.db").unwrap();
+        assert!(canonical_db.starts_with(&canonical_fixture_root));
+    }
+
+    #[test]
+    fn r2_rejects_symlink_escape_via_db_relative_path() {
+        // DB 路径经目录 junction 逃逸——在 fixture 内创建 junction 指向外部目录，
+        // 外部目录里有 database.db。规范化后 DB 路径位于 fixture_root 外部 -> 必须拒绝。
+        // 使用目录 junction（mklink /J）是因为 Windows 无开发者模式时文件 symlink 不可靠。
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let outside = tempdir().unwrap();
+        // 在外部目录里放置 database.db 文件
+        let outside_db = outside.path().join("database.db");
+        fs::write(&outside_db, b"evil").unwrap();
+
+        // 在 fixture 内创建 junction `escape_dir` 指向外部目录
+        let link_path = fixture_root.join("escape_dir");
+        let create_result = symlink_file_best_effort(outside.path(), &link_path);
+        if !create_result {
+            panic!(
+                "BLOCKED: cannot create symlink/junction for r2_rejects_symlink_escape_via_db_relative_path"
+            );
+        }
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        // db_relative_path = "escape_dir/database.db" -> canonical 解析为 outside/database.db -> 逃逸
+        let err =
+            validate_db_relative_path_inside(&canonical_fixture_root, "escape_dir/database.db")
+                .unwrap_err();
+        assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+    }
+
+    #[test]
+    fn r2_rejects_symlink_escape_via_wal() {
+        // DB 安全但 WAL 经 junction 逃逸 -> 必须拒绝。
+        // 在 fixture 内创建 `database.db` 文件 + `database.db-wal` junction 指向外部目录。
+        // WAL 派生路径 `database.db-wal` 经 junction 解析后位于 fixture_root 外部 -> 拒绝。
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        // DB 安全地放在 fixture 内
+        fs::write(fixture_root.join("database.db"), b"db").unwrap();
+
+        let outside = tempdir().unwrap();
+        // 在 fixture 内创建 junction `database.db-wal` 指向外部目录
+        // junction 是目录，但验证逻辑只检查 candidate.exists() 与 canonicalize 后的封闭性
+        let link_path = fixture_root.join("database.db-wal");
+        let create_result = symlink_file_best_effort(outside.path(), &link_path);
+        if !create_result {
+            panic!("BLOCKED: cannot create symlink/junction for r2_rejects_symlink_escape_via_wal");
+        }
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err =
+            validate_db_relative_path_inside(&canonical_fixture_root, "database.db").unwrap_err();
+        assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+    }
+
+    #[test]
+    fn r2_rejects_symlink_escape_via_shm() {
+        // DB+WAL 安全但 SHM 经 junction 逃逸 -> 必须拒绝。
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        fs::write(fixture_root.join("database.db"), b"db").unwrap();
+        fs::write(fixture_root.join("database.db-wal"), b"wal").unwrap();
+
+        let outside = tempdir().unwrap();
+        // 在 fixture 内创建 junction `database.db-shm` 指向外部目录
+        let link_path = fixture_root.join("database.db-shm");
+        let create_result = symlink_file_best_effort(outside.path(), &link_path);
+        if !create_result {
+            panic!("BLOCKED: cannot create symlink/junction for r2_rejects_symlink_escape_via_shm");
+        }
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err =
+            validate_db_relative_path_inside(&canonical_fixture_root, "database.db").unwrap_err();
+        assert!(matches!(err, FixturePathError::OutsideFixtureRoot { .. }));
+    }
+
+    #[test]
+    fn r2_rejects_db_canonicalize_failure() {
+        // DB 不存在 -> CannotCanonicalize（区别于词法拒绝）
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let fixture_root = make_subdir(test_root.path(), "fixture");
+        let policy = PathPolicy::new(roots);
+        let canonical_fixture_root = policy.validate_fixture_root(&fixture_root).unwrap();
+        let err = validate_db_relative_path_inside(&canonical_fixture_root, "nonexistent.db")
+            .unwrap_err();
+        assert!(matches!(err, FixturePathError::CannotCanonicalize { .. }));
     }
 }
 
