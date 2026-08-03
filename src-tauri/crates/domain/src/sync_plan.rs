@@ -1,4 +1,8 @@
 use std::collections::BTreeSet;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -124,6 +128,83 @@ pub enum PlanAction {
     },
 }
 
+/// 操作 manifest 使用的唯一状态集合；状态意图必须先于对应副作用持久化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Planned,
+    BackingUp,
+    BackupVerified,
+    TargetWriting,
+    TargetCommittedUnverified,
+    TargetVerifying,
+    CatalogReconciling,
+    VerificationInconclusive,
+    FailurePreserving,
+    FailureSnapshotVerified,
+    RestoreStaging,
+    RestoreStaged,
+    RestoreReplacing,
+    RestoredVerifying,
+    Completed,
+    CancelledBeforeWrite,
+    FailedSafe,
+    NotApplied,
+    RestoredVerified,
+    ManualRecoveryRequired,
+}
+
+impl OperationState {
+    /// 终态不会被后续协调自动覆盖，避免重启时重放已完成或需人工处理的操作。
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::CancelledBeforeWrite
+                | Self::FailedSafe
+                | Self::NotApplied
+                | Self::RestoredVerified
+                | Self::ManualRecoveryRequired
+        )
+    }
+}
+
+/// 同步执行的结构化结果，不包含原始数据库错误、路径或密钥。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SyncPlanExecutionOutcome {
+    Completed { affected_rows: u64 },
+    CompletedWithPostCommitEvidenceDrift { affected_rows: u64 },
+    PlanExpired { backups_preserved: bool },
+    CancelledBeforeWrite { backups_preserved: bool },
+    FailedBeforeWrite { backups_preserved: bool },
+    FailedAfterWrite { backups_preserved: bool },
+    ManualRecoveryRequired { backups_preserved: bool },
+    UnsupportedPlan,
+}
+
+/// 跨命令共享的取消信号；进入目标写入后，执行器只读取但不再中断保护步骤。
+#[derive(Debug, Clone, Default)]
+pub struct OperationCancellation {
+    requested: Arc<AtomicBool>,
+}
+
+impl OperationCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录用户取消意图；调用方必须由当前操作阶段决定是否接受该意图。
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// 读取取消意图，不会改变状态或触发副作用。
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
 /// 计划排除原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,6 +261,21 @@ pub struct SyncPlan {
 }
 
 impl SyncPlan {
+    /// 返回本次计划固定的操作 ID；不提供从外部字符串恢复 ID 的入口。
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// 返回计划绑定的数据位置标识，执行器不得改用其它位置。
+    pub fn data_location_id(&self) -> &str {
+        &self.data_location_id
+    }
+
+    /// 返回计划绑定的写入前文件证据，供执行器临近写入时再次比较。
+    pub fn target_file_evidence(&self) -> &TargetFileEvidence {
+        &self.target_file_evidence
+    }
+
     pub fn actions(&self) -> &[PlanAction] {
         &self.actions
     }
@@ -190,6 +286,18 @@ impl SyncPlan {
 
     pub fn scope_snapshot(&self) -> &SyncScope {
         &self.scope_snapshot
+    }
+
+    /// 只接受与构建时完全一致的账号、目标文件、schema 与 mapping 证据。
+    pub fn matches_context(&self, context: &SyncPlanContext) -> bool {
+        self.platform_id == context.platform_id
+            && self.data_location_id == context.data_location_id
+            && self.current_user_id == context.current_user_id
+            && self.account_evidence_fingerprint == context.account_evidence_fingerprint
+            && self.target_file_evidence == context.target_file_evidence
+            && self.schema_fingerprint == context.schema_fingerprint
+            && self.mapping_version == context.mapping_version
+            && context.schema_compatible
     }
 }
 
@@ -613,6 +721,50 @@ mod tests {
                 from_user_id: "source-user".to_string(),
                 to_user_id: "target-user".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn immutable_plan_rejects_changed_account_or_file_evidence() {
+        let plan = build_sync_plan(input(
+            SyncScope::AllHistory,
+            vec![plan_project(
+                "source-project",
+                "biz-source",
+                "source-user",
+                &["session-1"],
+            )],
+        ));
+        let matching = SyncPlanContext {
+            created_at: SystemTime::now(),
+            platform_id: "work_cn".to_string(),
+            data_location_id: "fixture-location".to_string(),
+            current_user_id: "target-user".to_string(),
+            account_evidence_fingerprint: "account-fingerprint".to_string(),
+            target_file_evidence: TargetFileEvidence {
+                db_fingerprint: "db-fingerprint".to_string(),
+                wal_fingerprint: None,
+                shm_fingerprint: None,
+            },
+            schema_fingerprint: "schema-fingerprint".to_string(),
+            mapping_version: "work_cn_v1".to_string(),
+            schema_compatible: true,
+        };
+
+        assert!(plan.matches_context(&matching));
+
+        let mut changed_file = matching.clone();
+        changed_file.target_file_evidence.db_fingerprint = "changed-db".to_string();
+        assert!(
+            !plan.matches_context(&changed_file),
+            "目标 DB 指纹变化必须使不可变计划失效"
+        );
+
+        let mut changed_account = matching;
+        changed_account.account_evidence_fingerprint = "changed-account".to_string();
+        assert!(
+            !plan.matches_context(&changed_account),
+            "账号证据变化必须使不可变计划失效"
         );
     }
 

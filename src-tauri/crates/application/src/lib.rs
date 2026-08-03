@@ -7,6 +7,7 @@
 //! `AssignProjectSourceService`，承载 P1 历史基础用例。
 
 pub mod history;
+pub mod sync_apply;
 pub mod workbench_read;
 
 use traesync_domain::WorkspaceState;
@@ -18,11 +19,13 @@ pub use traesync_ports::{AccountEvidenceReaderPort, DatabaseProbePort};
 // 重导出 T03/T04 历史库 port，供 commands 层构造测试 fake 使用
 pub use traesync_ports::{
     CatalogRepository, ContentGraphHasher, FileIdentityProvider, SnapshotStore, SourceNormalizer,
+    SyncPlanEvidencePort, SyncPlanExecutorPort,
 };
 
 pub use history::{
     AssignProjectSourceService, BrowseHistoryService, BuildSyncPlanService, ScanHistoryService,
 };
+pub use sync_apply::ApplySyncPlanService;
 pub use workbench_read::WorkbenchReadService;
 
 /// 工作台状态服务：T01 阶段返回固定的空状态，所有真实能力禁用。

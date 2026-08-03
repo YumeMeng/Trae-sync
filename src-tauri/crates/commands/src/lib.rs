@@ -11,8 +11,13 @@
 
 use std::path::Path;
 use std::time::SystemTime;
-use traesync_application::{BuildSyncPlanService, WorkbenchReadService, WorkspaceStateService};
-use traesync_domain::{SyncPlan, SyncPlanContext, SyncScope, WorkbenchReadState, WorkspaceState};
+use traesync_application::{
+    ApplySyncPlanService, BuildSyncPlanService, WorkbenchReadService, WorkspaceStateService,
+};
+use traesync_domain::{
+    OperationCancellation, SyncPlan, SyncPlanContext, SyncPlanExecutionOutcome, SyncScope,
+    WorkbenchReadState, WorkspaceState,
+};
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::WorkspaceStateProvider;
 // T03/T04 历史命令所需的 application 服务与 domain 值对象
@@ -282,20 +287,78 @@ pub fn build_sync_plan(
     Ok(service.build(context, scope))
 }
 
+/// `apply_sync_plan` 命令：只委托 application 服务，计划和取消令牌均由组合根持有。
+///
+/// 不接受前端传入的 `SyncPlan`，避免客户端伪造或反序列化注入写入计划。
+pub fn apply_sync_plan(
+    plan: &SyncPlan,
+    cancellation: &OperationCancellation,
+    service: &ApplySyncPlanService,
+) -> SyncPlanExecutionOutcome {
+    service.apply(plan, cancellation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use traesync_application::WorkspaceStateProvider;
-    use traesync_application::{AccountEvidenceReaderPort, DatabaseProbePort};
+    use traesync_application::{
+        AccountEvidenceReaderPort, ApplySyncPlanService, DatabaseProbePort, SyncPlanEvidencePort,
+        SyncPlanExecutorPort, WorkspaceStateProvider,
+    };
     use traesync_domain::{
-        AccountEvidence, AuthFingerprint, CapabilityFlags, CompatibilityState, EvidenceState,
-        IncompatibleReason, PlatformId, ReadonlyReason, SchemaFingerprint, SourceEventSummary,
-        TableCounts, UserId, WorkspaceState,
+        AccountEvidence, AuthFingerprint, BuildSyncPlanInput, CapabilityFlags, CompatibilityState,
+        EvidenceState, IncompatibleReason, OperationCancellation, PlatformId, ReadonlyReason,
+        SchemaFingerprint, SourceEventSummary, SyncPlanExecutionOutcome, TableCounts,
+        TargetFileEvidence, UserId, WorkspaceState,
     };
 
     struct FakeProvider {
         state: WorkspaceState,
+    }
+
+    /// 过期证据确保 application 服务不会调用执行器。
+    struct ExpiredPlanEvidence;
+
+    impl SyncPlanEvidencePort for ExpiredPlanEvidence {
+        fn is_current(&self, _plan: &SyncPlan) -> bool {
+            false
+        }
+    }
+
+    /// 不应被调用的执行器；若命令绕过 application 服务，测试会立即失败。
+    struct UnreachableExecutor;
+
+    impl SyncPlanExecutorPort for UnreachableExecutor {
+        fn execute_sync_plan(
+            &self,
+            _plan: &SyncPlan,
+            _cancellation: &OperationCancellation,
+            _evidence: &dyn SyncPlanEvidencePort,
+        ) -> SyncPlanExecutionOutcome {
+            panic!("过期计划不得进入执行器")
+        }
+    }
+
+    /// 生成最小不可变计划，测试命令层不依赖客户端 JSON 输入。
+    fn plan_for_apply_command() -> SyncPlan {
+        traesync_domain::build_sync_plan(BuildSyncPlanInput {
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            platform_id: "work_cn".to_string(),
+            data_location_id: "fixture-location".to_string(),
+            current_user_id: "target-user".to_string(),
+            account_evidence_fingerprint: "account-fingerprint".to_string(),
+            target_file_evidence: TargetFileEvidence {
+                db_fingerprint: "database-fingerprint".to_string(),
+                wal_fingerprint: None,
+                shm_fingerprint: None,
+            },
+            schema_fingerprint: "schema-fingerprint".to_string(),
+            mapping_version: "work_cn_v1".to_string(),
+            schema_compatible: true,
+            scope: SyncScope::AllHistory,
+            projects: vec![],
+        })
     }
 
     impl WorkspaceStateProvider for FakeProvider {
@@ -405,6 +468,26 @@ mod tests {
         assert_eq!(result.platform.platform_id, PlatformId::work_cn());
         assert!(!result.capabilities.scan_enabled);
         assert_eq!(result.honest_status, "真实能力尚未启用");
+    }
+
+    #[test]
+    fn apply_sync_plan_delegates_expired_plan_to_application_service() {
+        let evidence = ExpiredPlanEvidence;
+        let executor = UnreachableExecutor;
+        let service = ApplySyncPlanService::new(&evidence, &executor);
+
+        let outcome = apply_sync_plan(
+            &plan_for_apply_command(),
+            &OperationCancellation::new(),
+            &service,
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::PlanExpired {
+                backups_preserved: false
+            }
+        );
     }
 
     #[test]

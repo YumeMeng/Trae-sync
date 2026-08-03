@@ -115,6 +115,8 @@ pub enum FixturePathError {
     OutsideFixtureRoot { raw: String },
     /// fixture_root 位于可信测试根之外
     FixtureRootOutsideTestRoot { raw: String },
+    /// fixture 存储根位于可信测试根之外
+    StorageRootOutsideTestRoot { raw: String },
     /// 候选路径或其父目录不存在，无法规范化
     CannotCanonicalize { raw: String, source: String },
     /// 候选路径没有父目录
@@ -150,6 +152,9 @@ impl std::fmt::Display for FixturePathError {
             }
             Self::FixtureRootOutsideTestRoot { raw } => {
                 write!(f, "fixture_root 位于可信测试根之外: {raw}")
+            }
+            Self::StorageRootOutsideTestRoot { raw } => {
+                write!(f, "fixture 存储根位于可信测试根之外: {raw}")
             }
             Self::CannotCanonicalize { raw, source } => {
                 write!(f, "无法规范化路径: {raw} ({source})")
@@ -292,6 +297,35 @@ impl PathPolicy {
 
         Ok(canonical_candidate)
     }
+
+    /// 验证固定恢复区位于可信测试根内，禁止把备份或 manifest 写到真实用户目录。
+    fn validate_fixture_storage_root(&self, candidate: &Path) -> Result<PathBuf, FixturePathError> {
+        let canonical_candidate =
+            candidate
+                .canonicalize()
+                .map_err(|e| FixturePathError::CannotCanonicalize {
+                    raw: candidate.to_string_lossy().into_owned(),
+                    source: e.to_string(),
+                })?;
+        let canonical_test_root = self.canonical_test_root()?;
+        if !path_strictly_inside(&canonical_candidate, &canonical_test_root) {
+            return Err(FixturePathError::StorageRootOutsideTestRoot {
+                raw: canonical_candidate.to_string_lossy().into_owned(),
+            });
+        }
+        if is_default_work_cn_path(
+            &canonical_candidate,
+            self.system_roots.default_work_cn_dir.as_deref(),
+        ) {
+            return Err(FixturePathError::DefaultWorkCnPath {
+                raw: canonical_candidate.to_string_lossy().into_owned(),
+                default_pattern: default_work_cn_display(
+                    self.system_roots.default_work_cn_dir.as_deref(),
+                ),
+            });
+        }
+        Ok(canonical_candidate)
+    }
 }
 
 /// Fixture 路径守卫：构造时固定 fixture_root，后续验证写目标。
@@ -334,6 +368,14 @@ impl FixturePathGuard {
     pub fn validate_write_target(&self, candidate: &Path) -> Result<PathBuf, FixturePathError> {
         self.policy
             .validate_write_target(&self.canonical_fixture_root, candidate)
+    }
+
+    /// 验证备份和 manifest 存储根仍位于可信 fixture 测试根，且必须预先存在。
+    pub fn validate_fixture_storage_root(
+        &self,
+        candidate: &Path,
+    ) -> Result<PathBuf, FixturePathError> {
+        self.policy.validate_fixture_storage_root(candidate)
     }
 
     /// 返回规范化后的 fixture_root（仅供诊断使用）

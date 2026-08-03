@@ -10,17 +10,672 @@
 //! - 未知 schema 返回 `UnknownSchema`
 //! - Backup API 必须保留未 checkpoint WAL 的已提交记录
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use traesync_domain::{CompatibilityState, IncompatibleReason};
-use traesync_ports::DatabaseProbePort;
+use traesync_domain::{
+    CompatibilityState, IncompatibleReason, OperationCancellation, OperationState, PlanAction,
+    SyncPlan, SyncPlanExecutionOutcome,
+};
+use traesync_ports::{DatabaseProbePort, SyncPlanEvidencePort, SyncPlanExecutorPort};
 
+use crate::fixture_paths::FixturePathGuard;
+use crate::operation_manifest::{
+    has_manual_recovery_required, reconcile_unfinished_manifests, OperationManifestJournal,
+};
 use crate::work_cn_schema::{check_schema, compute_schema_fingerprint, read_table_counts};
 
 /// 嵌入式 SQLCipher 探测器：实现 `DatabaseProbePort`。
 pub struct SqlCipherProbe;
+
+/// Work CN 的最小同步执行器。
+///
+/// T06 首个纵切只支持完整项目跟随；公开入口强制 fixture 路径防护。
+pub struct WorkCnSyncExecutor {
+    raw_key: String,
+}
+
+/// `FollowProject` 的结构化执行结论，不暴露原始数据库错误或密钥。
+pub type FollowProjectExecution = SyncPlanExecutionOutcome;
+
+/// 已固定 guard、目标 DB 与恢复存储根的执行器；只能由 `bind_fixture` 构造。
+pub struct FixtureWorkCnSyncExecutor<'a> {
+    executor: &'a WorkCnSyncExecutor,
+    target_db_path: PathBuf,
+    storage_root: PathBuf,
+}
+
+/// 事务提交时固定的最小关系断言，供新连接提交后验证使用。
+struct FollowProjectCommit {
+    affected_rows: u64,
+    session_count: i64,
+}
+
+/// 事务结果区分证据漂移与 SQL 失败，避免把可重建计划误报为数据库故障。
+enum FollowProjectTransaction {
+    Committed(FollowProjectCommit),
+    EvidenceChanged,
+    Failed,
+}
+
+impl WorkCnSyncExecutor {
+    /// 在组合根注入 fixture SQLCipher key，避免 key 进入 UI、日志和返回值。
+    pub fn new(raw_key: impl Into<String>) -> Self {
+        Self {
+            raw_key: raw_key.into(),
+        }
+    }
+
+    /// 绑定唯一生产执行入口所需的 fixture guard、目标数据库和恢复存储根。
+    pub fn bind_fixture<'a>(
+        &'a self,
+        fixture_guard: &FixturePathGuard,
+        target_db_path: &Path,
+        storage_root: &Path,
+    ) -> Result<FixtureWorkCnSyncExecutor<'a>, crate::FixturePathError> {
+        // DB 与恢复区均由 guard 验证，避免 public API 变成真实路径的写入旁路。
+        let target_db_path = fixture_guard.validate_write_target(target_db_path)?;
+        let storage_root = fixture_guard.validate_fixture_storage_root(storage_root)?;
+        Ok(FixtureWorkCnSyncExecutor {
+            executor: self,
+            target_db_path,
+            storage_root,
+        })
+    }
+
+    /// 受 fixture 守卫后的执行核心；仅供本模块测试与公开入口复用。
+    #[cfg(test)]
+    fn execute_follow_project_inner(
+        &self,
+        target_db_path: &Path,
+        storage_root: &Path,
+        operation_id: &traesync_domain::OperationId,
+        project_id: &str,
+        expected_source_user_id: &str,
+        target_user_id: &str,
+    ) -> FollowProjectExecution {
+        let before_dir = storage_root
+            .join("backups")
+            .join(operation_id.as_str())
+            .join("before");
+        let raw_dir = before_dir.join("raw");
+        let logical_db_path = before_dir.join("logical").join("database.db");
+
+        // 先固定原始 DB/WAL/SHM 字节证据；主库缺失或任一复制哈希不一致时禁止写入。
+        if !capture_raw_backup(target_db_path, &raw_dir) {
+            return FollowProjectExecution::FailedBeforeWrite {
+                backups_preserved: false,
+            };
+        }
+
+        // 再生成并用新只读连接验证逻辑副本；原始证据保留，失败不触碰目标库。
+        if !backup_to_logical_copy_at_inner(target_db_path, &self.raw_key, &logical_db_path)
+            || !verify_logical_backup(&logical_db_path, &self.raw_key)
+        {
+            return FollowProjectExecution::FailedBeforeWrite {
+                backups_preserved: true,
+            };
+        }
+
+        let committed = match apply_follow_project_transaction(
+            target_db_path,
+            &self.raw_key,
+            project_id,
+            expected_source_user_id,
+            target_user_id,
+        ) {
+            Some(rows) => rows,
+            None => {
+                return FollowProjectExecution::FailedBeforeWrite {
+                    backups_preserved: true,
+                };
+            }
+        };
+
+        // 事务提交后必须重新打开数据库验证；验证失败绝不报告成功。
+        if !verify_follow_project_after_commit(
+            target_db_path,
+            &self.raw_key,
+            project_id,
+            target_user_id,
+            committed.session_count,
+        ) {
+            return FollowProjectExecution::FailedAfterWrite {
+                backups_preserved: true,
+            };
+        }
+
+        FollowProjectExecution::Completed {
+            affected_rows: committed.affected_rows,
+        }
+    }
+}
+
+impl SyncPlanExecutorPort for FixtureWorkCnSyncExecutor<'_> {
+    fn execute_sync_plan(
+        &self,
+        plan: &SyncPlan,
+        cancellation: &OperationCancellation,
+        evidence: &dyn SyncPlanEvidencePort,
+    ) -> SyncPlanExecutionOutcome {
+        self.execute_sync_plan_inner(plan, cancellation, evidence)
+    }
+}
+
+impl FixtureWorkCnSyncExecutor<'_> {
+    /// 按 manifest 状态机执行单个 `FollowProject`；其它动作留给后续 ticket 实现。
+    fn execute_sync_plan_inner(
+        &self,
+        plan: &SyncPlan,
+        cancellation: &OperationCancellation,
+        evidence: &dyn SyncPlanEvidencePort,
+    ) -> SyncPlanExecutionOutcome {
+        // 先协调旧操作；任一写入中断都进入人工恢复，当前操作不碰目标库。
+        if !reconcile_unfinished_manifests(&self.storage_root)
+            || has_manual_recovery_required(&self.storage_root)
+        {
+            return SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                backups_preserved: false,
+            };
+        }
+
+        let (project_id, source_user_id, target_user_id) = match plan.actions() {
+            [PlanAction::FollowProject {
+                project_id,
+                from_user_id,
+                to_user_id,
+            }] => (
+                project_id.as_str(),
+                from_user_id.as_str(),
+                to_user_id.as_str(),
+            ),
+            _ => return SyncPlanExecutionOutcome::UnsupportedPlan,
+        };
+
+        // 应用层已检查一次；执行器再检查，防止调用者绕过 service 或计划在间隙失效。
+        if !evidence.is_current(plan) || !target_file_matches_plan(&self.target_db_path, plan) {
+            return SyncPlanExecutionOutcome::PlanExpired {
+                backups_preserved: false,
+            };
+        }
+
+        let journal = match OperationManifestJournal::create(
+            &self.storage_root,
+            plan.operation_id(),
+            plan.data_location_id(),
+            plan.target_file_evidence(),
+        ) {
+            Some(journal) => journal,
+            None => {
+                return SyncPlanExecutionOutcome::FailedBeforeWrite {
+                    backups_preserved: false,
+                }
+            }
+        };
+        let before_dir = self
+            .storage_root
+            .join("backups")
+            .join(plan.operation_id().as_str())
+            .join("before");
+        let raw_dir = before_dir.join("raw");
+        let logical_db_path = before_dir.join("logical").join("database.db");
+
+        if journal.transition(OperationState::BackingUp).is_err()
+            || !capture_raw_backup(&self.target_db_path, &raw_dir)
+        {
+            let _ = journal.transition(OperationState::FailedSafe);
+            return SyncPlanExecutionOutcome::FailedBeforeWrite {
+                backups_preserved: false,
+            };
+        }
+        if !backup_to_logical_copy_at_inner(
+            &self.target_db_path,
+            &self.executor.raw_key,
+            &logical_db_path,
+        ) || !verify_logical_backup(&logical_db_path, &self.executor.raw_key)
+        {
+            let _ = journal.transition(OperationState::FailedSafe);
+            return SyncPlanExecutionOutcome::FailedBeforeWrite {
+                backups_preserved: true,
+            };
+        }
+        if journal.transition(OperationState::BackupVerified).is_err() {
+            return SyncPlanExecutionOutcome::FailedBeforeWrite {
+                backups_preserved: true,
+            };
+        }
+
+        // 备份完成但尚未写目标时仍可取消，双备份按规格保留。
+        if cancellation.is_requested() {
+            let _ = journal.transition(OperationState::CancelledBeforeWrite);
+            return SyncPlanExecutionOutcome::CancelledBeforeWrite {
+                backups_preserved: true,
+            };
+        }
+        if !evidence.is_current(plan) || !target_file_matches_plan(&self.target_db_path, plan) {
+            let _ = journal.transition(OperationState::NotApplied);
+            return SyncPlanExecutionOutcome::PlanExpired {
+                backups_preserved: true,
+            };
+        }
+        if journal.transition(OperationState::TargetWriting).is_err() {
+            return SyncPlanExecutionOutcome::FailedBeforeWrite {
+                backups_preserved: true,
+            };
+        }
+
+        let committed = match apply_follow_project_transaction_with_evidence(
+            &self.target_db_path,
+            &self.executor.raw_key,
+            project_id,
+            source_user_id,
+            target_user_id,
+            || evidence.is_current(plan) && target_file_matches_plan(&self.target_db_path, plan),
+        ) {
+            FollowProjectTransaction::Committed(commit) => commit,
+            FollowProjectTransaction::EvidenceChanged => {
+                let _ = journal.transition(OperationState::NotApplied);
+                return SyncPlanExecutionOutcome::PlanExpired {
+                    backups_preserved: true,
+                };
+            }
+            FollowProjectTransaction::Failed => {
+                let _ = journal.transition(OperationState::NotApplied);
+                return SyncPlanExecutionOutcome::FailedBeforeWrite {
+                    backups_preserved: true,
+                };
+            }
+        };
+
+        if journal
+            .transition(OperationState::TargetCommittedUnverified)
+            .is_err()
+            || journal.transition(OperationState::TargetVerifying).is_err()
+        {
+            let _ = preserve_failure_evidence(
+                &journal,
+                &self.target_db_path,
+                &self.storage_root,
+                plan.operation_id(),
+            );
+            return SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                backups_preserved: true,
+            };
+        }
+
+        let verified = verify_follow_project_after_commit(
+            &self.target_db_path,
+            &self.executor.raw_key,
+            project_id,
+            target_user_id,
+            committed.session_count,
+        );
+        // 提交后漂移不能撤销已确认目标，但必须继续完整验证且不报告普通成功。
+        let post_commit_drift = !evidence.is_current(plan);
+        if !verified {
+            if journal
+                .transition(OperationState::VerificationInconclusive)
+                .is_err()
+                || !preserve_failure_evidence(
+                    &journal,
+                    &self.target_db_path,
+                    &self.storage_root,
+                    plan.operation_id(),
+                )
+                || journal
+                    .transition(OperationState::ManualRecoveryRequired)
+                    .is_err()
+            {
+                return SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                    backups_preserved: true,
+                };
+            }
+            return SyncPlanExecutionOutcome::FailedAfterWrite {
+                backups_preserved: true,
+            };
+        }
+        if journal.transition(OperationState::Completed).is_err() {
+            let _ = preserve_failure_evidence(
+                &journal,
+                &self.target_db_path,
+                &self.storage_root,
+                plan.operation_id(),
+            );
+            return SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                backups_preserved: true,
+            };
+        }
+
+        if post_commit_drift {
+            SyncPlanExecutionOutcome::CompletedWithPostCommitEvidenceDrift {
+                affected_rows: committed.affected_rows,
+            }
+        } else {
+            SyncPlanExecutionOutcome::Completed {
+                affected_rows: committed.affected_rows,
+            }
+        }
+    }
+}
+
+/// 复制捕获时存在的原始 DB/WAL/SHM，并用独立哈希清单验证每个副本。
+fn capture_raw_backup(source_db_path: &Path, raw_dir: &Path) -> bool {
+    if std::fs::create_dir_all(raw_dir).is_err() {
+        return false;
+    }
+
+    let source_files = [
+        (source_db_path.to_path_buf(), "database.db", true),
+        (
+            database_sidecar_path(source_db_path, "-wal"),
+            "database.db-wal",
+            false,
+        ),
+        (
+            database_sidecar_path(source_db_path, "-shm"),
+            "database.db-shm",
+            false,
+        ),
+    ];
+    let mut hashes = Vec::new();
+
+    for (source_path, backup_name, required) in source_files {
+        if !source_path.exists() {
+            if required {
+                return false;
+            }
+            continue;
+        }
+
+        let backup_path = raw_dir.join(backup_name);
+        if std::fs::copy(&source_path, &backup_path).is_err() {
+            return false;
+        }
+
+        let source_hash = match sha256_file_for_backup(&source_path) {
+            Some(hash) => hash,
+            None => return false,
+        };
+        let backup_hash = match sha256_file_for_backup(&backup_path) {
+            Some(hash) => hash,
+            None => return false,
+        };
+        if source_hash != backup_hash {
+            return false;
+        }
+        hashes.push(format!("{backup_hash}  {backup_name}"));
+    }
+
+    if std::fs::write(raw_dir.join("hashes.sha256"), hashes.join("\n")).is_err() {
+        return false;
+    }
+
+    verify_raw_backup(raw_dir)
+}
+
+/// 原始备份清单只允许本次固定的三个文件名，防止验证范围被清单意外扩大。
+fn verify_raw_backup(raw_dir: &Path) -> bool {
+    let contents = match std::fs::read_to_string(raw_dir.join("hashes.sha256")) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+    let mut count = 0;
+
+    for line in contents.lines().filter(|line| !line.is_empty()) {
+        let (expected_hash, name) = match line.split_once("  ") {
+            Some(parts) => parts,
+            None => return false,
+        };
+        if !matches!(name, "database.db" | "database.db-wal" | "database.db-shm") {
+            return false;
+        }
+        let actual_hash = match sha256_file_for_backup(&raw_dir.join(name)) {
+            Some(hash) => hash,
+            None => return false,
+        };
+        if actual_hash != expected_hash {
+            return false;
+        }
+        count += 1;
+    }
+
+    count > 0
+}
+
+/// 生成目标数据库的 WAL 或 SHM 路径，不依赖当前文件扩展名。
+fn database_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", db_path.to_string_lossy(), suffix))
+}
+
+/// 比较目标三件套与计划固定指纹；存在性变化也视为漂移，不允许继续写入。
+fn target_file_matches_plan(target_db_path: &Path, plan: &SyncPlan) -> bool {
+    let expected = plan.target_file_evidence();
+    let current_matches = |path: PathBuf, fingerprint: Option<&String>| match fingerprint {
+        Some(expected) => sha256_file_for_backup(&path).as_deref() == Some(expected.as_str()),
+        None => !path.exists(),
+    };
+
+    sha256_file_for_backup(target_db_path).as_deref() == Some(expected.db_fingerprint.as_str())
+        && current_matches(
+            database_sidecar_path(target_db_path, "-wal"),
+            expected.wal_fingerprint.as_ref(),
+        )
+        && current_matches(
+            database_sidecar_path(target_db_path, "-shm"),
+            expected.shm_fingerprint.as_ref(),
+        )
+}
+
+/// 写后验证失败时捕获当前目标现场；失败也不删除已验证的写前双备份。
+fn capture_failure_evidence(
+    target_db_path: &Path,
+    storage_root: &Path,
+    operation_id: &traesync_domain::OperationId,
+) -> bool {
+    let failure_raw_dir = storage_root
+        .join("backups")
+        .join(operation_id.as_str())
+        .join("failure")
+        .join("raw");
+    capture_raw_backup(target_db_path, &failure_raw_dir)
+}
+
+/// 写后异常先持久化现场保存意图，再捕获目标三件套并记录验证完成。
+fn preserve_failure_evidence(
+    journal: &OperationManifestJournal,
+    target_db_path: &Path,
+    storage_root: &Path,
+    operation_id: &traesync_domain::OperationId,
+) -> bool {
+    journal
+        .transition(OperationState::FailurePreserving)
+        .is_ok()
+        && capture_failure_evidence(target_db_path, storage_root, operation_id)
+        && journal
+            .transition(OperationState::FailureSnapshotVerified)
+            .is_ok()
+}
+
+/// 仅用于备份验证的 SHA-256 计算；失败关闭，不返回部分结果。
+fn sha256_file_for_backup(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// 向指定恢复目录写入 SQLCipher 逻辑副本，绝不覆盖既有备份。
+fn backup_to_logical_copy_at_inner(source_db: &Path, raw_key: &str, destination: &Path) -> bool {
+    let parent = match destination.parent() {
+        Some(parent) => parent,
+        None => return false,
+    };
+    if destination.exists() || std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+
+    // SQLCipher 导出要求主连接可写；调用方已先固定原始备份，测试另行证明导出不改源三件套。
+    let conn = match open_with_key(source_db, raw_key) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    // SQLCipher 的 KEY 语法不接受绑定参数；路径来自已受 fixture 防护的组合根，仍逐字转义。
+    let destination_text = destination.to_string_lossy().replace('\'', "''");
+    let attach_sql = format!("ATTACH DATABASE '{destination_text}' AS dst KEY \"x'{raw_key}'\";");
+    if conn.execute_batch(&attach_sql).is_err() {
+        return false;
+    }
+
+    let exported = conn
+        .query_row("SELECT sqlcipher_export('dst')", [], |_row| Ok(()))
+        .is_ok();
+    let detached = conn.execute_batch("DETACH DATABASE dst;").is_ok();
+    exported && detached && destination.exists()
+}
+
+/// 用新只读连接验证逻辑副本的 schema 与两层完整性检查。
+fn verify_logical_backup(logical_db_path: &Path, raw_key: &str) -> bool {
+    let conn = match open_with_key_readonly(logical_db_path, raw_key) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    let (cipher_ok, sqlite_ok) = run_integrity_checks_on_connection(&conn);
+    cipher_ok && sqlite_ok && check_schema(&conn).is_ok()
+}
+
+/// 旧的 fixture 纵切复用无额外证据检查的事务入口。
+#[cfg(test)]
+fn apply_follow_project_transaction(
+    target_db_path: &Path,
+    raw_key: &str,
+    project_id: &str,
+    expected_source_user_id: &str,
+    target_user_id: &str,
+) -> Option<FollowProjectCommit> {
+    match apply_follow_project_transaction_with_evidence(
+        target_db_path,
+        raw_key,
+        project_id,
+        expected_source_user_id,
+        target_user_id,
+        || true,
+    ) {
+        FollowProjectTransaction::Committed(commit) => Some(commit),
+        FollowProjectTransaction::EvidenceChanged | FollowProjectTransaction::Failed => None,
+    }
+}
+
+/// 使用参数绑定更新 owner，并在提交前再次验证计划证据。
+fn apply_follow_project_transaction_with_evidence<F>(
+    target_db_path: &Path,
+    raw_key: &str,
+    project_id: &str,
+    expected_source_user_id: &str,
+    target_user_id: &str,
+    before_commit: F,
+) -> FollowProjectTransaction
+where
+    F: FnOnce() -> bool,
+{
+    let mut conn = match open_with_key(target_db_path, raw_key) {
+        Ok(conn) => conn,
+        Err(_) => return FollowProjectTransaction::Failed,
+    };
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(_) => return FollowProjectTransaction::Failed,
+    };
+    let (actual_owner, biz_project_id): (String, String) = tx
+        .query_row(
+            "SELECT user_id, biz_project_id FROM project WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()
+        .unwrap_or_else(|| (String::new(), String::new()));
+    if actual_owner != expected_source_user_id {
+        return FollowProjectTransaction::Failed;
+    }
+
+    // 固定写前会话数量，提交后新连接必须确认未涉及关系没有被意外改写。
+    let session_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM chat_session WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    if session_count < 0 {
+        return FollowProjectTransaction::Failed;
+    }
+
+    let affected_rows = tx
+        .execute(
+            "UPDATE project SET user_id = ?1 WHERE project_id = ?2 AND user_id = ?3",
+            params![target_user_id, project_id, expected_source_user_id],
+        )
+        .unwrap_or(0);
+    if affected_rows != 1 {
+        return FollowProjectTransaction::Failed;
+    }
+
+    let matching_projects: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM project WHERE biz_project_id = ?1 AND user_id = ?2",
+            params![biz_project_id, target_user_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    if matching_projects != 1 {
+        return FollowProjectTransaction::Failed;
+    }
+
+    // 更新仍未提交，对外新连接看不到本事务；证据变化时 drop 事务即回滚。
+    if !before_commit() {
+        return FollowProjectTransaction::EvidenceChanged;
+    }
+    if tx.commit().is_err() {
+        return FollowProjectTransaction::Failed;
+    }
+    FollowProjectTransaction::Committed(FollowProjectCommit {
+        affected_rows: affected_rows as u64,
+        session_count,
+    })
+}
+
+/// 提交后重新打开目标数据库，确认 owner 和两层完整性检查均通过。
+fn verify_follow_project_after_commit(
+    target_db_path: &Path,
+    raw_key: &str,
+    project_id: &str,
+    target_user_id: &str,
+    expected_session_count: i64,
+) -> bool {
+    let conn = match open_with_key_readonly(target_db_path, raw_key) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT user_id FROM project WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let session_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chat_session WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let (cipher_ok, sqlite_ok) = run_integrity_checks_on_connection(&conn);
+    owner.as_deref() == Some(target_user_id)
+        && session_count == expected_session_count
+        && cipher_ok
+        && sqlite_ok
+}
 
 impl Default for SqlCipherProbe {
     fn default() -> Self {
@@ -332,11 +987,16 @@ fn verify_transaction_rollback_inner(copy_db: &Path, raw_key: &str) -> bool {
 /// - `PRAGMA cipher_integrity_check` 无错误（返回 0 行）
 /// - `PRAGMA integrity_check` 返回 "ok"
 fn run_integrity_checks_inner(db_path: &Path, raw_key: &str) -> (bool, bool) {
-    let conn = match open_with_key(db_path, raw_key) {
+    let conn = match open_with_key_readonly(db_path, raw_key) {
         Ok(c) => c,
         Err(_) => return (false, false),
     };
 
+    run_integrity_checks_on_connection(&conn)
+}
+
+/// 对已打开的只读连接运行两层完整性检查，供逻辑副本和提交后验证复用。
+fn run_integrity_checks_on_connection(conn: &Connection) -> (bool, bool) {
     // cipher_integrity_check：每行代表一个错误。无错误时返回 0 行。
     let cipher_ok: bool = {
         let mut stmt = match conn.prepare("PRAGMA cipher_integrity_check") {
@@ -477,6 +1137,7 @@ fn generate_random_hex_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     /// 合成 fixture raw key（不使用 TECHNICAL_BASELINE.md 中的真实基线 key）。
@@ -486,6 +1147,66 @@ mod tests {
 
     /// 错误 key（与基线不同的 64 字符 hex）
     const WRONG_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// 计划驱动测试用证据读取器；通过调用序号模拟备份阶段之后的证据漂移。
+    struct SequencedEvidence {
+        current_through: usize,
+        calls: AtomicUsize,
+    }
+
+    impl SyncPlanEvidencePort for SequencedEvidence {
+        fn is_current(&self, _plan: &SyncPlan) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst) < self.current_through
+        }
+    }
+
+    /// 构造与本 fixture 三件套绑定的单个 `FollowProject` 不可变计划。
+    fn follow_project_plan(db_path: &Path) -> SyncPlan {
+        traesync_domain::build_sync_plan(traesync_domain::BuildSyncPlanInput {
+            created_at: SystemTime::UNIX_EPOCH,
+            platform_id: "work_cn".to_string(),
+            data_location_id: "fixture-location".to_string(),
+            current_user_id: "2000000000000002".to_string(),
+            account_evidence_fingerprint: "fixture-account".to_string(),
+            target_file_evidence: traesync_domain::TargetFileEvidence {
+                db_fingerprint: sha256_file_for_backup(db_path).unwrap(),
+                wal_fingerprint: sha256_file_for_backup(&database_sidecar_path(db_path, "-wal")),
+                shm_fingerprint: sha256_file_for_backup(&database_sidecar_path(db_path, "-shm")),
+            },
+            schema_fingerprint: "fixture-schema".to_string(),
+            mapping_version: "work_cn_v1".to_string(),
+            schema_compatible: true,
+            scope: traesync_domain::SyncScope::AllHistory,
+            projects: vec![traesync_domain::PlanProjectInput {
+                identity: traesync_domain::ProjectIdentity {
+                    project_id: "p1".to_string(),
+                    biz_project_id: "biz-1".to_string(),
+                    display_name: "fixture project".to_string(),
+                    soft_deleted: false,
+                },
+                display_owner: "1000000000000001".to_string(),
+                current_live_owner: "1000000000000001".to_string(),
+                sessions: vec![traesync_domain::PlanSessionInput {
+                    identity: traesync_domain::SessionIdentity::new("work_cn", "s1"),
+                    version_available: true,
+                }],
+                archived_only: false,
+            }],
+        })
+    }
+
+    /// 测试仅直接构造私有执行核心；生产只能通过 `bind_fixture` 创建执行器。
+    fn fixture_executor<'a>(
+        executor: &'a WorkCnSyncExecutor,
+        db_path: &Path,
+        storage_root: &Path,
+    ) -> FixtureWorkCnSyncExecutor<'a> {
+        FixtureWorkCnSyncExecutor {
+            executor,
+            target_db_path: db_path.to_path_buf(),
+            storage_root: storage_root.to_path_buf(),
+        }
+    }
 
     /// 构造合成 Work CN SQLCipher 数据库
     fn make_work_cn_fixture(dir: &Path) -> PathBuf {
@@ -555,6 +1276,385 @@ mod tests {
         // 关闭连接让 WAL 落盘
         drop(conn);
         db_path
+    }
+
+    #[test]
+    fn follow_project_creates_verified_dual_backups_and_updates_only_expected_owner() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture_with_wal(target.path());
+        let source_before = snapshot_db_trio(target.path(), "database.db");
+        let operation_id = traesync_domain::OperationId::new();
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+
+        let result = executor.execute_follow_project_inner(
+            &db_path,
+            storage.path(),
+            &operation_id,
+            "p1",
+            "1000000000000001",
+            "2000000000000002",
+        );
+
+        assert_eq!(
+            result,
+            FollowProjectExecution::Completed { affected_rows: 1 },
+            "完整项目跟随应报告单行更新成功"
+        );
+
+        let before_dir = storage
+            .path()
+            .join("backups")
+            .join(operation_id.as_str())
+            .join("before");
+        let raw_dir = before_dir.join("raw");
+        assert!(
+            verify_raw_backup(&raw_dir),
+            "原始备份哈希清单必须独立可验证"
+        );
+        assert_eq!(
+            std::fs::read(raw_dir.join("database.db")).unwrap(),
+            source_before.0,
+            "原始 DB 备份必须保留写入前字节"
+        );
+        if !source_before.1.is_empty() {
+            assert_eq!(
+                std::fs::read(raw_dir.join("database.db-wal")).unwrap(),
+                source_before.1,
+                "原始 WAL 备份必须保留写入前字节"
+            );
+        }
+        if !source_before.2.is_empty() {
+            assert_eq!(
+                std::fs::read(raw_dir.join("database.db-shm")).unwrap(),
+                source_before.2,
+                "原始 SHM 备份必须保留写入前字节"
+            );
+        }
+
+        let logical_db_path = before_dir.join("logical").join("database.db");
+        assert!(verify_logical_backup(&logical_db_path, TEST_RAW_KEY));
+        assert_eq!(
+            project_owner(&logical_db_path, "p1"),
+            Some("1000000000000001".to_string()),
+            "逻辑副本必须保留写入前 owner"
+        );
+        assert_eq!(
+            project_owner(&db_path, "p1"),
+            Some("2000000000000002".to_string()),
+            "目标库只应更新计划指定项目的 owner"
+        );
+    }
+
+    #[test]
+    fn plan_execution_cancels_after_backup_without_writing_target() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture(target.path());
+        let plan = follow_project_plan(&db_path);
+        let cancellation = OperationCancellation::new();
+        cancellation.request();
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+        let evidence = SequencedEvidence {
+            current_through: usize::MAX,
+            calls: AtomicUsize::new(0),
+        };
+
+        let outcome = fixture_executor(&executor, &db_path, storage.path()).execute_sync_plan(
+            &plan,
+            &cancellation,
+            &evidence,
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::CancelledBeforeWrite {
+                backups_preserved: true
+            }
+        );
+        assert_eq!(
+            project_owner(&db_path, "p1"),
+            Some("1000000000000001".to_string()),
+            "写前取消不得修改项目归属"
+        );
+        let before = storage
+            .path()
+            .join("backups")
+            .join(plan.operation_id().as_str())
+            .join("before");
+        assert!(verify_raw_backup(&before.join("raw")));
+        assert!(verify_logical_backup(
+            &before.join("logical").join("database.db"),
+            TEST_RAW_KEY
+        ));
+    }
+
+    #[test]
+    fn plan_execution_rejects_drift_after_backup_before_target_write() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture(target.path());
+        let plan = follow_project_plan(&db_path);
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+        let evidence = SequencedEvidence {
+            // 首次进入执行器为当前；备份完成后的复查变为漂移。
+            current_through: 1,
+            calls: AtomicUsize::new(0),
+        };
+
+        let outcome = fixture_executor(&executor, &db_path, storage.path()).execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &evidence,
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::PlanExpired {
+                backups_preserved: true
+            }
+        );
+        assert_eq!(
+            project_owner(&db_path, "p1"),
+            Some("1000000000000001".to_string())
+        );
+        assert!(verify_raw_backup(
+            &storage
+                .path()
+                .join("backups")
+                .join(plan.operation_id().as_str())
+                .join("before")
+                .join("raw")
+        ));
+    }
+
+    #[test]
+    fn plan_execution_keeps_failure_scene_when_post_commit_verification_fails() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture(target.path());
+        {
+            let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+            // fixture 触发器模拟提交后会话关系被非预期改写。
+            conn.execute_batch(
+                "CREATE TRIGGER remove_followed_sessions AFTER UPDATE ON project BEGIN DELETE FROM chat_session WHERE project_id = NEW.project_id; END;",
+            )
+            .unwrap();
+        }
+        // 触发器属于 fixture 初始状态，计划必须在该状态固定目标指纹。
+        let plan = follow_project_plan(&db_path);
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+        let evidence = SequencedEvidence {
+            current_through: usize::MAX,
+            calls: AtomicUsize::new(0),
+        };
+
+        let outcome = fixture_executor(&executor, &db_path, storage.path()).execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &evidence,
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::FailedAfterWrite {
+                backups_preserved: true
+            }
+        );
+        let backup_root = storage
+            .path()
+            .join("backups")
+            .join(plan.operation_id().as_str());
+        assert!(verify_raw_backup(&backup_root.join("before").join("raw")));
+        assert!(verify_raw_backup(&backup_root.join("failure").join("raw")));
+    }
+
+    #[test]
+    fn plan_execution_reports_post_commit_evidence_drift_without_hiding_successful_validation() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture(target.path());
+        let plan = follow_project_plan(&db_path);
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+        let evidence = SequencedEvidence {
+            // 写前两次与提交前复查均匹配；提交后的最终证据读取发生漂移。
+            current_through: 3,
+            calls: AtomicUsize::new(0),
+        };
+
+        let outcome = fixture_executor(&executor, &db_path, storage.path()).execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &evidence,
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::CompletedWithPostCommitEvidenceDrift { affected_rows: 1 }
+        );
+        assert_eq!(
+            project_owner(&db_path, "p1"),
+            Some("2000000000000002".to_string()),
+            "提交后漂移不能掩盖已完成的新连接完整验证"
+        );
+    }
+
+    #[test]
+    fn logical_backup_at_requested_recovery_path_is_independently_verified() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture_with_wal(target.path());
+        let logical_db_path = storage
+            .path()
+            .join("before")
+            .join("logical")
+            .join("database.db");
+        let source_before = snapshot_db_trio(target.path(), "database.db");
+
+        // 逻辑副本必须写入恢复目录，而非源库同目录的临时文件。
+        assert!(backup_to_logical_copy_at_inner(
+            &db_path,
+            TEST_RAW_KEY,
+            &logical_db_path
+        ));
+        assert!(verify_logical_backup(&logical_db_path, TEST_RAW_KEY));
+        assert_eq!(
+            snapshot_db_trio(target.path(), "database.db"),
+            source_before,
+            "SQLCipher 导出不得改写源 DB/WAL/SHM"
+        );
+    }
+
+    #[test]
+    fn follow_project_stops_before_write_when_backup_root_is_unavailable() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture(target.path());
+        let source_before = snapshot_db_trio(target.path(), "database.db");
+        let blocked_storage_root = storage.path().join("not-a-directory");
+        std::fs::write(&blocked_storage_root, b"fixture").unwrap();
+
+        let result = WorkCnSyncExecutor::new(TEST_RAW_KEY).execute_follow_project_inner(
+            &db_path,
+            &blocked_storage_root,
+            &traesync_domain::OperationId::new(),
+            "p1",
+            "1000000000000001",
+            "2000000000000002",
+        );
+
+        assert_eq!(
+            result,
+            FollowProjectExecution::FailedBeforeWrite {
+                backups_preserved: false
+            }
+        );
+        assert_eq!(
+            snapshot_db_trio(target.path(), "database.db"),
+            source_before,
+            "备份无法创建时目标 DB/WAL/SHM 必须零修改"
+        );
+    }
+
+    #[test]
+    fn follow_project_rolls_back_when_target_owner_would_violate_unique_constraint() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture(target.path());
+        {
+            let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+            conn.execute(
+                "INSERT INTO project (project_id, user_id, biz_project_id) VALUES (?1, ?2, ?3)",
+                params!["p2", "2000000000000002", "biz-1"],
+            )
+            .unwrap();
+        }
+        let operation_id = traesync_domain::OperationId::new();
+
+        let result = WorkCnSyncExecutor::new(TEST_RAW_KEY).execute_follow_project_inner(
+            &db_path,
+            storage.path(),
+            &operation_id,
+            "p1",
+            "1000000000000001",
+            "2000000000000002",
+        );
+
+        assert_eq!(
+            result,
+            FollowProjectExecution::FailedBeforeWrite {
+                backups_preserved: true
+            }
+        );
+        assert_eq!(
+            project_owner(&db_path, "p1"),
+            Some("1000000000000001".to_string()),
+            "唯一约束失败必须回滚 owner 更新"
+        );
+        let before_dir = storage
+            .path()
+            .join("backups")
+            .join(operation_id.as_str())
+            .join("before");
+        assert!(verify_raw_backup(&before_dir.join("raw")));
+        assert!(verify_logical_backup(
+            &before_dir.join("logical").join("database.db"),
+            TEST_RAW_KEY
+        ));
+    }
+
+    #[test]
+    fn follow_project_preserves_dual_backups_when_post_commit_verification_fails() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_work_cn_fixture(target.path());
+        {
+            let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+            // fixture 触发器模拟提交后未涉及会话关系发生变化。
+            conn.execute_batch(
+                "CREATE TRIGGER remove_followed_sessions AFTER UPDATE ON project BEGIN DELETE FROM chat_session WHERE project_id = NEW.project_id; END;",
+            )
+            .unwrap();
+        }
+        let operation_id = traesync_domain::OperationId::new();
+
+        let result = WorkCnSyncExecutor::new(TEST_RAW_KEY).execute_follow_project_inner(
+            &db_path,
+            storage.path(),
+            &operation_id,
+            "p1",
+            "1000000000000001",
+            "2000000000000002",
+        );
+
+        assert_eq!(
+            result,
+            FollowProjectExecution::FailedAfterWrite {
+                backups_preserved: true
+            },
+            "提交后验证失败绝不允许报告成功"
+        );
+        let before_dir = storage
+            .path()
+            .join("backups")
+            .join(operation_id.as_str())
+            .join("before");
+        assert!(verify_raw_backup(&before_dir.join("raw")));
+        assert!(verify_logical_backup(
+            &before_dir.join("logical").join("database.db"),
+            TEST_RAW_KEY
+        ));
+    }
+
+    /// 使用新只读连接读取项目 owner，避免复用执行器连接掩盖提交后问题。
+    fn project_owner(db_path: &Path, project_id: &str) -> Option<String> {
+        let conn = open_with_key_readonly(db_path, TEST_RAW_KEY).ok()?;
+        conn.query_row(
+            "SELECT user_id FROM project WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .ok()
     }
 
     #[test]

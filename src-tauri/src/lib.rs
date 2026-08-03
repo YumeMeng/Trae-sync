@@ -15,26 +15,27 @@
 //! - 按命令构造 application service（注入 raw_key 与 normalizer）
 //! - raw_key 不进入 commands 层、UI 或日志
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::{
-    AccountEvidenceReaderPort, AssignProjectSourceService, BrowseHistoryService,
-    BuildSyncPlanService, CatalogRepository, DatabaseProbePort, ScanHistoryService,
-    WorkbenchReadService, WorkspaceStateProvider,
+    AccountEvidenceReaderPort, ApplySyncPlanService, AssignProjectSourceService,
+    BrowseHistoryService, BuildSyncPlanService, CatalogRepository, DatabaseProbePort,
+    ScanHistoryService, SyncPlanEvidencePort, WorkbenchReadService, WorkspaceStateProvider,
 };
 use traesync_commands as commands;
 // R8：组合根直接使用 commands::HistoryCommandError 构造授权失败错误消息
 use traesync_commands::HistoryCommandError;
 use traesync_domain::{
     AuthorizationState, BrowseResult, CompatibilityState, ConversationPreview, EvidenceState,
-    ProcessRunningState, ScanOutcome, SearchHit, SessionIdentity, SyncPlan, SyncPlanContext,
-    SyncScope, TargetFileEvidence, WorkbenchReadState, WorkspaceState,
+    OperationCancellation, ProcessRunningState, ScanOutcome, SearchHit, SessionIdentity, SyncPlan,
+    SyncPlanContext, SyncPlanExecutionOutcome, SyncScope, TargetFileEvidence, WorkbenchReadState,
+    WorkspaceState,
 };
 use traesync_infrastructure::{
     sha256_file, AccountEvidenceReader, FilesystemSnapshotStore, FixturePathGuard,
     PlatformFileIdentityProvider, SqlCipherCatalogRepository, SqlCipherProbe,
-    StaticWorkspaceStateProvider, WorkCnSourceNormalizer,
+    StaticWorkspaceStateProvider, WorkCnSourceNormalizer, WorkCnSyncExecutor,
 };
 
 /// 扫描授权槽：服务端生成代次，确保晚完成的旧 grant/revoke 不能覆盖新意图。
@@ -98,6 +99,117 @@ struct AppState {
     /// 用户通过 `grant_scan_authorization` 显式授权后设为 Authorized，
     /// 默认 NotAuthorized。scan_history 在任何 FS/DB 访问前检查此状态。
     authorization: Mutex<AuthorizationSlot>,
+    /// T06：仅缓存后端生成的不可变计划，客户端不能反序列化或注入计划。
+    pending_sync_plan: Mutex<Option<SyncPlan>>,
+    /// T06：当前写操作的取消令牌；进入目标写入后执行器自行忽略取消。
+    active_sync_cancellation: Mutex<Option<OperationCancellation>>,
+}
+
+/// 执行前和执行中都从 fixture 重读计划证据，绝不复用建计划时的内存快照。
+struct RuntimeSyncPlanEvidence<'a> {
+    fixture_root: &'a Path,
+    target_db_path: &'a Path,
+    raw_key: &'a str,
+    reader: &'a AccountEvidenceReader,
+    probe: &'a SqlCipherProbe,
+}
+
+impl SyncPlanEvidencePort for RuntimeSyncPlanEvidence<'_> {
+    fn is_current(&self, plan: &SyncPlan) -> bool {
+        read_sync_plan_context(
+            self.reader,
+            self.probe,
+            self.raw_key,
+            self.fixture_root,
+            self.target_db_path,
+            std::time::SystemTime::now(),
+            true,
+        )
+        .map(|context| plan.matches_context(&context))
+        .unwrap_or(false)
+    }
+}
+
+/// 读取已授权 fixture 的目标数据库；未授权时在构造 guard 或访问文件系统前拒绝。
+fn resolve_authorized_fixture(state: &AppState) -> Result<(FixturePathGuard, PathBuf), String> {
+    let authorization = state.authorization.lock().unwrap().state.clone();
+    let (fixture_root, db_relative_path) = match authorization {
+        AuthorizationState::Authorized {
+            canonical_fixture_root,
+            db_relative_path,
+        } => (canonical_fixture_root, db_relative_path),
+        AuthorizationState::NotAuthorized => {
+            return Err(HistoryCommandError::NotAuthorized.to_string())
+        }
+    };
+    let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
+    let db_path = guard
+        .validate_db_relative_path(&db_relative_path)
+        .map_err(|e| e.to_string())?;
+    Ok((guard, db_path))
+}
+
+/// 用当前账号、三件套、schema 和固定 mapping 构造计划证据上下文。
+fn read_sync_plan_context(
+    reader: &AccountEvidenceReader,
+    probe: &SqlCipherProbe,
+    raw_key: &str,
+    fixture_root: &Path,
+    db_path: &Path,
+    now: std::time::SystemTime,
+    re_read_after_close: bool,
+) -> Result<SyncPlanContext, String> {
+    let account = if re_read_after_close {
+        reader.re_read_after_close(fixture_root, now)
+    } else {
+        reader.read_account_evidence(fixture_root, now)
+    };
+    if account.evidence_state != EvidenceState::Verified {
+        return Err("当前账号证据未通过双来源验证，无法执行同步计划".to_string());
+    }
+    let current_user_id = account
+        .user_id
+        .as_ref()
+        .map(|user_id| user_id.as_str().to_string())
+        .ok_or_else(|| "当前账号证据不足，无法执行同步计划".to_string())?;
+    let account_evidence_fingerprint = account
+        .auth_fingerprint
+        .as_ref()
+        .map(|fingerprint| fingerprint.0.clone())
+        .ok_or_else(|| "当前账号指纹缺失，无法执行同步计划".to_string())?;
+
+    let compatibility = probe.probe_database(db_path, raw_key);
+    let (schema_compatible, schema_fingerprint) = match compatibility {
+        CompatibilityState::Verified {
+            schema_fingerprint, ..
+        } => (true, schema_fingerprint.0),
+        CompatibilityState::Incompatible { .. } => (false, "incompatible".to_string()),
+    };
+    let wal_path = database_sidecar_path(db_path, "-wal");
+    let shm_path = database_sidecar_path(db_path, "-shm");
+    Ok(SyncPlanContext {
+        created_at: now,
+        platform_id: "work_cn".to_string(),
+        data_location_id: fixture_root.to_string_lossy().into_owned(),
+        current_user_id,
+        account_evidence_fingerprint,
+        target_file_evidence: TargetFileEvidence {
+            db_fingerprint: sha256_file(db_path)
+                .ok_or_else(|| "无法读取目标数据库指纹".to_string())?,
+            wal_fingerprint: sha256_file(&wal_path),
+            shm_fingerprint: sha256_file(&shm_path),
+        },
+        schema_fingerprint,
+        mapping_version: "work_cn_v1".to_string(),
+        schema_compatible,
+    })
+}
+
+/// 生成同名 WAL 或 SHM 路径，保持 DB 三件套指纹读取的一致性。
+fn database_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 /// `get_workspace_state` Tauri command。
@@ -162,6 +274,8 @@ fn grant_scan_authorization(
     if db_relative_path.is_empty() {
         return Err("数据库相对路径不能为空".to_string());
     }
+    // 新授权代表新用户意图，旧计划不得继续作为可执行计划保留。
+    state.pending_sync_plan.lock().unwrap().take();
     // R12-B：先登记服务端代次，再做路径验证。后发请求/撤销会使本次提交失效。
     let generation = state.authorization.lock().unwrap().begin_grant();
     // R1：用 FixturePathGuard 验证 fixture_root——拒绝真实 TRAE 路径与 disk root
@@ -189,6 +303,9 @@ fn grant_scan_authorization(
 #[tauri::command]
 fn revoke_scan_authorization(state: tauri::State<AppState>) -> Result<(), String> {
     state.authorization.lock().unwrap().revoke();
+    // 撤销授权同时使缓存计划失效，并请求当前操作在仍可取消时停止。
+    state.pending_sync_plan.lock().unwrap().take();
+    request_cancel_inner(&state);
     Ok(())
 }
 
@@ -383,76 +500,97 @@ fn build_sync_plan(scope: SyncScope, state: tauri::State<AppState>) -> Result<Sy
     if state.raw_key.is_empty() || state.storage_root.is_empty() {
         return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
     }
-
-    let authorization = state.authorization.lock().unwrap().state.clone();
-    let (fixture_root, db_relative_path) = match authorization {
-        AuthorizationState::Authorized {
-            canonical_fixture_root,
-            db_relative_path,
-        } => (canonical_fixture_root, db_relative_path),
-        AuthorizationState::NotAuthorized => {
-            return Err(HistoryCommandError::NotAuthorized.to_string())
-        }
-    };
-    let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
-    let db_path = guard
-        .validate_db_relative_path(&db_relative_path)
-        .map_err(|e| e.to_string())?;
+    if state.active_sync_cancellation.lock().unwrap().is_some() {
+        return Err("同步操作正在进行，不能生成新计划".to_string());
+    }
+    // 每次重新规划先丢弃旧缓存，失败时也不能继续执行旧范围。
+    state.pending_sync_plan.lock().unwrap().take();
 
     let now = std::time::SystemTime::now();
-    let account = state
-        .workbench_reader
-        .read_account_evidence(guard.canonical_root(), now);
-    if account.evidence_state != EvidenceState::Verified {
-        return Err("当前账号证据未通过双来源验证，无法生成同步计划".to_string());
-    }
-    let current_user_id = account
-        .user_id
-        .as_ref()
-        .map(|user_id| user_id.as_str().to_string())
-        .ok_or_else(|| "当前账号证据不足，无法生成同步计划".to_string())?;
-    let account_evidence_fingerprint = account
-        .auth_fingerprint
-        .as_ref()
-        .map(|fingerprint| fingerprint.0.clone())
-        .ok_or_else(|| "当前账号指纹缺失，无法生成同步计划".to_string())?;
-
-    let compatibility = state
-        .workbench_probe
-        .probe_database(&db_path, &state.raw_key);
-    let (schema_compatible, schema_fingerprint) = match compatibility {
-        CompatibilityState::Verified {
-            schema_fingerprint, ..
-        } => (true, schema_fingerprint.0),
-        CompatibilityState::Incompatible { .. } => (false, "incompatible".to_string()),
-    };
-    let mut wal_name = db_path.as_os_str().to_os_string();
-    wal_name.push("-wal");
-    let wal_path = std::path::PathBuf::from(wal_name);
-    let mut shm_name = db_path.as_os_str().to_os_string();
-    shm_name.push("-shm");
-    let shm_path = std::path::PathBuf::from(shm_name);
-    let context = SyncPlanContext {
-        created_at: now,
-        platform_id: "work_cn".to_string(),
-        data_location_id: fixture_root,
-        current_user_id,
-        account_evidence_fingerprint,
-        target_file_evidence: TargetFileEvidence {
-            db_fingerprint: sha256_file(&db_path)
-                .ok_or_else(|| "无法读取目标数据库指纹".to_string())?,
-            wal_fingerprint: sha256_file(&wal_path),
-            shm_fingerprint: sha256_file(&shm_path),
-        },
-        schema_fingerprint,
-        mapping_version: "work_cn_v1".to_string(),
-        schema_compatible,
-    };
+    let (guard, db_path) = resolve_authorized_fixture(&state)?;
+    let context = read_sync_plan_context(
+        &state.workbench_reader,
+        &state.workbench_probe,
+        &state.raw_key,
+        guard.canonical_root(),
+        &db_path,
+        now,
+        false,
+    )?;
 
     let catalog_path = Path::new(&state.storage_root).join("catalog.db");
     let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
     let service = BuildSyncPlanService::new(&catalog);
-    commands::build_sync_plan(scope, context, &service).map_err(|e| e.to_string())
+    let plan = commands::build_sync_plan(scope, context, &service).map_err(|e| e.to_string())?;
+    // 仅服务端保留可执行副本；前端获得的 DTO 不能再作为执行输入传回。
+    *state.pending_sync_plan.lock().unwrap() = Some(plan.clone());
+    Ok(plan)
+}
+
+/// `apply_sync_plan` Tauri 命令：只执行服务端缓存的计划，不接受前端计划参数。
+#[tauri::command]
+fn apply_sync_plan(state: tauri::State<AppState>) -> Result<SyncPlanExecutionOutcome, String> {
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+
+    let cancellation = {
+        let mut active = state.active_sync_cancellation.lock().unwrap();
+        if active.is_some() {
+            return Err("同步操作正在进行".to_string());
+        }
+        let cancellation = OperationCancellation::new();
+        *active = Some(cancellation.clone());
+        cancellation
+    };
+    let outcome = apply_cached_sync_plan(&state, &cancellation);
+    state.active_sync_cancellation.lock().unwrap().take();
+    outcome
+}
+
+/// 组合根执行缓存计划：绑定受保护路径并重新读取实时证据。
+fn apply_cached_sync_plan(
+    state: &AppState,
+    cancellation: &OperationCancellation,
+) -> Result<SyncPlanExecutionOutcome, String> {
+    // 无缓存计划时不构造 guard、不访问 fixture，避免客户端把执行变成路径探测入口。
+    let plan = state
+        .pending_sync_plan
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| "没有可执行的同步计划，请先重新生成计划".to_string())?;
+    let (guard, db_path) = resolve_authorized_fixture(state)?;
+    let evidence = RuntimeSyncPlanEvidence {
+        fixture_root: guard.canonical_root(),
+        target_db_path: &db_path,
+        raw_key: &state.raw_key,
+        reader: &state.workbench_reader,
+        probe: &state.workbench_probe,
+    };
+    let executor = WorkCnSyncExecutor::new(state.raw_key.clone());
+    let executor = executor
+        .bind_fixture(&guard, &db_path, Path::new(&state.storage_root))
+        .map_err(|e| e.to_string())?;
+    let service = ApplySyncPlanService::new(&evidence, &executor);
+    Ok(commands::apply_sync_plan(&plan, cancellation, &service))
+}
+
+/// 标记当前操作取消；执行器会在进入目标写入后继续完成保护阶段。
+#[tauri::command]
+fn request_cancel(state: tauri::State<AppState>) -> bool {
+    request_cancel_inner(&state)
+}
+
+/// 提取为纯共享逻辑，供撤销授权和组合根测试复用。
+fn request_cancel_inner(state: &AppState) -> bool {
+    let cancellation = state.active_sync_cancellation.lock().unwrap().clone();
+    if let Some(cancellation) = cancellation {
+        cancellation.request();
+        true
+    } else {
+        false
+    }
 }
 
 /// 启动 Tauri 应用。
@@ -476,6 +614,8 @@ pub fn run() {
             storage_root,
             // R1：默认未授权——必须由 grant_scan_authorization 显式授权后才能扫描
             authorization: Mutex::new(AuthorizationSlot::new(AuthorizationState::NotAuthorized)),
+            pending_sync_plan: Mutex::new(None),
+            active_sync_cancellation: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_workspace_state,
@@ -488,7 +628,9 @@ pub fn run() {
             search_history,
             read_conversation,
             assign_source,
-            build_sync_plan
+            build_sync_plan,
+            apply_sync_plan,
+            request_cancel
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用时出错");
@@ -501,6 +643,7 @@ pub fn run() {
 #[cfg(test)]
 mod r8_order_tests {
     use super::*;
+    use traesync_domain::{BuildSyncPlanInput, TargetFileEvidence};
 
     /// 构造测试用 AppState——使用不存在的 fixture 路径与临时 storage_root。
     /// R8 反例：未授权时即使 fixture_root 是不存在的路径，也应返回 NotAuthorized，
@@ -513,7 +656,61 @@ mod r8_order_tests {
             raw_key: "0".repeat(64),
             storage_root: "/nonexistent/storage-root".to_string(),
             authorization: Mutex::new(AuthorizationSlot::new(authorization)),
+            pending_sync_plan: Mutex::new(None),
+            active_sync_cancellation: Mutex::new(None),
         }
+    }
+
+    /// 构造最小计划，仅用于验证组合根缓存与授权边界，不包含真实项目或数据。
+    fn cached_test_plan() -> SyncPlan {
+        traesync_domain::build_sync_plan(BuildSyncPlanInput {
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            platform_id: "work_cn".to_string(),
+            data_location_id: "fixture-location".to_string(),
+            current_user_id: "target-user".to_string(),
+            account_evidence_fingerprint: "account-fingerprint".to_string(),
+            target_file_evidence: TargetFileEvidence {
+                db_fingerprint: "database-fingerprint".to_string(),
+                wal_fingerprint: None,
+                shm_fingerprint: None,
+            },
+            schema_fingerprint: "schema-fingerprint".to_string(),
+            mapping_version: "work_cn_v1".to_string(),
+            schema_compatible: true,
+            scope: SyncScope::AllHistory,
+            projects: vec![],
+        })
+    }
+
+    #[test]
+    fn t06_apply_requires_server_cached_plan_before_fixture_access() {
+        let state = make_test_state(AuthorizationState::NotAuthorized);
+
+        let err = apply_cached_sync_plan(&state, &OperationCancellation::new()).unwrap_err();
+
+        assert!(err.contains("没有可执行的同步计划"));
+    }
+
+    #[test]
+    fn t06_apply_rejects_unauthorized_cached_plan_before_fixture_access() {
+        let state = make_test_state(AuthorizationState::NotAuthorized);
+        *state.pending_sync_plan.lock().unwrap() = Some(cached_test_plan());
+
+        let err = apply_cached_sync_plan(&state, &OperationCancellation::new()).unwrap_err();
+
+        assert!(err.contains("未授权"));
+    }
+
+    #[test]
+    fn t06_cancel_marks_only_current_operation_token() {
+        let state = make_test_state(AuthorizationState::NotAuthorized);
+        assert!(!request_cancel_inner(&state));
+
+        let cancellation = OperationCancellation::new();
+        *state.active_sync_cancellation.lock().unwrap() = Some(cancellation.clone());
+
+        assert!(request_cancel_inner(&state));
+        assert!(cancellation.is_requested());
     }
 
     #[test]

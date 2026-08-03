@@ -17,6 +17,7 @@ pub mod content_graph;
 pub mod file_identity;
 pub mod fixture_paths;
 pub mod logging;
+mod operation_manifest;
 pub mod snapshot_store;
 pub mod sqlcipher;
 pub mod work_cn_normalizer;
@@ -32,6 +33,6 @@ pub use logging::{
     LogEvent, LogEventCode, LogLevel, LogSink, RedactingLogSink, SafeLogEventBuilder, SafeLogField,
 };
 pub use snapshot_store::{sha256_file, FilesystemSnapshotStore};
-pub use sqlcipher::SqlCipherProbe;
+pub use sqlcipher::{FollowProjectExecution, SqlCipherProbe, WorkCnSyncExecutor};
 pub use work_cn_normalizer::WorkCnSourceNormalizer;
 pub use workspace::StaticWorkspaceStateProvider;
