@@ -20,7 +20,9 @@ pub use traesync_ports::{
     CatalogRepository, ContentGraphHasher, FileIdentityProvider, SnapshotStore, SourceNormalizer,
 };
 
-pub use history::{AssignProjectSourceService, BrowseHistoryService, ScanHistoryService};
+pub use history::{
+    AssignProjectSourceService, BrowseHistoryService, BuildSyncPlanService, ScanHistoryService,
+};
 pub use workbench_read::WorkbenchReadService;
 
 /// 工作台状态服务：T01 阶段返回固定的空状态，所有真实能力禁用。

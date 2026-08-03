@@ -125,6 +125,26 @@ test.describe("账号/项目/会话导航", () => {
   });
 });
 
+test.describe("T05 同步计划", () => {
+  test("自定义选择一条对话后显示目标账号与可同步动作", async ({ page }) => {
+    await setup(page, { scanOutcome: "success", browseMode: "full" });
+    await authorizeAndScan(page);
+
+    await page.getByRole("radio", { name: "自定义选择" }).check();
+    await expect(page.getByTestId("build-sync-plan-button")).toBeDisabled();
+    await page.getByRole("checkbox", { name: /选择对话 会话 AAA/ }).check();
+    await expect(page.getByTestId("plan-selected")).toHaveText("1");
+    await page.getByTestId("build-sync-plan-button").click();
+
+    await expect(page.getByTestId("sync-plan-result")).toBeVisible();
+    await expect(page.getByTestId("plan-target-account")).toHaveText("user-B");
+    await expect(page.getByTestId("plan-syncable")).toHaveText("1");
+    await expect(page.getByTestId("sync-plan-result")).toContainText("挂接 1 条对话");
+    await expect(page.getByText(/不会复制成两份账号历史/)).toBeVisible();
+    await expect(page.getByTestId("sync-button")).toBeDisabled();
+  });
+});
+
 // ============================================================================
 // 完整对话预览
 // ============================================================================

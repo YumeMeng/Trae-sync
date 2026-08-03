@@ -9,7 +9,14 @@
 use serde::{Deserialize, Serialize};
 
 pub mod history;
+pub mod sync_plan;
 pub mod workbench_read;
+
+pub use sync_plan::{
+    build_sync_plan, compare_project_identity, BuildSyncPlanInput, PlanAction, PlanAssertion,
+    PlanExclusion, PlanExclusionReason, PlanProjectInput, PlanSessionInput, ProjectIdentityMatch,
+    SyncPlan, SyncPlanContext, SyncScope, TargetFileEvidence,
+};
 
 // 重导出 T02 工作台只读入口的核心值对象
 // `DataLocationState` 复用 T01 已有定义，不重复导出

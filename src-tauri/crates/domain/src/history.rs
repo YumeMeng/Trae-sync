@@ -360,7 +360,7 @@ pub struct ProjectSourceAssignment {
 /// 会话身份：(product_history_namespace, original_session_id)。
 ///
 /// Gate I 核心：会话身份不依赖 title。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionIdentity {
     /// 产品历史命名空间（如 "work_cn"）
     pub product_history_namespace: String,

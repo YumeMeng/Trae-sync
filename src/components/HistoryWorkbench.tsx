@@ -8,6 +8,8 @@ import type {
   ScanOutcomeDto,
   SearchHitDto,
   SessionIdentityDto,
+  SyncPlanDto,
+  SyncScopeDto,
 } from "../types/history";
 
 // ============================================================================
@@ -65,6 +67,16 @@ export function HistoryWorkbench({
   const [searchResults, setSearchResults] = useState<readonly SearchHitDto[] | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
 
+  // T05：同步范围与只读计划预览。执行写入仍由后续任务包提供。
+  const [scopeMode, setScopeMode] = useState<"all" | "custom">("all");
+  const [selectedAccounts, setSelectedAccounts] = useState<readonly string[]>([]);
+  const [selectedProjects, setSelectedProjects] = useState<readonly string[]>([]);
+  const [selectedSessions, setSelectedSessions] = useState<readonly SessionIdentityDto[]>([]);
+  const [syncPlan, setSyncPlan] = useState<SyncPlanDto | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const planGenerationRef = useRef(0);
+
   // R7：已授权的 canonical fixture_root——由后端 grant_scan_authorization 返回。
   // 前端不再持有"自封"的授权；只有后端成功授权后此值才非空。
   // 取消授权或路径变化时此值清空，旧授权在后端被撤销。
@@ -111,6 +123,9 @@ export function HistoryWorkbench({
     authGenerationRef.current += 1;
     pendingAuthSnapshotRef.current = null;
     setAuthorizationPending(false);
+    planGenerationRef.current += 1;
+    setSyncPlan(null);
+    setPlanLoading(false);
   }, []);
 
   // R12-B：撤销后端授权的辅助——调用 revoke 并处理失败状态。
@@ -275,6 +290,9 @@ export function HistoryWorkbench({
     }
     setPhase("scanning");
     setScanError(null);
+    planGenerationRef.current += 1;
+    setSyncPlan(null);
+    setPlanLoading(false);
     try {
       const processState: ProcessRunningState = processRunning ? "running" : "not_running";
       // R7：使用后端授权返回的 canonical fixture_root，确保与授权范围一致
@@ -287,6 +305,7 @@ export function HistoryWorkbench({
         // 扫描成功后刷新浏览
         try {
           const result = await invoke<BrowseResultDto>("browse_history");
+          setSyncPlan(null);
           setBrowseResult(result);
           setBrowseError(null);
           const totalVisible =
@@ -302,6 +321,7 @@ export function HistoryWorkbench({
         // 去重也刷新浏览
         try {
           const result = await invoke<BrowseResultDto>("browse_history");
+          setSyncPlan(null);
           setBrowseResult(result);
           setBrowseError(null);
           const totalVisible =
@@ -398,6 +418,127 @@ export function HistoryWorkbench({
   }, [browseResult, selectedProject]);
 
   const summary = browseResult?.summary;
+
+  const sessionKey = useCallback(
+    (session: SessionIdentityDto) =>
+      `${session.product_history_namespace}:${session.original_session_id}`,
+    [],
+  );
+
+  const toggleStringSelection = useCallback(
+    (value: string, selected: readonly string[], setSelected: (next: readonly string[]) => void) => {
+      setSelected(
+        selected.includes(value)
+          ? selected.filter((item) => item !== value)
+          : [...selected, value],
+      );
+      planGenerationRef.current += 1;
+      setSyncPlan(null);
+      setPlanLoading(false);
+    },
+    [],
+  );
+
+  const toggleSessionSelection = useCallback(
+    (session: SessionIdentityDto) => {
+      const key = sessionKey(session);
+      setSelectedSessions((current) =>
+        current.some((item) => sessionKey(item) === key)
+          ? current.filter((item) => sessionKey(item) !== key)
+          : [...current, session],
+      );
+      planGenerationRef.current += 1;
+      setSyncPlan(null);
+      setPlanLoading(false);
+    },
+    [sessionKey],
+  );
+
+  const selectedSessionKeys = useMemo(() => {
+    if (!browseResult) return new Set<string>();
+    if (scopeMode === "all") {
+      return new Set(browseResult.sessions.map((session) => sessionKey(session.session_identity)));
+    }
+    const selectedProjectIds = new Set(selectedProjects);
+    for (const project of browseResult.projects) {
+      if (selectedAccounts.includes(project.display_owner)) {
+        selectedProjectIds.add(project.project_id);
+      }
+    }
+    const keys = new Set(selectedSessions.map(sessionKey));
+    for (const session of browseResult.sessions) {
+      if (selectedProjectIds.has(session.project_id)) {
+        keys.add(sessionKey(session.session_identity));
+      }
+    }
+    return keys;
+  }, [
+    browseResult,
+    scopeMode,
+    selectedAccounts,
+    selectedProjects,
+    selectedSessions,
+    sessionKey,
+  ]);
+
+  const handleBuildPlan = useCallback(async () => {
+    if (!authorized || !browseResult) return;
+    const scope: SyncScopeDto =
+      scopeMode === "all"
+        ? { kind: "all_history" }
+        : {
+            kind: "custom",
+            account_ids: selectedAccounts,
+            project_ids: selectedProjects,
+            session_ids: selectedSessions,
+          };
+    setPlanLoading(true);
+    setPlanError(null);
+    const generation = (planGenerationRef.current += 1);
+    try {
+      const plan = await invoke<SyncPlanDto>("build_sync_plan", { scope });
+      if (mountedRef.current && generation === planGenerationRef.current) {
+        setSyncPlan(plan);
+      }
+    } catch (error) {
+      if (mountedRef.current && generation === planGenerationRef.current) {
+        setSyncPlan(null);
+        setPlanError(String(error));
+      }
+    } finally {
+      if (mountedRef.current && generation === planGenerationRef.current) {
+        setPlanLoading(false);
+      }
+    }
+  }, [
+    authorized,
+    browseResult,
+    scopeMode,
+    selectedAccounts,
+    selectedProjects,
+    selectedSessions,
+  ]);
+
+  const syncableCount = useMemo(() => {
+    if (!syncPlan || !browseResult) return 0;
+    return syncPlan.actions.reduce((count, action) => {
+      if (action.kind === "attach_sessions") return count + action.session_ids.length;
+      return (
+        count +
+        browseResult.sessions.filter((session) => session.project_id === action.project_id).length
+      );
+    }, 0);
+  }, [syncPlan, browseResult]);
+
+  const alreadyCurrentCount = useMemo(
+    () => countExcludedSessions(syncPlan, browseResult, (reason) => reason === "already_current"),
+    [syncPlan, browseResult],
+  );
+
+  const needsProcessingCount = useMemo(
+    () => countExcludedSessions(syncPlan, browseResult, (reason) => reason !== "already_current"),
+    [syncPlan, browseResult],
+  );
 
   return (
     <section className="workbench" role="region" aria-label="历史库">
@@ -526,21 +667,37 @@ export function HistoryWorkbench({
               <ul role="group">
                 {browseResult.accounts.map((acc) => (
                   <li key={acc.user_id} role="treeitem">
-                    <button
-                      type="button"
-                      className="workbench__node"
-                      onClick={() => {
-                        setSelectedAccount(
-                          selectedAccount === acc.user_id ? null : acc.user_id,
-                        );
-                        setSelectedProject(null);
-                      }}
-                      aria-expanded={selectedAccount === acc.user_id}
-                      data-testid={`account-${acc.user_id}`}
-                    >
-                      {acc.display_label}（项目 {acc.project_count}，对话{" "}
-                      {acc.session_count}）
-                    </button>
+                    <div className="workbench__select-row">
+                      {scopeMode === "custom" && (
+                        <input
+                          type="checkbox"
+                          checked={selectedAccounts.includes(acc.user_id)}
+                          onChange={() =>
+                            toggleStringSelection(
+                              acc.user_id,
+                              selectedAccounts,
+                              setSelectedAccounts,
+                            )
+                          }
+                          aria-label={`选择账号 ${acc.display_label}`}
+                        />
+                      )}
+                      <button
+                        type="button"
+                        className="workbench__node"
+                        onClick={() => {
+                          setSelectedAccount(
+                            selectedAccount === acc.user_id ? null : acc.user_id,
+                          );
+                          setSelectedProject(null);
+                        }}
+                        aria-expanded={selectedAccount === acc.user_id}
+                        data-testid={`account-${acc.user_id}`}
+                      >
+                        {acc.display_label}（项目 {acc.project_count}，对话{" "}
+                        {acc.session_count}）
+                      </button>
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -549,20 +706,36 @@ export function HistoryWorkbench({
               <ul role="group" className="workbench__subtree">
                 {filteredProjects.map((proj) => (
                   <li key={proj.project_id} role="treeitem">
-                    <button
-                      type="button"
-                      className="workbench__node workbench__node--child"
-                      onClick={() => {
-                        setSelectedProject(
-                          selectedProject === proj.project_id ? null : proj.project_id,
-                        );
-                      }}
-                      aria-expanded={selectedProject === proj.project_id}
-                      data-testid={`project-${proj.project_id}`}
-                    >
-                      {proj.display_name}（归属 {proj.display_owner}，对话{" "}
-                      {proj.session_count}）
-                    </button>
+                    <div className="workbench__select-row workbench__select-row--child">
+                      {scopeMode === "custom" && (
+                        <input
+                          type="checkbox"
+                          checked={selectedProjects.includes(proj.project_id)}
+                          onChange={() =>
+                            toggleStringSelection(
+                              proj.project_id,
+                              selectedProjects,
+                              setSelectedProjects,
+                            )
+                          }
+                          aria-label={`选择项目 ${proj.display_name}`}
+                        />
+                      )}
+                      <button
+                        type="button"
+                        className="workbench__node workbench__node--child"
+                        onClick={() => {
+                          setSelectedProject(
+                            selectedProject === proj.project_id ? null : proj.project_id,
+                          );
+                        }}
+                        aria-expanded={selectedProject === proj.project_id}
+                        data-testid={`project-${proj.project_id}`}
+                      >
+                        {proj.display_name}（归属 {proj.display_owner}，对话{" "}
+                        {proj.session_count}）
+                      </button>
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -640,20 +813,32 @@ export function HistoryWorkbench({
                     s.session_identity.original_session_id;
                   return (
                     <li key={s.session_identity.original_session_id}>
-                      <button
-                        type="button"
-                        className={
-                          "workbench__session" +
-                          (isPreviewing ? " workbench__session--active" : "")
-                        }
-                        onClick={() => handleSessionClick(s)}
-                        data-testid={`session-${s.session_identity.original_session_id}`}
-                      >
-                        <span className="workbench__session-title">{s.title}</span>
-                        <span className="workbench__session-meta">
-                          {s.message_count} 条消息
-                        </span>
-                      </button>
+                      <div className="workbench__select-row">
+                        {scopeMode === "custom" && (
+                          <input
+                            type="checkbox"
+                            checked={selectedSessions.some(
+                              (item) => sessionKey(item) === sessionKey(s.session_identity),
+                            )}
+                            onChange={() => toggleSessionSelection(s.session_identity)}
+                            aria-label={`选择对话 ${s.title}`}
+                          />
+                        )}
+                        <button
+                          type="button"
+                          className={
+                            "workbench__session" +
+                            (isPreviewing ? " workbench__session--active" : "")
+                          }
+                          onClick={() => handleSessionClick(s)}
+                          data-testid={`session-${s.session_identity.original_session_id}`}
+                        >
+                          <span className="workbench__session-title">{s.title}</span>
+                          <span className="workbench__session-meta">
+                            {s.message_count} 条消息
+                          </span>
+                        </button>
+                      </div>
                     </li>
                   );
                 })}
@@ -703,27 +888,92 @@ export function HistoryWorkbench({
         </>
       )}
 
-      {/* 同步计划区域：P1 阶段只展示禁用状态 */}
+      {/* T05：同步范围与不可变计划预览，不执行写入。 */}
       <div className="workbench__plan" role="region" aria-label="同步计划">
         <h3>同步计划</h3>
+        <div className="workbench__scope" role="group" aria-label="同步范围">
+          <label>
+            <input
+              type="radio"
+              name="sync-scope"
+              checked={scopeMode === "all"}
+              onChange={() => {
+                setScopeMode("all");
+                planGenerationRef.current += 1;
+                setSyncPlan(null);
+                setPlanLoading(false);
+              }}
+            />
+            全部历史
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="sync-scope"
+              checked={scopeMode === "custom"}
+              onChange={() => {
+                setScopeMode("custom");
+                planGenerationRef.current += 1;
+                setSyncPlan(null);
+                setPlanLoading(false);
+              }}
+            />
+            自定义选择
+          </label>
+        </div>
         <dl className="plan-summary">
           <dt>已选择</dt>
-          <dd data-testid="plan-selected">0</dd>
+          <dd data-testid="plan-selected">{selectedSessionKeys.size}</dd>
           <dt>本次可同步</dt>
-          <dd data-testid="plan-syncable">0</dd>
+          <dd data-testid="plan-syncable">{syncableCount}</dd>
           <dt>已在当前账号</dt>
-          <dd data-testid="plan-already-current">0</dd>
+          <dd data-testid="plan-already-current">{alreadyCurrentCount}</dd>
           <dt>需要处理</dt>
-          <dd data-testid="plan-needs-processing">0</dd>
+          <dd data-testid="plan-needs-processing">{needsProcessingCount}</dd>
+          <dt>目标账号</dt>
+          <dd data-testid="plan-target-account">{syncPlan?.current_user_id ?? "生成后确认"}</dd>
         </dl>
+        <p className="workbench__hint">
+          计划会把项目归属调整到当前账号，或把选中对话挂到可靠的目标项目；不会复制成两份账号历史。
+        </p>
+        {planError && <p className="workbench__error" role="alert">{planError}</p>}
+        {syncPlan && (
+          <div className="workbench__plan-result" data-testid="sync-plan-result">
+            <p>动作 {syncPlan.actions.length}，排除 {syncPlan.exclusions.length}</p>
+            <ul>
+              {syncPlan.actions.map((action, index) => (
+                <li key={`${action.kind}-${index}`}>{renderPlanAction(action)}</li>
+              ))}
+              {syncPlan.exclusions.map((item, index) => (
+                <li key={`${item.project_id}-${index}`}>
+                  排除 {item.project_id}：{renderPlanExclusion(item.reason)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <button
           type="button"
           className="btn btn--primary"
-          disabled={!capabilities.sync_enabled}
-          aria-disabled={!capabilities.sync_enabled}
+          onClick={handleBuildPlan}
+          disabled={
+            planLoading ||
+            !authorized ||
+            !browseResult ||
+            (scopeMode === "custom" && selectedSessionKeys.size === 0)
+          }
+          data-testid="build-sync-plan-button"
+        >
+          {planLoading ? "生成中…" : "生成同步计划"}
+        </button>
+        <button
+          type="button"
+          className="btn"
+          disabled={!capabilities.sync_enabled || !syncPlan}
+          aria-disabled={!capabilities.sync_enabled || !syncPlan}
           data-testid="sync-button"
         >
-          检查并安全同步
+          检查并安全同步（后续任务包）
         </button>
       </div>
 
@@ -732,6 +982,53 @@ export function HistoryWorkbench({
       </p>
     </section>
   );
+}
+
+function renderPlanAction(action: SyncPlanDto["actions"][number]): string {
+  if (action.kind === "follow_project") {
+    return `跟随整个项目 ${action.project_id} 到账号 ${action.to_user_id}`;
+  }
+  return `挂接 ${action.session_ids.length} 条对话到项目 ${action.target_project_id}`;
+}
+
+function renderPlanExclusion(reason: string): string {
+  const labels: Record<string, string> = {
+    already_current: "已在当前账号",
+    project_identity_conflict: "项目身份冲突",
+    project_identity_unknown: "项目身份证据不足",
+    archived_only: "仅有归档内容",
+    deleted_project: "项目已删除",
+    schema_incompatible: "数据库结构不兼容",
+    session_version_unavailable: "对话版本不可用",
+    partial_project_requires_target: "目标无同项目，请选择整个项目",
+  };
+  return labels[reason] ?? reason;
+}
+
+function countExcludedSessions(
+  plan: SyncPlanDto | null,
+  browseResult: BrowseResultDto | null,
+  include: (reason: string) => boolean,
+): number {
+  if (!plan || !browseResult) return 0;
+  const sessionKeys = new Set<string>();
+  for (const exclusion of plan.exclusions) {
+    if (!include(exclusion.reason)) continue;
+    if (exclusion.session_id) {
+      sessionKeys.add(
+        `${exclusion.session_id.product_history_namespace}:${exclusion.session_id.original_session_id}`,
+      );
+      continue;
+    }
+    for (const session of browseResult.sessions) {
+      if (session.project_id === exclusion.project_id) {
+        sessionKeys.add(
+          `${session.session_identity.product_history_namespace}:${session.session_identity.original_session_id}`,
+        );
+      }
+    }
+  }
+  return sessionKeys.size;
 }
 
 // 渲染扫描失败原因：结构化，不携带 secret

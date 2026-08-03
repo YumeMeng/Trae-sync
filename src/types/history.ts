@@ -158,3 +158,52 @@ export interface SearchHitDto {
 
 /** TRAE 进程运行状态 */
 export type ProcessRunningState = "unknown" | "not_running" | "running";
+
+/** T05 同步范围：全部历史或用户明确选择的稳定 ID 并集 */
+export type SyncScopeDto =
+  | { readonly kind: "all_history" }
+  | {
+      readonly kind: "custom";
+      readonly account_ids: readonly string[];
+      readonly project_ids: readonly string[];
+      readonly session_ids: readonly SessionIdentityDto[];
+    };
+
+export type PlanActionDto =
+  | {
+      readonly kind: "follow_project";
+      readonly project_id: string;
+      readonly from_user_id: string;
+      readonly to_user_id: string;
+    }
+  | {
+      readonly kind: "attach_sessions";
+      readonly source_project_id: string;
+      readonly target_project_id: string;
+      readonly session_ids: readonly SessionIdentityDto[];
+    };
+
+export type PlanExclusionReason =
+  | "already_current"
+  | "project_identity_conflict"
+  | "project_identity_unknown"
+  | "archived_only"
+  | "deleted_project"
+  | "schema_incompatible"
+  | "session_version_unavailable"
+  | "partial_project_requires_target";
+
+export interface PlanExclusionDto {
+  readonly project_id: string;
+  readonly session_id: SessionIdentityDto | null;
+  readonly reason: PlanExclusionReason;
+}
+
+/** T05 只读计划 DTO；执行能力由 T06/T07 提供。 */
+export interface SyncPlanDto {
+  readonly operation_id: string;
+  readonly current_user_id: string;
+  readonly scope_snapshot: SyncScopeDto;
+  readonly actions: readonly PlanActionDto[];
+  readonly exclusions: readonly PlanExclusionDto[];
+}

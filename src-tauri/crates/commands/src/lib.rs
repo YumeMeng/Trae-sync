@@ -11,8 +11,8 @@
 
 use std::path::Path;
 use std::time::SystemTime;
-use traesync_application::{WorkbenchReadService, WorkspaceStateService};
-use traesync_domain::{WorkbenchReadState, WorkspaceState};
+use traesync_application::{BuildSyncPlanService, WorkbenchReadService, WorkspaceStateService};
+use traesync_domain::{SyncPlan, SyncPlanContext, SyncScope, WorkbenchReadState, WorkspaceState};
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::WorkspaceStateProvider;
 // T03/T04 历史命令所需的 application 服务与 domain 值对象
@@ -271,6 +271,15 @@ pub fn assign_source(
         return Err(HistoryCommandError::EmptyProjectId);
     }
     Ok(service.assign(project_id, user_assigned_owner, now))
+}
+
+/// `build_sync_plan` 命令：使用后端固定的证据上下文生成只读计划预览。
+pub fn build_sync_plan(
+    scope: SyncScope,
+    context: SyncPlanContext,
+    service: &BuildSyncPlanService,
+) -> Result<SyncPlan, HistoryCommandError> {
+    Ok(service.build(context, scope))
 }
 
 #[cfg(test)]

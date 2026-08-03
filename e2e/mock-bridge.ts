@@ -376,6 +376,35 @@ export async function installMockBridge(
       },
     ];
 
+    const SYNC_PLAN = {
+      operation_id: "op-fixture-plan",
+      current_user_id: "user-B",
+      scope_snapshot: { kind: "all_history" },
+      actions: [
+        {
+          kind: "attach_sessions",
+          source_project_id: "p1",
+          target_project_id: "p2",
+          session_ids: [
+            {
+              product_history_namespace: "work_cn",
+              original_session_id: "session-aaa",
+            },
+          ],
+        },
+      ],
+      exclusions: [
+        {
+          project_id: "p1",
+          session_id: {
+            product_history_namespace: "work_cn",
+            original_session_id: "session-bbb",
+          },
+          reason: "already_current",
+        },
+      ],
+    };
+
     function makePreview(sessionId: string) {
       if (sessionId === "session-aaa") {
         return {
@@ -526,6 +555,12 @@ export async function installMockBridge(
         return makePreview(sid);
       }
       if (cmd === "assign_source") return true;
+      if (cmd === "build_sync_plan") {
+        if (authState.status !== "authorized") {
+          throw new Error("未授权扫描");
+        }
+        return { ...SYNC_PLAN, scope_snapshot: args?.scope ?? SYNC_PLAN.scope_snapshot };
+      }
       throw new Error(`mock bridge: 未模拟命令 ${cmd}`);
     }
 

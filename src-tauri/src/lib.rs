@@ -19,20 +19,22 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::{
-    AssignProjectSourceService, BrowseHistoryService, CatalogRepository, ScanHistoryService,
+    AccountEvidenceReaderPort, AssignProjectSourceService, BrowseHistoryService,
+    BuildSyncPlanService, CatalogRepository, DatabaseProbePort, ScanHistoryService,
     WorkbenchReadService, WorkspaceStateProvider,
 };
 use traesync_commands as commands;
 // R8：组合根直接使用 commands::HistoryCommandError 构造授权失败错误消息
 use traesync_commands::HistoryCommandError;
 use traesync_domain::{
-    AuthorizationState, BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome,
-    SearchHit, SessionIdentity, WorkbenchReadState, WorkspaceState,
+    AuthorizationState, BrowseResult, CompatibilityState, ConversationPreview, EvidenceState,
+    ProcessRunningState, ScanOutcome, SearchHit, SessionIdentity, SyncPlan, SyncPlanContext,
+    SyncScope, TargetFileEvidence, WorkbenchReadState, WorkspaceState,
 };
 use traesync_infrastructure::{
-    AccountEvidenceReader, FilesystemSnapshotStore, FixturePathGuard, PlatformFileIdentityProvider,
-    SqlCipherCatalogRepository, SqlCipherProbe, StaticWorkspaceStateProvider,
-    WorkCnSourceNormalizer,
+    sha256_file, AccountEvidenceReader, FilesystemSnapshotStore, FixturePathGuard,
+    PlatformFileIdentityProvider, SqlCipherCatalogRepository, SqlCipherProbe,
+    StaticWorkspaceStateProvider, WorkCnSourceNormalizer,
 };
 
 /// 扫描授权槽：服务端生成代次，确保晚完成的旧 grant/revoke 不能覆盖新意图。
@@ -374,6 +376,85 @@ fn assign_source(
         .map_err(|e| e.to_string())
 }
 
+/// `build_sync_plan` Tauri command：重新读取当前 fixture 账号、schema 和文件指纹，
+/// 再由目录库生成不可变计划。此命令只读，不修改活动数据库或目录库。
+#[tauri::command]
+fn build_sync_plan(scope: SyncScope, state: tauri::State<AppState>) -> Result<SyncPlan, String> {
+    if state.raw_key.is_empty() || state.storage_root.is_empty() {
+        return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
+    }
+
+    let authorization = state.authorization.lock().unwrap().state.clone();
+    let (fixture_root, db_relative_path) = match authorization {
+        AuthorizationState::Authorized {
+            canonical_fixture_root,
+            db_relative_path,
+        } => (canonical_fixture_root, db_relative_path),
+        AuthorizationState::NotAuthorized => {
+            return Err(HistoryCommandError::NotAuthorized.to_string())
+        }
+    };
+    let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
+    let db_path = guard
+        .validate_db_relative_path(&db_relative_path)
+        .map_err(|e| e.to_string())?;
+
+    let now = std::time::SystemTime::now();
+    let account = state
+        .workbench_reader
+        .read_account_evidence(guard.canonical_root(), now);
+    if account.evidence_state != EvidenceState::Verified {
+        return Err("当前账号证据未通过双来源验证，无法生成同步计划".to_string());
+    }
+    let current_user_id = account
+        .user_id
+        .as_ref()
+        .map(|user_id| user_id.as_str().to_string())
+        .ok_or_else(|| "当前账号证据不足，无法生成同步计划".to_string())?;
+    let account_evidence_fingerprint = account
+        .auth_fingerprint
+        .as_ref()
+        .map(|fingerprint| fingerprint.0.clone())
+        .ok_or_else(|| "当前账号指纹缺失，无法生成同步计划".to_string())?;
+
+    let compatibility = state
+        .workbench_probe
+        .probe_database(&db_path, &state.raw_key);
+    let (schema_compatible, schema_fingerprint) = match compatibility {
+        CompatibilityState::Verified {
+            schema_fingerprint, ..
+        } => (true, schema_fingerprint.0),
+        CompatibilityState::Incompatible { .. } => (false, "incompatible".to_string()),
+    };
+    let mut wal_name = db_path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal_path = std::path::PathBuf::from(wal_name);
+    let mut shm_name = db_path.as_os_str().to_os_string();
+    shm_name.push("-shm");
+    let shm_path = std::path::PathBuf::from(shm_name);
+    let context = SyncPlanContext {
+        created_at: now,
+        platform_id: "work_cn".to_string(),
+        data_location_id: fixture_root,
+        current_user_id,
+        account_evidence_fingerprint,
+        target_file_evidence: TargetFileEvidence {
+            db_fingerprint: sha256_file(&db_path)
+                .ok_or_else(|| "无法读取目标数据库指纹".to_string())?,
+            wal_fingerprint: sha256_file(&wal_path),
+            shm_fingerprint: sha256_file(&shm_path),
+        },
+        schema_fingerprint,
+        mapping_version: "work_cn_v1".to_string(),
+        schema_compatible,
+    };
+
+    let catalog_path = Path::new(&state.storage_root).join("catalog.db");
+    let catalog = SqlCipherCatalogRepository::new(catalog_path, state.raw_key.clone());
+    let service = BuildSyncPlanService::new(&catalog);
+    commands::build_sync_plan(scope, context, &service).map_err(|e| e.to_string())
+}
+
 /// 启动 Tauri 应用。
 pub fn run() {
     let provider = Arc::new(StaticWorkspaceStateProvider::new());
@@ -406,7 +487,8 @@ pub fn run() {
             browse_history,
             search_history,
             read_conversation,
-            assign_source
+            assign_source,
+            build_sync_plan
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用时出错");

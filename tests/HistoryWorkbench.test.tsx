@@ -120,6 +120,122 @@ describe("T03 历史库工作台", () => {
     mockInvoke.mockResolvedValue(undefined);
   });
 
+  it("T05：自定义选择一条完整对话并生成绑定目标账号的计划", async () => {
+    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "scan_history") {
+        return {
+          kind: "success",
+          snapshot_id: "snapshot-1",
+          snapshot_meta: {},
+          catalog_updated: true,
+        };
+      }
+      if (cmd === "browse_history") return makeBrowseResult();
+      if (cmd === "build_sync_plan") {
+        return {
+          operation_id: "op-plan",
+          current_user_id: "user-B",
+          scope_snapshot: (args as { scope?: unknown } | undefined)?.scope,
+          actions: [
+            {
+              kind: "attach_sessions",
+              source_project_id: "p1",
+              target_project_id: "p2",
+              session_ids: [
+                {
+                  product_history_namespace: "work_cn",
+                  original_session_id: "session-aaa",
+                },
+              ],
+            },
+          ],
+          exclusions: [],
+        };
+      }
+      return undefined;
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => expect(screen.getByTestId("scan-history-button")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("scan-history-button"));
+    await screen.findByTestId("session-list");
+
+    fireEvent.click(screen.getByRole("radio", { name: "自定义选择" }));
+    expect(screen.getByTestId("build-sync-plan-button")).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择对话 会话 AAA" }));
+    expect(screen.getByTestId("plan-selected")).toHaveTextContent("1");
+    fireEvent.click(screen.getByTestId("build-sync-plan-button"));
+
+    await screen.findByTestId("sync-plan-result");
+    expect(screen.getByTestId("plan-target-account")).toHaveTextContent("user-B");
+    expect(screen.getByTestId("plan-syncable")).toHaveTextContent("1");
+    expect(mockInvoke).toHaveBeenCalledWith("build_sync_plan", {
+      scope: {
+        kind: "custom",
+        account_ids: [],
+        project_ids: [],
+        session_ids: [
+          {
+            product_history_namespace: "work_cn",
+            original_session_id: "session-aaa",
+          },
+        ],
+      },
+    });
+  });
+
+  it("T05：生成期间改变选择会丢弃旧计划响应", async () => {
+    let resolvePlan: (value: unknown) => void = () => undefined;
+    const pendingPlan = new Promise((resolve) => {
+      resolvePlan = resolve;
+    });
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "scan_history") {
+        return {
+          kind: "success",
+          snapshot_id: "snapshot-1",
+          snapshot_meta: {},
+          catalog_updated: true,
+        };
+      }
+      if (cmd === "browse_history") return makeBrowseResult();
+      if (cmd === "build_sync_plan") return pendingPlan;
+      return undefined;
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => expect(screen.getByTestId("scan-history-button")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("scan-history-button"));
+    await screen.findByTestId("session-list");
+    fireEvent.click(screen.getByRole("radio", { name: "自定义选择" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择对话 会话 AAA" }));
+    fireEvent.click(screen.getByTestId("build-sync-plan-button"));
+    expect(screen.getByTestId("build-sync-plan-button")).toHaveTextContent("生成中");
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择对话 会话 BBB" }));
+    expect(screen.getByTestId("plan-selected")).toHaveTextContent("2");
+    expect(screen.getByTestId("build-sync-plan-button")).toHaveTextContent("生成同步计划");
+    resolvePlan({
+      operation_id: "stale-plan",
+      current_user_id: "user-B",
+      scope_snapshot: { kind: "custom" },
+      actions: [],
+      exclusions: [],
+    });
+
+    await waitFor(() => expect(screen.queryByTestId("sync-plan-result")).not.toBeInTheDocument());
+  });
+
   // ============== TDD #1：初始不自动扫描 ==============
 
   it("初始渲染不调用 scan_history（AC1）", () => {

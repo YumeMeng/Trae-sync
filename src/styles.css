@@ -183,6 +183,28 @@ body {
   background: #f0f3f6;
 }
 
+.workbench__select-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.workbench__select-row > input {
+  flex: 0 0 auto;
+  margin-top: 9px;
+}
+
+.workbench__select-row > .workbench__node,
+.workbench__select-row > .workbench__session {
+  flex: 1;
+  min-width: 0;
+}
+
+.workbench__select-row--child > input {
+  margin-left: 12px;
+}
+
 .workbench__node--child {
   padding-left: 20px;
   font-size: 12px;
@@ -388,6 +410,34 @@ body {
 .workbench__plan h3 {
   margin: 0;
   font-size: 14px;
+}
+
+.workbench__scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.workbench__scope label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workbench__plan-result {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #f6f8fa;
+}
+
+.workbench__plan-result p {
+  margin: 0 0 6px;
+}
+
+.workbench__plan-result ul {
+  margin: 0;
+  padding-left: 20px;
 }
 
 .plan-summary {

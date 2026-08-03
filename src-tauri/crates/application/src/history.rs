@@ -16,9 +16,10 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use traesync_domain::{
-    BrowseProjectNode, BrowseResult, BrowseSessionNode, CompatibilityState, ConversationPreview,
-    HistoryBrowseSummary, ProcessRunningState, ProjectSourceAssignment, ScanFailureReason,
-    ScanOutcome, ScanRequest, SearchHit, SessionIdentity,
+    build_sync_plan, BrowseProjectNode, BrowseResult, BrowseSessionNode, BuildSyncPlanInput,
+    CompatibilityState, ConversationPreview, HistoryBrowseSummary, PlanProjectInput,
+    PlanSessionInput, ProcessRunningState, ProjectSourceAssignment, ScanFailureReason, ScanOutcome,
+    ScanRequest, SearchHit, SessionIdentity, SyncPlan, SyncPlanContext, SyncScope,
 };
 use traesync_ports::{
     AccountEvidenceReaderPort, CatalogRepository, DatabaseProbePort, SnapshotStore,
@@ -229,6 +230,76 @@ impl<'a> AssignProjectSourceService<'a> {
     }
 }
 
+/// 同步计划服务：只读取目录库并生成不可变计划，不访问或修改活动数据库。
+pub struct BuildSyncPlanService<'a> {
+    catalog: &'a dyn CatalogRepository,
+}
+
+impl<'a> BuildSyncPlanService<'a> {
+    pub fn new(catalog: &'a dyn CatalogRepository) -> Self {
+        Self { catalog }
+    }
+
+    /// 将目录库中的观察、显示归属和活动会话转换为纯领域 Planner 输入。
+    pub fn build(&self, context: SyncPlanContext, scope: SyncScope) -> SyncPlan {
+        let browse = self.catalog.browse();
+        let display_owners: std::collections::HashMap<String, String> = browse
+            .projects
+            .iter()
+            .map(|project| (project.project_id.clone(), project.display_owner.clone()))
+            .collect();
+        let mut sessions_by_project: std::collections::HashMap<String, Vec<PlanSessionInput>> =
+            std::collections::HashMap::new();
+        for session in browse.sessions {
+            let version_available = self
+                .catalog
+                .read_session_projection(&session.session_identity)
+                .is_some();
+            sessions_by_project
+                .entry(session.project_id)
+                .or_default()
+                .push(PlanSessionInput {
+                    identity: session.session_identity,
+                    version_available,
+                });
+        }
+
+        let projects = self
+            .catalog
+            .read_all_project_observations()
+            .into_iter()
+            .map(|observation| {
+                let project_id = observation.project_identity.project_id.clone();
+                let sessions = sessions_by_project.remove(&project_id).unwrap_or_default();
+                PlanProjectInput {
+                    identity: observation.project_identity,
+                    display_owner: display_owners
+                        .get(&project_id)
+                        .cloned()
+                        .unwrap_or_else(|| observation.first_observed_owner.clone()),
+                    current_live_owner: observation.current_live_owner,
+                    archived_only: sessions.is_empty(),
+                    sessions,
+                }
+            })
+            .collect();
+
+        build_sync_plan(BuildSyncPlanInput {
+            created_at: context.created_at,
+            platform_id: context.platform_id,
+            data_location_id: context.data_location_id,
+            current_user_id: context.current_user_id,
+            account_evidence_fingerprint: context.account_evidence_fingerprint,
+            target_file_evidence: context.target_file_evidence,
+            schema_fingerprint: context.schema_fingerprint,
+            mapping_version: context.mapping_version,
+            schema_compatible: context.schema_compatible,
+            scope,
+            projects,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +447,8 @@ mod tests {
         search_result: Vec<SearchHit>,
         conversation_result: Option<ConversationPreview>,
         project_snapshot_result: Result<(), ScanFailureReason>,
+        project_observations: Vec<ProjectObservation>,
+        session_projections: Vec<SessionProjection>,
     }
 
     impl Default for FakeCatalog {
@@ -392,6 +465,8 @@ mod tests {
                 search_result: vec![],
                 conversation_result: None,
                 project_snapshot_result: Ok(()),
+                project_observations: vec![],
+                session_projections: vec![],
             }
         }
     }
@@ -430,13 +505,16 @@ mod tests {
             None
         }
         fn read_all_project_observations(&self) -> Vec<ProjectObservation> {
-            vec![]
+            self.project_observations.clone()
         }
         fn read_all_session_versions(&self) -> Vec<SessionVersion> {
             vec![]
         }
         fn read_session_projection(&self, _session: &SessionIdentity) -> Option<SessionProjection> {
-            None
+            self.session_projections
+                .iter()
+                .find(|projection| projection.session_identity == *_session)
+                .cloned()
         }
         fn assign_project_source(&self, assignment: &ProjectSourceAssignment) -> bool {
             self.project_calls.lock().unwrap().push(assignment.clone());
@@ -628,5 +706,72 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].project_id, "p1");
         assert_eq!(calls[0].user_assigned_owner, Some("u1".to_string()));
+    }
+
+    #[test]
+    fn build_sync_plan_service_uses_catalog_observations_and_visible_sessions() {
+        let mut catalog = FakeCatalog::default();
+        let session_identity = SessionIdentity::new("work_cn", "session-1");
+        catalog.browse_result = BrowseResult {
+            accounts: vec![],
+            projects: vec![BrowseProjectNode {
+                project_id: "source-project".to_string(),
+                display_name: "来源项目".to_string(),
+                display_owner: "source-user".to_string(),
+                session_count: 1,
+            }],
+            sessions: vec![BrowseSessionNode {
+                session_identity: session_identity.clone(),
+                title: "完整对话".to_string(),
+                message_count: 2,
+                last_captured_at: SystemTime::UNIX_EPOCH,
+                project_id: "source-project".to_string(),
+            }],
+            summary: HistoryBrowseSummary::default(),
+        };
+        catalog.project_observations = vec![ProjectObservation {
+            project_identity: ProjectIdentity {
+                project_id: "source-project".to_string(),
+                biz_project_id: "biz-source".to_string(),
+                display_name: "来源项目".to_string(),
+                soft_deleted: false,
+            },
+            first_observed_owner: "source-user".to_string(),
+            first_observed_at: SystemTime::UNIX_EPOCH,
+            current_live_owner: "source-user".to_string(),
+            owner_observations: vec![],
+        }];
+        catalog.session_projections = vec![SessionProjection {
+            session_identity,
+            active_content_graph_hash: ContentGraphHash("hash".to_string()),
+            active_title: "完整对话".to_string(),
+            soft_deleted: false,
+            project_id: "source-project".to_string(),
+        }];
+        let service = BuildSyncPlanService::new(&catalog);
+        let plan = service.build(
+            traesync_domain::SyncPlanContext {
+                created_at: SystemTime::UNIX_EPOCH,
+                platform_id: "work_cn".to_string(),
+                data_location_id: "fixture-location".to_string(),
+                current_user_id: "target-user".to_string(),
+                account_evidence_fingerprint: "account-fingerprint".to_string(),
+                target_file_evidence: traesync_domain::TargetFileEvidence {
+                    db_fingerprint: "db-fingerprint".to_string(),
+                    wal_fingerprint: None,
+                    shm_fingerprint: None,
+                },
+                schema_fingerprint: "schema-fingerprint".to_string(),
+                mapping_version: "work_cn_v1".to_string(),
+                schema_compatible: true,
+            },
+            traesync_domain::SyncScope::AllHistory,
+        );
+
+        assert!(matches!(
+            plan.actions(),
+            [traesync_domain::PlanAction::FollowProject { project_id, .. }]
+                if project_id == "source-project"
+        ));
     }
 }

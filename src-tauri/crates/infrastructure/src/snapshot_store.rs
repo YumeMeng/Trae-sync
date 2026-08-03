@@ -1271,3 +1271,10 @@ mod tests {
         }
     }
 }
+/// 计算受路径防护验证后的文件 SHA-256；文件不存在或读取失败时返回 None。
+pub fn sha256_file(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Some(hex::encode(hasher.finalize()))
+}

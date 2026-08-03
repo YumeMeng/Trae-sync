@@ -31,7 +31,7 @@ pub use fixture_paths::{FixturePathError, FixturePathGuard, SystemRootsError};
 pub use logging::{
     LogEvent, LogEventCode, LogLevel, LogSink, RedactingLogSink, SafeLogEventBuilder, SafeLogField,
 };
-pub use snapshot_store::FilesystemSnapshotStore;
+pub use snapshot_store::{sha256_file, FilesystemSnapshotStore};
 pub use sqlcipher::SqlCipherProbe;
 pub use work_cn_normalizer::WorkCnSourceNormalizer;
 pub use workspace::StaticWorkspaceStateProvider;
