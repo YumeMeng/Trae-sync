@@ -13,15 +13,13 @@
 //! - fixture-only：所有方法只操作 fixture 路径，不访问真实 TRAE 数据
 
 use std::path::Path;
-use std::time::SystemTime;
 
 use traesync_domain::{
-    BrowseAccountNode, BrowseProjectNode, BrowseResult, BrowseSessionNode, ContentGraphHash,
-    ConversationPreview, DiagnosticIntegrityAssertion, FileIdentity, HistoryBrowseSummary,
-    MessageProjection, OwnerObservation, ProjectIdentity, ProjectObservation,
-    ProjectSourceAssignment, ScanFailureReason, ScanOutcome, ScanRequest, SearchHit,
-    SessionIdentity, SessionProjection, SessionVersion, SnapshotFileEntry, SnapshotFingerprint,
-    SnapshotId, SourceSnapshotMeta, VersionClassification,
+    BrowseProjectNode, BrowseResult, BrowseSessionNode, ContentGraphHash, ConversationPreview,
+    DiagnosticIntegrityAssertion, FileIdentity, HistoryBrowseSummary, MessageProjection,
+    ProjectIdentity, ProjectObservation, ProjectSourceAssignment, ScanFailureReason, ScanOutcome,
+    ScanRequest, SearchHit, SessionIdentity, SessionProjection, SessionVersion,
+    SnapshotFingerprint, SnapshotId, SourceSnapshotMeta, VersionClassification,
 };
 
 /// 快照存储 port：捕获不可变 DB/WAL/SHM 快照并查询。

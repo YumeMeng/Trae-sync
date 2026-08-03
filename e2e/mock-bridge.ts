@@ -425,6 +425,14 @@ export async function installMockBridge(
       };
     }
 
+    // R7：mock 授权状态机——模拟后端 AuthorizationState
+    // 未授权时 scan_history 必须返回 failed/not_authorized，不能无条件返回成功
+    const authState: {
+      status: "not_authorized" | "authorized";
+      canonicalFixtureRoot: string | null;
+      dbRelativePath: string | null;
+    } = { status: "not_authorized", canonicalFixtureRoot: null, dbRelativePath: null };
+
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
       const scn = (window as any).__activeScenario || {};
@@ -451,7 +459,45 @@ export async function installMockBridge(
           readonly_reason: "missing",
         };
       }
+      // R7：grant_scan_authorization 建立后端授权状态
+      if (cmd === "grant_scan_authorization") {
+        const fr = args?.fixtureRoot;
+        const db = args?.dbRelativePath;
+        if (!fr || !db) {
+          throw new Error("fixture_root 或 db_relative_path 不能为空");
+        }
+        // 模拟后端 canonicalize——直接返回原路径作为 canonical
+        const canonical = String(fr);
+        authState.status = "authorized";
+        authState.canonicalFixtureRoot = canonical;
+        authState.dbRelativePath = String(db);
+        return canonical;
+      }
+      // R7：revoke_scan_authorization 撤销后端授权
+      if (cmd === "revoke_scan_authorization") {
+        authState.status = "not_authorized";
+        authState.canonicalFixtureRoot = null;
+        authState.dbRelativePath = null;
+        return null;
+      }
       if (cmd === "scan_history") {
+        // R7：未授权时必须返回 failed/not_authorized——不能无条件返回成功
+        if (authState.status !== "authorized") {
+          return { kind: "failed", reason: "not_authorized" };
+        }
+        // R7：授权范围不匹配——返回 failed/not_authorized
+        const requestedFr = args?.fixtureRoot;
+        const requestedDb = args?.dbRelativePath;
+        if (
+          requestedFr !== authState.canonicalFixtureRoot ||
+          requestedDb !== authState.dbRelativePath
+        ) {
+          return { kind: "failed", reason: "not_authorized" };
+        }
+        // 进程运行中——返回 failed/process_running
+        if (args?.processState === "running") {
+          return { kind: "failed", reason: "process_running" };
+        }
         const outcome = scn.scanOutcome ?? "success";
         if (outcome === "success") return SCAN_SUCCESS;
         if (outcome === "deduplicated") {

@@ -138,7 +138,14 @@ describe("T03 历史库工作台", () => {
     expect(scanButton).toBeDisabled();
   });
 
-  it("TRAE 运行中时扫描按钮禁用且不调用 scan_history（AC2）", () => {
+  it("TRAE 运行中时扫描按钮禁用且不调用 scan_history（AC2）", async () => {
+    // R7：mock grant_scan_authorization 返回 canonical 路径
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
     render(<HistoryWorkbench {...defaultProps} />);
     // 填写表单
     fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
@@ -146,8 +153,12 @@ describe("T03 历史库工作台", () => {
     });
     // 取消"TRAE 已关闭"勾选 → processRunning = true
     fireEvent.click(screen.getByTestId("trae-not-running-check"));
-    // 授权
+    // 授权（R7：异步调用 grant_scan_authorization）
     fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待授权完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
     // 扫描按钮仍应禁用（processRunning）
     expect(screen.getByTestId("scan-history-button")).toBeDisabled();
     const scanCalls = mockInvoke.mock.calls.filter(
@@ -177,6 +188,9 @@ describe("T03 历史库工作台", () => {
       catalog_updated: true,
     };
     mockInvoke.mockImplementation(async (cmd: string) => {
+      // R7：mock grant_scan_authorization 返回 canonical 路径
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
       if (cmd === "scan_history") return successOutcome;
       if (cmd === "browse_history") return makeBrowseResult();
       throw new Error(`未模拟: ${cmd}`);
@@ -188,6 +202,10 @@ describe("T03 历史库工作台", () => {
       target: { value: "C:\\fixture" },
     });
     fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待 R7 异步授权完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
     // 扫描
     fireEvent.click(screen.getByTestId("scan-history-button"));
     // 应显示浏览结果
@@ -207,6 +225,9 @@ describe("T03 历史库工作台", () => {
       reason: "schema_incompatible",
     };
     mockInvoke.mockImplementation(async (cmd: string) => {
+      // R7：mock grant_scan_authorization 返回 canonical 路径
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
       if (cmd === "scan_history") return failedOutcome;
       throw new Error(`未模拟: ${cmd}`);
     });
@@ -216,6 +237,10 @@ describe("T03 历史库工作台", () => {
       target: { value: "C:\\fixture" },
     });
     fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待 R7 异步授权完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
     fireEvent.click(screen.getByTestId("scan-history-button"));
 
     await waitFor(() => {
@@ -259,6 +284,9 @@ describe("T03 历史库工作台", () => {
       },
     };
     mockInvoke.mockImplementation(async (cmd: string) => {
+      // R7：mock grant_scan_authorization 返回 canonical 路径
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
       if (cmd === "scan_history") return successOutcome;
       if (cmd === "browse_history") return emptyBrowse;
       throw new Error(`未模拟: ${cmd}`);
@@ -269,6 +297,10 @@ describe("T03 历史库工作台", () => {
       target: { value: "C:\\fixture" },
     });
     fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待 R7 异步授权完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
     fireEvent.click(screen.getByTestId("scan-history-button"));
 
     await waitFor(() => {
@@ -295,6 +327,9 @@ describe("T03 历史库工作台", () => {
       catalog_updated: true,
     };
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      // R7：mock grant_scan_authorization 返回 canonical 路径
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
       if (cmd === "scan_history") return successOutcome;
       if (cmd === "browse_history") return makeBrowseResult();
       if (cmd === "read_conversation") {
@@ -310,6 +345,10 @@ describe("T03 历史库工作台", () => {
       target: { value: "C:\\fixture" },
     });
     fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待 R7 异步授权完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
     fireEvent.click(screen.getByTestId("scan-history-button"));
 
     // 等待会话列表渲染
@@ -365,6 +404,9 @@ describe("T03 历史库工作台", () => {
       },
     ];
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      // R7：mock grant_scan_authorization 返回 canonical 路径
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
       if (cmd === "scan_history") return successOutcome;
       if (cmd === "browse_history") return makeBrowseResult();
       if (cmd === "search_history") return searchHits;
@@ -381,6 +423,10 @@ describe("T03 历史库工作台", () => {
       target: { value: "C:\\fixture" },
     });
     fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待 R7 异步授权完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
     fireEvent.click(screen.getByTestId("scan-history-button"));
 
     await waitFor(() => {
@@ -413,6 +459,9 @@ describe("T03 历史库工作台", () => {
       reason: "catalog_key_missing",
     };
     mockInvoke.mockImplementation(async (cmd: string) => {
+      // R7：mock grant_scan_authorization 返回 canonical 路径
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
       if (cmd === "scan_history") return failedOutcome;
       throw new Error(`未模拟: ${cmd}`);
     });
@@ -422,6 +471,10 @@ describe("T03 历史库工作台", () => {
       target: { value: "C:\\fixture" },
     });
     fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待 R7 异步授权完成
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
     fireEvent.click(screen.getByTestId("scan-history-button"));
 
     await waitFor(() => {
@@ -430,5 +483,172 @@ describe("T03 历史库工作台", () => {
     const failureText = screen.getByTestId("failure-state").textContent ?? "";
     // 不暴露 raw_key、认证正文或 secret
     expect(failureText).not.toMatch(/raw_key|rawkey|secret|bearer|token/i);
+  });
+
+  // ============== R7：前端授权调用链反例测试 ==============
+
+  it("R7：未建立后端授权时扫描被拒绝（scan_history 不被调用）", async () => {
+    // grant_scan_authorization 抛错——后端授权未建立
+    // scan_history mock 抛错——若被调用则测试失败
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") {
+        throw new Error("授权失败：fixture 路径无效");
+      }
+      if (cmd === "scan_history") {
+        throw new Error("scan_history 不应被调用——未授权");
+      }
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    // 点击授权——grant_scan_authorization 抛错，授权失败
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    // 等待异步授权失败——应进入 failure 状态
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-state")).toBeInTheDocument();
+    });
+    // 扫描按钮仍禁用（phase 不是 idle，但仍禁用）
+    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
+    // scan_history 未被调用——后端授权未建立
+    const scanCalls = mockInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "scan_history",
+    );
+    expect(scanCalls.length).toBe(0);
+  });
+
+  it("R7：授权成功后才允许扫描", async () => {
+    const successOutcome: ScanOutcomeDto = {
+      kind: "success",
+      snapshot_id: "snap-1",
+      snapshot_meta: {
+        snapshot_id: "snap-1",
+        platform_id: "work_cn",
+        data_location_id: "loc-1",
+        product_version: "1.0",
+        schema_fingerprint: "fp",
+        mapping_version: "work_cn_v1",
+        account_evidence_ref: null,
+        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
+        files: [],
+        fingerprint: "abc",
+      },
+      catalog_updated: true,
+    };
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      // R7：grant_scan_authorization 成功返回 canonical 路径
+      if (cmd === "grant_scan_authorization") return "C:\\canonical-fixture";
+      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "scan_history") return successOutcome;
+      if (cmd === "browse_history") return makeBrowseResult();
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    // 授权成功
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
+    // 扫描按钮启用
+    expect(screen.getByTestId("scan-history-button")).toBeEnabled();
+    // 执行扫描——应调用 scan_history 并使用授权返回的 canonical 路径
+    fireEvent.click(screen.getByTestId("scan-history-button"));
+    await waitFor(() => {
+      expect(screen.getByTestId("account-project-tree")).toBeInTheDocument();
+    });
+    // 验证 scan_history 被调用时传入 authorizedFixtureRoot（canonical）
+    const scanCall = mockInvoke.mock.calls.find(
+      ([cmd]) => cmd === "scan_history",
+    );
+    expect(scanCall).toBeDefined();
+    const scanArgs = scanCall?.[1] as { fixtureRoot: string };
+    expect(scanArgs.fixtureRoot).toBe("C:\\canonical-fixture");
+  });
+
+  it("R7：路径变化后旧授权失效（调用 revoke_scan_authorization）", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    // 第一次填写并授权
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
+    // 修改 fixture 路径——应触发撤销
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "D:\\other-fixture" },
+    });
+    // 等待异步撤销完成——checkbox 应取消选中
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).not.toBeChecked();
+    });
+    // revoke_scan_authorization 被调用
+    const revokeCalls = mockInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "revoke_scan_authorization",
+    );
+    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("R7：撤销授权后再次扫描被拒绝", async () => {
+    const successOutcome: ScanOutcomeDto = {
+      kind: "success",
+      snapshot_id: "snap-1",
+      snapshot_meta: {
+        snapshot_id: "snap-1",
+        platform_id: "work_cn",
+        data_location_id: "loc-1",
+        product_version: "1.0",
+        schema_fingerprint: "fp",
+        mapping_version: "work_cn_v1",
+        account_evidence_ref: null,
+        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
+        files: [],
+        fingerprint: "abc",
+      },
+      catalog_updated: true,
+    };
+    let scanCalled = false;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "grant_scan_authorization") return "C:\\fixture";
+      if (cmd === "revoke_scan_authorization") return null;
+      if (cmd === "scan_history") {
+        scanCalled = true;
+        return successOutcome;
+      }
+      if (cmd === "browse_history") return makeBrowseResult();
+      throw new Error(`未模拟: ${cmd}`);
+    });
+
+    render(<HistoryWorkbench {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
+      target: { value: "C:\\fixture" },
+    });
+    // 授权
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).toBeChecked();
+    });
+    // 取消授权
+    fireEvent.click(screen.getByTestId("authorize-check"));
+    await waitFor(() => {
+      expect(screen.getByTestId("authorize-check")).not.toBeChecked();
+    });
+    // 扫描按钮应禁用——未授权
+    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
+    // scan_history 不应被调用
+    expect(scanCalled).toBe(false);
   });
 });

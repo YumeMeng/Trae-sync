@@ -20,12 +20,11 @@
 //! - 相同指纹不重复创建快照
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 use traesync_domain::{
-    FileIdentity, ProcessRunningState, ScanFailureReason, ScanOutcome, ScanRequest,
-    SnapshotFileEntry, SnapshotFileKind, SnapshotFingerprint, SnapshotId, SourceSnapshotMeta,
+    ProcessRunningState, ScanFailureReason, ScanOutcome, ScanRequest, SnapshotFileEntry,
+    SnapshotFileKind, SnapshotFingerprint, SnapshotId, SourceSnapshotMeta,
 };
 use traesync_ports::{FileIdentityProvider, SnapshotStore};
 
@@ -372,6 +371,12 @@ fn file_sets_content_equal(a: &[SnapshotFileEntry], b: &[SnapshotFileEntry]) -> 
 /// - 不比较 `sha256`（SHA-256 已隐含在 size + identity 稳定性中，且 identity 更精准）
 ///
 /// 任一文件 presence/size/identity 变化即判定为漂移。
+///
+/// R11：identity 的 Option 状态或具体值变化都判定为 drift。
+/// - `Some(A) -> None`：身份读取变得不确定，保守失败
+/// - `None -> Some(A)`：身份读取变得不确定，保守失败
+/// - `Some(A) -> Some(B)` 且 A != B：身份变更
+/// 仅当前后 identity 完全相等（同为 None 或同为 Some 且值相等）时才视为稳定。
 fn file_sets_source_stable(pre: &[SnapshotFileEntry], post: &[SnapshotFileEntry]) -> bool {
     if pre.len() != post.len() {
         return false;
@@ -389,12 +394,9 @@ fn file_sets_source_stable(pre: &[SnapshotFileEntry], post: &[SnapshotFileEntry]
             if pe.size != ae.size {
                 return false;
             }
-            // file_identity 变化 -> 漂移
-            // 注意：identity 为 None 时（读取失败）保守视为稳定，避免误报
-            if pe.file_identity.is_some()
-                && ae.file_identity.is_some()
-                && pe.file_identity != ae.file_identity
-            {
+            // R11：file_identity 的 Option 状态或具体值变化 -> 漂移
+            // 保守失败：identity 读取不确定时不得继续发布快照
+            if pe.file_identity != ae.file_identity {
                 return false;
             }
         }
@@ -474,7 +476,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use traesync_domain::ProcessRunningState;
+    use std::time::SystemTime;
+    use traesync_domain::{FileIdentity, ProcessRunningState};
 
     /// 测试用 mock FileIdentityProvider——返回固定的虚拟身份。
     struct MockFileIdentityProvider;
@@ -783,6 +786,7 @@ mod tests {
     /// 因此 pre_capture 的 DB entry 保留旧 size，post_source 读到新 size → 漂移。
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     struct DriftDbSizeProvider {
         fixture_db_path: std::path::PathBuf,
@@ -849,6 +853,48 @@ mod tests {
                 file_index_high: 0,
                 file_index_low: low,
             })
+        }
+    }
+
+    /// R11 辅助：identity 在 pre_capture 与 post_source 之间发生 Some/None 状态变化。
+    /// - `SomeToNone`：第 0 次返回 Some，第 1 次返回 None（模拟身份读取变得不确定）
+    /// - `NoneToSome`：第 0 次返回 None，第 1 次返回 Some
+    /// 调用顺序：read_file_set 对 DB/WAL/SHM 各调用一次 read_file_identity；
+    /// 仅 DB 存在时第 0 次为 pre_capture DB，第 1 次为 post_source DB。
+    enum IdentityDriftMode {
+        SomeToNone,
+        NoneToSome,
+    }
+
+    struct CountingIdentityProvider {
+        call_count: Arc<AtomicUsize>,
+        mode: IdentityDriftMode,
+    }
+
+    impl FileIdentityProvider for CountingIdentityProvider {
+        fn read_file_identity(&self, _path: &Path) -> Option<FileIdentity> {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let sample = FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            };
+            match self.mode {
+                IdentityDriftMode::SomeToNone => {
+                    if n == 0 {
+                        Some(sample)
+                    } else {
+                        None
+                    }
+                }
+                IdentityDriftMode::NoneToSome => {
+                    if n == 0 {
+                        None
+                    } else {
+                        Some(sample)
+                    }
+                }
+            }
         }
     }
 
@@ -1075,7 +1121,7 @@ mod tests {
 
     #[test]
     fn r3_file_sets_source_stable_accepts_none_identity() {
-        // identity 为 None 时不判定漂移（保守，避免误报）
+        // identity 同为 None 时视为稳定（前后都读取不到，状态一致）
         let pre = vec![SnapshotFileEntry {
             kind: SnapshotFileKind::Db,
             relative_path: "database.db".to_string(),
@@ -1086,5 +1132,142 @@ mod tests {
         }];
         let post = pre.clone();
         assert!(file_sets_source_stable(&pre, &post));
+    }
+
+    // ============== R11 反例：identity Some/None 状态变化判定为 drift ==============
+
+    #[test]
+    fn r11_some_to_none_identity_judged_drift() {
+        // Some(A) -> None：身份读取变得不确定，必须判定为 drift
+        let pre = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            }),
+        }];
+        let post = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: None,
+        }];
+        assert!(
+            !file_sets_source_stable(&pre, &post),
+            "Some(A) -> None 必须判定为 drift"
+        );
+    }
+
+    #[test]
+    fn r11_none_to_some_identity_judged_drift() {
+        // None -> Some(A)：身份读取变得不确定，必须判定为 drift
+        let pre = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: None,
+        }];
+        let post = vec![SnapshotFileEntry {
+            kind: SnapshotFileKind::Db,
+            relative_path: "database.db".to_string(),
+            present: true,
+            size: 100,
+            sha256: "abc".to_string(),
+            file_identity: Some(FileIdentity {
+                volume_serial: 1,
+                file_index_high: 0,
+                file_index_low: 1,
+            }),
+        }];
+        assert!(
+            !file_sets_source_stable(&pre, &post),
+            "None -> Some(A) 必须判定为 drift"
+        );
+    }
+
+    #[test]
+    fn r11_capture_returns_source_set_drift_on_identity_some_to_none() {
+        // capture 级别反例：复制后 identity 由 Some 变 None，capture 返回 SourceSetDrift，
+        // 且 staging 已清理、snapshots 中没有本次快照。
+        let fixture = tempfile::tempdir().expect("create fixture tempdir");
+        let storage = tempfile::tempdir().expect("create storage tempdir");
+        let db_path = fixture.path().join("database.db");
+        std::fs::write(&db_path, b"initial content").unwrap();
+
+        // 计数器控制 file_identity 读取行为：pre_capture 后变 None
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let provider = CountingIdentityProvider {
+            call_count: call_count.clone(),
+            // 第 1 次（pre_capture DB）返回 Some，第 2 次（post_source DB）返回 None
+            // 第 3+ 次（staging 验证）无关——drift 已判定
+            mode: IdentityDriftMode::SomeToNone,
+        };
+        let store = FilesystemSnapshotStore::new(Box::new(provider));
+        let request = make_scan_request(fixture.path(), storage.path());
+        let outcome = store.capture_snapshot(&request);
+
+        match outcome {
+            ScanOutcome::Failed {
+                reason: ScanFailureReason::SourceSetDrift,
+            } => {
+                // staging 已清理
+                let staging = storage.path().join("staging");
+                let staging_clean = !staging.exists()
+                    || std::fs::read_dir(&staging)
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(true);
+                assert!(staging_clean, "drift 后 staging 必须被清理");
+                // snapshots 中没有本次快照
+                let snapshots_dir = storage.path().join("snapshots");
+                if snapshots_dir.exists() {
+                    let count = std::fs::read_dir(&snapshots_dir)
+                        .map(|d| d.count())
+                        .unwrap_or(0);
+                    assert_eq!(count, 0, "drift 后不得发布任何快照");
+                }
+            }
+            other => panic!("期望 SourceSetDrift，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn r11_capture_returns_source_set_drift_on_identity_none_to_some() {
+        // capture 级别反例：复制后 identity 由 None 变 Some，capture 返回 SourceSetDrift
+        let fixture = tempfile::tempdir().expect("create fixture tempdir");
+        let storage = tempfile::tempdir().expect("create storage tempdir");
+        let db_path = fixture.path().join("database.db");
+        std::fs::write(&db_path, b"initial content").unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let provider = CountingIdentityProvider {
+            call_count: call_count.clone(),
+            mode: IdentityDriftMode::NoneToSome,
+        };
+        let store = FilesystemSnapshotStore::new(Box::new(provider));
+        let request = make_scan_request(fixture.path(), storage.path());
+        let outcome = store.capture_snapshot(&request);
+
+        match outcome {
+            ScanOutcome::Failed {
+                reason: ScanFailureReason::SourceSetDrift,
+            } => {
+                let staging = storage.path().join("staging");
+                let staging_clean = !staging.exists()
+                    || std::fs::read_dir(&staging)
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(true);
+                assert!(staging_clean, "drift 后 staging 必须被清理");
+            }
+            other => panic!("期望 SourceSetDrift，实际 {:?}", other),
+        }
     }
 }

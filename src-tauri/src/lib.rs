@@ -23,6 +23,8 @@ use traesync_application::{
     WorkbenchReadService, WorkspaceStateProvider,
 };
 use traesync_commands as commands;
+// R8：组合根直接使用 commands::HistoryCommandError 构造授权失败错误消息
+use traesync_commands::HistoryCommandError;
 use traesync_domain::{
     AuthorizationState, BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome,
     SearchHit, SessionIdentity, WorkbenchReadState, WorkspaceState,
@@ -144,12 +146,17 @@ fn revoke_scan_authorization(state: tauri::State<AppState>) -> Result<(), String
 /// `scan_history` Tauri command：执行首次扫描。
 ///
 /// R1 修复：后端在任何 FS/DB 访问之前检查显式用户授权与进程边界。
+/// R8 修复：授权检查移到 `FixturePathGuard::new` 之前——未授权/范围不匹配/运行中
+///   时不构造 guard、不 canonicalize、不访问文件系统。授权状态中已保存的
+///   canonical_fixture_root 直接用作 canonical_root，避免对未授权请求的任意路径
+///   做 canonicalize。
 /// 前端通过 `invoke("scan_history", { fixtureRoot, dbRelativePath, processState })` 调用。
 /// 组合根负责：
 /// 1. 验证 raw_key 与 storage_root 已配置（storage_root 来自 env，不接受前端注入）
-/// 2. 用 `FixturePathGuard` 验证 fixture_root
-/// 3. R1：检查授权状态——未授权或范围不匹配时在任何 FS/DB 访问前拒绝
-/// 4. R1：检查 process_state == Running——运行中时在任何 DB probing 前拒绝
+/// 2. R8：先锁定授权状态，未授权/范围不匹配/运行中时立即返回，不构造 guard
+/// 3. R8：用授权状态中的 canonical_fixture_root 作为 canonical_root，跳过再次 canonicalize
+/// 4. R2：用 `FixturePathGuard::new(canonical_root)` 构造 guard（此时路径已验证为授权范围）
+///    并用 `validate_db_relative_path` 验证 db_relative_path 与派生 WAL/SHM 全部封闭
 /// 5. 构造 SnapshotStore / Catalog / Normalizer / Service 并注入 raw_key
 /// 6. 调用 `catalog.ensure_initialized()` 确保目录库表存在
 /// 7. 调用 commands 层纯函数（内含二次授权检查——defense in depth）
@@ -164,34 +171,58 @@ fn scan_history(
     process_state: ProcessRunningState,
     state: tauri::State<AppState>,
 ) -> Result<ScanOutcome, String> {
+    scan_history_inner(&state, &fixture_root, &db_relative_path, process_state)
+}
+
+/// R8：`scan_history` 核心逻辑——提取为 `pub(crate)` 以便组合根级顺序测试。
+///
+/// 此函数完整复现 Tauri command 的行为，但接收 `&AppState` 而非 `tauri::State<AppState>`，
+/// 使得 `#[cfg(test)]` 模块可直接调用并验证授权检查顺序。
+fn scan_history_inner(
+    state: &AppState,
+    fixture_root: &str,
+    db_relative_path: &str,
+    process_state: ProcessRunningState,
+) -> Result<ScanOutcome, String> {
     // 1. raw_key 或 storage_root 未配置时返回错误——不泄露 key 是否存在
     if state.raw_key.is_empty() || state.storage_root.is_empty() {
         return Err("fixture 模式未启用：raw key 或 storage root 未配置".to_string());
     }
 
-    // 2. 用 FixturePathGuard 验证 fixture_root——拒绝真实 TRAE 路径
-    let guard = FixturePathGuard::new(Path::new(&fixture_root)).map_err(|e| e.to_string())?;
-    let canonical_root = guard.canonical_root();
-
-    // 3. R1：锁定授权状态进行检查——在任何 FS/DB 访问之前
+    // 2. R8：先锁定授权状态进行检查——在任何 FS/DB 访问、guard 构造、canonicalize 之前
     let authorization = state.authorization.lock().unwrap().clone();
-    {
-        use traesync_commands::check_scan_authorization;
-        // 在构造任何 infrastructure 组件之前验证授权与进程边界
-        check_scan_authorization(
-            canonical_root,
-            &db_relative_path,
-            process_state,
-            &authorization,
-        )
-        .map_err(|e| e.to_string())?;
-    }
+    let canonical_root_str = match &authorization {
+        AuthorizationState::NotAuthorized => {
+            // 未授权：立即拒绝，不构造 guard、不访问文件系统
+            return Err(HistoryCommandError::NotAuthorized.to_string());
+        }
+        AuthorizationState::Authorized {
+            canonical_fixture_root,
+            db_relative_path: authorized_db_path,
+        } => {
+            // R8：使用授权建立阶段已保存的 canonical 范围完成早拒
+            // 不对未授权请求的任意路径做 canonicalize
+            if fixture_root != *canonical_fixture_root || db_relative_path != *authorized_db_path {
+                return Err(HistoryCommandError::AuthorizationMismatch.to_string());
+            }
+            // R1：运行中早拒——在任何 DB probing/account-evidence 读之前
+            if process_state == ProcessRunningState::Running {
+                return Err(HistoryCommandError::ProcessRunning.to_string());
+            }
+            canonical_fixture_root.clone()
+        }
+    };
+
+    // 3. R8：用授权状态中的 canonical_root 构造 guard——此时路径已验证为授权范围
+    //    guard 不会对未授权路径做 canonicalize；此处用于 R2 完整封闭证明（DB+WAL+SHM+symlink）
+    let guard = FixturePathGuard::new(Path::new(&canonical_root_str)).map_err(|e| e.to_string())?;
+    let canonical_root = guard.canonical_root();
 
     // 4. R2：用 FixturePathGuard 验证 db_relative_path 与派生 WAL/SHM 全部封闭在 fixture_root 内
     //    在任何 DB probing / 文件复制之前完成，拒绝绝对路径、父目录遍历与 symlink/junction 逃逸
     //    返回的规范化 DB 路径严格位于 canonical_root 内部——后续 infrastructure 调用可信任此路径
     let _canonical_db_path = guard
-        .validate_db_relative_path(&db_relative_path)
+        .validate_db_relative_path(db_relative_path)
         .map_err(|e| e.to_string())?;
 
     // 5. 构造 infrastructure 组件——raw_key 仅在此注入，不进入 commands 层
@@ -218,7 +249,7 @@ fn scan_history(
     let now = std::time::SystemTime::now();
     commands::scan_history(
         canonical_root,
-        &db_relative_path,
+        db_relative_path,
         process_state,
         Path::new(&state.storage_root),
         now,
@@ -332,4 +363,107 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用时出错");
+}
+
+// ============================================================================
+// R8：组合根级顺序测试——证明拒绝发生时没有构造 guard 或访问文件系统
+// ============================================================================
+
+#[cfg(test)]
+mod r8_order_tests {
+    use super::*;
+
+    /// 构造测试用 AppState——使用不存在的 fixture 路径与临时 storage_root。
+    /// R8 反例：未授权时即使 fixture_root 是不存在的路径，也应返回 NotAuthorized，
+    /// 而不是 guard 构造错误。这间接证明授权检查在 guard 之前——guard 未被构造。
+    fn make_test_state(authorization: AuthorizationState) -> AppState {
+        AppState {
+            provider: Arc::new(StaticWorkspaceStateProvider::new()),
+            workbench_probe: SqlCipherProbe::new(),
+            workbench_reader: AccountEvidenceReader::new(),
+            raw_key: "0".repeat(64),
+            storage_root: "/nonexistent/storage-root".to_string(),
+            authorization: Mutex::new(authorization),
+        }
+    }
+
+    #[test]
+    fn r8_unauthorized_returns_not_authorized_without_guard_construction() {
+        // 未授权状态——fixture_root 指向不存在的路径
+        // 若授权检查在 guard 之后，FixturePathGuard::new 会因路径不存在而失败，
+        // 返回 guard 错误而非 NotAuthorized。
+        // R8 修复后：授权检查在 guard 之前，返回 NotAuthorized，guard 未被构造。
+        let state = make_test_state(AuthorizationState::NotAuthorized);
+        let result = scan_history_inner(
+            &state,
+            "/nonexistent/fixture-root",
+            "database.db",
+            ProcessRunningState::NotRunning,
+        );
+        // 必须返回 NotAuthorized 错误——不是 guard 错误
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("未授权") || err.contains("not_authorized"),
+            "未授权时应返回 NotAuthorized，实际: {err}"
+        );
+        // 不应包含 guard 错误特征（如 "canonical" 或 "fixture"）
+        assert!(
+            !err.to_lowercase().contains("canonical"),
+            "未授权时不应触发 guard 构造（canonicalize），实际: {err}"
+        );
+    }
+
+    #[test]
+    fn r8_authorization_mismatch_returns_mismatch_without_guard_construction() {
+        // 已授权路径 A，但请求路径 B（不存在）
+        // R8：授权范围不匹配时立即返回 AuthorizationMismatch，不构造 guard
+        let state = make_test_state(AuthorizationState::Authorized {
+            canonical_fixture_root: "/authorized/fixture-root".to_string(),
+            db_relative_path: "database.db".to_string(),
+        });
+        let result = scan_history_inner(
+            &state,
+            "/nonexistent/different-fixture-root",
+            "database.db",
+            ProcessRunningState::NotRunning,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("授权不匹配") || err.contains("authorization"),
+            "范围不匹配时应返回 AuthorizationMismatch，实际: {err}"
+        );
+        // 不应触发 guard 构造
+        assert!(
+            !err.to_lowercase().contains("canonical"),
+            "范围不匹配时不应触发 guard 构造，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn r8_process_running_returns_process_running_without_guard_construction() {
+        // 已授权但 TRAE 运行中——R8：返回 ProcessRunning，不构造 guard
+        let state = make_test_state(AuthorizationState::Authorized {
+            canonical_fixture_root: "/authorized/fixture-root".to_string(),
+            db_relative_path: "database.db".to_string(),
+        });
+        let result = scan_history_inner(
+            &state,
+            "/authorized/fixture-root",
+            "database.db",
+            ProcessRunningState::Running,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("运行中") || err.contains("running"),
+            "运行中时应返回 ProcessRunning，实际: {err}"
+        );
+        // 不应触发 guard 构造
+        assert!(
+            !err.to_lowercase().contains("canonical"),
+            "运行中时不应触发 guard 构造，实际: {err}"
+        );
+    }
 }

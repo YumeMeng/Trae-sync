@@ -348,7 +348,9 @@ impl CatalogRepository for SqlCipherCatalogRepository {
             None => return vec![],
         };
         // FTS5 MATCH 查询，JOIN message_projection 获取 soft_deleted/role，
-        // JOIN session_projection 获取 project_id/title。排除软删除。
+        // JOIN session_projection 获取 project_id/title，
+        // JOIN project_identity 获取 project soft_deleted。
+        // R9：同时排除软删除消息、会话和项目——任一层级软删除都不出现在搜索结果。
         let mut stmt = match conn.prepare(
             "SELECT mp.message_id, mp.session_id, mp.role, mp.content_excerpt, mp.namespace, \
                     sp.project_id, sp.active_title \
@@ -359,7 +361,12 @@ impl CatalogRepository for SqlCipherCatalogRepository {
               AND message_fts.namespace = mp.namespace \
              JOIN session_projection sp \
                ON sp.namespace = mp.namespace AND sp.original_session_id = mp.session_id \
-             WHERE message_fts MATCH ?1 AND mp.soft_deleted = 0",
+             JOIN project_identity pi \
+               ON pi.project_id = sp.project_id \
+             WHERE message_fts MATCH ?1 \
+               AND mp.soft_deleted = 0 \
+               AND sp.soft_deleted = 0 \
+               AND pi.soft_deleted = 0",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -586,9 +593,12 @@ impl CatalogRepository for SqlCipherCatalogRepository {
             })
             .unwrap_or(0);
         // 会话：visible 排除 soft_deleted，retained 全部
+        // R9：visible_sessions 同时排除会话自身软删除和所属项目软删除
         let visible_sessions: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM session_projection WHERE soft_deleted = 0",
+                "SELECT COUNT(*) FROM session_projection sp \
+                 JOIN project_identity pi ON pi.project_id = sp.project_id \
+                 WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0",
                 [],
                 |row| row.get(0),
             )
@@ -598,10 +608,14 @@ impl CatalogRepository for SqlCipherCatalogRepository {
                 row.get(0)
             })
             .unwrap_or(0);
-        // 消息：visible 排除 soft_deleted，retained 全部（Gate J：retained 含软删除）
+        // R9：visible_messages 同时排除消息自身软删除、所属会话软删除和所属项目软删除
         let visible_messages: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM message_projection WHERE soft_deleted = 0",
+                "SELECT COUNT(*) FROM message_projection mp \
+                 JOIN session_projection sp \
+                   ON sp.namespace = mp.namespace AND sp.original_session_id = mp.session_id \
+                 JOIN project_identity pi ON pi.project_id = sp.project_id \
+                 WHERE mp.soft_deleted = 0 AND sp.soft_deleted = 0 AND pi.soft_deleted = 0",
                 [],
                 |row| row.get(0),
             )
@@ -645,9 +659,12 @@ impl CatalogRepository for SqlCipherCatalogRepository {
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        // R9：visible_sessions 同时排除会话自身软删除和所属项目软删除
         let visible_sessions: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM session_projection WHERE soft_deleted = 0",
+                "SELECT COUNT(*) FROM session_projection sp \
+                 JOIN project_identity pi ON pi.project_id = sp.project_id \
+                 WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0",
                 [],
                 |row| row.get(0),
             )
@@ -1034,6 +1051,10 @@ fn read_all_browse_projects(
 }
 
 /// 读取会话节点。filter_project 为 Some 时按 project_id 过滤，排除软删除。
+///
+/// R9：全局浏览（filter_project = None）时排除所属项目已软删除的会话。
+/// 按项目浏览（filter_project = Some）时由 `browse_sessions_by_project` 调用方负责只传未软删除的项目，
+/// 但为 defense in depth，这里仍 JOIN project_identity 排除软删除项目。
 fn read_all_browse_sessions(
     conn: &Connection,
     filter_project: Option<&str>,
@@ -1048,7 +1069,8 @@ fn read_all_browse_sessions(
                      WHERE sv.namespace = sp.namespace AND sv.original_session_id = sp.original_session_id) AS last_captured, \
                     sp.project_id \
              FROM session_projection sp \
-             WHERE sp.soft_deleted = 0 AND sp.project_id = ?1 \
+             JOIN project_identity pi ON pi.project_id = sp.project_id \
+             WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0 AND sp.project_id = ?1 \
              ORDER BY sp.active_title ASC"
         }
         None => {
@@ -1060,7 +1082,8 @@ fn read_all_browse_sessions(
                      WHERE sv.namespace = sp.namespace AND sv.original_session_id = sp.original_session_id) AS last_captured, \
                     sp.project_id \
              FROM session_projection sp \
-             WHERE sp.soft_deleted = 0 \
+             JOIN project_identity pi ON pi.project_id = sp.project_id \
+             WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0 \
              ORDER BY sp.active_title ASC"
         }
     };
@@ -1105,10 +1128,12 @@ fn build_account_nodes(conn: &Connection) -> Vec<BrowseAccountNode> {
                 )
                 .unwrap_or(0);
             // 统计这些项目下的可见会话数
+            // R9：排除软删除会话 + 排除所属项目已软删除的会话
             let session_count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM session_projection sp \
-                     WHERE sp.soft_deleted = 0 AND \
+                     JOIN project_identity pi ON pi.project_id = sp.project_id \
+                     WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0 AND \
                      COALESCE(\
                        (SELECT psa.user_assigned_owner FROM project_source_assignment psa \
                         WHERE psa.project_id = sp.project_id), \
@@ -1149,9 +1174,12 @@ fn compute_history_summary(conn: &Connection) -> HistoryBrowseSummary {
             |row| row.get(0),
         )
         .unwrap_or(0);
+    // R9：visible_sessions 同时排除会话自身软删除和所属项目软删除
     let visible_sessions: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM session_projection WHERE soft_deleted = 0",
+            "SELECT COUNT(*) FROM session_projection sp \
+             JOIN project_identity pi ON pi.project_id = sp.project_id \
+             WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0",
             [],
             |row| row.get(0),
         )
@@ -2187,5 +2215,124 @@ mod tests {
             2,
             "应有 2 条 owner 观察（删除前后各一次）"
         );
+    }
+
+    // ============== R9：软删除项目的子会话与消息从 browse/search/count 排除 ==============
+
+    #[test]
+    fn r9_soft_deleted_project_sessions_excluded_from_browse() {
+        // 反例：软删除项目 p2 的会话 s2 不应出现在 browse.sessions
+        let dir = tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture_with_soft_deleted_project(&snapshot_dir, "user-A");
+
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .unwrap();
+
+        let browse = repo.browse();
+        // browse.sessions 应只包含 s1（p1 的会话），不含 s2（p2 的会话）
+        let session_ids: Vec<&str> = browse
+            .sessions
+            .iter()
+            .map(|s| s.session_identity.original_session_id.as_str())
+            .collect();
+        assert!(
+            session_ids.contains(&"s1"),
+            "s1（p1 的会话）应出现在 browse.sessions"
+        );
+        assert!(
+            !session_ids.contains(&"s2"),
+            "s2（软删除项目 p2 的会话）不应出现在 browse.sessions"
+        );
+    }
+
+    #[test]
+    fn r9_soft_deleted_project_messages_excluded_from_search() {
+        // 反例：搜索命中不包含软删除项目 p2 下的消息 m2
+        let dir = tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture_with_soft_deleted_project(&snapshot_dir, "user-A");
+
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .unwrap();
+
+        // 搜索一个会同时匹配 m1 和 m2 的关键词
+        let hits = repo.search_messages("hello");
+        let hit_ids: Vec<&str> = hits.iter().map(|h| h.message_id.as_str()).collect();
+        assert!(hit_ids.contains(&"m1"), "m1（p1 的消息）应被搜索命中");
+        assert!(
+            !hit_ids.contains(&"m2"),
+            "m2（软删除项目 p2 的消息）不应被搜索命中"
+        );
+
+        // 搜索 m2 独有的内容，应返回空
+        let hits2 = repo.search_messages("soft-deleted-project-msg");
+        assert!(hits2.is_empty(), "搜索软删除项目专属内容应返回空");
+    }
+
+    #[test]
+    fn r9_soft_deleted_project_session_excluded_from_counts() {
+        // 反例：visible_session_count 不计入软删除项目 p2 下的会话
+        let dir = tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture_with_soft_deleted_project(&snapshot_dir, "user-A");
+
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .unwrap();
+
+        let summary = repo.history_summary();
+        // visible_session_count 应为 1（仅 s1），不含 s2
+        assert_eq!(
+            summary.visible_session_count, 1,
+            "visible_session_count 不应计入软删除项目下的会话"
+        );
+
+        let browse = repo.browse();
+        assert_eq!(
+            browse.summary.visible_session_count, 1,
+            "browse.summary.visible_session_count 不应计入软删除项目下的会话"
+        );
+
+        // 账号 user-B 的 session_count 应为 0（p2 软删除）
+        let user_b = browse.accounts.iter().find(|a| a.user_id == "user-B");
+        if let Some(acc) = user_b {
+            assert_eq!(
+                acc.session_count, 0,
+                "user-B 的 session_count 不应计入软删除项目 p2 下的会话"
+            );
+        }
+    }
+
+    #[test]
+    fn r9_soft_deleted_project_retained_in_diagnostic_counts() {
+        // 反例：diagnostic retained counts 仍包含软删除项目下的会话与消息
+        let dir = tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture_with_soft_deleted_project(&snapshot_dir, "user-A");
+
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .unwrap();
+
+        let diag = repo.diagnostic_integrity();
+        // retained 应包含全部（含软删除项目的会话和消息）
+        assert_eq!(diag.retained_projects, 2, "retained_projects 含 p1+p2");
+        assert_eq!(diag.retained_sessions, 2, "retained_sessions 含 s1+s2");
+        assert_eq!(diag.retained_messages, 2, "retained_messages 含 m1+m2");
+        // visible 排除软删除项目及其子会话
+        assert_eq!(diag.visible_projects, 1, "visible_projects 仅 p1");
+        assert_eq!(diag.visible_sessions, 1, "visible_sessions 仅 s1");
+        assert_eq!(diag.visible_messages, 1, "visible_messages 仅 m1");
     }
 }

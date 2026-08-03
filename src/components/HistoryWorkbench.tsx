@@ -44,7 +44,6 @@ export function HistoryWorkbench({
   const [phase, setPhase] = useState<HistoryPhase>("idle");
   const [fixtureRoot, setFixtureRoot] = useState("");
   const [dbRelativePath, setDbRelativePath] = useState("database.db");
-  const [authorized, setAuthorized] = useState(false);
   const [processRunning, setProcessRunning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
 
@@ -66,12 +65,87 @@ export function HistoryWorkbench({
   const [searchResults, setSearchResults] = useState<readonly SearchHitDto[] | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
 
-  // 扫描授权处理：用户显式勾选授权 + 确认 TRAE 未运行
-  // 授权前置条件：fixture_root 与 db_relative_path 非空
+  // R7：已授权的 canonical fixture_root——由后端 grant_scan_authorization 返回。
+  // 前端不再持有"自封"的授权；只有后端成功授权后此值才非空。
+  // 取消授权或路径变化时此值清空，旧授权在后端被撤销。
+  const [authorizedFixtureRoot, setAuthorizedFixtureRoot] = useState<string | null>(null);
+
+  // 扫描授权前置条件：fixture_root 与 db_relative_path 非空
   // storage_root 由后端 env 控制，前端不可注入，未配置时后端返回错误
   const canAuthorize =
     fixtureRoot.trim().length > 0 &&
     dbRelativePath.trim().length > 0;
+
+  // R7：authorized 派生自后端授权状态——只有 authorizedFixtureRoot 非空时为 true
+  const authorized = authorizedFixtureRoot !== null;
+
+  // R7：用户勾选授权时调用后端 grant_scan_authorization，建立后端授权状态机
+  // 取消勾选时调用 revoke_scan_authorization 撤销后端授权
+  const handleAuthorizeToggle = useCallback(
+    async (checked: boolean) => {
+      if (checked) {
+        if (!canAuthorize) {
+          // 前置条件不满足——拒绝建立授权（按钮应已禁用，此处防御）
+          return;
+        }
+        try {
+          // 调用后端建立授权——传入当前 fixtureRoot 与 dbRelativePath
+          // 后端会 canonicalize 路径并存储 AuthorizationState::Authorized
+          const canonical = await invoke<string>("grant_scan_authorization", {
+            fixtureRoot,
+            dbRelativePath,
+          });
+          // 只有后端成功后才进入已授权状态
+          setAuthorizedFixtureRoot(canonical);
+          setScanError(null);
+        } catch (e) {
+          // 授权失败：保持未授权并显示结构化错误
+          setAuthorizedFixtureRoot(null);
+          setScanError(String(e));
+          setPhase("failure");
+        }
+      } else {
+        // 取消授权：撤销后端授权，清空本地状态
+        try {
+          await invoke<void>("revoke_scan_authorization");
+        } catch {
+          // 撤销失败不阻塞——本地状态仍清空，旧授权在后端可能残留但已无本地凭证
+        }
+        setAuthorizedFixtureRoot(null);
+      }
+    },
+    [canAuthorize, fixtureRoot, dbRelativePath],
+  );
+
+  // R7：路径变化时撤销旧授权——旧授权不得继续有效
+  // 当 fixtureRoot 或 dbRelativePath 改变时，已授权状态自动失效
+  const handleFixtureRootChange = useCallback(
+    (value: string) => {
+      setFixtureRoot(value);
+      if (authorizedFixtureRoot !== null) {
+        // 路径变化导致授权范围变化——撤销后端授权
+        setAuthorizedFixtureRoot(null);
+        invoke<void>("revoke_scan_authorization").catch(() => {
+          // 撤销失败不阻塞本地状态更新
+        });
+      }
+    },
+    [authorizedFixtureRoot],
+  );
+
+  const handleDbRelativePathChange = useCallback(
+    (value: string) => {
+      setDbRelativePath(value);
+      if (authorizedFixtureRoot !== null) {
+        // 路径变化导致授权范围变化——撤销后端授权
+        setAuthorizedFixtureRoot(null);
+        invoke<void>("revoke_scan_authorization").catch(() => {
+          // 撤销失败不阻塞本地状态更新
+        });
+      }
+    },
+    [authorizedFixtureRoot],
+  );
 
   // 执行扫描：显式用户动作，不自动触发
   const handleScan = useCallback(async () => {
@@ -89,8 +163,9 @@ export function HistoryWorkbench({
     setScanError(null);
     try {
       const processState: ProcessRunningState = processRunning ? "running" : "not_running";
+      // R7：使用后端授权返回的 canonical fixture_root，确保与授权范围一致
       const outcome = await invoke<ScanOutcomeDto>("scan_history", {
-        fixtureRoot,
+        fixtureRoot: authorizedFixtureRoot,
         dbRelativePath,
         processState,
       });
@@ -133,7 +208,7 @@ export function HistoryWorkbench({
       setScanError(String(e));
       setPhase("failure");
     }
-  }, [authorized, processRunning, fixtureRoot, dbRelativePath]);
+  }, [authorized, processRunning, authorizedFixtureRoot, dbRelativePath]);
 
   // 点击会话标题：只打开预览，不改选择（AC9）
   const handleSessionClick = useCallback(async (session: BrowseSessionNodeDto) => {
@@ -245,7 +320,7 @@ export function HistoryWorkbench({
               <input
                 type="text"
                 value={fixtureRoot}
-                onChange={(e) => setFixtureRoot(e.target.value)}
+                onChange={(e) => handleFixtureRootChange(e.target.value)}
                 placeholder="例如：%LOCALAPPDATA%\Trae Sync\tests\fixture-xxx"
                 data-testid="history-fixture-root-input"
               />
@@ -255,7 +330,7 @@ export function HistoryWorkbench({
               <input
                 type="text"
                 value={dbRelativePath}
-                onChange={(e) => setDbRelativePath(e.target.value)}
+                onChange={(e) => handleDbRelativePathChange(e.target.value)}
                 data-testid="history-db-path-input"
               />
             </label>
@@ -272,7 +347,7 @@ export function HistoryWorkbench({
               <input
                 type="checkbox"
                 checked={authorized}
-                onChange={(e) => setAuthorized(e.target.checked)}
+                onChange={(e) => handleAuthorizeToggle(e.target.checked)}
                 disabled={!canAuthorize}
                 data-testid="authorize-check"
               />

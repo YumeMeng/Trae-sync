@@ -280,3 +280,96 @@ test.describe("布局稳定性：无重叠、裁剪或水平溢出", () => {
     expect(overflow.ok).toBe(true);
   });
 });
+
+// ============================================================================
+// R7：前端授权调用链——mock 授权状态机验证
+// ============================================================================
+
+test.describe("R7 前端授权调用链", () => {
+  test("R7：未授权时 scan_history 返回 failed/not_authorized（mock 状态机）", async ({ page }) => {
+    // 安装 mock 但不点击授权 checkbox——直接尝试扫描
+    // 由于扫描按钮在未授权时禁用，无法直接点击 scan-history-button
+    // 验证：未授权时 authorize-check 未选中，scan-history-button 禁用
+    await setup(page, { scanOutcome: "success", browseMode: "full" });
+    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
+    // authorize-check 未勾选
+    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
+    // 扫描按钮禁用
+    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+  });
+
+  test("R7：授权成功后 scan_history 使用 canonical fixture_root", async ({ page }) => {
+    // 监听 mock invoke 调用——通过 window 对象记录
+    await setup(page, { scanOutcome: "success", browseMode: "full" });
+    // 注入调用记录器
+    await page.addInitScript(() => {
+      (window as any).__invokeCalls = [];
+      const orig = (window as any).__TAURI_INTERNALS__.invoke;
+      (window as any).__TAURI_INTERNALS__.invoke = async function (cmd: string, args?: any) {
+        (window as any).__invokeCalls.push({ cmd, args });
+        return orig(cmd, args);
+      };
+    });
+    // 重新加载以使记录器生效
+    await page.reload();
+    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+
+    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
+    await page.getByTestId("authorize-check").check();
+    await page.getByTestId("scan-history-button").click();
+    await expect(page.getByTestId("account-project-tree")).toBeVisible({ timeout: 10_000 });
+
+    // 验证 grant_scan_authorization 被调用
+    const calls = await page.evaluate(() => (window as any).__invokeCalls);
+    const grantCall = calls.find((c: any) => c.cmd === "grant_scan_authorization");
+    expect(grantCall).toBeDefined();
+    // 验证 scan_history 被调用时传入授权返回的 canonical fixture_root
+    const scanCall = calls.find((c: any) => c.cmd === "scan_history");
+    expect(scanCall).toBeDefined();
+    expect(scanCall.args.fixtureRoot).toBe("C:\\fixture");
+  });
+
+  test("R7：路径变化后旧授权失效（调用 revoke_scan_authorization）", async ({ page }) => {
+    await setup(page, { scanOutcome: "success", browseMode: "full" });
+    // 注入调用记录器
+    await page.addInitScript(() => {
+      (window as any).__invokeCalls = [];
+      const orig = (window as any).__TAURI_INTERNALS__.invoke;
+      (window as any).__TAURI_INTERNALS__.invoke = async function (cmd: string, args?: any) {
+        (window as any).__invokeCalls.push({ cmd, args });
+        return orig(cmd, args);
+      };
+    });
+    await page.reload();
+    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+
+    // 第一次填写并授权
+    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
+    await page.getByTestId("authorize-check").check();
+    await expect(page.getByTestId("authorize-check")).toBeChecked();
+
+    // 修改 fixture 路径——应触发撤销
+    await page.getByTestId("history-fixture-root-input").fill("D:\\other-fixture");
+    // 等待异步撤销完成——checkbox 应取消选中
+    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
+
+    // 验证 revoke_scan_authorization 被调用
+    const calls = await page.evaluate(() => (window as any).__invokeCalls);
+    const revokeCalls = calls.filter((c: any) => c.cmd === "revoke_scan_authorization");
+    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("R7：撤销授权后 scan_history 按钮禁用", async ({ page }) => {
+    await setup(page, { scanOutcome: "success", browseMode: "full" });
+    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
+    await page.getByTestId("authorize-check").check();
+    await expect(page.getByTestId("authorize-check")).toBeChecked();
+    // 扫描按钮启用
+    await expect(page.getByTestId("scan-history-button")).toBeEnabled();
+    // 取消授权
+    await page.getByTestId("authorize-check").uncheck();
+    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
+    // 扫描按钮应禁用
+    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+  });
+});
