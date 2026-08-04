@@ -10,8 +10,9 @@
 //! - 未知 schema 返回 `UnknownSchema`
 //! - Backup API 必须保留未 checkpoint WAL 的已提交记录
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, types::ValueRef, Connection, OpenFlags, Row};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use traesync_domain::{
@@ -22,7 +23,8 @@ use traesync_ports::{DatabaseProbePort, SyncPlanEvidencePort, SyncPlanExecutorPo
 
 use crate::fixture_paths::FixturePathGuard;
 use crate::operation_manifest::{
-    has_manual_recovery_required, reconcile_unfinished_manifests, OperationManifestJournal,
+    has_manual_recovery_required, reconcile_unfinished_manifests_with_recovery_handlers,
+    OperationManifestJournal,
 };
 use crate::work_cn_schema::{check_schema, compute_schema_fingerprint, read_table_counts};
 
@@ -31,7 +33,7 @@ pub struct SqlCipherProbe;
 
 /// Work CN 的最小同步执行器。
 ///
-/// T06 首个纵切只支持完整项目跟随；公开入口强制 fixture 路径防护。
+/// T06/T07 执行器支持受限项目跟随与会话重挂；公开入口强制 fixture 路径防护。
 pub struct WorkCnSyncExecutor {
     raw_key: String,
 }
@@ -42,6 +44,7 @@ pub type FollowProjectExecution = SyncPlanExecutionOutcome;
 /// 已固定 guard、目标 DB 与恢复存储根的执行器；只能由 `bind_fixture` 构造。
 pub struct FixtureWorkCnSyncExecutor<'a> {
     executor: &'a WorkCnSyncExecutor,
+    fixture_root: PathBuf,
     target_db_path: PathBuf,
     storage_root: PathBuf,
 }
@@ -57,6 +60,73 @@ enum FollowProjectTransaction {
     Committed(FollowProjectCommit),
     EvidenceChanged,
     Failed,
+}
+
+/// 会话重挂提交后必须由新连接复核的最小关系快照。
+struct AttachSessionsCommit {
+    affected_rows: u64,
+    source_remaining_sessions: i64,
+    target_original_sessions: i64,
+    source_remaining_session_projects: i64,
+    target_original_session_projects: i64,
+    message_count: i64,
+    protected_table_fingerprints: Vec<TableFingerprint>,
+}
+
+/// 不允许改写的表内容摘要；包含消息、正文、缓存、FTS 与未选中关系。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableFingerprint {
+    table_name: String,
+    row_count: u64,
+    content_hash: String,
+}
+
+/// 将允许更新的单元格归一化后做摘要，仍会捕捉其它列或非目标行的任何变动。
+struct AttachSessionMutationScope {
+    selected_session_ids: BTreeSet<String>,
+    selected_artifact_ids: BTreeSet<String>,
+}
+
+/// 会话重挂事务结果与完整项目跟随保持相同的漂移语义。
+enum AttachSessionsTransaction {
+    Committed(AttachSessionsCommit),
+    EvidenceChanged,
+    Failed,
+}
+
+/// 已通过写前预检的唯一可执行动作；其它计划继续显式拒绝。
+enum ExecutableAction<'a> {
+    FollowProject {
+        project_id: &'a str,
+        source_user_id: &'a str,
+        target_user_id: &'a str,
+    },
+    AttachSessions {
+        source_project_id: &'a str,
+        target_project_id: &'a str,
+        session_ids: &'a [traesync_domain::SessionIdentity],
+    },
+}
+
+/// 统一承载两类事务结果，避免后续状态机分叉。
+enum SyncTransaction {
+    FollowProject(FollowProjectTransaction),
+    AttachSessions(AttachSessionsTransaction),
+}
+
+/// 事务已经提交、但还未完成新连接验证的结果。
+enum CommittedAction {
+    FollowProject(FollowProjectCommit),
+    AttachSessions(AttachSessionsCommit),
+}
+
+impl CommittedAction {
+    fn affected_rows(&self) -> u64 {
+        match self {
+            Self::FollowProject(commit) => commit.affected_rows,
+            Self::AttachSessions(commit) => commit.affected_rows,
+        }
+    }
 }
 
 impl WorkCnSyncExecutor {
@@ -79,6 +149,7 @@ impl WorkCnSyncExecutor {
         let storage_root = fixture_guard.validate_fixture_storage_root(storage_root)?;
         Ok(FixtureWorkCnSyncExecutor {
             executor: self,
+            fixture_root: fixture_guard.canonical_root().to_path_buf(),
             target_db_path,
             storage_root,
         })
@@ -164,7 +235,7 @@ impl SyncPlanExecutorPort for FixtureWorkCnSyncExecutor<'_> {
 }
 
 impl FixtureWorkCnSyncExecutor<'_> {
-    /// 按 manifest 状态机执行单个 `FollowProject`；其它动作留给后续 ticket 实现。
+    /// 按 manifest 状态机执行单个受支持动作；其它动作留给后续 ticket 实现。
     fn execute_sync_plan_inner(
         &self,
         plan: &SyncPlan,
@@ -172,7 +243,28 @@ impl FixtureWorkCnSyncExecutor<'_> {
         evidence: &dyn SyncPlanEvidencePort,
     ) -> SyncPlanExecutionOutcome {
         // 先协调旧操作；任一写入中断都进入人工恢复，当前操作不碰目标库。
-        if !reconcile_unfinished_manifests(&self.storage_root)
+        if !reconcile_unfinished_manifests_with_recovery_handlers(
+            &self.storage_root,
+            |journal| {
+                journal.data_location_id() == plan.data_location_id()
+                    && journal
+                        .verified_target_file_evidence()
+                        .is_some_and(|expected| {
+                            target_file_matches_evidence(&self.target_db_path, expected)
+                        })
+            },
+            |journal| {
+                if journal.data_location_id() != plan.data_location_id() {
+                    return false;
+                }
+                preserve_failure_evidence(
+                    journal,
+                    &self.target_db_path,
+                    &self.storage_root,
+                    journal.operation_id(),
+                )
+            },
+        )
             || has_manual_recovery_required(&self.storage_root)
         {
             return SyncPlanExecutionOutcome::ManualRecoveryRequired {
@@ -180,16 +272,32 @@ impl FixtureWorkCnSyncExecutor<'_> {
             };
         }
 
-        let (project_id, source_user_id, target_user_id) = match plan.actions() {
+        let action = match plan.actions() {
             [PlanAction::FollowProject {
                 project_id,
                 from_user_id,
                 to_user_id,
-            }] => (
-                project_id.as_str(),
-                from_user_id.as_str(),
-                to_user_id.as_str(),
-            ),
+            }] => ExecutableAction::FollowProject {
+                project_id: project_id.as_str(),
+                source_user_id: from_user_id.as_str(),
+                target_user_id: to_user_id.as_str(),
+            },
+            [PlanAction::AttachSessions {
+                source_project_id,
+                target_project_id,
+                session_ids,
+            }] if attach_sessions_preflight(
+                &self.target_db_path,
+                &self.executor.raw_key,
+                &self.fixture_root,
+                source_project_id,
+                target_project_id,
+                session_ids,
+            ) => ExecutableAction::AttachSessions {
+                source_project_id: source_project_id.as_str(),
+                target_project_id: target_project_id.as_str(),
+                session_ids,
+            },
             _ => return SyncPlanExecutionOutcome::UnsupportedPlan,
         };
 
@@ -265,22 +373,52 @@ impl FixtureWorkCnSyncExecutor<'_> {
             };
         }
 
-        let committed = match apply_follow_project_transaction_with_evidence(
-            &self.target_db_path,
-            &self.executor.raw_key,
-            project_id,
-            source_user_id,
-            target_user_id,
-            || evidence.is_current(plan) && target_file_matches_plan(&self.target_db_path, plan),
-        ) {
-            FollowProjectTransaction::Committed(commit) => commit,
-            FollowProjectTransaction::EvidenceChanged => {
+        let transaction = match &action {
+            ExecutableAction::FollowProject {
+                project_id,
+                source_user_id,
+                target_user_id,
+            } => SyncTransaction::FollowProject(apply_follow_project_transaction_with_evidence(
+                &self.target_db_path,
+                &self.executor.raw_key,
+                *project_id,
+                *source_user_id,
+                *target_user_id,
+                || evidence.is_current(plan) && target_file_matches_plan(&self.target_db_path, plan),
+            )),
+            ExecutableAction::AttachSessions {
+                source_project_id,
+                target_project_id,
+                session_ids,
+            } => SyncTransaction::AttachSessions(apply_attach_sessions_transaction_with_evidence(
+                &self.target_db_path,
+                &self.executor.raw_key,
+                *source_project_id,
+                *target_project_id,
+                session_ids,
+                || {
+                    evidence.is_current(plan)
+                        && target_file_matches_plan(&self.target_db_path, plan)
+                        && target_sandbox_is_available(&self.fixture_root, target_project_id)
+                },
+            )),
+        };
+        let committed = match transaction {
+            SyncTransaction::FollowProject(FollowProjectTransaction::Committed(commit)) => {
+                CommittedAction::FollowProject(commit)
+            }
+            SyncTransaction::AttachSessions(AttachSessionsTransaction::Committed(commit)) => {
+                CommittedAction::AttachSessions(commit)
+            }
+            SyncTransaction::FollowProject(FollowProjectTransaction::EvidenceChanged)
+            | SyncTransaction::AttachSessions(AttachSessionsTransaction::EvidenceChanged) => {
                 let _ = journal.transition(OperationState::NotApplied);
                 return SyncPlanExecutionOutcome::PlanExpired {
                     backups_preserved: true,
                 };
             }
-            FollowProjectTransaction::Failed => {
+            SyncTransaction::FollowProject(FollowProjectTransaction::Failed)
+            | SyncTransaction::AttachSessions(AttachSessionsTransaction::Failed) => {
                 let _ = journal.transition(OperationState::NotApplied);
                 return SyncPlanExecutionOutcome::FailedBeforeWrite {
                     backups_preserved: true,
@@ -297,20 +435,45 @@ impl FixtureWorkCnSyncExecutor<'_> {
                 &journal,
                 &self.target_db_path,
                 &self.storage_root,
-                plan.operation_id(),
+                plan.operation_id().as_str(),
             );
             return SyncPlanExecutionOutcome::ManualRecoveryRequired {
                 backups_preserved: true,
             };
         }
 
-        let verified = verify_follow_project_after_commit(
-            &self.target_db_path,
-            &self.executor.raw_key,
-            project_id,
-            target_user_id,
-            committed.session_count,
-        );
+        let verified = match (&action, &committed) {
+            (
+                ExecutableAction::FollowProject {
+                    project_id,
+                    target_user_id,
+                    ..
+                },
+                CommittedAction::FollowProject(commit),
+            ) => verify_follow_project_after_commit(
+                &self.target_db_path,
+                &self.executor.raw_key,
+                project_id,
+                target_user_id,
+                commit.session_count,
+            ),
+            (
+                ExecutableAction::AttachSessions {
+                    source_project_id,
+                    target_project_id,
+                    session_ids,
+                },
+                CommittedAction::AttachSessions(commit),
+            ) => verify_attach_sessions_after_commit(
+                &self.target_db_path,
+                &self.executor.raw_key,
+                source_project_id,
+                target_project_id,
+                session_ids,
+                commit,
+            ),
+            _ => false,
+        };
         // 提交后漂移不能撤销已确认目标，但必须继续完整验证且不报告普通成功。
         let post_commit_drift = !evidence.is_current(plan);
         if !verified {
@@ -321,7 +484,7 @@ impl FixtureWorkCnSyncExecutor<'_> {
                     &journal,
                     &self.target_db_path,
                     &self.storage_root,
-                    plan.operation_id(),
+                    plan.operation_id().as_str(),
                 )
                 || journal
                     .transition(OperationState::ManualRecoveryRequired)
@@ -335,12 +498,31 @@ impl FixtureWorkCnSyncExecutor<'_> {
                 backups_preserved: true,
             };
         }
-        if journal.transition(OperationState::Completed).is_err() {
+        // 新连接验证完成后再写入完成；若崩溃在两条状态之间，journal 无独立复核凭据，只能保留现场并人工恢复。
+        let verified_target_file_evidence = match target_file_evidence(&self.target_db_path) {
+            Some(evidence) => evidence,
+            None => {
+                let _ = preserve_failure_evidence(
+                    &journal,
+                    &self.target_db_path,
+                    &self.storage_root,
+                    plan.operation_id().as_str(),
+                );
+                return SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                    backups_preserved: true,
+                };
+            }
+        };
+        if journal
+            .transition_catalog_reconciling(&verified_target_file_evidence)
+            .is_err()
+            || journal.transition(OperationState::Completed).is_err()
+        {
             let _ = preserve_failure_evidence(
                 &journal,
                 &self.target_db_path,
                 &self.storage_root,
-                plan.operation_id(),
+                plan.operation_id().as_str(),
             );
             return SyncPlanExecutionOutcome::ManualRecoveryRequired {
                 backups_preserved: true,
@@ -349,11 +531,11 @@ impl FixtureWorkCnSyncExecutor<'_> {
 
         if post_commit_drift {
             SyncPlanExecutionOutcome::CompletedWithPostCommitEvidenceDrift {
-                affected_rows: committed.affected_rows,
+                affected_rows: committed.affected_rows(),
             }
         } else {
             SyncPlanExecutionOutcome::Completed {
-                affected_rows: committed.affected_rows,
+                affected_rows: committed.affected_rows(),
             }
         }
     }
@@ -450,7 +632,23 @@ fn database_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 
 /// 比较目标三件套与计划固定指纹；存在性变化也视为漂移，不允许继续写入。
 fn target_file_matches_plan(target_db_path: &Path, plan: &SyncPlan) -> bool {
-    let expected = plan.target_file_evidence();
+    target_file_matches_evidence(target_db_path, plan.target_file_evidence())
+}
+
+/// 读取当前目标三件套指纹；主数据库缺失或不可读时不生成可完成凭据。
+fn target_file_evidence(target_db_path: &Path) -> Option<traesync_domain::TargetFileEvidence> {
+    Some(traesync_domain::TargetFileEvidence {
+        db_fingerprint: sha256_file_for_backup(target_db_path)?,
+        wal_fingerprint: sha256_file_for_backup(&database_sidecar_path(target_db_path, "-wal")),
+        shm_fingerprint: sha256_file_for_backup(&database_sidecar_path(target_db_path, "-shm")),
+    })
+}
+
+/// 比较目标三件套与固定指纹；存在性变化也视为漂移，不允许自动完成。
+fn target_file_matches_evidence(
+    target_db_path: &Path,
+    expected: &traesync_domain::TargetFileEvidence,
+) -> bool {
     let current_matches = |path: PathBuf, fingerprint: Option<&String>| match fingerprint {
         Some(expected) => sha256_file_for_backup(&path).as_deref() == Some(expected.as_str()),
         None => !path.exists(),
@@ -471,14 +669,24 @@ fn target_file_matches_plan(target_db_path: &Path, plan: &SyncPlan) -> bool {
 fn capture_failure_evidence(
     target_db_path: &Path,
     storage_root: &Path,
-    operation_id: &traesync_domain::OperationId,
+    operation_id: &str,
 ) -> bool {
     let failure_raw_dir = storage_root
         .join("backups")
-        .join(operation_id.as_str())
+        .join(operation_id)
         .join("failure")
         .join("raw");
-    capture_raw_backup(target_db_path, &failure_raw_dir)
+    let Some(failure_dir) = failure_raw_dir.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(failure_dir).is_err() {
+        return false;
+    }
+    match std::fs::create_dir(&failure_raw_dir) {
+        // 当前调用抢到首次现场目录后才允许写入；后续恢复不得覆盖它。
+        Ok(()) => capture_raw_backup(target_db_path, &failure_raw_dir),
+        Err(_) => verify_raw_backup(&failure_raw_dir),
+    }
 }
 
 /// 写后异常先持久化现场保存意图，再捕获目标三件套并记录验证完成。
@@ -486,7 +694,7 @@ fn preserve_failure_evidence(
     journal: &OperationManifestJournal,
     target_db_path: &Path,
     storage_root: &Path,
-    operation_id: &traesync_domain::OperationId,
+    operation_id: &str,
 ) -> bool {
     journal
         .transition(OperationState::FailurePreserving)
@@ -675,6 +883,816 @@ fn verify_follow_project_after_commit(
         && session_count == expected_session_count
         && cipher_ok
         && sqlite_ok
+}
+
+/// 仅接受文件名安全且已存在的目标 sandbox 配置；缺失时不进入事务。
+fn target_sandbox_is_available(fixture_root: &Path, target_project_id: &str) -> bool {
+    !target_project_id.is_empty()
+        && !target_project_id.contains(['/', '\\'])
+        && fixture_root
+            .join("sandbox")
+            .join(format!("{target_project_id}.json"))
+            .is_file()
+}
+
+/// 会话重挂所需映射固定在已验证 schema 中；未知直接项目关系表一律拒绝。
+fn attach_relation_schema_supported(conn: &Connection) -> bool {
+    const SUPPORTED_COLUMNS: &[(&str, &[&str])] = &[
+        ("project", &["project_id", "user_id", "biz_project_id"]),
+        ("chat_session", &["session_id", "project_id"]),
+        ("chat_message", &["message_id", "session_id", "body"]),
+        ("session_project", &["session_id", "project_id"]),
+        ("snapshot", &["snapshot_id", "chat_session_id", "project_id"]),
+        ("staging", &["staging_id", "chat_session_id", "project_id"]),
+        (
+            "local_artifact",
+            &[
+                "artifact_id",
+                "source_session_id",
+                "source_project_id",
+                "user_id",
+            ],
+        ),
+        (
+            "local_artifact_version",
+            &["version_id", "artifact_id", "source_project_id"],
+        ),
+        // 当前映射已经验证的 fixture FTS；其它携带直接引用的表必须先补证据。
+        ("chat_fts", &["session_id", "indexed_body"]),
+    ];
+
+    for (table, supported_columns) in SUPPORTED_COLUMNS {
+        let Some(columns) = table_columns(conn, table) else {
+            return false;
+        };
+        let expected_columns = supported_columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<BTreeSet<_>>();
+        if columns != expected_columns {
+            return false;
+        }
+    }
+
+    let mut statement = match conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return false,
+    };
+    let tables = match statement.query_map([], |row| row.get::<_, String>(0)) {
+        Ok(tables) => tables,
+        Err(_) => return false,
+    };
+    for table in tables {
+        let table = match table {
+            Ok(table) => table,
+            Err(_) => return false,
+        };
+        if !SUPPORTED_COLUMNS
+            .iter()
+            .any(|(supported_table, _)| *supported_table == table)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// 在创建 manifest 和备份前验证 sandbox、schema 与选中关系，避免无效计划进入写入阶段。
+fn attach_sessions_preflight(
+    target_db_path: &Path,
+    raw_key: &str,
+    fixture_root: &Path,
+    source_project_id: &str,
+    target_project_id: &str,
+    session_ids: &[traesync_domain::SessionIdentity],
+) -> bool {
+    if source_project_id == target_project_id
+        || session_ids.is_empty()
+        || !target_sandbox_is_available(fixture_root, target_project_id)
+    {
+        return false;
+    }
+    let conn = match open_with_key_readonly(target_db_path, raw_key) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    if !attach_relation_schema_supported(&conn) {
+        return false;
+    }
+
+    let source_user_id: String = match conn.query_row(
+        "SELECT user_id FROM project WHERE project_id = ?1",
+        params![source_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(user_id) if !user_id.is_empty() => user_id,
+        _ => return false,
+    };
+    let target_user_id: String = match conn.query_row(
+        "SELECT user_id FROM project WHERE project_id = ?1",
+        params![target_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(user_id) if !user_id.is_empty() => user_id,
+        _ => return false,
+    };
+    if source_user_id == target_user_id {
+        return false;
+    }
+    let source_biz_project_id: String = match conn.query_row(
+        "SELECT biz_project_id FROM project WHERE project_id = ?1",
+        params![source_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(project_id) if !project_id.is_empty() => project_id,
+        _ => return false,
+    };
+    let target_biz_project_id: String = match conn.query_row(
+        "SELECT biz_project_id FROM project WHERE project_id = ?1",
+        params![target_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(project_id) if !project_id.is_empty() => project_id,
+        _ => return false,
+    };
+    if source_biz_project_id != target_biz_project_id {
+        return false;
+    }
+
+    let mut seen_session_ids = BTreeSet::new();
+    for session in session_ids {
+        let session_id = session.original_session_id.as_str();
+        if session.product_history_namespace != "work_cn"
+            || session_id.is_empty()
+            || !seen_session_ids.insert(session_id)
+        {
+            return false;
+        }
+        let source_session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id = ?1 AND project_id = ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let source_relation_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_project WHERE session_id = ?1 AND project_id = ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let total_relation_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_project WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let snapshot_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot WHERE chat_session_id = ?1 AND project_id <> ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let staging_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM staging WHERE chat_session_id = ?1 AND project_id <> ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let artifact_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_artifact WHERE source_session_id = ?1 AND (source_project_id <> ?2 OR user_id <> ?3)",
+                params![session_id, source_project_id, source_user_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let artifact_version_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_artifact_version version INNER JOIN local_artifact artifact ON artifact.artifact_id = version.artifact_id WHERE artifact.source_session_id = ?1 AND version.source_project_id <> ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        if source_session_count != 1
+            || source_relation_count != 1
+            || total_relation_count != 1
+            || snapshot_mismatch_count != 0
+            || staging_mismatch_count != 0
+            || artifact_mismatch_count != 0
+            || artifact_version_mismatch_count != 0
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// 使用参数绑定的单事务重挂；每张允许表按选中 session 精确更新。
+fn apply_attach_sessions_transaction_with_evidence<F>(
+    target_db_path: &Path,
+    raw_key: &str,
+    source_project_id: &str,
+    target_project_id: &str,
+    session_ids: &[traesync_domain::SessionIdentity],
+    before_commit: F,
+) -> AttachSessionsTransaction
+where
+    F: FnOnce() -> bool,
+{
+    let mut conn = match open_with_key(target_db_path, raw_key) {
+        Ok(conn) => conn,
+        Err(_) => return AttachSessionsTransaction::Failed,
+    };
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(_) => return AttachSessionsTransaction::Failed,
+    };
+    if !attach_relation_schema_supported(&tx) || session_ids.is_empty() {
+        return AttachSessionsTransaction::Failed;
+    }
+
+    let source_user_id: String = match tx.query_row(
+        "SELECT user_id FROM project WHERE project_id = ?1",
+        params![source_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(user_id) if !user_id.is_empty() => user_id,
+        _ => return AttachSessionsTransaction::Failed,
+    };
+    let target_user_id: String = match tx.query_row(
+        "SELECT user_id FROM project WHERE project_id = ?1",
+        params![target_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(user_id) if !user_id.is_empty() => user_id,
+        _ => return AttachSessionsTransaction::Failed,
+    };
+    if source_project_id == target_project_id || source_user_id == target_user_id {
+        return AttachSessionsTransaction::Failed;
+    }
+    let source_biz_project_id: String = match tx.query_row(
+        "SELECT biz_project_id FROM project WHERE project_id = ?1",
+        params![source_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(project_id) if !project_id.is_empty() => project_id,
+        _ => return AttachSessionsTransaction::Failed,
+    };
+    let target_biz_project_id: String = match tx.query_row(
+        "SELECT biz_project_id FROM project WHERE project_id = ?1",
+        params![target_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(project_id) if !project_id.is_empty() => project_id,
+        _ => return AttachSessionsTransaction::Failed,
+    };
+    if source_biz_project_id != target_biz_project_id {
+        return AttachSessionsTransaction::Failed;
+    }
+
+    let source_session_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM chat_session WHERE project_id = ?1",
+            params![source_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let target_session_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM chat_session WHERE project_id = ?1",
+            params![target_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let source_relation_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM session_project WHERE project_id = ?1",
+            params![source_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let target_relation_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM session_project WHERE project_id = ?1",
+            params![target_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let message_count: i64 = tx
+        .query_row("SELECT COUNT(*) FROM chat_message", [], |row| row.get(0))
+        .unwrap_or(-1);
+    let mutation_scope = match AttachSessionMutationScope::from_source(
+        &tx,
+        source_project_id,
+        &source_user_id,
+        session_ids,
+    ) {
+        Some(scope) => scope,
+        None => return AttachSessionsTransaction::Failed,
+    };
+    // 对每个用户表保留内容摘要，仅把明确允许的单元格归一化。
+    let protected_table_fingerprints = match fingerprint_protected_tables(&tx, &mutation_scope) {
+        Some(fingerprints) => fingerprints,
+        None => return AttachSessionsTransaction::Failed,
+    };
+    let selected_count = session_ids.len() as i64;
+    if source_session_count < selected_count || source_relation_count < selected_count {
+        return AttachSessionsTransaction::Failed;
+    }
+
+    let mut affected_rows = 0_u64;
+    let mut seen_session_ids = BTreeSet::new();
+    for session in session_ids {
+        let session_id = session.original_session_id.as_str();
+        if session.product_history_namespace != "work_cn"
+            || session_id.is_empty()
+            || !seen_session_ids.insert(session_id)
+        {
+            return AttachSessionsTransaction::Failed;
+        }
+
+        let snapshot_mismatch_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot WHERE chat_session_id = ?1 AND project_id <> ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let total_relation_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM session_project WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let staging_mismatch_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM staging WHERE chat_session_id = ?1 AND project_id <> ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let artifact_mismatch_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM local_artifact WHERE source_session_id = ?1 AND (source_project_id <> ?2 OR user_id <> ?3)",
+                params![session_id, source_project_id, source_user_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        if total_relation_count != 1
+            || snapshot_mismatch_count != 0
+            || staging_mismatch_count != 0
+            || artifact_mismatch_count != 0
+        {
+            return AttachSessionsTransaction::Failed;
+        }
+
+        let artifact_version_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM local_artifact_version version INNER JOIN local_artifact artifact ON artifact.artifact_id = version.artifact_id WHERE artifact.source_session_id = ?1 AND artifact.source_project_id = ?2 AND version.source_project_id = ?2",
+                params![session_id, source_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        if artifact_version_count < 0 {
+            return AttachSessionsTransaction::Failed;
+        }
+
+        let changed_sessions = tx
+            .execute(
+                "UPDATE chat_session SET project_id = ?1 WHERE session_id = ?2 AND project_id = ?3",
+                params![target_project_id, session_id, source_project_id],
+            )
+            .unwrap_or(0);
+        let changed_session_projects = tx
+            .execute(
+                "UPDATE session_project SET project_id = ?1 WHERE session_id = ?2 AND project_id = ?3",
+                params![target_project_id, session_id, source_project_id],
+            )
+            .unwrap_or(0);
+        if changed_sessions != 1 || changed_session_projects != 1 {
+            return AttachSessionsTransaction::Failed;
+        }
+        let changed_snapshots = tx
+            .execute(
+                "UPDATE snapshot SET project_id = ?1 WHERE chat_session_id = ?2 AND project_id = ?3",
+                params![target_project_id, session_id, source_project_id],
+            )
+            .unwrap_or(usize::MAX);
+        let changed_staging = tx
+            .execute(
+                "UPDATE staging SET project_id = ?1 WHERE chat_session_id = ?2 AND project_id = ?3",
+                params![target_project_id, session_id, source_project_id],
+            )
+            .unwrap_or(usize::MAX);
+        let changed_artifacts = tx
+            .execute(
+                "UPDATE local_artifact SET source_project_id = ?1, user_id = ?2 WHERE source_session_id = ?3 AND source_project_id = ?4 AND user_id = ?5",
+                params![target_project_id, target_user_id, session_id, source_project_id, source_user_id],
+            )
+            .unwrap_or(usize::MAX);
+        let changed_artifact_versions = tx
+            .execute(
+                "UPDATE local_artifact_version SET source_project_id = ?1 WHERE source_project_id = ?2 AND artifact_id IN (SELECT artifact_id FROM local_artifact WHERE source_session_id = ?3 AND source_project_id = ?1)",
+                params![target_project_id, source_project_id, session_id],
+            )
+            .unwrap_or(usize::MAX);
+        if changed_snapshots == usize::MAX
+            || changed_staging == usize::MAX
+            || changed_artifacts == usize::MAX
+            || changed_artifact_versions == usize::MAX
+            || changed_artifact_versions as i64 != artifact_version_count
+        {
+            return AttachSessionsTransaction::Failed;
+        }
+        affected_rows += (changed_sessions
+            + changed_session_projects
+            + changed_snapshots
+            + changed_staging
+            + changed_artifacts
+            + changed_artifact_versions) as u64;
+    }
+
+    // 提交前最后一次证据和 sandbox 检查失败时，drop 事务保证目标零改动。
+    if !before_commit() {
+        return AttachSessionsTransaction::EvidenceChanged;
+    }
+    if tx.commit().is_err() {
+        return AttachSessionsTransaction::Failed;
+    }
+    AttachSessionsTransaction::Committed(AttachSessionsCommit {
+        affected_rows,
+        source_remaining_sessions: source_session_count - selected_count,
+        target_original_sessions: target_session_count,
+        source_remaining_session_projects: source_relation_count - selected_count,
+        target_original_session_projects: target_relation_count,
+        message_count,
+        protected_table_fingerprints,
+    })
+}
+
+/// 提交后用新只读连接验证选中关系、未选数量、消息、FTS 和双层完整性。
+fn verify_attach_sessions_after_commit(
+    target_db_path: &Path,
+    raw_key: &str,
+    source_project_id: &str,
+    target_project_id: &str,
+    session_ids: &[traesync_domain::SessionIdentity],
+    commit: &AttachSessionsCommit,
+) -> bool {
+    let conn = match open_with_key_readonly(target_db_path, raw_key) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    if !attach_relation_schema_supported(&conn) {
+        return false;
+    }
+    let target_user_id: String = match conn.query_row(
+        "SELECT user_id FROM project WHERE project_id = ?1",
+        params![target_project_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(user_id) if !user_id.is_empty() => user_id,
+        _ => return false,
+    };
+
+    for session in session_ids {
+        let session_id = session.original_session_id.as_str();
+        let target_session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id = ?1 AND project_id = ?2",
+                params![session_id, target_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let target_relation_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_project WHERE session_id = ?1 AND project_id = ?2",
+                params![session_id, target_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let snapshot_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot WHERE chat_session_id = ?1 AND project_id <> ?2",
+                params![session_id, target_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let staging_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM staging WHERE chat_session_id = ?1 AND project_id <> ?2",
+                params![session_id, target_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let artifact_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_artifact WHERE source_session_id = ?1 AND (source_project_id <> ?2 OR user_id <> ?3)",
+                params![session_id, target_project_id, target_user_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        let artifact_version_mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_artifact_version version INNER JOIN local_artifact artifact ON artifact.artifact_id = version.artifact_id WHERE artifact.source_session_id = ?1 AND version.source_project_id <> ?2",
+                params![session_id, target_project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        if target_session_count != 1
+            || target_relation_count != 1
+            || snapshot_mismatch_count != 0
+            || staging_mismatch_count != 0
+            || artifact_mismatch_count != 0
+            || artifact_version_mismatch_count != 0
+        {
+            return false;
+        }
+    }
+
+    let selected_count = session_ids.len() as i64;
+    let source_session_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chat_session WHERE project_id = ?1",
+            params![source_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let target_session_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chat_session WHERE project_id = ?1",
+            params![target_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let source_relation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_project WHERE project_id = ?1",
+            params![source_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let target_relation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_project WHERE project_id = ?1",
+            params![target_project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let message_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chat_message", [], |row| row.get(0))
+        .unwrap_or(-1);
+    let (cipher_ok, sqlite_ok) = run_integrity_checks_on_connection(&conn);
+
+    source_session_count == commit.source_remaining_sessions
+        && target_session_count == commit.target_original_sessions + selected_count
+        && source_relation_count == commit.source_remaining_session_projects
+        && target_relation_count == commit.target_original_session_projects + selected_count
+        && message_count == commit.message_count
+        && AttachSessionMutationScope::from_target(&conn, target_project_id, session_ids)
+            .and_then(|scope| fingerprint_protected_tables(&conn, &scope))
+            == Some(commit.protected_table_fingerprints.clone())
+        && cipher_ok
+        && sqlite_ok
+}
+
+impl AttachSessionMutationScope {
+    /// 提交前从来源关系固定受许可的会话和 artifact ID，防止事务扩大更新范围。
+    fn from_source(
+        conn: &Connection,
+        source_project_id: &str,
+        source_user_id: &str,
+        session_ids: &[traesync_domain::SessionIdentity],
+    ) -> Option<Self> {
+        let selected_session_ids = selected_session_ids(session_ids)?;
+        let selected_artifact_ids = artifact_ids_for_sessions(
+            conn,
+            source_project_id,
+            source_user_id,
+            &selected_session_ids,
+        )?;
+        Some(Self {
+            selected_session_ids,
+            selected_artifact_ids,
+        })
+    }
+
+    /// 提交后从目标关系重建同一许可范围，再与提交前摘要比较。
+    fn from_target(
+        conn: &Connection,
+        target_project_id: &str,
+        session_ids: &[traesync_domain::SessionIdentity],
+    ) -> Option<Self> {
+        let selected_session_ids = selected_session_ids(session_ids)?;
+        let target_user_id: String = conn
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = ?1",
+                params![target_project_id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let selected_artifact_ids = artifact_ids_for_sessions(
+            conn,
+            target_project_id,
+            &target_user_id,
+            &selected_session_ids,
+        )?;
+        Some(Self {
+            selected_session_ids,
+            selected_artifact_ids,
+        })
+    }
+
+    /// 只有规格列出的关系单元格可归一化，其余字段、行和表必须逐字保持。
+    fn allows_cell(&self, table: &str, columns: &[String], values: &[Vec<u8>], column: &str) -> bool {
+        let text_at = |name: &str| {
+            columns
+                .iter()
+                .position(|candidate| candidate == name)
+                .and_then(|index| values.get(index))
+                .and_then(|value| value.strip_prefix(&[b't']))
+                .and_then(|value| std::str::from_utf8(value).ok())
+        };
+        match (table, column) {
+            ("chat_session" | "session_project", "project_id") => text_at("session_id")
+                .is_some_and(|session_id| self.selected_session_ids.contains(session_id)),
+            ("snapshot" | "staging", "project_id") => text_at("chat_session_id")
+                .is_some_and(|session_id| self.selected_session_ids.contains(session_id)),
+            ("local_artifact", "source_project_id" | "user_id") => text_at("source_session_id")
+                .is_some_and(|session_id| self.selected_session_ids.contains(session_id)),
+            ("local_artifact_version", "source_project_id") => text_at("artifact_id")
+                .is_some_and(|artifact_id| self.selected_artifact_ids.contains(artifact_id)),
+            _ => false,
+        }
+    }
+}
+
+/// 固化每个选中会话，拒绝空 ID、重复 ID 或非 Work CN 命名空间。
+fn selected_session_ids(
+    session_ids: &[traesync_domain::SessionIdentity],
+) -> Option<BTreeSet<String>> {
+    let mut selected_session_ids = BTreeSet::new();
+    for session in session_ids {
+        if session.product_history_namespace != "work_cn"
+            || session.original_session_id.is_empty()
+            || !selected_session_ids.insert(session.original_session_id.clone())
+        {
+            return None;
+        }
+    }
+    Some(selected_session_ids)
+}
+
+/// 只收集计划会话当前归属的 artifact，避免版本表更新被同 ID 记录放大。
+fn artifact_ids_for_sessions(
+    conn: &Connection,
+    project_id: &str,
+    user_id: &str,
+    session_ids: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let mut artifact_ids = BTreeSet::new();
+    for session_id in session_ids {
+        let mut statement = conn
+            .prepare(
+                "SELECT artifact_id FROM local_artifact WHERE source_session_id = ?1 AND source_project_id = ?2 AND user_id = ?3",
+            )
+            .ok()?;
+        let rows = statement
+            .query_map(params![session_id, project_id, user_id], |row| row.get::<_, String>(0))
+            .ok()?;
+        for artifact_id in rows {
+            artifact_ids.insert(artifact_id.ok()?);
+        }
+    }
+    Some(artifact_ids)
+}
+
+/// 遍历全部用户表，保证消息、正文、缓存、FTS 和非目标关系均未被事务或触发器改写。
+fn fingerprint_protected_tables(
+    conn: &Connection,
+    mutation_scope: &AttachSessionMutationScope,
+) -> Option<Vec<TableFingerprint>> {
+    let mut statement = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    ).ok()?;
+    let table_names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .ok()?;
+    let mut fingerprints = Vec::new();
+    for table_name in table_names {
+        let table_name = table_name.ok()?;
+        fingerprints.push(fingerprint_table(conn, &table_name, mutation_scope)?);
+    }
+    Some(fingerprints)
+}
+
+/// 对单表按稳定 rowid 顺序编码。没有 rowid 或无法读取的 schema 一律拒绝写入。
+fn fingerprint_table(
+    conn: &Connection,
+    table_name: &str,
+    mutation_scope: &AttachSessionMutationScope,
+) -> Option<TableFingerprint> {
+    let query = format!(
+        "SELECT * FROM {} ORDER BY rowid",
+        quote_sql_identifier(table_name)
+    );
+    let mut statement = conn.prepare(&query).ok()?;
+    let columns = statement
+        .column_names()
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect::<Vec<_>>();
+    let mut rows = statement.query([]).ok()?;
+    let mut row_count = 0_u64;
+    let mut hasher = Sha256::new();
+    hasher.update(table_name.as_bytes());
+    hasher.update([0]);
+    for column in &columns {
+        hasher.update(column.as_bytes());
+        hasher.update([0]);
+    }
+
+    while let Some(row) = rows.next().ok()? {
+        let values = row_values(row, columns.len())?;
+        for (index, column) in columns.iter().enumerate() {
+            hasher.update(column.as_bytes());
+            hasher.update([0]);
+            if mutation_scope.allows_cell(table_name, &columns, &values, column) {
+                hasher.update(b"allowed-relationship-change");
+            } else {
+                hasher.update((values[index].len() as u64).to_le_bytes());
+                hasher.update(&values[index]);
+            }
+            hasher.update([0]);
+        }
+        row_count += 1;
+    }
+
+    Some(TableFingerprint {
+        table_name: table_name.to_string(),
+        row_count,
+        content_hash: hex::encode(hasher.finalize()),
+    })
+}
+
+/// 将 SQLite 值编码为带类型标签的字节，避免文本、数字或 blob 间出现歧义碰撞。
+fn row_values(row: &Row<'_>, column_count: usize) -> Option<Vec<Vec<u8>>> {
+    (0..column_count)
+        .map(|index| {
+            let value = row.get_ref(index).ok()?;
+            Some(match value {
+                ValueRef::Null => vec![b'n'],
+                ValueRef::Integer(value) => {
+                    let mut bytes = vec![b'i'];
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                    bytes
+                }
+                ValueRef::Real(value) => {
+                    let mut bytes = vec![b'r'];
+                    bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+                    bytes
+                }
+                ValueRef::Text(value) => {
+                    let mut bytes = vec![b't'];
+                    bytes.extend_from_slice(value);
+                    bytes
+                }
+                ValueRef::Blob(value) => {
+                    let mut bytes = vec![b'b'];
+                    bytes.extend_from_slice(value);
+                    bytes
+                }
+            })
+        })
+        .collect()
+}
+
+/// SQLite PRAGMA 和表计数只能插入标识符；此处通过双引号转义消除注入面。
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// 读取表列集合；失败视为 schema 未被当前映射支持。
+fn table_columns(conn: &Connection, table: &str) -> Option<BTreeSet<String>> {
+    let query = format!("PRAGMA table_info({})", quote_sql_identifier(table));
+    let mut statement = conn.prepare(&query).ok()?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .ok()?;
+    let mut result = BTreeSet::new();
+    for column in columns {
+        result.insert(column.ok()?);
+    }
+    Some(result)
 }
 
 impl Default for SqlCipherProbe {
@@ -1195,6 +2213,71 @@ mod tests {
         })
     }
 
+    /// 构造仅把选中会话挂到目标已存在项目的不可变计划。
+    fn attach_sessions_plan(db_path: &Path, selected_session_ids: &[&str]) -> SyncPlan {
+        traesync_domain::build_sync_plan(traesync_domain::BuildSyncPlanInput {
+            created_at: SystemTime::UNIX_EPOCH,
+            platform_id: "work_cn".to_string(),
+            data_location_id: "fixture-location".to_string(),
+            current_user_id: "2000000000000002".to_string(),
+            account_evidence_fingerprint: "fixture-account".to_string(),
+            target_file_evidence: traesync_domain::TargetFileEvidence {
+                db_fingerprint: sha256_file_for_backup(db_path).unwrap(),
+                wal_fingerprint: sha256_file_for_backup(&database_sidecar_path(db_path, "-wal")),
+                shm_fingerprint: sha256_file_for_backup(&database_sidecar_path(db_path, "-shm")),
+            },
+            schema_fingerprint: "fixture-schema".to_string(),
+            mapping_version: "work_cn_v1".to_string(),
+            schema_compatible: true,
+            scope: traesync_domain::SyncScope::Custom {
+                account_ids: vec![],
+                project_ids: vec![],
+                session_ids: selected_session_ids
+                    .iter()
+                    .map(|session_id| traesync_domain::SessionIdentity::new("work_cn", session_id))
+                    .collect(),
+            },
+            projects: vec![
+                traesync_domain::PlanProjectInput {
+                    identity: traesync_domain::ProjectIdentity {
+                        project_id: "p-source".to_string(),
+                        biz_project_id: "biz-shared".to_string(),
+                        display_name: "source fixture project".to_string(),
+                        soft_deleted: false,
+                    },
+                    display_owner: "1000000000000001".to_string(),
+                    current_live_owner: "1000000000000001".to_string(),
+                    sessions: vec![
+                        traesync_domain::PlanSessionInput {
+                            identity: traesync_domain::SessionIdentity::new("work_cn", "s1"),
+                            version_available: true,
+                        },
+                        traesync_domain::PlanSessionInput {
+                            identity: traesync_domain::SessionIdentity::new("work_cn", "s2"),
+                            version_available: true,
+                        },
+                    ],
+                    archived_only: false,
+                },
+                traesync_domain::PlanProjectInput {
+                    identity: traesync_domain::ProjectIdentity {
+                        project_id: "p-target".to_string(),
+                        biz_project_id: "biz-shared".to_string(),
+                        display_name: "target fixture project".to_string(),
+                        soft_deleted: false,
+                    },
+                    display_owner: "2000000000000002".to_string(),
+                    current_live_owner: "2000000000000002".to_string(),
+                    sessions: vec![traesync_domain::PlanSessionInput {
+                        identity: traesync_domain::SessionIdentity::new("work_cn", "target-session"),
+                        version_available: true,
+                    }],
+                    archived_only: false,
+                },
+            ],
+        })
+    }
+
     /// 测试仅直接构造私有执行核心；生产只能通过 `bind_fixture` 创建执行器。
     fn fixture_executor<'a>(
         executor: &'a WorkCnSyncExecutor,
@@ -1203,6 +2286,7 @@ mod tests {
     ) -> FixtureWorkCnSyncExecutor<'a> {
         FixtureWorkCnSyncExecutor {
             executor,
+            fixture_root: db_path.parent().unwrap().to_path_buf(),
             target_db_path: db_path.to_path_buf(),
             storage_root: storage_root.to_path_buf(),
         }
@@ -1276,6 +2360,734 @@ mod tests {
         // 关闭连接让 WAL 落盘
         drop(conn);
         db_path
+    }
+
+    /// 构造包含全部受限关系的会话重挂 fixture，并提供目标项目 sandbox。
+    fn make_attach_sessions_fixture(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir.join("sandbox")).unwrap();
+        std::fs::write(dir.join("sandbox").join("p-target.json"), b"{}").unwrap();
+
+        let db_path = dir.join("database.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", TEST_RAW_KEY))
+            .unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (
+                project_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                biz_project_id TEXT NOT NULL,
+                UNIQUE (biz_project_id, user_id)
+            );
+            CREATE TABLE chat_session (
+                session_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL
+            );
+            CREATE TABLE chat_message (
+                message_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                body TEXT NOT NULL
+            );
+            CREATE TABLE session_project (
+                session_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL
+            );
+            CREATE TABLE snapshot (
+                snapshot_id TEXT PRIMARY KEY,
+                chat_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL
+            );
+            CREATE TABLE staging (
+                staging_id TEXT PRIMARY KEY,
+                chat_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL
+            );
+            CREATE TABLE local_artifact (
+                artifact_id TEXT PRIMARY KEY,
+                source_session_id TEXT NOT NULL,
+                source_project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL
+            );
+            CREATE TABLE local_artifact_version (
+                version_id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                source_project_id TEXT NOT NULL
+            );
+            CREATE TABLE chat_fts (
+                session_id TEXT PRIMARY KEY,
+                indexed_body TEXT NOT NULL
+            );
+            INSERT INTO project VALUES ('p-source', '1000000000000001', 'biz-shared');
+            INSERT INTO project VALUES ('p-target', '2000000000000002', 'biz-shared');
+            INSERT INTO chat_session VALUES ('s1', 'p-source');
+            INSERT INTO chat_session VALUES ('s2', 'p-source');
+            INSERT INTO chat_session VALUES ('target-session', 'p-target');
+            INSERT INTO chat_message VALUES ('m1', 's1', 'source one body');
+            INSERT INTO chat_message VALUES ('m2', 's2', 'source two body');
+            INSERT INTO chat_message VALUES ('m3', 'target-session', 'target body');
+            INSERT INTO session_project VALUES ('s1', 'p-source');
+            INSERT INTO session_project VALUES ('s2', 'p-source');
+            INSERT INTO session_project VALUES ('target-session', 'p-target');
+            INSERT INTO snapshot VALUES ('snapshot-1', 's1', 'p-source');
+            INSERT INTO snapshot VALUES ('snapshot-2', 's2', 'p-source');
+            INSERT INTO staging VALUES ('staging-1', 's1', 'p-source');
+            INSERT INTO staging VALUES ('staging-2', 's2', 'p-source');
+            INSERT INTO local_artifact VALUES ('artifact-1', 's1', 'p-source', '1000000000000001');
+            INSERT INTO local_artifact VALUES ('artifact-2', 's2', 'p-source', '1000000000000001');
+            INSERT INTO local_artifact_version VALUES ('artifact-version-1', 'artifact-1', 'p-source');
+            INSERT INTO local_artifact_version VALUES ('artifact-version-2', 'artifact-2', 'p-source');
+            INSERT INTO chat_fts VALUES ('s1', 'source one body');
+            INSERT INTO chat_fts VALUES ('s2', 'source two body');
+            INSERT INTO chat_fts VALUES ('target-session', 'target body');
+            "#,
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+        db_path
+    }
+
+    #[test]
+    fn attach_sessions_updates_only_selected_relationships() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+        let evidence = SequencedEvidence {
+            current_through: usize::MAX,
+            calls: AtomicUsize::new(0),
+        };
+
+        assert!(matches!(
+            plan.actions(),
+            [PlanAction::AttachSessions { source_project_id, target_project_id, session_ids }]
+                if source_project_id == "p-source"
+                    && target_project_id == "p-target"
+                    && session_ids == &[traesync_domain::SessionIdentity::new("work_cn", "s1")]
+        ));
+
+        let outcome = fixture_executor(&executor, &db_path, storage.path()).execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &evidence,
+        );
+
+        assert!(matches!(
+            outcome,
+            SyncPlanExecutionOutcome::Completed { affected_rows } if affected_rows >= 6
+        ));
+        assert_eq!(table_value(&db_path, "chat_session", "project_id", "session_id", "s1"), Some("p-target".to_string()));
+        assert_eq!(table_value(&db_path, "session_project", "project_id", "session_id", "s1"), Some("p-target".to_string()));
+        assert_eq!(table_value(&db_path, "snapshot", "project_id", "chat_session_id", "s1"), Some("p-target".to_string()));
+        assert_eq!(table_value(&db_path, "staging", "project_id", "chat_session_id", "s1"), Some("p-target".to_string()));
+        assert_eq!(table_value(&db_path, "local_artifact", "source_project_id", "artifact_id", "artifact-1"), Some("p-target".to_string()));
+        assert_eq!(table_value(&db_path, "local_artifact", "user_id", "artifact_id", "artifact-1"), Some("2000000000000002".to_string()));
+        assert_eq!(table_value(&db_path, "local_artifact_version", "source_project_id", "artifact_id", "artifact-1"), Some("p-target".to_string()));
+        assert_eq!(table_value(&db_path, "chat_session", "project_id", "session_id", "s2"), Some("p-source".to_string()));
+        assert_eq!(table_value(&db_path, "local_artifact", "source_project_id", "artifact_id", "artifact-2"), Some("p-source".to_string()));
+        assert_eq!(table_value(&db_path, "chat_message", "body", "message_id", "m1"), Some("source one body".to_string()));
+        assert_eq!(table_value(&db_path, "chat_fts", "indexed_body", "session_id", "s1"), Some("source one body".to_string()));
+    }
+
+    #[test]
+    fn attach_sessions_updates_every_selected_session_without_touching_content() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let plan = attach_sessions_plan(&db_path, &["s1", "s2"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            SyncPlanExecutionOutcome::Completed { affected_rows } if affected_rows >= 12
+        ));
+        for session_id in ["s1", "s2"] {
+            assert_eq!(
+                table_value(&db_path, "chat_session", "project_id", "session_id", session_id),
+                Some("p-target".to_string())
+            );
+            assert_eq!(
+                table_value(
+                    &db_path,
+                    "session_project",
+                    "project_id",
+                    "session_id",
+                    session_id
+                ),
+                Some("p-target".to_string())
+            );
+        }
+        assert_eq!(
+            table_value(&db_path, "chat_message", "body", "message_id", "m1"),
+            Some("source one body".to_string())
+        );
+        assert_eq!(
+            table_value(&db_path, "chat_message", "body", "message_id", "m2"),
+            Some("source two body".to_string())
+        );
+        assert_eq!(
+            table_value(&db_path, "chat_fts", "indexed_body", "session_id", "s1"),
+            Some("source one body".to_string())
+        );
+        assert_eq!(
+            table_value(&db_path, "chat_fts", "indexed_body", "session_id", "s2"),
+            Some("source two body".to_string())
+        );
+    }
+
+    #[test]
+    fn attach_sessions_rejects_missing_target_sandbox_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let before = snapshot_db_trio(target.path(), "database.db");
+        std::fs::remove_file(target.path().join("sandbox").join("p-target.json")).unwrap();
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+        assert!(!storage.path().join("backups").exists());
+    }
+
+    #[test]
+    fn attach_sessions_rejects_unknown_project_reference_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        conn.execute_batch("CREATE TABLE unknown_project_reference (project_id TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+    }
+
+    #[test]
+    fn attach_sessions_rejects_unknown_session_reference_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        conn.execute_batch("CREATE TABLE unknown_session_reference (session_id TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+    }
+
+    #[test]
+    fn attach_sessions_rejects_unmapped_table_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        conn.execute_batch("CREATE TABLE unmapped_cache (cache_key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+    }
+
+    #[test]
+    fn attach_sessions_rejects_unmapped_column_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        conn.execute_batch("ALTER TABLE local_artifact ADD COLUMN project_ref TEXT;")
+            .unwrap();
+        drop(conn);
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+    }
+
+    #[test]
+    fn attach_sessions_rejects_ambiguous_session_relation_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE session_project RENAME TO session_project_original;\
+             CREATE TABLE session_project (session_id TEXT NOT NULL, project_id TEXT NOT NULL);\
+             INSERT INTO session_project SELECT session_id, project_id FROM session_project_original;\
+             DROP TABLE session_project_original;\
+             INSERT INTO session_project (session_id, project_id) VALUES ('s1', 'p-other');",
+        )
+        .unwrap();
+        drop(conn);
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+        assert!(!storage.path().join("backups").exists());
+    }
+
+    #[test]
+    fn attach_sessions_rejects_incomplete_session_relation_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        conn.execute("DELETE FROM session_project WHERE session_id = ?1", params!["s1"])
+            .unwrap();
+        drop(conn);
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+    }
+
+    #[test]
+    fn attach_sessions_rejects_target_project_with_different_identity_before_backup() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        conn.execute(
+            "UPDATE project SET biz_project_id = ?1 WHERE project_id = ?2",
+            params!["other-project", "p-target"],
+        )
+        .unwrap();
+        drop(conn);
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(outcome, SyncPlanExecutionOutcome::UnsupportedPlan);
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert!(!storage.path().join("operations").exists());
+    }
+
+    #[test]
+    fn restarted_postwrite_manifest_captures_failure_scene_without_replaying_attach_sessions() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+        let interrupted_operation_id = traesync_domain::OperationId::new();
+        let journal = crate::operation_manifest::OperationManifestJournal::create(
+            storage.path(),
+            &interrupted_operation_id,
+            "fixture-location",
+            plan.target_file_evidence(),
+        )
+        .unwrap();
+        journal.transition(OperationState::BackupVerified).unwrap();
+        journal.transition(OperationState::TargetWriting).unwrap();
+        let before = snapshot_db_trio(target.path(), "database.db");
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                backups_preserved: false
+            }
+        );
+        let failure_raw = storage
+            .path()
+            .join("backups")
+            .join(interrupted_operation_id.as_str())
+            .join("failure")
+            .join("raw");
+        assert!(verify_raw_backup(&failure_raw));
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        assert_eq!(
+            table_value(&db_path, "chat_session", "project_id", "session_id", "s1"),
+            Some("p-source".to_string()),
+            "协调不得重放中断操作或当前 AttachSessions 计划"
+        );
+    }
+
+    #[test]
+    fn restarted_manifest_from_another_data_location_does_not_capture_current_target() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+        let interrupted_operation_id = traesync_domain::OperationId::new();
+        let journal = crate::operation_manifest::OperationManifestJournal::create(
+            storage.path(),
+            &interrupted_operation_id,
+            "another-fixture-location",
+            plan.target_file_evidence(),
+        )
+        .unwrap();
+        journal.transition(OperationState::TargetWriting).unwrap();
+        let before = snapshot_db_trio(target.path(), "database.db");
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                backups_preserved: false
+            }
+        );
+        assert_eq!(journal.latest_state(), Some(OperationState::TargetWriting));
+        assert!(!storage
+            .path()
+            .join("backups")
+            .join(interrupted_operation_id.as_str())
+            .join("failure")
+            .exists());
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+    }
+
+    #[test]
+    fn reconciliation_does_not_overwrite_existing_failure_scene_after_interruption() {
+        for state in [
+            OperationState::FailurePreserving,
+            OperationState::FailureSnapshotVerified,
+        ] {
+            let target = tempdir().unwrap();
+            let storage = tempdir().unwrap();
+            let db_path = make_attach_sessions_fixture(target.path());
+            let plan = attach_sessions_plan(&db_path, &["s1"]);
+            let operation_id = traesync_domain::OperationId::new();
+            let journal = crate::operation_manifest::OperationManifestJournal::create(
+                storage.path(),
+                &operation_id,
+                "fixture-location",
+                plan.target_file_evidence(),
+            )
+            .unwrap();
+            journal.transition(OperationState::FailurePreserving).unwrap();
+            assert!(capture_failure_evidence(
+                &db_path,
+                storage.path(),
+                operation_id.as_str()
+            ));
+            if state == OperationState::FailureSnapshotVerified {
+                journal.transition(OperationState::FailureSnapshotVerified).unwrap();
+            }
+            let failure_raw = storage
+                .path()
+                .join("backups")
+                .join(operation_id.as_str())
+                .join("failure")
+                .join("raw");
+            let first_failure_scene = snapshot_db_trio(&failure_raw, "database.db");
+            let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+            conn.execute(
+                "UPDATE chat_message SET body = ?1 WHERE message_id = ?2",
+                params!["changed-after-crash", "m1"],
+            )
+            .unwrap();
+            drop(conn);
+
+            let outcome = fixture_executor(
+                &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+                &db_path,
+                storage.path(),
+            )
+            .execute_sync_plan(
+                &plan,
+                &OperationCancellation::new(),
+                &SequencedEvidence {
+                    current_through: usize::MAX,
+                    calls: AtomicUsize::new(0),
+                },
+            );
+
+            assert_eq!(
+                outcome,
+                SyncPlanExecutionOutcome::ManualRecoveryRequired {
+                    backups_preserved: false
+                }
+            );
+            assert!(verify_raw_backup(&failure_raw));
+            assert_eq!(
+                snapshot_db_trio(&failure_raw, "database.db"),
+                first_failure_scene,
+                "{state:?} 重启不得覆盖首份失败现场"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_sessions_rolls_back_when_evidence_drifts_before_commit() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let before = snapshot_db_trio(target.path(), "database.db");
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+        let evidence = SequencedEvidence {
+            // 写前两次匹配，事务提交前复查变为漂移。
+            current_through: 2,
+            calls: AtomicUsize::new(0),
+        };
+
+        let outcome = fixture_executor(&executor, &db_path, storage.path()).execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &evidence,
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::PlanExpired {
+                backups_preserved: true
+            }
+        );
+        assert_eq!(snapshot_db_trio(target.path(), "database.db"), before);
+        let before_backup = storage
+            .path()
+            .join("backups")
+            .join(plan.operation_id().as_str())
+            .join("before");
+        assert!(verify_raw_backup(&before_backup.join("raw")));
+        assert!(verify_logical_backup(
+            &before_backup.join("logical").join("database.db"),
+            TEST_RAW_KEY
+        ));
+    }
+
+    #[test]
+    fn attach_sessions_preserves_failure_evidence_after_post_commit_relation_damage() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        // 模拟产品触发器在提交中损坏未允许改写的消息关系。
+        conn.execute_batch(
+            "CREATE TRIGGER delete_message_after_attach AFTER UPDATE ON local_artifact_version BEGIN DELETE FROM chat_message WHERE session_id = 's1'; END;",
+        )
+        .unwrap();
+        drop(conn);
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+        let executor = WorkCnSyncExecutor::new(TEST_RAW_KEY);
+
+        let outcome = fixture_executor(&executor, &db_path, storage.path()).execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::FailedAfterWrite {
+                backups_preserved: true
+            }
+        );
+        let backup_root = storage.path().join("backups").join(plan.operation_id().as_str());
+        assert!(verify_raw_backup(&backup_root.join("before").join("raw")));
+        assert!(verify_raw_backup(&backup_root.join("failure").join("raw")));
+    }
+
+    #[test]
+    fn attach_sessions_preserves_failure_evidence_after_same_count_fts_mutation() {
+        let target = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        let db_path = make_attach_sessions_fixture(target.path());
+        let conn = open_with_key(&db_path, TEST_RAW_KEY).unwrap();
+        // 触发器保持 FTS 行数不变，用于证明验证不能只比较计数。
+        conn.execute_batch(
+            "CREATE TRIGGER mutate_fts_after_attach AFTER UPDATE ON local_artifact_version BEGIN UPDATE chat_fts SET indexed_body = 'mutated' WHERE session_id = 's1'; END;",
+        )
+        .unwrap();
+        drop(conn);
+        let plan = attach_sessions_plan(&db_path, &["s1"]);
+
+        let outcome = fixture_executor(
+            &WorkCnSyncExecutor::new(TEST_RAW_KEY),
+            &db_path,
+            storage.path(),
+        )
+        .execute_sync_plan(
+            &plan,
+            &OperationCancellation::new(),
+            &SequencedEvidence {
+                current_through: usize::MAX,
+                calls: AtomicUsize::new(0),
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            SyncPlanExecutionOutcome::FailedAfterWrite {
+                backups_preserved: true
+            }
+        );
+        let backup_root = storage.path().join("backups").join(plan.operation_id().as_str());
+        assert!(verify_raw_backup(&backup_root.join("before").join("raw")));
+        assert!(verify_raw_backup(&backup_root.join("failure").join("raw")));
     }
 
     #[test]
@@ -1655,6 +3467,22 @@ mod tests {
             |row| row.get(0),
         )
         .ok()
+    }
+
+    /// 从 fixture 的指定表读取单个文本字段，供关系完整性断言使用。
+    fn table_value(
+        db_path: &Path,
+        table: &str,
+        value_column: &str,
+        key_column: &str,
+        key: &str,
+    ) -> Option<String> {
+        let conn = open_with_key_readonly(db_path, TEST_RAW_KEY).ok()?;
+        let statement = format!(
+            "SELECT {value_column} FROM {table} WHERE {key_column} = ?1 LIMIT 1"
+        );
+        conn.query_row(&statement, params![key], |row| row.get(0))
+            .ok()
     }
 
     #[test]

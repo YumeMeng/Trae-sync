@@ -105,17 +105,17 @@
 
 ## T07 会话重挂与崩溃恢复矩阵
 
-**Status:** ready-for-agent
+**Status:** in-progress (fixture validated; Gate C NOT_QUALIFIED)
 
 **What to build:** 用户可以把选中会话安全挂到目标账号已有的可靠项目；任一非终态发生进程终止后，重启都能得到唯一、可解释且不会重复写入的结果。
 
 **Blocked by:** T06 双备份与完整项目安全执行。
 
-- [ ] `AttachSessions` 只修改规格允许的项目关系，消息、正文 ID 和非目标记录保持不变。
-- [ ] 未知引用表、目标 sandbox 不可用或关系断言不足时动作在写前被拒绝。
-- [ ] 每个非终态均执行终止注入和重启协调，覆盖写前、已提交未验证、验证失败和恢复中断。
-- [ ] 未提交结束为 `not_applied`，已验证提交协调为 `completed`，未知第三状态进入 `manual_recovery_required`。
-- [ ] 不重复事务、不复用旧 WAL/SHM、不覆盖未知外部状态，所有备份和失败证据保留。
+- [x] `AttachSessions` 只修改规格允许的项目关系，消息、正文 ID 和非目标记录保持不变。
+- [x] 未知引用表、目标 sandbox 不可用或关系断言不足时动作在写前被拒绝。
+- [x] 每个非终态均执行终止注入和重启协调，覆盖写前、已提交未验证、验证失败和恢复中断。
+- [x] 未提交结束为 `not_applied`；持久化新连接验证后的三件套并在重启复验匹配后收口 `completed`；缺凭据、漂移或跨数据位置时进入 `manual_recovery_required`。
+- [x] 不重复事务、不复用旧 WAL/SHM、不覆盖未知外部状态，所有备份和失败证据保留。
 - [ ] Gate C 生成完整 PASS 证据并达到 `Qualified`。
 
 ## T08 数据位置、排他锁与证据漂移
