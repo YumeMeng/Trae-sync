@@ -7,12 +7,29 @@
 
 use traesync_domain::WorkspaceState;
 
+pub mod account_switch;
+pub mod checkin;
+pub mod handoff_intent;
 pub mod history;
+pub mod process_control;
+pub mod recovery;
 pub mod sync_apply;
 pub mod workbench_read;
 
+pub use account_switch::ManagedAccountProfileStorePort;
+pub use checkin::{CheckinDeviceRemint, CheckinTransport, CheckinTransportError};
+pub use handoff_intent::HandoffIntentStorePort;
 pub use history::{
-    CatalogRepository, ContentGraphHasher, FileIdentityProvider, SnapshotStore, SourceNormalizer,
+    CatalogMutationOutcome, CatalogReadError, CatalogRepository, ContentGraphHasher,
+    FileIdentityProvider, NormalizedSnapshot, SnapshotStore, SourceNormalizer, SourceReadError,
+};
+pub use process_control::{
+    ProcessControllerPort, ProcessIdentity, ProcessMatchEvidence, ProcessObservation,
+    ProcessObservationStatus,
+};
+pub use recovery::{
+    KeyWrapperError, KeyWrapperPort, KeyWrapperReceipt, KeyWrapperRequest, RecoveryImportError,
+    RecoveryImportRequest, RecoveryPackageImportPort, VerifiedRecoveryMaterial,
 };
 pub use sync_apply::{SyncPlanEvidencePort, SyncPlanExecutorPort};
 pub use workbench_read::{AccountEvidenceReaderPort, DatabaseProbePort};

@@ -1,209 +1,99 @@
-// 历史库 DTO：与 Rust 后端 T03/T04 命令返回结构保持一致。
-// 所有 newtype 使用 transparent serde，enum 使用 snake_case，与 Rust 约定对齐。
+// P5-3 历史页主库视图 DTO：项目/会话两栏 + 接力台账 + 主库消息预览。
+// 与 Rust 后端 get_master_history / get_master_session_messages /
+// get_relay_ledger 命令返回结构保持一致（snake_case wire 格式）。
+// 旧 T03/T04 扫描/浏览类型已随 U-6 骨架退役（环境模型取代账号中心方案）。
 
-/** 系统时间序列化形态（Rust SystemTime 的 serde_json 默认） */
-export interface SystemTimeDto {
-  readonly secs_since_epoch: number;
-  readonly nanos_since_epoch: number;
-}
+import type {
+  InstanceFingerprintDto,
+  SessionMessageDto,
+} from "./account_switch";
 
-/** 扫描失败原因：结构化，不携带 secret */
-export type ScanFailureReason =
-  | "not_authorized"
-  | "process_running"
-  | "database_missing"
-  | "schema_incompatible"
-  | "storage_root_unavailable"
-  | "source_set_drift"
-  | "catalog_transaction_failed"
-  | "catalog_key_missing";
+/** P5-3 主库历史状态（get_master_history.status）。 */
+export type MasterHistoryStatus =
+  | "ready" // 读取成功（projects/sessions 有效）
+  | "unchanged" // 指纹与 previous 一致：维持前端现有列表（轮询预检）
+  | "no_master_data" // 主库从未启动过（无 database.db）
+  | "no_current_account" // 主库尚未登记登录账号
+  | "read_failed"; // 打开或读取失败（key 不匹配、文件损坏等）
 
-/** 快照文件种类 */
-export type SnapshotFileKind = "db" | "wal" | "shm";
-
-/** 文件身份：volume + file index */
-export interface FileIdentityDto {
-  readonly volume_serial: number;
-  readonly file_index_high: number;
-  readonly file_index_low: number;
-}
-
-/** 单个快照文件捕获信息 */
-export interface SnapshotFileEntryDto {
-  readonly kind: SnapshotFileKind;
-  readonly relative_path: string;
-  readonly present: boolean;
-  readonly size: number;
-  readonly sha256: string;
-  readonly file_identity: FileIdentityDto | null;
-}
-
-/** 来源快照元数据 */
-export interface SourceSnapshotMetaDto {
-  readonly snapshot_id: string;
-  readonly platform_id: string;
-  readonly data_location_id: string;
-  readonly product_version: string;
-  readonly schema_fingerprint: string;
-  readonly mapping_version: string;
-  readonly account_evidence_ref: string | null;
-  readonly captured_at: SystemTimeDto;
-  readonly files: readonly SnapshotFileEntryDto[];
-  readonly fingerprint: string;
-}
-
-/** 扫描结果：tagged union，kind 字段区分 */
-export type ScanOutcomeDto =
-  | {
-      readonly kind: "success";
-      readonly snapshot_id: string;
-      readonly snapshot_meta: SourceSnapshotMetaDto;
-      readonly catalog_updated: boolean;
-    }
-  | {
-      readonly kind: "deduplicated";
-      readonly existing_snapshot_id: string;
-      readonly fingerprint: string;
-    }
-  | {
-      readonly kind: "failed";
-      readonly reason: ScanFailureReason;
-    };
-
-/** 会话身份：(product_history_namespace, original_session_id) */
-export interface SessionIdentityDto {
-  readonly product_history_namespace: string;
-  readonly original_session_id: string;
-}
-
-/** 版本分类：Gate I 四类 */
-export type VersionClassification =
-  | "identical"
-  | "fast_forward"
-  | "forked"
-  | "unclassified";
-
-/** 浏览账号节点 */
-export interface BrowseAccountNodeDto {
-  readonly user_id: string;
-  readonly display_label: string;
-  readonly project_count: number;
-  readonly session_count: number;
-}
-
-/** 浏览项目节点 */
-export interface BrowseProjectNodeDto {
+/** 左栏项目条目（源库 project 表，当前账号归属过滤后）。 */
+export interface MasterProjectEntryDto {
   readonly project_id: string;
-  readonly display_name: string;
-  /** 显示归属（user_assigned 优先，否则 first_observed_owner） */
-  readonly display_owner: string;
-  readonly session_count: number;
+  /** 项目展示名；哈希/空名已回退路径尾段，仍不可读为空串（前端占位「未关联文件夹」）。 */
+  readonly name: string;
+  /** 项目文件夹绝对路径（悬浮提示展示）；缺失为 null。 */
+  readonly absolute_path: string | null;
 }
 
-/** 浏览会话节点 */
-export interface BrowseSessionNodeDto {
-  readonly session_identity: SessionIdentityDto;
+/** 右栏会话条目（chat_session 摘要 + project_id 联动筛选键）。 */
+export interface MasterSessionEntryDto {
+  readonly session_id: string;
+  readonly project_id: string;
   readonly title: string;
   readonly message_count: number;
-  readonly last_captured_at: SystemTimeDto;
-  /** 所属项目 ID：用于前端按选中项目筛选会话（方案 D 三级层次） */
-  readonly project_id: string;
+  /** unix 秒（源库毫秒已归一化）；缺失为 null。 */
+  readonly updated_at_unix_seconds: number | null;
+  readonly deleted: boolean;
+  /**
+   * TRAE 原生隐藏状态：`voice_discussion` 借用为归档（ADR-0022），
+   * `scheduled_task` 为原生过滤值；null = 正常显示。
+   * 主列表排除非空值（与 TRAE 侧栏白名单一致），归档视图收纳
+   * `voice_discussion`。
+   */
+  readonly hidden_status: string | null;
+  /** 会话模式（code/work，会话列优先回退项目列）；归档视图分层键。 */
+  readonly work_mode: string | null;
 }
 
-/** 历史浏览摘要：普通统计只计算可见项（Gate J） */
-export interface HistoryBrowseSummaryDto {
-  readonly visible_account_count: number;
-  readonly visible_project_count: number;
-  readonly visible_session_count: number;
-  readonly soft_deleted_project_count: number;
-  readonly soft_deleted_session_count: number;
-  readonly soft_deleted_message_count: number;
+/** get_master_history 返回（两栏数据源 + 轮询指纹）。 */
+export interface MasterHistoryDto {
+  readonly status: MasterHistoryStatus;
+  /** 主库当前登录账号的 TRAE user_id（接力轨迹账号对齐用）；未登记为 null。 */
+  readonly current_user_id: string | null;
+  readonly projects: readonly MasterProjectEntryDto[];
+  readonly sessions: readonly MasterSessionEntryDto[];
+  /** 读取时刻的三件套 stat 指纹（前端保存为下一轮 previous）。 */
+  readonly fingerprint: InstanceFingerprintDto;
 }
 
-/** 浏览结果：账号树 + 项目 + 会话 + 摘要 */
-export interface BrowseResultDto {
-  readonly accounts: readonly BrowseAccountNodeDto[];
-  readonly projects: readonly BrowseProjectNodeDto[];
-  readonly sessions: readonly BrowseSessionNodeDto[];
-  readonly summary: HistoryBrowseSummaryDto;
-}
+/** P5-3 主库单会话消息读取状态。 */
+export type MasterSessionMessagesStatus =
+  | "ready"
+  | "no_master_data"
+  | "read_failed";
 
-/** 消息投影 */
-export interface MessageProjectionDto {
-  readonly message_id: string;
+/** get_master_session_messages 返回（预览弹层数据源）。 */
+export interface MasterSessionMessagesDto {
   readonly session_id: string;
-  readonly role: string;
-  readonly content_excerpt: string;
-  readonly soft_deleted: boolean;
-  readonly seq: number;
+  readonly status: MasterSessionMessagesStatus;
+  readonly messages: readonly SessionMessageDto[];
 }
 
-/** 对话预览：完整对话的消息序列 */
-export interface ConversationPreviewDto {
-  readonly session_identity: SessionIdentityDto;
-  readonly title: string;
-  readonly messages: readonly MessageProjectionDto[];
-  readonly total_message_count: number;
+/** merge_master_projects 返回（P5-8c 分组合并回执）。 */
+export interface MasterMergeResultDto {
+  /** 改挂到目标分组的会话数（含归档会话）。 */
+  readonly moved_sessions: number;
+  /** 被清理的空壳源分组行数。 */
+  readonly removed_projects: number;
+  /** 合并前自动创建的备份路径（人工恢复定位）。 */
+  readonly backup_path: string;
 }
 
-/** 搜索命中 */
-export interface SearchHitDto {
-  readonly session_identity: SessionIdentityDto;
-  readonly message_id: string;
+/** get_relay_ledger 逐条记录（前端按 session_id / from_session_id 链回轨迹）。 */
+export interface RelayLedgerEntryDto {
+  /** 新腿 session_id（换腿后身份）。 */
+  readonly session_id: string;
+  /** 旧腿 session_id（链回上一跳）；早期条目缺失为 null（轨迹在此自然断链）。 */
+  readonly from_session_id: string | null;
   readonly project_id: string;
-  readonly title: string;
-  readonly content_excerpt: string;
-  readonly role: string;
-}
-
-/** TRAE 进程运行状态 */
-export type ProcessRunningState = "unknown" | "not_running" | "running";
-
-/** T05 同步范围：全部历史或用户明确选择的稳定 ID 并集 */
-export type SyncScopeDto =
-  | { readonly kind: "all_history" }
-  | {
-      readonly kind: "custom";
-      readonly account_ids: readonly string[];
-      readonly project_ids: readonly string[];
-      readonly session_ids: readonly SessionIdentityDto[];
-    };
-
-export type PlanActionDto =
-  | {
-      readonly kind: "follow_project";
-      readonly project_id: string;
-      readonly from_user_id: string;
-      readonly to_user_id: string;
-    }
-  | {
-      readonly kind: "attach_sessions";
-      readonly source_project_id: string;
-      readonly target_project_id: string;
-      readonly session_ids: readonly SessionIdentityDto[];
-    };
-
-export type PlanExclusionReason =
-  | "already_current"
-  | "project_identity_conflict"
-  | "project_identity_unknown"
-  | "archived_only"
-  | "deleted_project"
-  | "schema_incompatible"
-  | "session_version_unavailable"
-  | "partial_project_requires_target";
-
-export interface PlanExclusionDto {
-  readonly project_id: string;
-  readonly session_id: SessionIdentityDto | null;
-  readonly reason: PlanExclusionReason;
-}
-
-/** T05 只读计划 DTO；执行能力由 T06/T07 提供。 */
-export interface SyncPlanDto {
-  readonly operation_id: string;
-  readonly current_user_id: string;
-  readonly scope_snapshot: SyncScopeDto;
-  readonly actions: readonly PlanActionDto[];
-  readonly exclusions: readonly PlanExclusionDto[];
+  /** 交接前账号的 TRAE user_id。 */
+  readonly from_user_id: string;
+  /** 交接前账号显示名（注册表反查）；账号已移除为 null。 */
+  readonly from_account_name: string | null;
+  /** 接收账号的 TRAE user_id。 */
+  readonly to_user_id: string;
+  readonly to_account_name: string | null;
+  /** 交接时会话累计消息数（相邻条目差值 = 该腿新增）。 */
+  readonly message_count_at_switch: number;
+  readonly switched_at_unix_seconds: number;
 }

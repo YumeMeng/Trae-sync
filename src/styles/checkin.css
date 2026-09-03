@@ -1,0 +1,221 @@
+/* 签到页 */
+
+/* —— 签到页（自账号页拆出）：选择 + 批量执行 + 逐账号结果 —— */
+.checkin-page {
+  display: grid;
+  gap: 16px;
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line-hair);
+}
+
+.checkin-page__selection {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.checkin-page__action-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.checkin-page__meta {
+  margin: 8px 0 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.checkin-page__message {
+  margin: 0;
+  padding: 10px 12px;
+  /* 正常态消息条：中性玻璃（绿色清剿） */
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.checkin-page__empty {
+  margin-top: 5px;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.checkin-page__empty-actions {
+  display: grid;
+  gap: 12px;
+  justify-items: start;
+  padding: 16px;
+  border: 1px dashed var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+/* ============================================================
+   U-3 签到页重设计（DESIGN_TOKENS 契约）：
+   总进度条 + 单列表演进式（同一行随流程变状态）。
+   ============================================================ */
+
+/* 总进度条：玻璃轨道 + 靛蓝填充 */
+.checkin-progress {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.checkin-progress__track {
+  height: 6px;
+  border-radius: 999px;
+  /* 0.06 归并入 --fill（U-4 值归一规则） */
+  background: var(--fill);
+  border: 1px solid var(--line-hair);
+  overflow: hidden;
+}
+
+.checkin-progress__fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 240ms ease;
+}
+
+.checkin-progress__label {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+/* 单列表演进式行：勾选 + 身份列 | 阶段/结果 + 行内按钮 */
+.checkin-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.checkin-flow__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  /* 签到行玻璃标准组合 */
+  border: 1px solid var(--line-hair);
+  border-radius: 14px;
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+/* 当前行高亮：靛蓝描边 + 轻微内晕（执行中的视觉焦点） */
+.checkin-flow__row--active {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-panel);
+}
+
+.checkin-flow__select {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.checkin-flow__id {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.checkin-flow__name-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.checkin-flow__name-row strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.checkin-flow__meta {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.checkin-flow__side {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+/* 阶段标签：排队灰 / 执行中靛蓝 + 旋转 */
+.checkin-flow__phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.checkin-flow__phase--active {
+  color: var(--accent);
+  font-weight: 550;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .checkin-flow__spinner {
+    animation: checkin-flow-spin 1s linear infinite;
+  }
+}
+
+@keyframes checkin-flow-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 行内结果：成功安静（中性）/ 失败琥珀（需要关注） */
+.checkin-flow__result {
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.checkin-flow__result--ok {
+  color: var(--text-2);
+}
+
+.checkin-flow__result--warn {
+  color: var(--warn);
+  font-weight: 550;
+}
+
+/* 行内单签按钮：紧凑次级 */
+.checkin-flow__inline-btn {
+  padding: 4px 12px;
+  font-size: 12px;
+}
+

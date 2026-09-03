@@ -43,12 +43,17 @@
 //!     renderer.log
 //!     main.log
 //!   globalStorage/storage.json
-//!   Local Storage/local_storage.json   # 逻辑读取接口，非原始 leveldb
+//!   Local Storage/leveldb/             # 生产格式；只在隔离 work-copy 上打开
+//!   Local Storage/local_storage.json   # LevelDB 不存在时的 fixture 兼容格式
 //!   product_version.txt                # 可选
 //! ```
 
 use crate::fixture_paths::path_strictly_inside;
+use rusty_leveldb::{LdbIterator, Options, DB};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use traesync_domain::{
@@ -79,6 +84,7 @@ const SESSION_EXPIRY_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// 注意：本结构体不持有任何状态——`read_account_evidence` 每次重新扫描 fixture_root。
 /// 真实环境中会按会话范围扫描，但 T02 阶段只扫描 fixture。
+#[derive(Clone, Copy)]
 pub struct AccountEvidenceReader;
 
 impl Default for AccountEvidenceReader {
@@ -91,6 +97,17 @@ impl AccountEvidenceReader {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// 生成仅用于 UI 复核的账号短指纹；不返回或持久化原始 user_id。
+pub fn user_id_display_fingerprint(user_id: &UserId) -> String {
+    let digest = hex::encode(Sha256::digest(user_id.as_str().as_bytes()));
+    format!("acct-{}", &digest[..12])
+}
+
+/// 生成用于后端授权绑定的完整不可逆账号指纹；不返回或持久化原始 user_id。
+pub fn user_id_binding_fingerprint(user_id: &UserId) -> String {
+    hex::encode(Sha256::digest(user_id.as_str().as_bytes()))
 }
 
 impl AccountEvidenceReaderPort for AccountEvidenceReader {
@@ -172,15 +189,27 @@ fn read_evidence_inner(fixture_root: &Path, now: SystemTime) -> AccountEvidence 
             session_id,
             &mut events_with_uid,
         );
+        // 真实 TRAE 将 renderer.log 放在 logs/<session>/windowN/ 下，不能只读取会话根目录。
+        for renderer_path in nested_renderer_log_paths(session_path) {
+            parse_log_file(
+                &renderer_path,
+                &canonical_root,
+                SOURCE_RENDERER,
+                session_id,
+                &mut events_with_uid,
+            );
+        }
     }
 
     // 3. 解析 storage.json 生成认证指纹与可能的明文 userId（R4 + R2-1：canonical 检查）
-    let storage_path = canonical_root.join("globalStorage").join("storage.json");
+    let storage_path = select_storage_json_path(&canonical_root);
     let (auth_fingerprint, product_version, plaintext_user_id) =
         parse_storage_for_fingerprint(&storage_path, &canonical_root);
 
     // 4. Local Storage 逻辑读取（R2-1：canonical 检查）
-    let local_storage_user_id = read_local_storage_logical(&canonical_root);
+    // LevelDB 存在时只读 LevelDB；打开/解析失败保持缺失，不能回退 fixture JSON。
+    let local_storage = read_local_storage_state(&canonical_root);
+    let local_storage_user_id = local_storage.user_id.clone();
 
     // 5. 决定 user_id：白名单事件一致优先；其次明文兼容认证对象的 userId（R4）
     //    R2-2/R2-3：日志事件 userId 冲突时 pick_consistent 返回 None，
@@ -202,7 +231,7 @@ fn read_evidence_inner(fixture_root: &Path, now: SystemTime) -> AccountEvidence 
     //    P1：Conflict 状态下 user_id 不应被填充——避免前端 UI 显示"账号 X（冲突）"误导用户
     //    P2：会话过期但 events 冲突时优先返回 Conflict——数据可信度比时间问题更严重
     let ls_uid_mismatch = matches!(&user_id, Some(uid) if matches!(&local_storage_user_id, Some(ls_uid) if uid != ls_uid));
-    if log_events_conflict || ls_uid_mismatch {
+    if log_events_conflict || local_storage.conflict || ls_uid_mismatch {
         return AccountEvidence {
             user_id: None, // P1：Conflict 状态下 user_id 必须为 None
             source_events,
@@ -254,9 +283,21 @@ fn read_evidence_inner(fixture_root: &Path, now: SystemTime) -> AccountEvidence 
     }
 }
 
+/// 选择认证存储路径：生产 Work CN 使用 User/globalStorage；fixture 仅在生产路径不存在时兼容根级布局。
+fn select_storage_json_path(canonical_root: &Path) -> PathBuf {
+    let production_path = canonical_root
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    if std::fs::symlink_metadata(&production_path).is_ok() {
+        return production_path;
+    }
+    canonical_root.join("globalStorage").join("storage.json")
+}
+
 /// R2：选择最新启动会话目录。
 ///
-/// 扫描 `fixture_root/logs/` 下的所有子目录，按 mtime 降序返回最新的一个。
+/// 扫描 `fixture_root/logs/` 下含白名单日志文件的会话目录，按 mtime 降序返回最新的一个。
 /// 返回 (path, session_id, mtime) 或 None（无会话目录）。
 ///
 /// R2-1：每个 session 目录必须 canonical 后严格位于 `canonical_root` 内。
@@ -289,6 +330,9 @@ fn pick_latest_session(canonical_root: &Path) -> Option<(PathBuf, String, System
         if !path_strictly_inside(&canonical_session, &canonical_root) {
             continue;
         }
+        if !contains_session_log(&canonical_session, &canonical_root) {
+            continue;
+        }
         let session_id = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -308,6 +352,49 @@ fn pick_latest_session(canonical_root: &Path) -> Option<(PathBuf, String, System
         }
     }
     best
+}
+
+/// 会话目录至少包含一个受支持日志文件；普通诊断目录不能遮蔽真实启动会话。
+fn contains_session_log(session_dir: &Path, canonical_root: &Path) -> bool {
+    ["alog.log", "main.log"]
+        .into_iter()
+        .map(|name| session_dir.join(name))
+        .chain(nested_renderer_log_paths(session_dir))
+        .any(|candidate| {
+            let Ok(canonical) = candidate.canonicalize() else {
+                return false;
+            };
+            path_strictly_inside(&canonical, canonical_root) && canonical.is_file()
+        })
+}
+
+/// 返回会话根部及 windowN 子目录中的 renderer.log，顺序固定以保证证据摘要稳定。
+fn nested_renderer_log_paths(session_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let root_renderer = session_dir.join("renderer.log");
+    if root_renderer.is_file() {
+        paths.push(root_renderer);
+    }
+    if let Ok(entries) = std::fs::read_dir(session_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let is_window_dir = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("window"));
+            if is_window_dir {
+                let renderer = path.join("renderer.log");
+                if renderer.is_file() {
+                    paths.push(renderer);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths
 }
 
 /// 解析单个日志文件，提取白名单事件的 userId。
@@ -512,10 +599,10 @@ fn pick_consistent_user_id(events: &[(SourceEventSummary, Option<UserId>)]) -> O
 /// 决定 `EvidenceState`（R3）：
 /// - 0 个白名单事件且无明文 userId → Missing
 /// - 0 个白名单事件但有明文 userId → SingleSource（明文兼容降级）
-/// - 1 个来源类型 → SingleSource
-/// - 2+ 来源类型且 userId 一致且 **绑定认证指纹** → Verified
-/// - 2+ 来源类型但 userId 不一致 → Conflict
-/// - 2+ 来源类型一致但无认证指纹 → SingleSource（R3：无指纹不得成为完整 Verified）
+/// - 1 个证据类型 → SingleSource
+/// - 2+ 证据类型且 userId 一致且 **绑定认证指纹** → Verified
+/// - 2+ 证据类型但 userId 不一致 → Conflict
+/// - 2+ 证据类型一致但无认证指纹 → SingleSource（R3：无指纹不得成为完整 Verified）
 /// - Local Storage user_id 与日志/明文 userId 不一致 → Conflict（R2-7/R2-8，无条件）
 ///
 /// R3 关键修复：`auth_fingerprint` 必须为 Some 才能成为 Verified。
@@ -549,14 +636,16 @@ fn decide_evidence_state(
         return EvidenceState::Missing;
     }
 
-    // 来源类型去重计数
-    let mut source_kinds = std::collections::HashSet::new();
+    // 证据类型按“日志来源 + 白名单事件”去重。
+    // 真实 TRAE 某些启动会话只有 main.log，但其中会同时记录 updateUserInfo/getUserInfo；
+    // 两类独立账号事件应与 alog.log、renderer.log 等来源一样参与完整证据判定。
+    let mut evidence_kinds = std::collections::HashSet::new();
     for e in events {
-        source_kinds.insert(e.source_kind.as_str());
+        evidence_kinds.insert((e.source_kind.as_str(), e.event_name.as_str()));
     }
 
-    if source_kinds.len() >= 2 {
-        // 两类以上来源一致 → Verified（user_id 已通过 pick_consistent 校验）
+    if evidence_kinds.len() >= 2 {
+        // 两类以上证据一致 → Verified（user_id 已通过 pick_consistent 校验）
         // ls_uid 不一致已在顶部检查
         if user_id.is_some() {
             // R3：必须绑定认证指纹才能成为 Verified；否则降级 SingleSource
@@ -674,34 +763,221 @@ fn parse_storage_for_fingerprint(
     )
 }
 
+/// Local Storage 逻辑读取结果。
+///
+/// `conflict` 表示同一隔离 LevelDB 中发现多个不同账号作用域。
+#[derive(Debug, Default)]
+struct LocalStorageState {
+    user_id: Option<UserId>,
+    conflict: bool,
+}
+
 /// Local Storage 逻辑读取接口。
 ///
-/// 不扫描原始 leveldb 字节——直接读取 fixture 提供的 `local_storage.json`。
-/// 该 JSON 表示 leveldb 的逻辑视图，避免引入 leveldb 依赖与原始字节扫描。
-///
-/// 文件格式：
-/// ```json
-/// {
-///   "current_user_id": "<synthetic-id>"
-/// }
-/// ```
-fn read_local_storage_logical(canonical_root: &Path) -> Option<UserId> {
-    // R2-1：防御性 canonicalize root（见 pick_latest_session 同名注释）
+/// LevelDB 目录存在时先复制到隔离临时目录，再由 `rusty-leveldb` 逻辑迭代。
+/// 该 crate 在打开时可能创建日志、锁或执行整理，因此绝不允许直接打开 TRAE 原目录。
+/// LevelDB 不存在时才兼容 fixture 的 `local_storage.json` 逻辑视图。
+fn read_local_storage_state(canonical_root: &Path) -> LocalStorageState {
     let canonical_root = canonical_root
         .canonicalize()
         .unwrap_or_else(|_| canonical_root.to_path_buf());
-    let path = canonical_root
-        .join("Local Storage")
-        .join("local_storage.json");
-    // R2-1：canonical containment 检查——失败保守返回 None，不读取内容
-    let canonical_path = path.canonicalize().ok()?;
+    let local_storage_root = canonical_root.join("Local Storage");
+    let leveldb_path = local_storage_root.join("leveldb");
+
+    // LevelDB 存在但越界、损坏或无法打开时都保持缺失；不得回退 JSON。
+    if leveldb_path.exists() || std::fs::symlink_metadata(&leveldb_path).is_ok() {
+        return read_leveldb_state(&leveldb_path, &canonical_root);
+    }
+
+    // Fixture 兼容路径：仅在 LevelDB 不存在时读取 JSON 逻辑视图。
+    let path = local_storage_root.join("local_storage.json");
+    let canonical_path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return LocalStorageState::default(),
+    };
     if !path_strictly_inside(&canonical_path, &canonical_root) {
+        return LocalStorageState::default();
+    }
+    let content = match std::fs::read_to_string(&canonical_path) {
+        Ok(content) => content,
+        Err(_) => return LocalStorageState::default(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(json) => json,
+        Err(_) => return LocalStorageState::default(),
+    };
+    let user_id = json
+        .get("current_user_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| UserId::from_verified(value).ok());
+    LocalStorageState {
+        user_id,
+        conflict: false,
+    }
+}
+
+/// 保留旧 fixture 测试调用的 Option 形状；生产读取使用完整状态。
+#[cfg(test)]
+fn read_local_storage_logical(canonical_root: &Path) -> Option<UserId> {
+    read_local_storage_state(canonical_root).user_id
+}
+
+/// 读取隔离 LevelDB work-copy。
+fn read_leveldb_state(leveldb_path: &Path, canonical_root: &Path) -> LocalStorageState {
+    let canonical_leveldb = match leveldb_path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return LocalStorageState::default(),
+    };
+    if !canonical_leveldb.is_dir() || !path_strictly_inside(&canonical_leveldb, canonical_root) {
+        return LocalStorageState::default();
+    }
+
+    let work_root = match tempfile::Builder::new()
+        .prefix("traesync-leveldb-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(_) => return LocalStorageState::default(),
+    };
+    let work_copy = work_root.path().join("leveldb");
+    if copy_leveldb_files(&canonical_leveldb, &work_copy).is_err() {
+        return LocalStorageState::default();
+    }
+
+    let mut options = Options::default();
+    options.create_if_missing = false;
+    options.error_if_exists = false;
+    options.paranoid_checks = true;
+    let mut db = match DB::open(&work_copy, options) {
+        Ok(db) => db,
+        Err(_) => return LocalStorageState::default(),
+    };
+    let mut iterator = match db.new_iter() {
+        Ok(iterator) => iterator,
+        Err(_) => return LocalStorageState::default(),
+    };
+
+    let mut candidates = std::collections::BTreeSet::new();
+    while let Some((key, value)) = iterator.next() {
+        if is_device_id_key(&key) {
+            continue;
+        }
+        if let Some(user_id) = extract_local_storage_user_id(&value) {
+            candidates.insert(user_id.as_str().to_string());
+        }
+    }
+
+    match candidates.len() {
+        0 => LocalStorageState::default(),
+        1 => LocalStorageState {
+            user_id: candidates
+                .first()
+                .and_then(|value| UserId::from_verified(value).ok()),
+            conflict: false,
+        },
+        _ => LocalStorageState {
+            user_id: None,
+            conflict: true,
+        },
+    }
+}
+
+/// 复制 LevelDB 根目录内的普通文件。
+///
+/// Chromium LevelDB 布局是平面目录；遇到子目录、symlink 或 junction 时保守失败，
+/// 避免循环引用或将根外内容带入 work-copy。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LevelDbFileFingerprint {
+    size: u64,
+    sha256: String,
+}
+
+fn leveldb_file_manifest(directory: &Path) -> io::Result<BTreeMap<String, LevelDbFileFingerprint>> {
+    let mut manifest = BTreeMap::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LevelDB 目录包含非普通文件",
+            ));
+        }
+        manifest.insert(
+            entry.file_name().to_string_lossy().into_owned(),
+            LevelDbFileFingerprint {
+                size: metadata.len(),
+                sha256: sha256_file(&path)?,
+            },
+        );
+    }
+    Ok(manifest)
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    // 大文件哈希缓冲区放在堆上，避免真实扫描阶段触发线程栈溢出。
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn verify_leveldb_manifest_stable(
+    expected: &BTreeMap<String, LevelDbFileFingerprint>,
+    actual: &BTreeMap<String, LevelDbFileFingerprint>,
+) -> io::Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "LevelDB 源目录在复制期间发生变化",
+        ))
+    }
+}
+
+fn copy_leveldb_files(source: &Path, target: &Path) -> io::Result<()> {
+    let source_before = leveldb_file_manifest(source)?;
+    std::fs::create_dir_all(target)?;
+    for name in source_before.keys() {
+        std::fs::copy(source.join(name), target.join(name))?;
+    }
+
+    let source_after = leveldb_file_manifest(source)?;
+    verify_leveldb_manifest_stable(&source_before, &source_after)?;
+    let target_manifest = leveldb_file_manifest(target)?;
+    verify_leveldb_manifest_stable(&source_before, &target_manifest)
+}
+
+/// 排除独立 RTC device ID 键；device_id 不得成为 current_user_id。
+fn is_device_id_key(key: &[u8]) -> bool {
+    std::str::from_utf8(key)
+        .map(|key| key.to_ascii_lowercase().ends_with("rtc_device_id"))
+        .unwrap_or(false)
+}
+
+/// 解析 TRAE 当前账号作用域记录：控制字节后跟 JSON，读取 `user_unique_id`。
+/// 只接受数字长度符合 UserId 约束的字段，不扫描原始 SSTable/日志字节。
+fn extract_local_storage_user_id(value: &[u8]) -> Option<UserId> {
+    let text = std::str::from_utf8(value).ok()?.trim_start_matches('\u{1}');
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    if json.get("_type_").and_then(|value| value.as_str()) != Some("default") {
         return None;
     }
-    let content = std::fs::read_to_string(&canonical_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let uid_str = json.get("current_user_id")?.as_str()?;
-    UserId::from_verified(uid_str).ok()
+    // `web_id` 是当前账号作用域记录的结构性见证；缺少该字段的遥测记录
+    // 即使也含 `user_unique_id`，仍不得被当作当前账号。
+    let web_id = json.get("web_id")?.as_str()?;
+    UserId::from_verified(web_id).ok()?;
+    let user_id = json.get("user_unique_id")?.as_str()?;
+    UserId::from_verified(user_id).ok()
 }
 
 #[cfg(test)]
@@ -750,6 +1026,13 @@ mod tests {
         fs::write(storage_dir.join("storage.json"), content).unwrap();
     }
 
+    /// 测试辅助：写入生产 Work CN 的 User/globalStorage 布局。
+    fn write_user_storage(dir: &Path, content: &str) {
+        let storage_dir = dir.join("User").join("globalStorage");
+        fs::create_dir_all(&storage_dir).unwrap();
+        fs::write(storage_dir.join("storage.json"), content).unwrap();
+    }
+
     /// 测试辅助：写入 Local Storage 逻辑 JSON
     fn write_local_storage(dir: &Path, current_user_id: Option<&str>) {
         let ls_dir = dir.join("Local Storage");
@@ -759,6 +1042,36 @@ mod tests {
             None => r#"{}"#.to_string(),
         };
         fs::write(ls_dir.join("local_storage.json"), content).unwrap();
+    }
+
+    /// 测试辅助：创建真实 LevelDB 逻辑 fixture。
+    fn write_leveldb(dir: &Path, entries: &[(&[u8], &[u8])]) {
+        let leveldb_dir = dir.join("Local Storage").join("leveldb");
+        fs::create_dir_all(&leveldb_dir).unwrap();
+        let mut options = Options::default();
+        options.create_if_missing = true;
+        let mut db = DB::open(&leveldb_dir, options).unwrap();
+        for (key, value) in entries {
+            db.put(key, value).unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    /// 测试辅助：记录 LevelDB 原目录逐文件字节，验证生产读取未直接打开或改写源目录。
+    fn snapshot_leveldb_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().to_string(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
     }
 
     /// 测试用 `now` 时间——使用 wall clock 当前时间。
@@ -913,6 +1226,40 @@ mod tests {
     }
 
     #[test]
+    fn nested_window_renderer_log_participates_in_account_evidence() {
+        let dir = tempdir().unwrap();
+        write_log(
+            dir.path(),
+            "session-1",
+            "main.log",
+            &format!("[updateUserInfo] userId={}", SYNTHETIC_USER_ID_A),
+        );
+        let renderer_dir = dir.path().join("logs").join("session-1").join("window1");
+        fs::create_dir_all(&renderer_dir).unwrap();
+        fs::write(
+            renderer_dir.join("renderer.log"),
+            format!(
+                "[RouteService] User info loaded {{ \"userId\": \"{}\" }}",
+                SYNTHETIC_USER_ID_A
+            ),
+        )
+        .unwrap();
+        write_storage(
+            dir.path(),
+            r#"{"iCubeAuthInfo://icube.cloudide":"dGVzdC1jaXBoZXItdGV4dA==","productVersion":"1.107.1"}"#,
+        );
+        write_local_storage(dir.path(), Some(SYNTHETIC_USER_ID_A));
+
+        let evidence = AccountEvidenceReader::new().read_account_evidence(dir.path(), fixed_now());
+
+        assert_eq!(evidence.evidence_state, EvidenceState::Verified);
+        assert!(evidence
+            .source_events
+            .iter()
+            .any(|event| event.source_kind == SOURCE_RENDERER));
+    }
+
+    #[test]
     fn two_source_consistent_without_fingerprint_returns_single_source() {
         // R3：仅两类日志一致但无认证指纹时不得成为完整 Verified
         let dir = tempdir().unwrap();
@@ -953,6 +1300,32 @@ mod tests {
         let reader = AccountEvidenceReader::new();
         let evidence = reader.read_account_evidence(dir.path(), fixed_now());
         assert_eq!(evidence.evidence_state, EvidenceState::SingleSource);
+    }
+
+    #[test]
+    fn two_account_events_in_one_main_log_return_verified_with_fingerprint() {
+        // 真实 TRAE 启动会话可能只生成 main.log，但同时记录两类账号事件。
+        let dir = tempdir().unwrap();
+        write_log(
+            dir.path(),
+            "session-main-only",
+            "main.log",
+            &format!(
+                "[updateUserInfo] userId={}\n[getUserInfo] userId={}",
+                SYNTHETIC_USER_ID_A, SYNTHETIC_USER_ID_A
+            ),
+        );
+        write_storage(
+            dir.path(),
+            r#"{"iCubeAuthInfo://default":"dGVzdC1jaXBoZXItdGV4dA==","productVersion":"1.107.1"}"#,
+        );
+        write_local_storage(dir.path(), Some(SYNTHETIC_USER_ID_A));
+
+        let reader = AccountEvidenceReader::new();
+        let evidence = reader.read_account_evidence(dir.path(), fixed_now());
+
+        assert_eq!(evidence.evidence_state, EvidenceState::Verified);
+        assert_eq!(evidence.source_events.len(), 2);
     }
 
     #[test]
@@ -1087,6 +1460,46 @@ fetchLogTask {{ "userId": "{}" }}"#,
         );
         assert!(plaintext_uid.is_some());
         assert_eq!(plaintext_uid.unwrap().as_str(), SYNTHETIC_USER_ID_A);
+    }
+
+    #[test]
+    fn production_user_global_storage_is_preferred_over_fixture_path() {
+        let dir = tempdir().unwrap();
+        let production_auth = format!(
+            r#"{{"iCubeAuthInfo://icube.cloudide":"{{\"userId\":\"{}\",\"accessToken\":\"test-only\"}}"}}"#,
+            SYNTHETIC_USER_ID_A
+        );
+        let fixture_auth = format!(
+            r#"{{"iCubeAuthInfo://icube.cloudide":"{{\"userId\":\"{}\",\"accessToken\":\"test-only\"}}"}}"#,
+            SYNTHETIC_USER_ID_B
+        );
+        write_user_storage(dir.path(), &production_auth);
+        write_storage(dir.path(), &fixture_auth);
+        write_local_storage(dir.path(), Some(SYNTHETIC_USER_ID_A));
+
+        let evidence = AccountEvidenceReader::new().read_account_evidence(dir.path(), fixed_now());
+
+        assert_eq!(
+            evidence.user_id.as_ref().map(UserId::as_str),
+            Some(SYNTHETIC_USER_ID_A)
+        );
+        assert_eq!(
+            evidence.local_storage_user_id.as_ref().map(UserId::as_str),
+            Some(SYNTHETIC_USER_ID_A)
+        );
+        assert_eq!(evidence.evidence_state, EvidenceState::SingleSource);
+    }
+
+    #[test]
+    fn user_id_display_fingerprint_is_stable_and_does_not_expose_user_id() {
+        let user_a = UserId::from_verified(SYNTHETIC_USER_ID_A).unwrap();
+        let user_b = UserId::from_verified(SYNTHETIC_USER_ID_B).unwrap();
+        let first = user_id_display_fingerprint(&user_a);
+        let second = user_id_display_fingerprint(&user_a);
+
+        assert_eq!(first, second);
+        assert_ne!(first, user_id_display_fingerprint(&user_b));
+        assert!(!first.contains(SYNTHETIC_USER_ID_A));
     }
 
     #[test]
@@ -1271,6 +1684,208 @@ fetchLogTask {{ "userId": "{}" }}"#,
         assert!(uid.is_none());
     }
 
+    #[test]
+    fn leveldb_logical_read_returns_user_id_and_excludes_device_id() {
+        let dir = tempdir().unwrap();
+        let user_value = b"\x01{\"web_id\":\"1000000000000003\",\"user_unique_id\":\"1000000000000001\",\"timestamp\":\"1000000000000\",\"_type_\":\"default\"}";
+        let device_value = b"\x01{\"user_unique_id\":\"1000000000000002\",\"timestamp\":\"1000000000000000\",\"_type_\":\"default\"}";
+        let telemetry_value = b"\x01{\"user_unique_id\":\"1000000000000002\",\"timestamp\":\"1000000000000000\",\"_type_\":\"default\"}";
+        write_leveldb(
+            dir.path(),
+            &[
+                (b"_vscode-file://vscode-app\0\x01scope", user_value),
+                (
+                    b"_vscode-file://vscode-app\0\x01RTC_DEVICE_ID",
+                    device_value,
+                ),
+                (
+                    b"_vscode-file://vscode-app\0\x01telemetry-scope",
+                    telemetry_value,
+                ),
+            ],
+        );
+        let leveldb_dir = dir.path().join("Local Storage").join("leveldb");
+        let before = snapshot_leveldb_files(&leveldb_dir);
+
+        let state = read_local_storage_state(dir.path());
+        assert_eq!(
+            state.user_id.as_ref().map(UserId::as_str),
+            Some(SYNTHETIC_USER_ID_A)
+        );
+        assert!(!state.conflict);
+        assert_eq!(snapshot_leveldb_files(&leveldb_dir), before);
+    }
+
+    #[test]
+    fn leveldb_multiple_user_scopes_return_conflict() {
+        let dir = tempdir().unwrap();
+        let user_a = b"\x01{\"web_id\":\"1000000000000003\",\"user_unique_id\":\"1000000000000001\",\"_type_\":\"default\"}";
+        let user_b = b"\x01{\"web_id\":\"1000000000000004\",\"user_unique_id\":\"1000000000000002\",\"_type_\":\"default\"}";
+        write_leveldb(
+            dir.path(),
+            &[
+                (b"_vscode-file://vscode-app\0\x01scope-a", user_a),
+                (b"_vscode-file://vscode-app\0\x01scope-b", user_b),
+            ],
+        );
+
+        let state = read_local_storage_state(dir.path());
+        assert!(state.user_id.is_none());
+        assert!(state.conflict);
+    }
+
+    #[test]
+    fn leveldb_conflict_forces_account_evidence_conflict() {
+        let dir = tempdir().unwrap();
+        write_log(
+            dir.path(),
+            "session-1",
+            "alog.log",
+            &format!(r#"fetchLogTask {{ "userId": "{}" }}"#, SYNTHETIC_USER_ID_A),
+        );
+        write_log(
+            dir.path(),
+            "session-1",
+            "renderer.log",
+            &format!(
+                r#"[RouteService] User info loaded {{ "userId": "{}" }}"#,
+                SYNTHETIC_USER_ID_A
+            ),
+        );
+        write_storage(
+            dir.path(),
+            r#"{"iCubeAuthInfo://default":"dGVzdA==","productVersion":"1.107.1"}"#,
+        );
+        let user_a = b"\x01{\"web_id\":\"1000000000000003\",\"user_unique_id\":\"1000000000000001\",\"_type_\":\"default\"}";
+        let user_b = b"\x01{\"web_id\":\"1000000000000004\",\"user_unique_id\":\"1000000000000002\",\"_type_\":\"default\"}";
+        write_leveldb(
+            dir.path(),
+            &[
+                (b"_vscode-file://vscode-app\0\x01scope-a", user_a),
+                (b"_vscode-file://vscode-app\0\x01scope-b", user_b),
+            ],
+        );
+
+        let evidence = AccountEvidenceReader::new().read_account_evidence(dir.path(), fixed_now());
+        assert_eq!(evidence.evidence_state, EvidenceState::Conflict);
+        assert!(evidence.user_id.is_none());
+        assert!(evidence.local_storage_user_id.is_none());
+    }
+
+    #[test]
+    fn leveldb_failure_does_not_fallback_to_fixture_json() {
+        let dir = tempdir().unwrap();
+        let leveldb_dir = dir.path().join("Local Storage").join("leveldb");
+        fs::create_dir_all(&leveldb_dir).unwrap();
+        fs::write(leveldb_dir.join("CURRENT"), b"invalid-leveldb").unwrap();
+        write_local_storage(dir.path(), Some(SYNTHETIC_USER_ID_A));
+
+        let state = read_local_storage_state(dir.path());
+        assert!(state.user_id.is_none());
+        assert!(!state.conflict);
+    }
+
+    #[test]
+    fn leveldb_manifest_detects_source_drift_after_copy() {
+        let dir = tempdir().unwrap();
+        let leveldb_dir = dir.path().join("leveldb");
+        fs::create_dir_all(&leveldb_dir).unwrap();
+        fs::write(leveldb_dir.join("CURRENT"), b"manifest-1").unwrap();
+
+        let before = leveldb_file_manifest(&leveldb_dir).unwrap();
+        fs::write(leveldb_dir.join("CURRENT"), b"manifest-2").unwrap();
+        let after = leveldb_file_manifest(&leveldb_dir).unwrap();
+
+        assert!(verify_leveldb_manifest_stable(&before, &after).is_err());
+    }
+
+    #[test]
+    fn leveldb_manifest_hash_survives_small_thread_stack() {
+        // 回归：LevelDB 文件哈希不能把 1 MiB 缓冲区放在线程栈上。
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("large.sst");
+        fs::write(&file, vec![0x5a_u8; 2 * 1024 * 1024]).unwrap();
+        let handle = std::thread::Builder::new()
+            .name("small-stack-account-evidence-test".to_string())
+            .stack_size(64 * 1024)
+            .spawn(move || sha256_file(&file).is_ok())
+            .unwrap();
+
+        assert!(
+            handle.join().expect("小栈线程不应崩溃"),
+            "LevelDB 文件哈希应完成"
+        );
+    }
+
+    #[test]
+    #[ignore = "仅在用户授权的真实 TRAE 目录上显式运行；实现内部仍只打开隔离 work-copy"]
+    fn real_leveldb_account_scope_matches_expected_without_source_write() {
+        let root = std::env::var_os("TRAE_SYNC_REAL_ACCOUNT_ROOT")
+            .map(PathBuf::from)
+            .expect("缺少 TRAE_SYNC_REAL_ACCOUNT_ROOT");
+        let expected =
+            std::env::var("TRAE_SYNC_EXPECTED_USER_ID").expect("缺少 TRAE_SYNC_EXPECTED_USER_ID");
+        let leveldb_dir = root.join("Local Storage").join("leveldb");
+        let before = snapshot_leveldb_files(&leveldb_dir);
+
+        let state = read_local_storage_state(&root);
+        let matches_expected = state
+            .user_id
+            .as_ref()
+            .map(UserId::as_str)
+            .is_some_and(|value| value == expected);
+        assert!(matches_expected, "真实 LevelDB 当前账号作用域不匹配");
+        assert!(!state.conflict, "真实 LevelDB 出现多个账号作用域");
+        assert_eq!(snapshot_leveldb_files(&leveldb_dir), before);
+    }
+
+    #[test]
+    #[ignore = "仅在用户授权的真实 TRAE 目录上显式运行；读取器不持久化认证正文"]
+    fn real_account_evidence_identifies_expected_account_without_source_write() {
+        let root = std::env::var_os("TRAE_SYNC_REAL_ACCOUNT_ROOT")
+            .map(PathBuf::from)
+            .expect("缺少 TRAE_SYNC_REAL_ACCOUNT_ROOT");
+        let expected =
+            std::env::var("TRAE_SYNC_EXPECTED_USER_ID").expect("缺少 TRAE_SYNC_EXPECTED_USER_ID");
+        let leveldb_dir = root.join("Local Storage").join("leveldb");
+        let before = snapshot_leveldb_files(&leveldb_dir);
+
+        let evidence =
+            AccountEvidenceReader::new().read_account_evidence(&root, std::time::SystemTime::now());
+
+        let user_matches = evidence
+            .user_id
+            .as_ref()
+            .is_some_and(|user_id| user_id.as_str() == expected);
+        let local_matches = evidence
+            .local_storage_user_id
+            .as_ref()
+            .is_some_and(|user_id| user_id.as_str() == expected);
+        assert!(
+            user_matches,
+            "真实账号主证据未识别：state={:?}, local_matches={}, auth_present={}, source_events={:?}",
+            evidence.evidence_state,
+            local_matches,
+            evidence.auth_fingerprint.is_some(),
+            evidence.source_events
+        );
+        assert_eq!(
+            evidence.local_storage_user_id.as_ref().map(UserId::as_str),
+            Some(expected.as_str()),
+            "真实 LevelDB 账号未识别为预期账号"
+        );
+        assert!(evidence.auth_fingerprint.is_some(), "真实认证指纹缺失");
+        assert!(
+            matches!(
+                evidence.evidence_state,
+                EvidenceState::Verified | EvidenceState::Expired
+            ),
+            "真实账号证据状态异常：{:?}",
+            evidence.evidence_state
+        );
+        assert_eq!(snapshot_leveldb_files(&leveldb_dir), before);
+    }
+
     // ============== AC7：认证指纹变化使结果只读 ==============
 
     #[test]
@@ -1347,6 +1962,28 @@ fetchLogTask {{ "userId": "{}" }}"#,
 
         let latest = pick_latest_session(dir.path()).expect("应有最新会话");
         assert_eq!(latest.1, "session-new");
+    }
+
+    #[test]
+    fn pick_latest_session_ignores_non_session_log_directories() {
+        let dir = tempdir().unwrap();
+        let session_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_999_000_000);
+        let noise_time = session_time + Duration::from_secs(60);
+        write_log_with_mtime(
+            dir.path(),
+            "session-valid",
+            "alog.log",
+            &format!(r#"fetchLogTask {{ "userId": "{}" }}"#, SYNTHETIC_USER_ID_A),
+            session_time,
+        );
+        let noise_dir = dir.path().join("logs").join("aha_log");
+        fs::create_dir_all(&noise_dir).unwrap();
+        fs::write(noise_dir.join("aha_electron.log"), "non-session log").unwrap();
+        filetime::set_file_mtime(&noise_dir, filetime::FileTime::from_system_time(noise_time))
+            .unwrap();
+
+        let latest = pick_latest_session(dir.path()).expect("应找到真实会话目录");
+        assert_eq!(latest.1, "session-valid");
     }
 
     #[test]

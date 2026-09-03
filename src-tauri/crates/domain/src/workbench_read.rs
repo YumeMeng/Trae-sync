@@ -81,6 +81,12 @@ pub enum IncompatibleReason {
     MissingConstraint { table: String, constraint: String },
     /// R5：cipher_version 不兼容——SQLCipher 版本与基线不匹配
     CipherVersionMismatch { version: String },
+    /// Gate A：关键 SQLCipher 4 参数与已验证基线不匹配
+    CipherPragmaMismatch {
+        pragma: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// 用户身份 ID：16 位数字字符串（TRAE Work CN 基线）。
@@ -326,6 +332,22 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains("\"kind\":\"Incompatible\""));
         assert!(json.contains("wrong_key"));
+    }
+
+    #[test]
+    fn compatibility_state_cipher_pragma_mismatch_serializes() {
+        let state = CompatibilityState::Incompatible {
+            reason: IncompatibleReason::CipherPragmaMismatch {
+                pragma: "kdf_iter".to_string(),
+                expected: "256000".to_string(),
+                actual: "64000".to_string(),
+            },
+        };
+        let value = serde_json::to_value(state).unwrap();
+        let mismatch = &value["reason"]["cipher_pragma_mismatch"];
+        assert_eq!(mismatch["pragma"], "kdf_iter");
+        assert_eq!(mismatch["expected"], "256000");
+        assert_eq!(mismatch["actual"], "64000");
     }
 
     #[test]

@@ -3,26 +3,106 @@ name = "traesync-infrastructure"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# 生产构建默认保持嵌入 SQLCipher + vendored OpenSSL 基线；关闭该 feature 仅用于
+# 不需要数据库的轻量 fixture 回归，避免每次路径/进度测试都重复冷编译 OpenSSL。
+default = ["sqlcipher"]
+sqlcipher = ["dep:rusqlite"]
+
 # infrastructure 依赖 domain + ports，不依赖 application/commands/tauri。
 # 这保证基础设施实现不会反向调用应用服务或 Tauri command。
 [dependencies]
 traesync-domain = { path = "../domain" }
 traesync-ports = { path = "../ports" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order：blob 保活写回要求明文 JSON 字段保持原顺序（C0-2 实测 TRAE
+# 接受按插入序重序列化的 blob；feature 经 cargo 合并对整个 workspace 的
+# serde_json::Value 对象统一生效，影响面评估见 U-7 C1 报告）。
+serde_json = { version = "1", features = ["preserve_order"] }
 # 嵌入式 SQLCipher：bundled-sqlcipher-vendored-openssl 把 SQLCipher + OpenSSL
 # 编译进 Rust 静态库，打包后端无需外部 CLI、系统 SQLCipher 或 TRAE DLL。
 # 对应 Gate A 停止规则：无法固定兼容构建时阻止所有 DB 功能。
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.31", optional = true, features = ["bundled-sqlcipher-vendored-openssl"] }
 # SHA-256 用于 schema 指纹和认证字段不可逆指纹
 sha2 = "0.10"
 # hex 编码
 hex = "0.4"
+# 恢复包使用 OpenSSL 提供的 PBKDF2-HMAC-SHA256 与 AES-256-GCM。
+openssl = { version = "0.10" }
+# Windows 空间查询，仅用于 T12 的实际预留前置检查。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_RestartManager",
+    "Win32_UI_WindowsAndMessaging",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem"
+] }
+# 跨进程文件锁：锁文件保留审计标记，OS 锁负责进程崩溃后的自动释放。
+fs2 = "0.4"
+# 真实签到/OAuth HTTP 客户端：blocking 模式（commands 层为同步函数），rustls 避免系统 OpenSSL 依赖。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # Base64 解码 storage.json 中的 iCubeAuthInfo 字段
 base64 = "0.22"
+# U-7 blob 保活：AES-128-CBC(PKCS7) 解密/重加密登录 blob（与 C0 探针同版本）。
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
+rusty-leveldb = "4.0.1"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # filetime 用于在测试中设置会话目录 mtime——Windows 上需要 FILE_FLAG_BACKUP_SEMANTICS
 # 才能打开目录并设置时间戳，std::fs::File::options().write(true).open(&dir) 会失败
 filetime = "0.2"
+# 遥测头探针（real_account_acceptance 集成测试）需要直接构造带自定义头的
+# status 请求并解析原始响应；与正式依赖同版本配置。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+
+[[test]]
+name = "real_clone_acceptance"
+path = "tests/real_clone_acceptance.rs"
+required-features = ["sqlcipher"]
+
+[[test]]
+name = "recovery_import_fixture"
+path = "tests/recovery_import_fixture.rs"
+required-features = ["sqlcipher"]
+
+[[test]]
+name = "recovery_dpapi_current_profile"
+path = "tests/recovery_dpapi_current_profile.rs"
+required-features = ["sqlcipher"]
+
+[[test]]
+name = "t11_sqlcipher_streaming_fixture"
+path = "tests/t11_sqlcipher_streaming_fixture.rs"
+required-features = ["sqlcipher"]
+
+[[test]]
+name = "sidecar_upgrade_crash_matrix"
+path = "tests/sidecar_upgrade_crash_matrix.rs"
+required-features = ["sqlcipher"]
+
+[[test]]
+name = "catalog_sidecar_contract"
+path = "tests/catalog_sidecar_contract.rs"
+required-features = ["sqlcipher"]
+
+# W0 运行中读取一致性探针（U-6 历史页轮询定参）：依赖 SQLCipher 只读路径。
+[[example]]
+name = "w0_probe"
+path = "examples/w0_probe.rs"
+required-features = ["sqlcipher"]
+
+# 重铸冷却探针：实测重铸后最短有效冷却（0/30/120 秒梯度），不需要 SQLCipher。
+[[example]]
+name = "remint_cooldown_probe"
+path = "examples/remint_cooldown_probe.rs"

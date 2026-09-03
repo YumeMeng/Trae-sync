@@ -44,8 +44,19 @@ impl FileIdentityProvider for PlatformFileIdentityProvider {
 #[cfg(windows)]
 fn read_file_identity_windows(path: &Path) -> Option<FileIdentity> {
     use std::os::windows::io::AsRawHandle;
-    // 打开文件（不删除/不修改），读取 BY_HANDLE_FILE_INFORMATION
-    let file = std::fs::OpenOptions::new().read(true).open(path).ok()?;
+    // 打开文件（不删除/不修改），读取 BY_HANDLE_FILE_INFORMATION。
+    // Windows 普通方式不能打开目录；备份语义允许读取目录本身的稳定身份。
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .or_else(|_| {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+        })
+        .ok()?;
 
     let handle = file.as_raw_handle();
     // SAFETY: 调用 Win32 GetFileInformationByHandle，handle 来自合法的 std::fs::File

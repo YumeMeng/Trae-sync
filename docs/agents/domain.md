@@ -7,10 +7,10 @@
 开始分析、设计或实现前读取：
 
 1. 根目录 `CONTEXT.md`。
-2. 与当前任务相关的 `docs/adr/` 文档。
-3. `docs/IMPLEMENTATION_SPEC.md`。
-4. `docs/GATE_PLAN.md` 中对应 Gate。
-5. 相关技术证据文档。
+2. `docs/DECISIONS-20260822-GRILL.md`（项目方向记录；**注意头部取代标注**——部分决策已被后续 ADR 取代）。
+3. `docs/adr/` 现行决策（0018-0024，见 `docs/adr/README.md` 索引；新 ADR 由任务驱动创建）。
+4. `tickets.new.md` 中对应 Phase 的 ticket（现行唯一计划文件）。
+5. 相关技术证据文档（`docs/TECHNICAL_BASELINE.md`、`.scratch/checkin-http/`）。
 
 文件尚不存在时继续工作，不为填充目录而创建无实际决策的文档。
 
@@ -19,11 +19,11 @@
 ```text
 /
 ├── CONTEXT.md
+├── tickets.new.md
 ├── docs/
 │   ├── adr/
 │   ├── agents/
-│   ├── IMPLEMENTATION_SPEC.md
-│   └── GATE_PLAN.md
+│   └── TECHNICAL_BASELINE.md
 └── src/
 ```
 

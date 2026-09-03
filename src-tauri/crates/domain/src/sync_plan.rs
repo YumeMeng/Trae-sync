@@ -174,7 +174,6 @@ impl OperationState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SyncPlanExecutionOutcome {
     Completed { affected_rows: u64 },
-    CompletedWithPostCommitEvidenceDrift { affected_rows: u64 },
     PlanExpired { backups_preserved: bool },
     CancelledBeforeWrite { backups_preserved: bool },
     FailedBeforeWrite { backups_preserved: bool },
@@ -271,6 +270,11 @@ impl SyncPlan {
         &self.data_location_id
     }
 
+    /// 返回计划生成时固定的目标账号，仅供后端生成安全预览。
+    pub fn current_user_id(&self) -> &str {
+        &self.current_user_id
+    }
+
     /// 返回计划绑定的写入前文件证据，供执行器临近写入时再次比较。
     pub fn target_file_evidence(&self) -> &TargetFileEvidence {
         &self.target_file_evidence
@@ -288,6 +292,26 @@ impl SyncPlan {
         &self.scope_snapshot
     }
 
+    /// 返回计划绑定的 schema 指纹；只用于承接意图失效判断，不包含正文。
+    pub fn schema_fingerprint(&self) -> &str {
+        &self.schema_fingerprint
+    }
+
+    /// 返回计划绑定的适配映射版本。
+    pub fn mapping_version(&self) -> &str {
+        &self.mapping_version
+    }
+
+    /// 返回写后关系断言；执行器使用它验证混合批量计划的最终状态。
+    pub fn expected_after(&self) -> &[PlanAssertion] {
+        &self.expected_after
+    }
+
+    /// 返回写前关系断言；诊断和撤销计划生成器可复用同一组稳定关系。
+    pub fn expected_before(&self) -> &[PlanAssertion] {
+        &self.expected_before
+    }
+
     /// 只接受与构建时完全一致的账号、目标文件、schema 与 mapping 证据。
     pub fn matches_context(&self, context: &SyncPlanContext) -> bool {
         self.platform_id == context.platform_id
@@ -295,6 +319,17 @@ impl SyncPlan {
             && self.current_user_id == context.current_user_id
             && self.account_evidence_fingerprint == context.account_evidence_fingerprint
             && self.target_file_evidence == context.target_file_evidence
+            && self.schema_fingerprint == context.schema_fingerprint
+            && self.mapping_version == context.mapping_version
+            && context.schema_compatible
+    }
+
+    /// 提交后目标数据库指纹会因本次已确认写入而变化，只复核非目标文件证据。
+    pub fn matches_post_commit_context(&self, context: &SyncPlanContext) -> bool {
+        self.platform_id == context.platform_id
+            && self.data_location_id == context.data_location_id
+            && self.current_user_id == context.current_user_id
+            && self.account_evidence_fingerprint == context.account_evidence_fingerprint
             && self.schema_fingerprint == context.schema_fingerprint
             && self.mapping_version == context.mapping_version
             && context.schema_compatible

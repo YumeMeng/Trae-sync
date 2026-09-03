@@ -6,14 +6,14 @@
 // - userId 只用于判断是否检测到账号，不显示真实 ID 正文
 // - 错误状态只展示结构化 kind，不展示 secret
 
-/** 平台上下文（与 T01 WorkspaceStateDto.platform 一致） */
+/** 平台上下文（与 WorkspaceStateDto.platform 一致）。 */
 export interface WorkbenchPlatformDto {
   readonly platform_id: string;
   readonly display_name: string;
   readonly adapter_implemented: boolean;
 }
 
-/** 数据位置状态（与 T01 一致） */
+/** 数据位置状态（与 WorkspaceStateDto 一致）。 */
 export interface WorkbenchDataLocationDto {
   readonly selected: boolean;
   readonly display_name: string | null;
@@ -42,7 +42,14 @@ export interface CompatibilityIncompatibleDto {
     | { readonly missing_column: { readonly table: string; readonly column: string } }
     | { readonly missing_index: { readonly table: string; readonly index: string } }
     | { readonly missing_constraint: { readonly table: string; readonly constraint: string } }
-    | { readonly cipher_version_mismatch: { readonly version: string } };
+    | { readonly cipher_version_mismatch: { readonly version: string } }
+    | {
+        readonly cipher_pragma_mismatch: {
+          readonly pragma: string;
+          readonly expected: string;
+          readonly actual: string;
+        };
+      };
 }
 
 export type CompatibilityStateDto =

@@ -324,6 +324,9 @@ impl<'a> WorkbenchReadService<'a> {
                 traesync_domain::IncompatibleReason::CipherVersionMismatch { .. } => {
                     ReadonlyReason::SchemaUnsupported
                 }
+                traesync_domain::IncompatibleReason::CipherPragmaMismatch { .. } => {
+                    ReadonlyReason::SchemaUnsupported
+                }
             });
         }
 
@@ -511,6 +514,31 @@ mod tests {
         let state = svc.build_read_state(dir.path(), "database.db", now());
 
         assert_eq!(state.readonly_reason, Some(ReadonlyReason::UnknownSchema));
+    }
+
+    #[test]
+    fn cipher_pragma_mismatch_yields_schema_unsupported_reason() {
+        let dir = tempdir().unwrap();
+        touch_db(dir.path(), "database.db");
+        let probe = FakeDbProbe {
+            state: CompatibilityState::Incompatible {
+                reason: IncompatibleReason::CipherPragmaMismatch {
+                    pragma: "kdf_iter".to_string(),
+                    expected: "256000".to_string(),
+                    actual: "64000".to_string(),
+                },
+            },
+        };
+        let reader = FakeAccountReader {
+            evidence: verified_account(),
+        };
+        let svc = WorkbenchReadService::new(&probe, &reader, "rawkey");
+        let state = svc.build_read_state(dir.path(), "database.db", now());
+
+        assert_eq!(
+            state.readonly_reason,
+            Some(ReadonlyReason::SchemaUnsupported)
+        );
     }
 
     #[test]

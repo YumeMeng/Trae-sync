@@ -11,9 +11,10 @@ use traesync_domain::{AccountEvidence, CompatibilityState};
 
 /// 数据库探测端口：infrastructure 实现嵌入式 SQLCipher 打开与 schema 兼容判断。
 ///
-/// 安全约束：
+/// 边界约束：
 /// - 实现必须只接受经过 `FixturePathGuard` 验证的 fixture 路径
-/// - 不得在日志、错误消息或返回值中包含 raw_key、Token 或认证正文
+/// - `raw_key` 是已授权的 TRAE 技术参数；Token、cookies 和完整认证正文不得进入返回值或账号证据
+/// - raw_key 不进入 OperationId、状态枚举或结构化错误代码，避免破坏审计协议；这不是密钥保密要求
 /// - 错误 key、截断文件、未知 schema 必须返回结构化 `CompatibilityState::Incompatible`
 pub trait DatabaseProbePort: Send + Sync {
     /// 探测指定数据库副本。
@@ -26,10 +27,31 @@ pub trait DatabaseProbePort: Send + Sync {
     /// 错误 key、正确 key 与探测失败均保持 DB/WAL/SHM 字节级不变。
     fn probe_database(&self, db_path: &Path, raw_key: &str) -> CompatibilityState;
 
-    /// 通过 SQLite Backup API 生成单文件逻辑副本。
+    /// 在长时间数据库探测期间持续复核授权上下文。
+    ///
+    /// 默认实现保留旧 mock/adapter 的兼容性；需要支持中途撤销的实现应覆盖此方法，
+    /// 并在隔离副本复制、哈希和打开数据库前后调用 `is_authorized`。
+    fn probe_database_with_validation(
+        &self,
+        db_path: &Path,
+        raw_key: &str,
+        is_authorized: &dyn Fn() -> bool,
+    ) -> Option<CompatibilityState> {
+        if !is_authorized() {
+            return None;
+        }
+        let result = self.probe_database(db_path, raw_key);
+        if !is_authorized() {
+            return None;
+        }
+        Some(result)
+    }
+
+    /// 通过 SQLCipher `sqlcipher_export()` 生成单文件逻辑副本。
     ///
     /// 返回逻辑副本路径（位于 fixture_root 内）。未 checkpoint WAL 的已提交记录
-    /// 必须进入逻辑副本。失败时返回 None（不抛出原始错误给上层）。
+    /// 必须进入逻辑副本。加密数据库不使用 SQLite `sqlite3_backup_*` API；失败时返回
+    /// None（不抛出原始错误给上层）。
     fn backup_to_logical_copy(&self, source_db: &Path, raw_key: &str)
         -> Option<std::path::PathBuf>;
 

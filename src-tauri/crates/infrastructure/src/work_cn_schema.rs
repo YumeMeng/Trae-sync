@@ -31,14 +31,14 @@ const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
 /// - chat_session.session_id UNIQUE
 /// - chat_message.message_id UNIQUE
 ///
-/// 通过 `PRAGMA index_list` 检查 origin='u'（UNIQUE 约束）或 origin='pk'（PRIMARY KEY）。
-const REQUIRED_UNIQUE_CONSTRAINTS: &[(&str, &[&str])] = &[
+/// 约束可由 PRIMARY KEY、UNIQUE 约束或命名 UNIQUE INDEX 提供；索引名不稳定，不能作为契约。
+const REQUIRED_UNIQUE_CONSTRAINTS: &[(&str, &[&[&str]])] = &[
     (
         "project",
-        &["sqlite_autoindex_project_1", "sqlite_autoindex_project_2"],
+        &[&["project_id"], &["biz_project_id", "user_id"]],
     ),
-    ("chat_session", &["sqlite_autoindex_chat_session_1"]),
-    ("chat_message", &["sqlite_autoindex_chat_message_1"]),
+    ("chat_session", &[&["session_id"]]),
+    ("chat_message", &[&["message_id"]]),
 ];
 
 /// 检查 schema 兼容性：返回 Ok(()) 或 Err(IncompatibleReason)。
@@ -70,13 +70,13 @@ pub fn check_schema(conn: &Connection) -> Result<(), IncompatibleReason> {
         }
     }
 
-    // 3. R5：检查必需唯一约束（不推迟到 T06）
-    for (table, constraint_names) in REQUIRED_UNIQUE_CONSTRAINTS {
-        for constraint_name in *constraint_names {
-            if !unique_constraint_exists(conn, table, constraint_name) {
+    // 3. R5：检查必需唯一列组合（不推迟到 T06）
+    for (table, column_sets) in REQUIRED_UNIQUE_CONSTRAINTS {
+        for columns in *column_sets {
+            if !unique_constraint_exists(conn, table, columns) {
                 return Err(IncompatibleReason::MissingConstraint {
                     table: (*table).to_string(),
-                    constraint: (*constraint_name).to_string(),
+                    constraint: columns.join(","),
                 });
             }
         }
@@ -121,37 +121,56 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     false
 }
 
-/// R5：判断唯一约束是否存在。
+/// 检查是否存在覆盖指定列组合的唯一索引。
 ///
-/// 通过 `PRAGMA index_list(<table>)` 查询表的索引列表：
-/// - origin='u' 表示 UNIQUE 约束自动生成的索引
-/// - origin='pk' 表示 PRIMARY KEY 约束自动生成的索引
-///
-/// SQLite 为 PRIMARY KEY 和 UNIQUE 约束自动创建名为 `sqlite_autoindex_<table>_<n>` 的索引。
-/// 检查该索引存在且 origin 为 'u' 或 'pk' 即可确认约束存在。
-fn unique_constraint_exists(conn: &Connection, table: &str, constraint_name: &str) -> bool {
+/// `PRAGMA index_list` 返回 `unique=1` 的索引时，无论来源是主键、UNIQUE 约束还是命名索引，
+/// 都能提供相同的写入安全保证。
+fn unique_constraint_exists(conn: &Connection, table: &str, required_columns: &[&str]) -> bool {
     let pragma = format!("PRAGMA index_list({})", table);
     let mut stmt = match conn.prepare(&pragma) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    // PRAGMA index_list 列：seq, name, unique, origin, partial
+    // PRAGMA index_list 列：seq, name, unique, origin, partial。
     let rows = match stmt.query_map([], |row| {
         let name: String = row.get(1)?;
-        let origin: String = row.get(3).unwrap_or_default();
-        Ok((name, origin))
+        let is_unique: i64 = row.get(2)?;
+        let is_partial: i64 = row.get(4)?;
+        Ok((name, is_unique, is_partial))
     }) {
         Ok(r) => r,
         Err(_) => return false,
     };
     for row in rows {
-        if let Ok((name, origin)) = row {
-            if name == constraint_name && (origin == "u" || origin == "pk") {
+        if let Ok((name, is_unique, is_partial)) = row {
+            if is_unique != 0
+                && is_partial == 0
+                && index_columns_match(conn, &name, required_columns)
+            {
                 return true;
             }
         }
     }
     false
+}
+
+/// 比较索引列顺序，避免把包含额外列的唯一索引误判为目标约束。
+fn index_columns_match(conn: &Connection, index_name: &str, required_columns: &[&str]) -> bool {
+    let escaped_index_name = index_name.replace('\'', "''");
+    let pragma = format!("PRAGMA index_info('{escaped_index_name}')");
+    let mut stmt = match conn.prepare(&pragma) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(2)) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let columns = rows.filter_map(Result::ok).collect::<Vec<_>>();
+    columns
+        .iter()
+        .map(String::as_str)
+        .eq(required_columns.iter().copied())
 }
 
 /// 计算 schema 指纹：SHA-256 hex，绑定全部表的 DDL。
@@ -242,6 +261,78 @@ mod tests {
         let conn = make_work_cn_schema_db(&db_path);
         let result = check_schema(&conn);
         assert!(result.is_ok());
+    }
+
+    /// 唯一性属于列组合契约，不依赖 SQLite 自动索引名称。
+    #[test]
+    fn check_schema_accepts_required_unique_columns_with_named_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("named-indexes.db")).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (
+                id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                biz_project_id TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX project_project_id_unique ON project(project_id);
+            CREATE UNIQUE INDEX project_biz_user_unique ON project(biz_project_id, user_id);
+            CREATE TABLE chat_session (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX chat_session_id_unique ON chat_session(session_id);
+            CREATE TABLE chat_message (
+                id INTEGER PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX chat_message_id_unique ON chat_message(message_id);
+            "#,
+        )
+        .unwrap();
+
+        assert!(check_schema(&conn).is_ok());
+    }
+
+    #[test]
+    fn check_schema_rejects_partial_unique_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("partial-indexes.db")).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                biz_project_id TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX project_project_id_partial ON project(project_id)
+                WHERE project_id IS NOT NULL;
+            CREATE UNIQUE INDEX project_biz_user_partial ON project(biz_project_id, user_id)
+                WHERE biz_project_id IS NOT NULL AND user_id IS NOT NULL;
+            CREATE TABLE chat_session (
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX chat_session_id_partial ON chat_session(session_id)
+                WHERE session_id IS NOT NULL;
+            CREATE TABLE chat_message (
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX chat_message_id_partial ON chat_message(message_id)
+                WHERE message_id IS NOT NULL;
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            check_schema(&conn),
+            Err(IncompatibleReason::MissingConstraint { table, constraint })
+                if table == "project" && constraint == "project_id"
+        ));
     }
 
     #[test]

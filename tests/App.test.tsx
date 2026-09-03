@@ -1,25 +1,31 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within, fireEvent } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import type { WorkspaceStateDto } from "../src/types/workspace";
-import type { WorkbenchReadStateDto } from "../src/types/workbench_read";
+import App from "../src/App";
 
-// 默认 mock：模拟后端返回的空工作台状态（T01 全部能力禁用）
-const mockEmptyWorkspace: WorkspaceStateDto = {
+// App 测试只模拟 Tauri command，确保测试不会访问真实 TRAE 数据。
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
+
+const mockInvoke = vi.mocked(invoke);
+
+const workspace: WorkspaceStateDto = {
   platform: {
     platform_id: "work_cn",
     display_name: "TRAE Work CN",
-    adapter_implemented: false,
+    adapter_implemented: true,
   },
   data_location: {
-    selected: false,
-    display_name: null,
-    unavailable_reason: "not_selected",
+    selected: true,
+    display_name: "C:\\TRAE\\ModularData",
+    unavailable_reason: null,
   },
   current_account: {
-    detected: false,
-    user_fingerprint: null,
-    unavailable_reason: "not_detected",
+    detected: true,
+    user_fingerprint: "acct-1234",
+    unavailable_reason: null,
   },
   history: {
     account_count: 0,
@@ -27,221 +33,228 @@ const mockEmptyWorkspace: WorkspaceStateDto = {
     session_count: 0,
   },
   capabilities: {
-    scan_enabled: false,
+    scan_enabled: true,
     sync_enabled: false,
     backup_enabled: false,
     restore_enabled: false,
   },
-  honest_status: "真实能力尚未启用",
+  honest_status: "RealReadPreview",
 };
 
-// mock Tauri invoke，让前端在不依赖真实后端的情况下测试
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async (cmd: string) => {
-    if (cmd === "get_workspace_state") {
-      return mockEmptyWorkspace;
-    }
-    throw new Error(`未模拟的命令: ${cmd}`);
-  }),
-}));
-
-import App from "../src/App";
-
-describe("空工作台 UI（T01 骨架）", () => {
+describe("应用工作区入口", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-  });
-
-  it("标题栏显示平台上下文（Work CN）", async () => {
-    render(<App />);
-    // 等待 Tauri invoke 返回后渲染
-    expect(await screen.findByText(/TRAE Work CN/)).toBeInTheDocument();
-  });
-
-  it("标题栏显示数据位置未选择状态", async () => {
-    render(<App />);
-    expect(await screen.findByText(/数据位置未选择|未选择数据位置/)).toBeInTheDocument();
-  });
-
-  it("标题栏显示当前账号未检测状态", async () => {
-    render(<App />);
-    expect(await screen.findByText(/当前账号未检测|未检测到账号/)).toBeInTheDocument();
-  });
-
-  it("显示历史库入口与空摘要（账号/项目/对话均为 0）", async () => {
-    render(<App />);
-    const historySection = await screen.findByRole("region", { name: /历史库/ });
-    // 历史库摘要显示账号/项目/对话数量均为 0
-    expect(within(historySection).getByText("账号 0")).toBeInTheDocument();
-    expect(within(historySection).getByText("项目 0")).toBeInTheDocument();
-    expect(within(historySection).getByText("对话 0")).toBeInTheDocument();
-    // 历史库区域应显示“查找新历史”入口（T01 阶段禁用）
-    expect(within(historySection).getByRole("button", { name: /查找新历史/ })).toBeDisabled();
-  });
-
-  it("显示操作与备份入口", async () => {
-    render(<App />);
-    expect(await screen.findByRole("region", { name: /操作与备份/ })).toBeInTheDocument();
-  });
-
-  it("显示设置入口", async () => {
-    render(<App />);
-    expect(await screen.findByRole("region", { name: /设置/ })).toBeInTheDocument();
-  });
-
-  it("显示诚实状态：真实能力尚未启用", async () => {
-    render(<App />);
-    // honestStatus 在历史库工作台中出现两次（空提示 + 状态栏），用 findAllByText
-    expect((await screen.findAllByText(/真实能力尚未启用/)).length).toBeGreaterThan(0);
-  });
-
-  it("所有真实能力按钮均禁用（扫描、同步、备份、恢复）", async () => {
-    render(<App />);
-    await screen.findAllByText(/真实能力尚未启用/);
-    // 扫描按钮在历史库区域
-    expect(screen.getByRole("button", { name: /查找新历史/ })).toBeDisabled();
-    // 同步按钮
-    expect(screen.getByRole("button", { name: /检查并安全同步/ })).toBeDisabled();
-  });
-});
-
-// T02 切片 C：Work CN 只读入口 UI 边界
-describe("Work CN 只读入口（T02 切片 C）", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("初始不自动调用 read_work_cn_state（切片 C AC1）", async () => {
-    const invokeSpy = vi.mocked(invoke);
-    render(<App />);
-    // 等待 T01 工作台加载
-    await screen.findByText(/TRAE Work CN/);
-    // read_work_cn_state 不应在初始渲染时被调用
-    const readCalls = invokeSpy.mock.calls.filter(
-      ([cmd]) => cmd === "read_work_cn_state",
-    );
-    expect(readCalls.length).toBe(0);
-  });
-
-  it("Work CN 只读入口区域显示 fixture 模式提示与读按钮（切片 C AC2）", async () => {
-    render(<App />);
-    expect(await screen.findByRole("region", { name: /Work CN 只读入口/ })).toBeInTheDocument();
-    expect(screen.getByTestId("workbench-read-hint")).toHaveTextContent(
-      /T02 阶段仅支持 fixture 路径/,
-    );
-    // 读取按钮初始存在
-    expect(screen.getByTestId("read-workbench-button")).toBeInTheDocument();
-  });
-
-  it("点击读取按钮调用 read_work_cn_state 并显示状态（切片 C AC2）", async () => {
-    const invokeSpy = vi.mocked(invoke);
-    // R2/R6：使用合成账号 ID（不复制真实基线 ID），UI 显示明确摘要而非“已检测”
-    const mockReadState: WorkbenchReadStateDto = {
-      platform: {
-        platform_id: "work_cn",
-        display_name: "TRAE Work CN",
-        adapter_implemented: true,
-      },
-      data_location: {
-        selected: true,
-        display_name: "C:\\fixture",
-        unavailable_reason: null,
-      },
-      compatibility: {
-        kind: "Verified",
-        schema_fingerprint: "abc123",
-        counts: {
-          project_count: 1,
-          chat_session_count: 2,
-          chat_message_count: 3,
-        },
-      },
-      current_account: {
-        user_id: "1000000000000001",
-        source_events: [],
-        auth_fingerprint: "fp",
-        local_storage_user_id: "1000000000000001",
-        product_version: "1.107.1",
-        observed_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        evidence_state: "verified",
-      },
-      readonly_reason: null,
-    };
-    invokeSpy.mockImplementation(async (cmd: string) => {
-      if (cmd === "get_workspace_state") return mockEmptyWorkspace;
-      if (cmd === "read_work_cn_state") return mockReadState;
-      throw new Error(`未模拟的命令: ${cmd}`);
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_workspace_state") return workspace;
+      if (command === "refresh_managed_current_account") return undefined;
+      if (command === "list_operations") return [];
+      if (command === "get_operation_lock_status") {
+        return {
+          data_location_id: "location-1",
+          catalog_lock_held: false,
+          data_location_lock_held: false,
+          write_allowed: false,
+          reason: null,
+        };
+      }
+      if (command === "get_progress") return null;
+      if (command === "get_checkin_capability") {
+        return {
+          enabled: false,
+          transport: "disabled",
+          real_http_enabled: false,
+          message: "签到能力当前不可读取。",
+        };
+      }
+      throw new Error(`未模拟的命令: ${command}`);
     });
-    render(<App />);
-    await screen.findByText(/TRAE Work CN/);
-    // 输入 fixture 路径
-    const input = screen.getByTestId("fixture-root-input") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "C:\\fixture" } });
-    // 点击读取按钮
-    const button = screen.getByTestId("read-workbench-button")!;
-    fireEvent.click(button);
-    // 状态应显示
-    expect(await screen.findByTestId("workbench-read-state")).toBeInTheDocument();
-    expect(screen.getByTestId("wr-compatibility")).toHaveTextContent("Verified");
-    // R6：UI 显示 user_id 摘要（首尾 4 位），而非模糊的“已检测”
-    expect(screen.getByTestId("wr-account")).toHaveTextContent(/1000…0001/);
   });
 
-  it("错误状态不展示 raw_key/认证正文（切片 C AC3）", async () => {
-    const invokeSpy = vi.mocked(invoke);
-    // 模拟错误 key 状态——只读原因为 wrong_key
-    const mockWrongKeyState: WorkbenchReadStateDto = {
-      platform: {
-        platform_id: "work_cn",
-        display_name: "TRAE Work CN",
-        adapter_implemented: true,
-      },
-      data_location: {
-        selected: true,
-        display_name: "C:\\fixture",
-        unavailable_reason: null,
-      },
-      compatibility: {
-        kind: "Incompatible",
-        reason: "wrong_key",
-      },
-      current_account: {
-        user_id: null,
-        source_events: [],
-        auth_fingerprint: null,
-        local_storage_user_id: null,
-        product_version: null,
-        observed_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        evidence_state: "missing",
-      },
-      readonly_reason: "wrong_key",
-    };
-    invokeSpy.mockImplementation(async (cmd: string) => {
-      if (cmd === "get_workspace_state") return mockEmptyWorkspace;
-      if (cmd === "read_work_cn_state") return mockWrongKeyState;
-      throw new Error(`未模拟的命令: ${cmd}`);
-    });
+  it("历史页走主库直读，不存在授权扫描入口", async () => {
     render(<App />);
-    await screen.findByText(/TRAE Work CN/);
-    const input = screen.getByTestId("fixture-root-input") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "C:\\fixture" } });
-    fireEvent.click(screen.getByTestId("read-workbench-button")!);
-    const state = await screen.findByTestId("workbench-read-state");
-    // 显示结构化只读原因
-    expect(screen.getByTestId("wr-readonly-reason")).toHaveTextContent("wrong_key");
-    expect(screen.getByTestId("wr-incompatible-reason")).toHaveTextContent("wrong_key");
-    // 不展示 raw_key 原文（mockReadState 不含 raw_key 字段）
-    expect(state.textContent).not.toContain("3605f669");
-    expect(state.textContent).not.toContain("rawkey");
+
+    expect(await screen.findByTestId("title-bar-mode")).toBeInTheDocument();
+    // P5-3 起历史页直接读主库，授权勾选/扫描入口全部退役。
+    expect(screen.queryByTestId("authorize-check")).not.toBeInTheDocument();
+    expect(screen.queryByText("Work CN 只读入口")).not.toBeInTheDocument();
+    expect(screen.queryByText("同步目标")).not.toBeInTheDocument();
+    expect(screen.queryByText("允许副作用")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("read_work_cn_state", expect.anything());
   });
 
-  it("只读提示明确手工账号选择不能解除只读（切片 C AC4）", async () => {
+  it("标题栏持续显示账号和只读状态，并提供重新检测", async () => {
     render(<App />);
-    expect(await screen.findByTestId("readonly-notice")).toHaveTextContent(
-      /手工账号选择不能解除只读/,
+
+    expect(await screen.findByTestId("title-bar-mode")).toHaveTextContent("只读保护中");
+    expect(screen.getByTestId("current-account-context")).toHaveTextContent(
+      "当前账号 · acct-1234",
     );
-    // 所有真实写能力按钮仍禁用
-    expect(screen.getByRole("button", { name: /查找新历史/ })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /检查并安全同步/ })).toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("redetect-account-button"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_managed_current_account");
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("get_workspace_state");
+  });
+
+  it("账号刷新失败仍重新读取工作区并清除旧标题栏账号", async () => {
+    let revoked = false;
+    let workspaceReadCount = 0;
+    const unauthorizedWorkspace: WorkspaceStateDto = {
+      ...workspace,
+      current_account: {
+        ...workspace.current_account,
+        detected: false,
+        user_fingerprint: null,
+        unavailable_reason: "authorization_required",
+      },
+      capabilities: {
+        ...workspace.capabilities,
+        scan_enabled: false,
+      },
+      honest_status: "读取未授权；等待用户授权后发现 TRAE 数据位置；TRAE 写入保持禁用。",
+    };
+
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_workspace_state") {
+        workspaceReadCount += 1;
+        return revoked ? unauthorizedWorkspace : workspace;
+      }
+      if (command === "refresh_managed_current_account") {
+        revoked = true;
+        throw new Error("account_profile_store_busy");
+      }
+      if (command === "list_operations") return [];
+      if (command === "get_operation_lock_status") {
+        return {
+          data_location_id: "location-1",
+          catalog_lock_held: false,
+          data_location_lock_held: false,
+          write_allowed: false,
+          reason: null,
+        };
+      }
+      if (command === "get_progress") return null;
+      throw new Error(`未模拟的命令: ${command}`);
+    });
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("current-account-context")).toHaveTextContent(
+        "当前账号 · acct-1234",
+      );
+    });
+
+    fireEvent.click(screen.getByTestId("redetect-account-button"));
+
+    // 账号失效会级联撤销历史读取授权，再触发一次权威工作区刷新。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_managed_current_account");
+      expect(screen.getByTestId("current-account-context")).toHaveTextContent(
+        "未检测",
+      );
+      expect(screen.getByTestId("current-account-context")).not.toHaveTextContent("acct-1234");
+      expect(screen.getByTestId("title-bar-mode")).toHaveTextContent("读取未授权");
+    });
+    expect(workspaceReadCount).toBeGreaterThanOrEqual(2);
+  });
+
+  it("读取授权未建立时显示读取未授权，不误导为账号重新检测", async () => {
+    const unauthorizedWorkspace: WorkspaceStateDto = {
+      ...workspace,
+      current_account: {
+        ...workspace.current_account,
+        detected: false,
+        user_fingerprint: null,
+        unavailable_reason: "authorization_required",
+      },
+      capabilities: {
+        ...workspace.capabilities,
+        scan_enabled: true,
+      },
+      honest_status: "真实只读 Preview；等待用户授权后发现 TRAE 数据位置；TRAE 写入保持禁用。",
+    };
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_workspace_state") return unauthorizedWorkspace;
+      if (command === "list_operations") return [];
+      if (command === "get_operation_lock_status") {
+        return {
+          data_location_id: "location-1",
+          catalog_lock_held: false,
+          data_location_lock_held: false,
+          write_allowed: false,
+          reason: null,
+        };
+      }
+      if (command === "get_progress") return null;
+      throw new Error(`未模拟的命令: ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByTestId("title-bar-mode")).toHaveTextContent("读取未授权");
+    // 内部发布术语不进入用户界面（honest_status 已不再直接渲染）。
+    expect(screen.queryByText(/RealReadPreview|真实只读 Preview/)).not.toBeInTheDocument();
+  });
+
+  it("初始化状态读取失败时提供可重试的工作台恢复动作", async () => {
+    let shouldFail = true;
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_workspace_state") {
+        if (shouldFail) {
+          throw new Error("IPC 暂时不可用");
+        }
+        return workspace;
+      }
+      throw new Error(`未模拟的命令: ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("加载工作台状态失败");
+    const retryButton = screen.getByRole("button", { name: "重新读取工作台状态" });
+
+    shouldFail = false;
+    fireEvent.click(retryButton);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("title-bar-mode")).toBeInTheDocument();
+    });
+    // 只统计工作区状态读取；总览页的活动面板会并行轮询其他只读命令。
+    expect(
+      mockInvoke.mock.calls.filter(([command]) => command === "get_workspace_state"),
+    ).toHaveLength(2);
+  });
+
+  it("导航使用总览、历史、账号、签到、环境、设置六个工作区", async () => {
+    render(<App />);
+    await screen.findByTestId("title-bar-mode");
+
+    expect(screen.getByRole("button", { name: "总览" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "历史" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "账号" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "签到" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "环境" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "账号" }));
+    expect(await screen.findByRole("region", { name: "账号" })).toBeVisible();
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "账号", level: 1 })).toHaveFocus();
+    });
+
+    // 签到是独立工作区：点击后区域可见且标题获得焦点，账号页隐藏。
+    fireEvent.click(screen.getByRole("button", { name: "签到" }));
+    expect(await screen.findByRole("region", { name: "签到" })).toBeVisible();
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "签到", level: 1 })).toHaveFocus();
+    });
+
+    // 环境是独立工作区（P5-2）：点击后区域可见且标题获得焦点。
+    fireEvent.click(screen.getByRole("button", { name: "环境" }));
+    expect(await screen.findByRole("region", { name: "环境" })).toBeVisible();
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "环境", level: 1 })).toHaveFocus();
+    });
   });
 });

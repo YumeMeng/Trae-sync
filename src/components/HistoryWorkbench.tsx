@@ -1,1047 +1,1554 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  Archive,
+  ArrowLeft,
+  CheckSquare,
+  Clock,
+  FolderClosed,
+  Layers,
+  ListChecks,
+  Merge,
+  MessageSquare,
+  RefreshCw,
+  Search,
+  Square,
+  Trash2,
+  Undo2,
+  X,
+} from "lucide-react";
+import type { AppPage } from "./NavigationRail";
 import type {
-  BrowseResultDto,
-  BrowseSessionNodeDto,
-  ConversationPreviewDto,
-  ProcessRunningState,
-  ScanOutcomeDto,
-  SearchHitDto,
-  SessionIdentityDto,
-  SyncPlanDto,
-  SyncScopeDto,
+  MasterHistoryDto,
+  MasterMergeResultDto,
+  MasterProjectEntryDto,
+  MasterSessionEntryDto,
+  RelayLedgerEntryDto,
 } from "../types/history";
+import type { SessionMessageDto } from "../types/account_switch";
+import { safeUiErrorMessage } from "../utils/safeUiError";
+import { SessionBatchBar } from "./SessionBatchBar";
 
 // ============================================================================
-// T03 历史库工作台：方案 D 三栏布局 + 授权扫描 + 浏览/搜索/预览
+// P5-3 历史页主库视图（环境模型 Q4/Q5）：项目左栏 + 会话右栏两栏结构。
 // ============================================================================
 //
-// 状态机：
-// - idle：未授权，显示授权表单
-// - scanning：扫描中，禁用交互
-// - success：扫描成功，显示浏览结果
-// - failure：扫描失败，显示结构化原因
-// - empty：扫描成功但目录库为空
+// 数据源 = 主库（environments\master 专属 data_dir），按主库当前登录账号的
+// project.user_id 过滤（E1b 可见性口径）；会话接力轨迹徽章由接力台账聚合
+// （session_id / from_session_id 逐跳链回完整轨迹）。
 //
-// 关键约束（T03/T04 AC）：
-// - 初始不自动扫描（AC1）
-// - 未授权/运行中不发布快照（AC2）
-// - 点击对话标题只打开预览，不改变同步选择（AC9）
-// - 搜索结果显示账号/项目/会话上下文，打开预览不改选择（AC9）
-// - 不暴露同步/写入/备份/恢复控件（P1 范围外）
-
-type HistoryPhase = "idle" | "scanning" | "success" | "failure" | "empty";
+// 准实时新鲜度：每 5 秒带 previous 指纹轮询 get_master_history，指纹未变
+// 返回 unchanged（维持现有列表，不重读）；台账仅在主库记录变化时随行刷新。
 
 interface HistoryWorkbenchProps {
-  /** T01 工作台能力开关——P1 阶段 scan_enabled 由历史库自身授权控制 */
-  capabilities: { scan_enabled: boolean; sync_enabled: boolean };
-  honestStatus: string;
+  /** 页面可见时才读取主库记录，避免后台 IPC；隐藏时停止轮询。 */
+  active: boolean;
+  /** 引导跳转（主库未启动/未登录时去环境页处理）。 */
+  onNavigate?: (page: AppPage) => void;
+  /** P5-8a-2 嵌入主库详情页 tab：不渲染页级标题，仅保留搜索/筛选/刷新工具行。 */
+  embedded?: boolean;
 }
 
-export function HistoryWorkbench({
-  capabilities,
-  honestStatus,
-}: HistoryWorkbenchProps) {
-  // 授权与扫描状态
-  const [phase, setPhase] = useState<HistoryPhase>("idle");
-  const [fixtureRoot, setFixtureRoot] = useState("");
-  const [dbRelativePath, setDbRelativePath] = useState("database.db");
-  const [processRunning, setProcessRunning] = useState(false);
-  const [scanError, setScanError] = useState<string | null>(null);
+type TimeRange = "all" | "today" | "week" | "month";
 
-  // 浏览结果
-  const [browseResult, setBrowseResult] = useState<BrowseResultDto | null>(null);
-  const [browseError, setBrowseError] = useState<string | null>(null);
+const TIME_RANGES: ReadonlyArray<{ value: TimeRange; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "today", label: "今天" },
+  { value: "week", label: "近 7 天" },
+  { value: "month", label: "近 30 天" },
+];
 
-  // 选中账号/项目（用于筛选树展开）
-  const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
-  const [selectedProject, setSelectedProject] = useState<string | null>(null);
+/** 一段接力轨迹：某账号持有该会话的时间段与其间新增消息数。 */
+interface RelayLeg {
+  readonly userId: string;
+  readonly accountName: string | null;
+  /** 该腿开始（上一跳交接时刻；首腿未知为 null）。 */
+  readonly fromUnixSeconds: number | null;
+  /** 该腿结束（交接时刻；当前腿为 null = 进行中）。 */
+  readonly toUnixSeconds: number | null;
+  readonly messages: number;
+}
 
-  // 预览（点击标题只打开预览，不改选择——AC9）
-  const [previewSession, setPreviewSession] = useState<SessionIdentityDto | null>(null);
-  const [previewData, setPreviewData] = useState<ConversationPreviewDto | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
+/** 会话预览弹层状态。 */
+interface PreviewState {
+  readonly session: MasterSessionEntryDto;
+  readonly status: "loading" | "ready" | "error";
+  readonly messages: readonly SessionMessageDto[];
+}
 
-  // 搜索
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<readonly SearchHitDto[] | null>(null);
-  const [searchError, setSearchError] = useState<string | null>(null);
+export function HistoryWorkbench({ active, onNavigate, embedded = false }: HistoryWorkbenchProps) {
+  const [history, setHistory] = useState<MasterHistoryDto | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [ledger, setLedger] = useState<readonly RelayLedgerEntryDto[]>([]);
+  const [selectedProject, setSelectedProject] = useState<string>("all");
+  const [timeRange, setTimeRange] = useState<TimeRange>("all");
+  const [searchText, setSearchText] = useState("");
+  const [preview, setPreview] = useState<PreviewState | null>(null);
+  // ===== P5-8a 选择模式 + 归档抽屉（Gmail 式：浏览态无框，选择态浮出批量栏）=====
+  // 主列表选择态与归档视图选择态各自独立（切换视图时清空，互不串选）。
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
+  const [archiveView, setArchiveView] = useState(false);
+  const [archiveSelect, setArchiveSelect] = useState(false);
+  const [archiveSelectedIds, setArchiveSelectedIds] = useState<ReadonlySet<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchError, setBatchError] = useState<string | null>(null);
+  // 删除二次确认（ADR-0018：列明规模，单次确认）。
+  const [deleteConfirm, setDeleteConfirm] = useState<readonly MasterSessionEntryDto[] | null>(null);
+  // ===== P5-8c 分组合并：左栏项目选择态 + 合并确认弹层 =====
+  const [projectSelect, setProjectSelect] = useState(false);
+  const [projectSelectedIds, setProjectSelectedIds] = useState<ReadonlySet<string>>(new Set());
+  // 待合并分组集合（弹层内选择保留目标；null = 未打开）。
+  const [mergeConfirm, setMergeConfirm] = useState<readonly MasterProjectEntryDto[] | null>(null);
+  // 合并完成回执（自然语言一句话；进入下一次分组选择时清除）。
+  const [mergeNotice, setMergeNotice] = useState<string | null>(null);
+  // 轮询指纹基线（上一轮读取成功的三件套指纹；unchanged 预检依据）。
+  const fingerprintRef = useRef<MasterHistoryDto["fingerprint"] | null>(null);
+  const pollCancelled = useRef(false);
 
-  // T05：同步范围与只读计划预览。执行写入仍由后续任务包提供。
-  const [scopeMode, setScopeMode] = useState<"all" | "custom">("all");
-  const [selectedAccounts, setSelectedAccounts] = useState<readonly string[]>([]);
-  const [selectedProjects, setSelectedProjects] = useState<readonly string[]>([]);
-  const [selectedSessions, setSelectedSessions] = useState<readonly SessionIdentityDto[]>([]);
-  const [syncPlan, setSyncPlan] = useState<SyncPlanDto | null>(null);
-  const [planLoading, setPlanLoading] = useState(false);
-  const [planError, setPlanError] = useState<string | null>(null);
-  const planGenerationRef = useRef(0);
-
-  // R7：已授权的 canonical fixture_root——由后端 grant_scan_authorization 返回。
-  // 前端不再持有"自封"的授权；只有后端成功授权后此值才非空。
-  // 取消授权或路径变化时此值清空，旧授权在后端被撤销。
-  const [authorizedFixtureRoot, setAuthorizedFixtureRoot] = useState<string | null>(null);
-
-  // R12：授权 pending 标记——true 时表示有 grant 请求未返回。
-  // pending 期间禁止重复发起同一授权；扫描按钮保持禁用；不显示为已授权。
-  const [authorizationPending, setAuthorizationPending] = useState(false);
-
-  // R12：单调递增的授权请求代次——每次路径变化、取消授权、卸载都递增。
-  // grant 返回时只有代次匹配且输入快照匹配才接受结果；否则立即 revoke 并丢弃。
-  const authGenerationRef = useRef(0);
-  // R12：当前 pending 请求的输入快照——用于验证返回时输入未变化
-  const pendingAuthSnapshotRef = useRef<{
-    fixtureRoot: string;
-    dbRelativePath: string;
-  } | null>(null);
-
-  // R12-B：串行保存 revoke。新的 grant 必须等待此前撤销完成，
-  // 避免旧 revoke 晚完成后清除新授权。
-  const authorizationMutationRef = useRef<Promise<void>>(Promise.resolve());
-
-  // R12-C：mounted guard——组件卸载后所有异步回调（grant 返回、stale revoke、
-  // revoke 失败）均不得调用 React setter，否则触发"对已卸载组件 setState"警告。
-  const mountedRef = useRef(true);
-
-  // 扫描授权前置条件：fixture_root 与 db_relative_path 非空
-  // storage_root 由后端 env 控制，前端不可注入，未配置时后端返回错误
-  const canAuthorize =
-    fixtureRoot.trim().length > 0 &&
-    dbRelativePath.trim().length > 0;
-
-  // R7：authorized 派生自后端授权状态——只有 authorizedFixtureRoot 非空时为 true
-  // R12：pending 时不视为已授权
-  const authorized = authorizedFixtureRoot !== null && !authorizationPending;
-
-  // R12-A：checkbox 在 pending 时也选中——用户可点击取消 pending 请求。
-  // pending 与已授权通过 label 文字区分，避免用户混淆。
-  const authorizeChecked = authorized || authorizationPending;
-
-  // R12：使当前 pending 请求失效的内部辅助——递增 generation 并清空快照。
-  // 调用后，任何未返回的 grant 响应都会被视为 stale。
-  const invalidatePendingAuth = useCallback(() => {
-    authGenerationRef.current += 1;
-    pendingAuthSnapshotRef.current = null;
-    setAuthorizationPending(false);
-    planGenerationRef.current += 1;
-    setSyncPlan(null);
-    setPlanLoading(false);
+  const load = useCallback(async (force: boolean) => {
+    const next = await invoke<MasterHistoryDto>("get_master_history", {
+      previous: force ? null : fingerprintRef.current,
+    });
+    if (next.status === "unchanged") return;
+    setHistory(next);
+    setLoadError(null);
+    if (next.status === "ready") {
+      fingerprintRef.current = next.fingerprint;
+      // 台账只在主库记录实际变化时随行刷新（切号后轨迹立即更新）。
+      const entries = await invoke<RelayLedgerEntryDto[]>("get_relay_ledger");
+      setLedger(entries);
+    }
   }, []);
 
-  // R12-B：撤销后端授权的辅助——调用 revoke 并处理失败状态。
-  // revoke 失败时本地仍保持未授权，并显示结构化失败状态；不静默恢复旧授权。
-  // R12-C：revoke 失败的 setScanError 通过 mountedRef guard 保护。
-  const revokeBackendAuth = useCallback((reason: string, reportFailure = true) => {
-    const revoke = authorizationMutationRef.current
-      .catch(() => undefined)
-      .then(() => invoke<void>("revoke_scan_authorization"))
-      .catch((e) => {
-        // R12-C：卸载清理失败不更新状态；交互触发的失败仍显示诊断。
-        if (reportFailure && mountedRef.current) {
-          setScanError(`${reason}: revoke 失败 ${String(e)}`);
-        }
-      });
-    authorizationMutationRef.current = revoke;
-    return revoke;
-  }, []);
-
-  // R7：用户勾选授权时调用后端 grant_scan_authorization，建立后端授权状态机
-  // R12：绑定 generation 与输入快照，await 返回后校验代次与输入一致性
-  // R12-A：pending 时 checkbox 选中，用户可点击取消（checked=false 进入 else 分支）
-  // R12-B：stale grant 返回时只在当前无有效授权时才 revoke，避免误伤新授权
-  // R12-C：所有 await 后的 setter 通过 mountedRef guard 保护
-  const handleAuthorizeToggle = useCallback(
-    async (checked: boolean) => {
-      if (checked) {
-        if (!canAuthorize) {
-          // 前置条件不满足——拒绝建立授权（按钮应已禁用，此处防御）
-          return;
-        }
-        if (authorizationPending) {
-          // R12：pending 期间禁止重复发起同一授权
-          return;
-        }
-        // R12：发起新授权请求——递增 generation 并捕获输入快照
-        const generation = (authGenerationRef.current += 1);
-        const snapshot = { fixtureRoot, dbRelativePath };
-        pendingAuthSnapshotRef.current = snapshot;
-        setAuthorizationPending(true);
-        setScanError(null);
-        try {
-          // R12-B：等待此前路径变化/取消产生的 revoke 完成，再建立新授权。
-          await authorizationMutationRef.current;
-          if (
-            !mountedRef.current ||
-            generation !== authGenerationRef.current ||
-            pendingAuthSnapshotRef.current !== snapshot
-          ) {
-            return;
-          }
-          const canonical = await invoke<string>("grant_scan_authorization", {
-            fixtureRoot,
-            dbRelativePath,
-          });
-          // R12-C：卸载后不更新任何状态
-          if (!mountedRef.current) return;
-          // R12：返回后校验——代次、输入快照、组件状态均须匹配
-          if (
-            generation !== authGenerationRef.current ||
-            pendingAuthSnapshotRef.current !== snapshot
-          ) {
-            // R12-B：后端服务端代次保证 stale grant 无法提交；此前撤销也已串行完成。
-            return;
-          }
-          // R12：再次校验当前输入与发起时一致
-          if (
-            fixtureRoot !== snapshot.fixtureRoot ||
-            dbRelativePath !== snapshot.dbRelativePath
-          ) {
-            // 输入已变化——不应发生（generation 匹配意味着未变化），防御性 revoke
-            revokeBackendAuth("grant 返回时输入已变化");
-            return;
-          }
-          // 接受最新授权结果
-          setAuthorizedFixtureRoot(canonical);
-          setAuthorizationPending(false);
-          pendingAuthSnapshotRef.current = null;
-          setScanError(null);
-        } catch (e) {
-          // R12-C：授权失败——仅在组件仍挂载且仍是当前 generation 时更新状态
-          if (mountedRef.current && generation === authGenerationRef.current) {
-            setAuthorizedFixtureRoot(null);
-            setAuthorizationPending(false);
-            pendingAuthSnapshotRef.current = null;
-            setScanError(String(e));
-            setPhase("failure");
-          }
-        }
-      } else {
-        // R12-A：取消授权（包括 pending 期间取消）——先使 pending 失效，
-        // 再撤销后端授权，清空本地状态。pending 时后端可能已建立授权，必须 revoke。
-        // revoke 失败时由 revokeBackendAuth 设置结构化失败状态，本地保持未授权
-        invalidatePendingAuth();
-        setAuthorizedFixtureRoot(null);
-        revokeBackendAuth("用户取消授权");
-      }
-    },
-    [
-      canAuthorize,
-      fixtureRoot,
-      dbRelativePath,
-      authorizationPending,
-      invalidatePendingAuth,
-      revokeBackendAuth,
-    ],
-  );
-
-  // R7：路径变化时撤销旧授权——旧授权不得继续有效
-  // R12：pending 请求也必须失效——递增 generation 使 stale response 被丢弃
-  const handleFixtureRootChange = useCallback(
-    (value: string) => {
-      setFixtureRoot(value);
-      // R12：无论 pending 还是已授权，路径变化都使当前授权上下文失效
-      if (authorizationPending || authorizedFixtureRoot !== null) {
-        invalidatePendingAuth();
-        setAuthorizedFixtureRoot(null);
-        revokeBackendAuth("fixtureRoot 变化");
-      }
-    },
-    [authorizationPending, authorizedFixtureRoot, invalidatePendingAuth, revokeBackendAuth],
-  );
-
-  const handleDbRelativePathChange = useCallback(
-    (value: string) => {
-      setDbRelativePath(value);
-      // R12：无论 pending 还是已授权，路径变化都使当前授权上下文失效
-      if (authorizationPending || authorizedFixtureRoot !== null) {
-        invalidatePendingAuth();
-        setAuthorizedFixtureRoot(null);
-        revokeBackendAuth("dbRelativePath 变化");
-      }
-    },
-    [authorizationPending, authorizedFixtureRoot, invalidatePendingAuth, revokeBackendAuth],
-  );
-
-  // R12-C：组件卸载时标记 mounted=false，使所有异步回调不再更新 React 状态。
-  // 同时递增 generation 使 pending grant 返回时被识别为 stale，并 revoke 后端授权。
   useEffect(() => {
-    // React StrictMode 开发模式会执行 setup-cleanup-setup；每次 setup 必须恢复挂载标记。
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      authGenerationRef.current += 1;
-      pendingAuthSnapshotRef.current = null;
-      // 卸载清理加入同一串行队列；失败不得触发 React setter。
-      void revokeBackendAuth("组件卸载", false);
-    };
-  }, [revokeBackendAuth]);
+    if (!active) return;
+    let cancelled = false;
+    void load(false).catch((reason: unknown) => {
+      if (!cancelled) setLoadError(safeUiErrorMessage(reason, "主库记录暂时不可读取，请稍后重试。"));
+    });
+    return () => { cancelled = true; };
+  }, [active, load]);
 
-  // 执行扫描：显式用户动作，不自动触发
-  const handleScan = useCallback(async () => {
-    if (!authorized) {
-      setScanError("未授权扫描");
-      setPhase("failure");
-      return;
-    }
-    if (processRunning) {
-      setScanError("TRAE 正在运行，无法扫描");
-      setPhase("failure");
-      return;
-    }
-    setPhase("scanning");
-    setScanError(null);
-    planGenerationRef.current += 1;
-    setSyncPlan(null);
-    setPlanLoading(false);
-    try {
-      const processState: ProcessRunningState = processRunning ? "running" : "not_running";
-      // R7：使用后端授权返回的 canonical fixture_root，确保与授权范围一致
-      const outcome = await invoke<ScanOutcomeDto>("scan_history", {
-        fixtureRoot: authorizedFixtureRoot,
-        dbRelativePath,
-        processState,
-      });
-      if (outcome.kind === "success") {
-        // 扫描成功后刷新浏览
-        try {
-          const result = await invoke<BrowseResultDto>("browse_history");
-          setSyncPlan(null);
-          setBrowseResult(result);
-          setBrowseError(null);
-          const totalVisible =
-            result.summary.visible_account_count +
-            result.summary.visible_project_count +
-            result.summary.visible_session_count;
-          setPhase(totalVisible === 0 ? "empty" : "success");
-        } catch (e) {
-          setBrowseError(String(e));
-          setPhase("success");
-        }
-      } else if (outcome.kind === "deduplicated") {
-        // 去重也刷新浏览
-        try {
-          const result = await invoke<BrowseResultDto>("browse_history");
-          setSyncPlan(null);
-          setBrowseResult(result);
-          setBrowseError(null);
-          const totalVisible =
-            result.summary.visible_account_count +
-            result.summary.visible_project_count +
-            result.summary.visible_session_count;
-          setPhase(totalVisible === 0 ? "empty" : "success");
-        } catch (e) {
-          setBrowseError(String(e));
-          setPhase("success");
-        }
-      } else {
-        // failed：结构化原因，不携带 secret
-        setScanError(renderScanFailure(outcome.reason));
-        setPhase("failure");
+  // 指纹轮询：主库被 TRAE 写入（新会话/新消息）时自动刷新两栏列表。
+  useEffect(() => {
+    if (!active) return;
+    pollCancelled.current = false;
+    const poll = async () => {
+      if (pollCancelled.current) return;
+      try {
+        await load(false);
+      } catch {
+        // 瞬态失败静默：下一轮轮询自动重试，不打断当前列表。
       }
-    } catch (e) {
-      setScanError(String(e));
-      setPhase("failure");
-    }
-  }, [authorized, processRunning, authorizedFixtureRoot, dbRelativePath]);
+    };
+    const timer = window.setInterval(() => void poll(), 5000);
+    return () => {
+      pollCancelled.current = true;
+      window.clearInterval(timer);
+    };
+  }, [active, load]);
 
-  // 点击会话标题：只打开预览，不改选择（AC9）
-  const handleSessionClick = useCallback(async (session: BrowseSessionNodeDto) => {
-    setPreviewSession(session.session_identity);
-    setPreviewLoading(true);
-    setPreviewData(null);
+  // 打开会话预览（主库消息流只读）。
+  const openPreview = useCallback(async (session: MasterSessionEntryDto) => {
+    setPreview({ session, status: "loading", messages: [] });
     try {
-      const preview = await invoke<ConversationPreviewDto | null>("read_conversation", {
-        session: session.session_identity,
-      });
-      setPreviewData(preview);
-    } catch (e) {
-      setPreviewData(null);
-    } finally {
-      setPreviewLoading(false);
+      const result = await invoke<{
+        session_id: string;
+        status: "ready" | "no_master_data" | "read_failed";
+        messages: SessionMessageDto[];
+      }>("get_master_session_messages", { sessionId: session.session_id });
+      setPreview((current) =>
+        current?.session.session_id === session.session_id
+          ? {
+              session,
+              status: result.status === "ready" ? "ready" : "error",
+              messages: result.status === "ready" ? result.messages : [],
+            }
+          : current,
+      );
+    } catch {
+      setPreview((current) =>
+        current?.session.session_id === session.session_id
+          ? { session, status: "error", messages: [] }
+          : current,
+      );
     }
   }, []);
 
-  // 搜索
-  const handleSearch = useCallback(async () => {
-    if (searchQuery.trim().length === 0) {
-      setSearchError("搜索查询不能为空");
-      return;
-    }
-    setSearchError(null);
-    try {
-      const hits = await invoke<readonly SearchHitDto[]>("search_history", {
-        query: searchQuery,
-      });
-      setSearchResults(hits);
-    } catch (e) {
-      setSearchError(String(e));
-      setSearchResults(null);
-    }
-  }, [searchQuery]);
+  const closePreview = useCallback(() => setPreview(null), []);
 
-  // 从搜索结果打开预览（不改选择——AC9）
-  const handleSearchHitClick = useCallback(
-    async (hit: SearchHitDto) => {
-      setPreviewSession(hit.session_identity);
-      setPreviewLoading(true);
-      setPreviewData(null);
-      try {
-        const preview = await invoke<ConversationPreviewDto | null>("read_conversation", {
-          session: hit.session_identity,
-        });
-        setPreviewData(preview);
-      } catch {
-        setPreviewData(null);
-      } finally {
-        setPreviewLoading(false);
-      }
-    },
-    [],
-  );
+  // ===== P5-8a 归档数据：hidden_status = voice_discussion 的会话 =====
 
-  // 按选中账号筛选项目
-  const filteredProjects = useMemo(() => {
-    if (!browseResult) return [];
-    if (!selectedAccount) return browseResult.projects;
-    // display_owner 与账号 user_id 一致时归属该账号
-    return browseResult.projects.filter((p) => p.display_owner === selectedAccount);
-  }, [browseResult, selectedAccount]);
-
-  // 按选中项目筛选会话
-  const filteredSessions = useMemo(() => {
-    if (!browseResult) return [];
-    if (!selectedProject) return browseResult.sessions;
-    // 会话归属项目通过 project_id 关联
-    return browseResult.sessions.filter(
-      (s) => s.project_id === selectedProject,
+  /** 归档会话集合（仅 voice_discussion；scheduled_task 等原生隐藏值不入库任何视图）。 */
+  const archivedSessions = useMemo(() => {
+    if (!history || history.status !== "ready") return [];
+    return history.sessions.filter(
+      (session) => !session.deleted && session.hidden_status === "voice_discussion",
     );
-  }, [browseResult, selectedProject]);
+  }, [history]);
 
-  const summary = browseResult?.summary;
+  /**
+   * 归档树：模式（work/code）→ 项目分组 → 会话。
+   * 恢复时 TRAE 侧栏按模式聚合，归档视图保持同构层级方便对位。
+   */
+  const archiveTree = useMemo(() => {
+    const tree = new Map<string, Map<string, MasterSessionEntryDto[]>>();
+    for (const session of archivedSessions) {
+      const mode = session.work_mode?.trim() || "未标注";
+      const group = tree.get(mode) ?? new Map<string, MasterSessionEntryDto[]>();
+      const list = group.get(session.project_id) ?? [];
+      list.push(session);
+      group.set(session.project_id, list);
+      tree.set(mode, group);
+    }
+    return tree;
+  }, [archivedSessions]);
 
-  const sessionKey = useCallback(
-    (session: SessionIdentityDto) =>
-      `${session.product_history_namespace}:${session.original_session_id}`,
-    [],
+  // ===== P5-8a 批量操作：归档 / 恢复 / 真实删除 =====
+
+  /** 统一批量执行骨架：忙态锁 + 成功后强制刷新主库 + 失败走安全文案。 */
+  const runBatch = useCallback(
+    async (action: () => Promise<unknown>, onDone: () => void) => {
+      setBatchBusy(true);
+      setBatchError(null);
+      try {
+        await action();
+        onDone();
+        // 归档/恢复/删除都直接改主库文件，强制重读让两栏立即反映新状态。
+        await load(true);
+      } catch (reason: unknown) {
+        setBatchError(safeUiErrorMessage(reason, "操作未完成，请稍后重试。"));
+      } finally {
+        setBatchBusy(false);
+      }
+    },
+    [load],
   );
 
-  const toggleStringSelection = useCallback(
-    (value: string, selected: readonly string[], setSelected: (next: readonly string[]) => void) => {
-      setSelected(
-        selected.includes(value)
-          ? selected.filter((item) => item !== value)
-          : [...selected, value],
+  /** 主列表：归档所选（hidden_status → voice_discussion，可逆）。 */
+  const archiveSelected = useCallback(() => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    void runBatch(
+      () => invoke("archive_master_sessions", { sessionIds: ids }),
+      () => {
+        setSelectMode(false);
+        setSelectedIds(new Set());
+      },
+    );
+  }, [runBatch, selectedIds]);
+
+  /** 归档视图：恢复所选（hidden_status 还原 NULL，会话归位原分组）。 */
+  const restoreSelected = useCallback(() => {
+    const ids = [...archiveSelectedIds];
+    if (ids.length === 0) return;
+    void runBatch(
+      () => invoke("restore_master_sessions", { sessionIds: ids }),
+      () => {
+        setArchiveSelect(false);
+        setArchiveSelectedIds(new Set());
+      },
+    );
+  }, [runBatch, archiveSelectedIds]);
+
+  /** 归档视图：删除所选（先弹确认，确认后走后端先备份再删除）。 */
+  const deleteSelected = useCallback(() => {
+    const targets = archivedSessions.filter((session) => archiveSelectedIds.has(session.session_id));
+    if (targets.length === 0) return;
+    setDeleteConfirm(targets);
+  }, [archivedSessions, archiveSelectedIds]);
+
+  /** 确认删除：真实删除（后端自动创建备份；失败不动原数据）。 */
+  const confirmDelete = useCallback(() => {
+    if (!deleteConfirm) return;
+    const ids = deleteConfirm.map((session) => session.session_id);
+    setDeleteConfirm(null);
+    void runBatch(
+      () => invoke("delete_master_sessions", { sessionIds: ids }),
+      () => {
+        setArchiveSelect(false);
+        setArchiveSelectedIds(new Set());
+      },
+    );
+  }, [runBatch, deleteConfirm]);
+
+  // ===== P5-8c 分组合并：左栏选择态 → 弹层选保留目标 → 后端备份 + 事务改挂 =====
+
+  // 左栏项目条目（P5-8c 合并目标候选；声明前置避免选择态回调引用滞后）。
+  const projects = history?.status === "ready" ? history.projects : [];
+
+  /** 进入左栏分组选择态（清掉上一次的回执，浏览态无框）。 */
+  const enterProjectSelect = useCallback(() => {
+    setMergeNotice(null);
+    setProjectSelect(true);
+    setProjectSelectedIds(new Set());
+  }, []);
+
+  const exitProjectSelect = useCallback(() => {
+    setProjectSelect(false);
+    setProjectSelectedIds(new Set());
+  }, []);
+
+  /** 打开合并确认弹层（至少选 2 个分组才有合并意义）。 */
+  const openMergeConfirm = useCallback(() => {
+    if (projectSelectedIds.size < 2) return;
+    const targets = projects.filter((project) => projectSelectedIds.has(project.project_id));
+    if (targets.length < 2) return;
+    setMergeConfirm(targets);
+  }, [projects, projectSelectedIds]);
+
+  /** 确认合并：其余分组的全部会话并入保留分组（后端先备份再事务改挂）。 */
+  const confirmMerge = useCallback(
+    (target: MasterProjectEntryDto) => {
+      if (!mergeConfirm) return;
+      const sourceIds = mergeConfirm
+        .filter((project) => project.project_id !== target.project_id)
+        .map((project) => project.project_id);
+      const targetName = target.name?.trim() || "未命名项目";
+      setMergeConfirm(null);
+      void runBatch(
+        async () => {
+          const result = await invoke<MasterMergeResultDto>("merge_master_projects", {
+            sourceProjectIds: sourceIds,
+            targetProjectId: target.project_id,
+          });
+          // 回执只用数量与动作结果表述（界面表达纪律）。
+          setMergeNotice(
+            `已把 ${result.moved_sessions} 个会话并入「${targetName}」，清理 ${result.removed_projects} 个空分组。`,
+          );
+        },
+        () => {
+          setProjectSelect(false);
+          setProjectSelectedIds(new Set());
+          // 合并后当前筛选的分组可能已不存在，回退全部项目视图。
+          if (selectedProject !== "all" && sourceIds.includes(selectedProject)) {
+            setSelectedProject("all");
+          }
+        },
       );
-      planGenerationRef.current += 1;
-      setSyncPlan(null);
-      setPlanLoading(false);
+    },
+    [mergeConfirm, runBatch, selectedProject],
+  );
+
+  /** 勾选切换（选择态会话行点击）。 */
+  const toggleSelected = useCallback(
+    (sessionId: string, current: ReadonlySet<string>, setter: (next: ReadonlySet<string>) => void) => {
+      const next = new Set(current);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      setter(next);
     },
     [],
   );
 
-  const toggleSessionSelection = useCallback(
-    (session: SessionIdentityDto) => {
-      const key = sessionKey(session);
-      setSelectedSessions((current) =>
-        current.some((item) => sessionKey(item) === key)
-          ? current.filter((item) => sessionKey(item) !== key)
-          : [...current, session],
-      );
-      planGenerationRef.current += 1;
-      setSyncPlan(null);
-      setPlanLoading(false);
+  // Esc 退出选择模式 / 关闭确认弹窗（Gmail 式操作习惯）。
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (deleteConfirm) setDeleteConfirm(null);
+      else if (mergeConfirm) setMergeConfirm(null);
+      else if (selectMode) {
+        setSelectMode(false);
+        setSelectedIds(new Set());
+      } else if (archiveSelect) {
+        setArchiveSelect(false);
+        setArchiveSelectedIds(new Set());
+      } else if (projectSelect) {
+        setProjectSelect(false);
+        setProjectSelectedIds(new Set());
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectMode, archiveSelect, deleteConfirm, mergeConfirm, projectSelect]);
+
+  // 切换主列表/归档视图时清空选择，避免跨视图残留勾选。
+  const enterArchiveView = useCallback(() => {
+    setArchiveView(true);
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  }, []);
+  const exitArchiveView = useCallback(() => {
+    setArchiveView(false);
+    setArchiveSelect(false);
+    setArchiveSelectedIds(new Set());
+  }, []);
+
+  // Esc 关闭预览弹层。
+  useEffect(() => {
+    if (!preview) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closePreview();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [preview, closePreview]);
+
+  // ===== 台账聚合：session_id → 完整接力轨迹（时间正序）=====
+
+  /** session_id → 台账条目（换腿后身份索引）。 */
+  const ledgerBySessionId = useMemo(() => {
+    const map = new Map<string, RelayLedgerEntryDto>();
+    for (const entry of ledger) map.set(entry.session_id, entry);
+    return map;
+  }, [ledger]);
+
+  /** 沿 from_session_id 逐跳链回，返回时间正序的交接记录链。 */
+  const relayChainBySession = useMemo(() => {
+    const chains = new Map<string, RelayLedgerEntryDto[]>();
+    for (const target of ledger) {
+      const hops: RelayLedgerEntryDto[] = [];
+      let cursor: RelayLedgerEntryDto | undefined = target;
+      // 防御：异常数据成环时最多回溯台账条数 + 1 跳，避免死循环。
+      let guard = ledger.length + 1;
+      while (cursor && guard > 0) {
+        hops.unshift(cursor);
+        // 显式标注断开控制流窄化的推断环（cursor 窄化 ← previousId ← cursor）。
+        const previousId: string | null = cursor.from_session_id;
+        cursor = previousId ? ledgerBySessionId.get(previousId) : undefined;
+        guard -= 1;
+      }
+      chains.set(target.session_id, hops);
+    }
+    return chains;
+  }, [ledger, ledgerBySessionId]);
+
+  /** 会话接力轨迹（无台账记录 → null，不显示徽章）。 */
+  const legsForSession = useCallback(
+    (session: MasterSessionEntryDto): readonly RelayLeg[] | null => {
+      const hops = relayChainBySession.get(session.session_id);
+      if (!hops || hops.length === 0) return null;
+      const legs: RelayLeg[] = [];
+      // 首腿：首跳之前的全部消息归属交接前账号。
+      legs.push({
+        userId: hops[0].from_user_id,
+        accountName: hops[0].from_account_name,
+        fromUnixSeconds: null,
+        toUnixSeconds: hops[0].switched_at_unix_seconds,
+        messages: hops[0].message_count_at_switch,
+      });
+      for (let index = 1; index < hops.length; index += 1) {
+        const hop = hops[index];
+        const previous = hops[index - 1];
+        legs.push({
+          userId: previous.to_user_id,
+          accountName: previous.to_account_name,
+          fromUnixSeconds: previous.switched_at_unix_seconds,
+          toUnixSeconds: hop.switched_at_unix_seconds,
+          messages: Math.max(hop.message_count_at_switch - previous.message_count_at_switch, 0),
+        });
+      }
+      const last = hops[hops.length - 1];
+      // 当前腿：最后一跳交接至今（进行中）。
+      legs.push({
+        userId: last.to_user_id,
+        accountName: last.to_account_name,
+        fromUnixSeconds: last.switched_at_unix_seconds,
+        toUnixSeconds: null,
+        messages: Math.max(session.message_count - last.message_count_at_switch, 0),
+      });
+      return legs;
     },
-    [sessionKey],
+    [relayChainBySession],
   );
 
-  const selectedSessionKeys = useMemo(() => {
-    if (!browseResult) return new Set<string>();
-    if (scopeMode === "all") {
-      return new Set(browseResult.sessions.map((session) => sessionKey(session.session_identity)));
-    }
-    const selectedProjectIds = new Set(selectedProjects);
-    for (const project of browseResult.projects) {
-      if (selectedAccounts.includes(project.display_owner)) {
-        selectedProjectIds.add(project.project_id);
-      }
-    }
-    const keys = new Set(selectedSessions.map(sessionKey));
-    for (const session of browseResult.sessions) {
-      if (selectedProjectIds.has(session.project_id)) {
-        keys.add(sessionKey(session.session_identity));
-      }
-    }
-    return keys;
-  }, [
-    browseResult,
-    scopeMode,
-    selectedAccounts,
-    selectedProjects,
-    selectedSessions,
-    sessionKey,
-  ]);
+  // ===== 右栏会话过滤（项目 × 时间段 × 搜索）=====
 
-  const handleBuildPlan = useCallback(async () => {
-    if (!authorized || !browseResult) return;
-    const scope: SyncScopeDto =
-      scopeMode === "all"
-        ? { kind: "all_history" }
-        : {
-            kind: "custom",
-            account_ids: selectedAccounts,
-            project_ids: selectedProjects,
-            session_ids: selectedSessions,
-          };
-    setPlanLoading(true);
-    setPlanError(null);
-    const generation = (planGenerationRef.current += 1);
-    try {
-      const plan = await invoke<SyncPlanDto>("build_sync_plan", { scope });
-      if (mountedRef.current && generation === planGenerationRef.current) {
-        setSyncPlan(plan);
+  const visibleSessions = useMemo(() => {
+    if (!history || history.status !== "ready") return [];
+    const keyword = searchText.trim();
+    const nowSeconds = Date.now() / 1000;
+    const rangeSeconds: Record<Exclude<TimeRange, "all">, number> = {
+      today: 24 * 3600,
+      week: 7 * 24 * 3600,
+      month: 30 * 24 * 3600,
+    };
+    return history.sessions.filter((session) => {
+      if (session.deleted) return false;
+      // P5-8a：归档（voice_discussion）与原生隐藏值（scheduled_task 等）
+      // 均不入主列表——与 TRAE 侧栏白名单口径一致，归档会话走归档视图。
+      if (session.hidden_status !== null) return false;
+      if (selectedProject !== "all" && session.project_id !== selectedProject) return false;
+      if (timeRange !== "all") {
+        const updated = session.updated_at_unix_seconds;
+        if (!updated) return false;
+        if (nowSeconds - updated > rangeSeconds[timeRange]) return false;
       }
-    } catch (error) {
-      if (mountedRef.current && generation === planGenerationRef.current) {
-        setSyncPlan(null);
-        setPlanError(String(error));
-      }
-    } finally {
-      if (mountedRef.current && generation === planGenerationRef.current) {
-        setPlanLoading(false);
-      }
-    }
-  }, [
-    authorized,
-    browseResult,
-    scopeMode,
-    selectedAccounts,
-    selectedProjects,
-    selectedSessions,
-  ]);
+      if (keyword && !session.title.includes(keyword)) return false;
+      return true;
+    });
+  }, [history, searchText, selectedProject, timeRange]);
 
-  const syncableCount = useMemo(() => {
-    if (!syncPlan || !browseResult) return 0;
-    return syncPlan.actions.reduce((count, action) => {
-      if (action.kind === "attach_sessions") return count + action.session_ids.length;
+  /** 项目统计：会话数 + 参与账号（台账轨迹聚合；归档/隐藏会话不计入）。 */
+  const projectStats = useMemo(() => {
+    const sessionCount = new Map<string, number>();
+    const members = new Map<string, Set<string>>();
+    for (const session of history?.sessions ?? []) {
+      if (session.deleted || session.hidden_status !== null) continue;
+      sessionCount.set(session.project_id, (sessionCount.get(session.project_id) ?? 0) + 1);
+      const legs = legsForSession(session);
+      if (!legs) continue;
+      const set = members.get(session.project_id) ?? new Set<string>();
+      for (const leg of legs) set.add(leg.userId);
+      members.set(session.project_id, set);
+    }
+    return { sessionCount, members };
+  }, [history, legsForSession]);
+
+  const projectName = useCallback(
+    (projectId: string): string => {
+      if (projectId === "all") return "全部项目";
+      const found = projects.find((project) => project.project_id === projectId);
+      // 后端已把哈希名回退为 absolute_path 尾段；空串占位「未命名项目」。
+      return found?.name?.trim() || "未命名项目";
+    },
+    [projects],
+  );
+
+  /**
+   * 主列表分组：全部项目视图按项目聚合（组序沿用左栏项目顺序，
+   * 组内维持后端时间倒序）；选中单个项目时不分组。
+   */
+  const sessionGroups = useMemo(() => {
+    if (selectedProject !== "all") return null;
+    const groups: { projectId: string; sessions: MasterSessionEntryDto[] }[] = [];
+    const byProject = new Map<string, MasterSessionEntryDto[]>();
+    for (const session of visibleSessions) {
+      const list = byProject.get(session.project_id) ?? [];
+      list.push(session);
+      byProject.set(session.project_id, list);
+    }
+    for (const project of projects) {
+      const sessions = byProject.get(project.project_id);
+      if (sessions && sessions.length > 0) groups.push({ projectId: project.project_id, sessions });
+    }
+    return groups;
+  }, [visibleSessions, projects, selectedProject]);
+
+  const currentUserId = history?.current_user_id ?? null;
+
+  // ===== P5-8c 合并弹层：分组 → 会话数（含已归档，不含已删除；规模展示） =====
+  const mergeSessionCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    if (!history || history.status !== "ready") return counts;
+    for (const session of history.sessions) {
+      if (session.deleted) continue;
+      counts.set(session.project_id, (counts.get(session.project_id) ?? 0) + 1);
+    }
+    return counts;
+  }, [history]);
+
+  // ===== 渲染 =====
+
+  const body = () => {
+    if (loadError) {
       return (
-        count +
-        browseResult.sessions.filter((session) => session.project_id === action.project_id).length
+        <div className="history-empty" data-testid="history-error">
+          <p>{loadError}</p>
+          <button
+            className="btn"
+            type="button"
+            onClick={() => void load(true).catch(() => undefined)}
+          >
+            <RefreshCw size={15} aria-hidden="true" />重试
+          </button>
+        </div>
       );
-    }, 0);
-  }, [syncPlan, browseResult]);
+    }
+    if (!history) {
+      return <div className="history-empty" data-testid="history-loading">正在读取主库记录…</div>;
+    }
+    if (history.status === "no_master_data") {
+      return (
+        <div className="history-empty" data-testid="history-guide">
+          <Layers size={26} strokeWidth={1.6} aria-hidden="true" />
+          <p>主库还没有对话数据。</p>
+          <p className="history-empty__hint">到环境页启动主库并在 TRAE 内登录一次，对话记录会自动出现在这里。</p>
+          {onNavigate && (
+            <button
+              className="btn btn--primary"
+              type="button"
+              onClick={() => onNavigate("environment")}
+              data-testid="history-guide-launch"
+            >
+              去环境页启动主库
+            </button>
+          )}
+        </div>
+      );
+    }
+    if (history.status === "no_current_account") {
+      return (
+        <div className="history-empty" data-testid="history-guide">
+          <Layers size={26} strokeWidth={1.6} aria-hidden="true" />
+          <p>主库尚未登记登录账号。</p>
+          <p className="history-empty__hint">在环境页确认主库已登录账号；切换账号后记录仍会保留。</p>
+          {onNavigate && (
+            <button
+              className="btn btn--primary"
+              type="button"
+              onClick={() => onNavigate("environment")}
+            >
+              去环境页查看
+            </button>
+          )}
+        </div>
+      );
+    }
+    if (history.status === "read_failed") {
+      return (
+        <div className="history-empty" data-testid="history-error">
+          <p>主库记录暂时无法读取，请稍后重试。</p>
+          <button
+            className="btn"
+            type="button"
+            onClick={() => void load(true).catch(() => undefined)}
+          >
+            <RefreshCw size={15} aria-hidden="true" />重试
+          </button>
+        </div>
+      );
+    }
+    // ready 且处于归档视图：单栏归档面板（模式 → 项目分组 → 会话，P5-8a）。
+    if (archiveView) {
+      const allArchivedSelected =
+        archivedSessions.length > 0 &&
+        archivedSessions.every((session) => archiveSelectedIds.has(session.session_id));
+      return (
+        <div className="history-body">
+          <section className="sess-panel archive-panel" aria-label="已归档会话">
+            {archiveSelect ? (
+              <SessionBatchBar
+                selectedCount={archiveSelectedIds.size}
+                totalCount={archivedSessions.length}
+                busy={batchBusy}
+                allSelected={allArchivedSelected}
+                onSelectAll={() =>
+                  setArchiveSelectedIds(
+                    allArchivedSelected
+                      ? new Set()
+                      : new Set(archivedSessions.map((session) => session.session_id)),
+                  )
+                }
+                onDone={() => {
+                  setArchiveSelect(false);
+                  setArchiveSelectedIds(new Set());
+                }}
+              >
+                <button
+                  className="btn btn--primary"
+                  type="button"
+                  onClick={restoreSelected}
+                  disabled={batchBusy || archiveSelectedIds.size === 0}
+                  data-testid="batch-restore"
+                >
+                  <Undo2 size={15} aria-hidden="true" />恢复所选
+                </button>
+                <button
+                  className="btn btn--danger"
+                  type="button"
+                  onClick={deleteSelected}
+                  disabled={batchBusy || archiveSelectedIds.size === 0}
+                  data-testid="batch-delete"
+                >
+                  <Trash2 size={15} aria-hidden="true" />删除所选
+                </button>
+              </SessionBatchBar>
+            ) : (
+              <div className="sess-panel__head">
+                <button
+                  className="btn btn--quiet"
+                  type="button"
+                  onClick={exitArchiveView}
+                  data-testid="history-archive-back"
+                >
+                  <ArrowLeft size={15} aria-hidden="true" />返回
+                </button>
+                <b>已归档会话</b>
+                <span>{archivedSessions.length} 个会话</span>
+                <div className="sess-panel__tools">
+                  <button
+                    className="btn btn--quiet"
+                    type="button"
+                    onClick={() => setArchiveSelect(true)}
+                    disabled={archivedSessions.length === 0}
+                    data-testid="archive-select-mode"
+                  >
+                    <ListChecks size={15} aria-hidden="true" />选择
+                  </button>
+                </div>
+              </div>
+            )}
+            {batchError && (
+              <div className="batch-error" data-testid="batch-error" role="alert">{batchError}</div>
+            )}
+            <div className="sess-list archive-list" data-testid="history-archive-list">
+              {archivedSessions.length === 0 ? (
+                <div className="sess-empty" data-testid="archive-empty">没有已归档的会话</div>
+              ) : (
+                [...archiveTree.entries()].map(([mode, groups]) => (
+                  <div className="archive-mode" key={mode} data-testid={`archive-mode-${mode}`}>
+                    <div className="archive-mode__head">{modeLabel(mode)}</div>
+                    {[...groups.entries()].map(([projectId, sessions]) => (
+                      <div className="archive-group" key={projectId}>
+                        <div className="archive-group__head">
+                          <span>{projectName(projectId)}</span>
+                          <span>{sessions.length} 个会话</span>
+                        </div>
+                        {sessions.map((session) => (
+                          <SessionRow
+                            key={session.session_id}
+                            session={session}
+                            testId={`archive-session-${session.session_id}`}
+                            selectMode={archiveSelect}
+                            checked={archiveSelectedIds.has(session.session_id)}
+                            onToggle={(id) => toggleSelected(id, archiveSelectedIds, setArchiveSelectedIds)}
+                            onOpen={(target) => void openPreview(target)}
+                            legs={legsForSession(session)}
+                            currentUserId={currentUserId}
+                          />
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+        </div>
+      );
+    }
+    // ready：两栏结构。
+    return (
+      <div className="history-body">
+        {/* 左栏：项目（数据源 project 表，统计由会话实时聚合；P5-8c 选择态可合并分组） */}
+        <aside className="proj-panel" aria-label="项目列表">
+          {projectSelect ? (
+            // P5-8c 分组选择态：紧凑批量栏（窄栏允许换行，动作 = 合并所选）。
+            (() => {
+              const allProjectsSelected =
+                projects.length > 0 && projectSelectedIds.size === projects.length;
+              return (
+                <div
+                  className="batch-bar batch-bar--proj"
+                  role="toolbar"
+                  aria-label="合并分组"
+                  data-testid="project-batch-bar"
+                >
+                  <button
+                    className="btn btn--quiet"
+                    type="button"
+                    onClick={() =>
+                      setProjectSelectedIds(
+                        allProjectsSelected
+                          ? new Set()
+                          : new Set(projects.map((project) => project.project_id)),
+                      )
+                    }
+                    disabled={batchBusy}
+                    data-testid="project-batch-select-all"
+                  >
+                    {allProjectsSelected ? (
+                      <CheckSquare size={15} aria-hidden="true" />
+                    ) : (
+                      <Square size={15} aria-hidden="true" />
+                    )}
+                    {allProjectsSelected ? "取消全选" : "全选"}
+                  </button>
+                  <span className="batch-bar__count" data-testid="project-batch-count">
+                    已选 {projectSelectedIds.size} / {projects.length}
+                  </span>
+                  <div className="batch-bar__actions">
+                    <button
+                      className="btn btn--primary"
+                      type="button"
+                      onClick={openMergeConfirm}
+                      disabled={batchBusy || projectSelectedIds.size < 2}
+                      title={projectSelectedIds.size < 2 ? "至少选择 2 个分组才能合并" : undefined}
+                      data-testid="batch-merge"
+                    >
+                      <Merge size={15} aria-hidden="true" />合并
+                    </button>
+                  </div>
+                  <button
+                    className="btn btn--quiet"
+                    type="button"
+                    onClick={exitProjectSelect}
+                    disabled={batchBusy}
+                    aria-label="退出分组选择"
+                    data-testid="project-batch-done"
+                  >
+                    <X size={15} aria-hidden="true" />
+                  </button>
+                </div>
+              );
+            })()
+          ) : (
+            <div className="proj-panel__head">
+              <b>项目</b>
+              <span>{projects.length} 个项目 · {visibleSessions.length} 个会话</span>
+              <div className="proj-panel__tools">
+                <button
+                  className="btn btn--quiet"
+                  type="button"
+                  onClick={enterProjectSelect}
+                  disabled={projects.length < 2}
+                  title={projects.length < 2 ? "至少 2 个分组才能合并" : "合并分组"}
+                  data-testid="project-merge-entry"
+                >
+                  <Merge size={15} aria-hidden="true" />合并
+                </button>
+              </div>
+            </div>
+          )}
+          {mergeNotice && (
+            <div className="batch-notice" role="status" data-testid="merge-notice">{mergeNotice}</div>
+          )}
+          <div className="proj-list" role="list">
+            {!projectSelect && (
+              <button
+                type="button"
+                role="listitem"
+                className={`proj-item ${selectedProject === "all" ? "proj-item--active" : ""}`}
+                onClick={() => setSelectedProject("all")}
+                data-testid="history-project-all"
+              >
+                <span className="proj-item__icon" aria-hidden="true"><Layers size={15} strokeWidth={1.8} /></span>
+                <span className="proj-item__main">
+                  <span className="proj-item__name">全部项目</span>
+                  <span className="proj-item__meta">{projectStats.sessionCount.size ? [...projectStats.sessionCount.values()].reduce((a, b) => a + b, 0) : 0} 会话 · 全部记录</span>
+                </span>
+              </button>
+            )}
+            {projects.map((project) => {
+              const count = projectStats.sessionCount.get(project.project_id) ?? 0;
+              const memberIds = [...(projectStats.members.get(project.project_id) ?? [])];
+              const projectChecked = projectSelectedIds.has(project.project_id);
+              // 选择态高亮勾选行，浏览态高亮当前筛选（互斥展示）。
+              const rowState = projectSelect
+                ? projectChecked
+                  ? "proj-item--checked"
+                  : ""
+                : selectedProject === project.project_id
+                  ? "proj-item--active"
+                  : "";
+              return (
+                <button
+                  key={project.project_id}
+                  type="button"
+                  role="listitem"
+                  className={`proj-item ${rowState}`}
+                  onClick={() =>
+                    projectSelect
+                      ? toggleSelected(project.project_id, projectSelectedIds, setProjectSelectedIds)
+                      : setSelectedProject(project.project_id)
+                  }
+                  aria-pressed={projectSelect ? projectChecked : undefined}
+                  // 项目文件夹路径收进悬浮提示，不占主视野（界面表达纪律）。
+                  title={project.absolute_path?.trim() || undefined}
+                  data-testid={`history-project-${project.project_id}`}
+                >
+                  <span className="proj-item__icon" aria-hidden="true">
+                    {projectSelect ? (
+                      projectChecked ? <CheckSquare size={15} strokeWidth={1.8} /> : <Square size={15} strokeWidth={1.8} />
+                    ) : (
+                      <FolderClosed size={15} strokeWidth={1.8} />
+                    )}
+                  </span>
+                  <span className="proj-item__main">
+                    <span className="proj-item__name">{project.name?.trim() || "未命名项目"}</span>
+                    <span className="proj-item__meta">{count} 会话</span>
+                  </span>
+                  {!projectSelect && memberIds.length > 0 && (
+                    <span className="relay-chain relay-chain--compact" aria-hidden="true">
+                      {memberIds.slice(0, 3).map((userId) => (
+                        <RelayAvatar key={userId} userId={userId} name={nameOfLeg(ledger, userId)} />
+                      ))}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </aside>
 
-  const alreadyCurrentCount = useMemo(
-    () => countExcludedSessions(syncPlan, browseResult, (reason) => reason === "already_current"),
-    [syncPlan, browseResult],
-  );
+        {/* 右栏：会话（数据源 chat_session + 接力台账轨迹徽章） */}
+        <section className="sess-panel" aria-label="会话列表">
+          {(() => {
+            const allVisibleSelected =
+              visibleSessions.length > 0 &&
+              visibleSessions.every((session) => selectedIds.has(session.session_id));
+            return selectMode ? (
+              <SessionBatchBar
+                selectedCount={selectedIds.size}
+                totalCount={visibleSessions.length}
+                busy={batchBusy}
+                allSelected={allVisibleSelected}
+                onSelectAll={() =>
+                  setSelectedIds(
+                    allVisibleSelected
+                      ? new Set()
+                      : new Set(visibleSessions.map((session) => session.session_id)),
+                  )
+                }
+                onDone={() => {
+                  setSelectMode(false);
+                  setSelectedIds(new Set());
+                }}
+              >
+                <button
+                  className="btn btn--primary"
+                  type="button"
+                  onClick={archiveSelected}
+                  disabled={batchBusy || selectedIds.size === 0}
+                  data-testid="batch-archive"
+                >
+                  <Archive size={15} aria-hidden="true" />归档所选
+                </button>
+              </SessionBatchBar>
+            ) : (
+              <div className="sess-panel__head">
+                <b>{projectName(selectedProject)}</b>
+                <span>{visibleSessions.length} 个会话</span>
+                <div className="sess-panel__tools">
+                  <button
+                    className="btn btn--quiet"
+                    type="button"
+                    onClick={() => setSelectMode(true)}
+                    disabled={visibleSessions.length === 0}
+                    data-testid="history-select-mode"
+                  >
+                    <ListChecks size={15} aria-hidden="true" />选择
+                  </button>
+                  <button
+                    className="btn btn--quiet"
+                    type="button"
+                    onClick={enterArchiveView}
+                    data-testid="history-archive-entry"
+                  >
+                    <Archive size={15} aria-hidden="true" />
+                    {archivedSessions.length > 0 ? `已归档 ${archivedSessions.length}` : "已归档"}
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+          {batchError && (
+            <div className="batch-error" data-testid="batch-error" role="alert">{batchError}</div>
+          )}
+          <div className="sess-list" data-testid="history-session-list">
+            {visibleSessions.length === 0 ? (
+              <div className="sess-empty" data-testid="history-empty-sessions">
+                {history.sessions.length === 0
+                  ? "当前账号还没有对话记录"
+                  : "没有符合条件的会话"}
+              </div>
+            ) : sessionGroups ? (
+              // 全部项目视图：按项目分组（组头 = 项目名 + 会话数）。
+              sessionGroups.map((group) => (
+                <div
+                  className="sess-group"
+                  key={group.projectId}
+                  data-testid={`history-session-group-${group.projectId}`}
+                >
+                  <div className="sess-group__head">
+                    <span>{projectName(group.projectId)}</span>
+                    <span>{group.sessions.length} 个会话</span>
+                  </div>
+                  {group.sessions.map((session) => (
+                    <SessionRow
+                      key={session.session_id}
+                      session={session}
+                      testId={`history-session-${session.session_id}`}
+                      selectMode={selectMode}
+                      checked={selectedIds.has(session.session_id)}
+                      onToggle={(id) => toggleSelected(id, selectedIds, setSelectedIds)}
+                      onOpen={(target) => void openPreview(target)}
+                      legs={legsForSession(session)}
+                      currentUserId={currentUserId}
+                    />
+                  ))}
+                </div>
+              ))
+            ) : (
+              visibleSessions.map((session) => (
+                <SessionRow
+                  key={session.session_id}
+                  session={session}
+                  testId={`history-session-${session.session_id}`}
+                  selectMode={selectMode}
+                  checked={selectedIds.has(session.session_id)}
+                  onToggle={(id) => toggleSelected(id, selectedIds, setSelectedIds)}
+                  onOpen={(target) => void openPreview(target)}
+                  legs={legsForSession(session)}
+                  currentUserId={currentUserId}
+                />
+              ))
+            )}
+          </div>
+        </section>
+      </div>
+    );
+  };
 
-  const needsProcessingCount = useMemo(
-    () => countExcludedSessions(syncPlan, browseResult, (reason) => reason !== "already_current"),
-    [syncPlan, browseResult],
+  // 工具行（搜索/时间范围/刷新）：页面态嵌在页级 header 内，嵌入态独立成行。
+  const actionsBar = (
+    <div className="page-header__actions">
+      <div className="history-search">
+        <Search size={14} aria-hidden="true" />
+        <input
+          type="text"
+          placeholder="搜索会话标题…"
+          value={searchText}
+          onChange={(event) => setSearchText(event.target.value)}
+          data-testid="history-search-input"
+          aria-label="搜索会话标题"
+        />
+      </div>
+      <div className="history-chips" role="group" aria-label="时间范围">
+        {TIME_RANGES.map((range) => (
+          <button
+            key={range.value}
+            type="button"
+            className={`history-chip ${timeRange === range.value ? "history-chip--active" : ""}`}
+            onClick={() => setTimeRange(range.value)}
+            data-testid={`history-time-${range.value}`}
+          >
+            {range.label}
+          </button>
+        ))}
+      </div>
+      <button
+        className="btn"
+        type="button"
+        onClick={() => void load(true).catch(() => undefined)}
+        title="同步主库最新记录"
+        data-testid="history-refresh"
+      >
+        <RefreshCw size={15} aria-hidden="true" />刷新
+      </button>
+    </div>
   );
 
   return (
-    <section className="workbench" role="region" aria-label="历史库">
-      {/* 头部：摘要 + 查找新历史 */}
-      <div className="workbench__header">
-        <h2>历史库</h2>
-        <div className="workbench__summary" data-testid="history-summary">
-          <span>账号 {summary?.visible_account_count ?? 0}</span>
-          <span>项目 {summary?.visible_project_count ?? 0}</span>
-          <span>对话 {summary?.visible_session_count ?? 0}</span>
-        </div>
-        <button
-          type="button"
-          className="btn btn--primary"
-          onClick={handleScan}
-          disabled={phase === "scanning" || !authorized || processRunning}
-          aria-disabled={phase === "scanning" || !authorized || processRunning}
-          data-testid="scan-history-button"
-        >
-          {phase === "scanning" ? "扫描中…" : "查找新历史"}
-        </button>
-      </div>
-
-      {/* 授权表单：未授权时显示 */}
-      {phase === "idle" && (
-        <div className="workbench__auth" data-testid="auth-panel">
-          <h3>扫描授权</h3>
-          <p className="workbench__hint">
-            P1 fixture 模式：扫描需要明确授权并确认 TRAE 未运行。
-          </p>
-          <div className="workbench__form">
-            <label className="workbench__field">
-              fixture 路径
-              <input
-                type="text"
-                value={fixtureRoot}
-                onChange={(e) => handleFixtureRootChange(e.target.value)}
-                placeholder="例如：%LOCALAPPDATA%\Trae Sync\tests\fixture-xxx"
-                data-testid="history-fixture-root-input"
-              />
-            </label>
-            <label className="workbench__field">
-              数据库相对路径
-              <input
-                type="text"
-                value={dbRelativePath}
-                onChange={(e) => handleDbRelativePathChange(e.target.value)}
-                data-testid="history-db-path-input"
-              />
-            </label>
-            <label className="workbench__check">
-              <input
-                type="checkbox"
-                checked={!processRunning}
-                onChange={(e) => setProcessRunning(!e.target.checked)}
-                data-testid="trae-not-running-check"
-              />
-              确认 TRAE 已关闭
-            </label>
-            <label className="workbench__check">
-              <input
-                type="checkbox"
-                checked={authorizeChecked}
-                onChange={(e) => handleAuthorizeToggle(e.target.checked)}
-                disabled={!canAuthorize}
-                data-testid="authorize-check"
-              />
-              {authorizationPending ? "授权中…（点击取消）" : "授权扫描指定 fixture 路径"}
-            </label>
+    <section
+      className={`history-page${embedded ? " history-page--embedded" : ""}`}
+      role="region"
+      aria-label={embedded ? "对话列表" : "历史"}
+    >
+      {embedded ? (
+        actionsBar
+      ) : (
+        <header className="page-header">
+          <div className="page-header__copy">
+            <h1 data-page-title="history" tabIndex={-1}>历史</h1>
+            <p>主库对话记录 · 自动同步，无需授权扫描</p>
           </div>
-        </div>
+          {actionsBar}
+        </header>
       )}
 
-      {/* 扫描中状态 */}
-      {phase === "scanning" && (
-        <div className="workbench__scanning" data-testid="scanning-state" role="status">
-          正在扫描并捕获不可变快照…
-        </div>
+      {body()}
+
+      {preview && (
+        <SessionPreview
+          preview={preview}
+          projectName={projectName(preview.session.project_id)}
+          legs={legsForSession(preview.session)}
+          currentUserId={currentUserId}
+          onClose={closePreview}
+        />
       )}
 
-      {/* 扫描失败状态 */}
-      {phase === "failure" && (
-        <div className="workbench__failure" role="alert" data-testid="failure-state">
-          <p>扫描失败：{scanError ?? "未知原因"}</p>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => setPhase("idle")}
-            data-testid="retry-scan-button"
-          >
-            重新授权
-          </button>
-        </div>
+      {/* P5-8a 删除二次确认：列明会话数与消息量（ADR-0018 单次确认） */}
+      {deleteConfirm && (
+        <DeleteConfirmDialog
+          sessions={deleteConfirm}
+          onCancel={() => setDeleteConfirm(null)}
+          onConfirm={confirmDelete}
+        />
       )}
 
-      {/* 扫描成功但空 */}
-      {phase === "empty" && (
-        <div className="workbench__empty" data-testid="empty-state">
-          <p>扫描完成，但目录库中暂无可见历史。{honestStatus}</p>
-          <button type="button" className="btn" onClick={() => setPhase("idle")}>
-            重新扫描
-          </button>
-        </div>
+      {/* P5-8c 合并确认弹层：选择保留分组（破坏性批量迁移，单次确认） */}
+      {mergeConfirm && (
+        <MergeConfirmDialog
+          projects={mergeConfirm}
+          sessionCounts={mergeSessionCounts}
+          onCancel={() => setMergeConfirm(null)}
+          onConfirm={confirmMerge}
+        />
       )}
-
-      {/* 扫描成功且有数据：三栏布局 */}
-      {(phase === "success" || phase === "empty") && browseResult && (
-        <>
-        {browseError && (
-          <p className="workbench__error" role="alert">
-            浏览失败：{browseError}
-          </p>
-        )}
-        <div className="workbench__body">
-          {/* 左栏：账号/项目树 */}
-          <div
-            className="workbench__tree"
-            role="tree"
-            aria-label="账号与项目树"
-            data-testid="account-project-tree"
-          >
-            <h3>账号与项目</h3>
-            {browseResult.accounts.length === 0 ? (
-              <p className="workbench__empty">无可见账号</p>
-            ) : (
-              <ul role="group">
-                {browseResult.accounts.map((acc) => (
-                  <li key={acc.user_id} role="treeitem">
-                    <div className="workbench__select-row">
-                      {scopeMode === "custom" && (
-                        <input
-                          type="checkbox"
-                          checked={selectedAccounts.includes(acc.user_id)}
-                          onChange={() =>
-                            toggleStringSelection(
-                              acc.user_id,
-                              selectedAccounts,
-                              setSelectedAccounts,
-                            )
-                          }
-                          aria-label={`选择账号 ${acc.display_label}`}
-                        />
-                      )}
-                      <button
-                        type="button"
-                        className="workbench__node"
-                        onClick={() => {
-                          setSelectedAccount(
-                            selectedAccount === acc.user_id ? null : acc.user_id,
-                          );
-                          setSelectedProject(null);
-                        }}
-                        aria-expanded={selectedAccount === acc.user_id}
-                        data-testid={`account-${acc.user_id}`}
-                      >
-                        {acc.display_label}（项目 {acc.project_count}，对话{" "}
-                        {acc.session_count}）
-                      </button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {filteredProjects.length > 0 && (
-              <ul role="group" className="workbench__subtree">
-                {filteredProjects.map((proj) => (
-                  <li key={proj.project_id} role="treeitem">
-                    <div className="workbench__select-row workbench__select-row--child">
-                      {scopeMode === "custom" && (
-                        <input
-                          type="checkbox"
-                          checked={selectedProjects.includes(proj.project_id)}
-                          onChange={() =>
-                            toggleStringSelection(
-                              proj.project_id,
-                              selectedProjects,
-                              setSelectedProjects,
-                            )
-                          }
-                          aria-label={`选择项目 ${proj.display_name}`}
-                        />
-                      )}
-                      <button
-                        type="button"
-                        className="workbench__node workbench__node--child"
-                        onClick={() => {
-                          setSelectedProject(
-                            selectedProject === proj.project_id ? null : proj.project_id,
-                          );
-                        }}
-                        aria-expanded={selectedProject === proj.project_id}
-                        data-testid={`project-${proj.project_id}`}
-                      >
-                        {proj.display_name}（归属 {proj.display_owner}，对话{" "}
-                        {proj.session_count}）
-                      </button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-
-          {/* 中栏：会话列表 + 搜索 */}
-          <div
-            className="workbench__sessions"
-            role="region"
-            aria-label="对话列表"
-            data-testid="session-list"
-          >
-            <h3>对话</h3>
-            <div className="workbench__search">
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="搜索消息内容…"
-                data-testid="search-input"
-              />
-              <button
-                type="button"
-                className="btn"
-                onClick={handleSearch}
-                disabled={searchQuery.trim().length === 0}
-                data-testid="search-button"
-              >
-                搜索
-              </button>
-            </div>
-            {searchError && (
-              <p className="workbench__error" role="alert">
-                {searchError}
-              </p>
-            )}
-
-            {/* 搜索结果 */}
-            {searchResults !== null && (
-              <div className="workbench__search-results" data-testid="search-results">
-                <h4>搜索结果（{searchResults.length}）</h4>
-                {searchResults.length === 0 ? (
-                  <p>无匹配结果</p>
-                ) : (
-                  <ul>
-                    {searchResults.map((hit) => (
-                      <li key={`${hit.message_id}-${hit.session_identity.original_session_id}`}>
-                        <button
-                          type="button"
-                          className="workbench__search-hit"
-                          onClick={() => handleSearchHitClick(hit)}
-                          data-testid={`search-hit-${hit.message_id}`}
-                        >
-                          <span className="workbench__hit-title">{hit.title}</span>
-                          <span className="workbench__hit-context">
-                            [{hit.role}] {hit.content_excerpt}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
-
-            {/* 会话列表（点击只预览，不改选择——AC9） */}
-            {filteredSessions.length === 0 ? (
-              <p className="workbench__empty">无可见对话</p>
-            ) : (
-              <ul className="workbench__session-list">
-                {filteredSessions.map((s) => {
-                  const isPreviewing =
-                    previewSession?.original_session_id ===
-                    s.session_identity.original_session_id;
-                  return (
-                    <li key={s.session_identity.original_session_id}>
-                      <div className="workbench__select-row">
-                        {scopeMode === "custom" && (
-                          <input
-                            type="checkbox"
-                            checked={selectedSessions.some(
-                              (item) => sessionKey(item) === sessionKey(s.session_identity),
-                            )}
-                            onChange={() => toggleSessionSelection(s.session_identity)}
-                            aria-label={`选择对话 ${s.title}`}
-                          />
-                        )}
-                        <button
-                          type="button"
-                          className={
-                            "workbench__session" +
-                            (isPreviewing ? " workbench__session--active" : "")
-                          }
-                          onClick={() => handleSessionClick(s)}
-                          data-testid={`session-${s.session_identity.original_session_id}`}
-                        >
-                          <span className="workbench__session-title">{s.title}</span>
-                          <span className="workbench__session-meta">
-                            {s.message_count} 条消息
-                          </span>
-                        </button>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </div>
-
-          {/* 右栏：对话预览 */}
-          <div
-            className="workbench__preview"
-            role="region"
-            aria-label="对话内容预览"
-            data-testid="conversation-preview"
-          >
-            <h3>对话内容</h3>
-            {previewLoading && <p data-testid="preview-loading">加载中…</p>}
-            {!previewLoading && !previewSession && (
-              <p className="workbench__empty">点击对话标题查看内容（不会改变选择）</p>
-            )}
-            {!previewLoading && previewSession && previewData && (
-              <div data-testid="preview-content">
-                <h4>{previewData.title}</h4>
-                <p className="workbench__preview-meta">
-                  共 {previewData.total_message_count} 条消息
-                </p>
-                <ul className="workbench__messages">
-                  {previewData.messages.map((m) => (
-                    <li
-                      key={m.message_id}
-                      className="workbench__message"
-                      data-testid={`message-${m.message_id}`}
-                    >
-                      <span className="workbench__message-role">{m.role}</span>
-                      <span className="workbench__message-content">
-                        {m.content_excerpt}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {!previewLoading && previewSession && !previewData && (
-              <p className="workbench__empty">无法加载对话内容</p>
-            )}
-          </div>
-        </div>
-        </>
-      )}
-
-      {/* T05：同步范围与不可变计划预览，不执行写入。 */}
-      <div className="workbench__plan" role="region" aria-label="同步计划">
-        <h3>同步计划</h3>
-        <div className="workbench__scope" role="group" aria-label="同步范围">
-          <label>
-            <input
-              type="radio"
-              name="sync-scope"
-              checked={scopeMode === "all"}
-              onChange={() => {
-                setScopeMode("all");
-                planGenerationRef.current += 1;
-                setSyncPlan(null);
-                setPlanLoading(false);
-              }}
-            />
-            全部历史
-          </label>
-          <label>
-            <input
-              type="radio"
-              name="sync-scope"
-              checked={scopeMode === "custom"}
-              onChange={() => {
-                setScopeMode("custom");
-                planGenerationRef.current += 1;
-                setSyncPlan(null);
-                setPlanLoading(false);
-              }}
-            />
-            自定义选择
-          </label>
-        </div>
-        <dl className="plan-summary">
-          <dt>已选择</dt>
-          <dd data-testid="plan-selected">{selectedSessionKeys.size}</dd>
-          <dt>本次可同步</dt>
-          <dd data-testid="plan-syncable">{syncableCount}</dd>
-          <dt>已在当前账号</dt>
-          <dd data-testid="plan-already-current">{alreadyCurrentCount}</dd>
-          <dt>需要处理</dt>
-          <dd data-testid="plan-needs-processing">{needsProcessingCount}</dd>
-          <dt>目标账号</dt>
-          <dd data-testid="plan-target-account">{syncPlan?.current_user_id ?? "生成后确认"}</dd>
-        </dl>
-        <p className="workbench__hint">
-          计划会把项目归属调整到当前账号，或把选中对话挂到可靠的目标项目；不会复制成两份账号历史。
-        </p>
-        {planError && <p className="workbench__error" role="alert">{planError}</p>}
-        {syncPlan && (
-          <div className="workbench__plan-result" data-testid="sync-plan-result">
-            <p>动作 {syncPlan.actions.length}，排除 {syncPlan.exclusions.length}</p>
-            <ul>
-              {syncPlan.actions.map((action, index) => (
-                <li key={`${action.kind}-${index}`}>{renderPlanAction(action)}</li>
-              ))}
-              {syncPlan.exclusions.map((item, index) => (
-                <li key={`${item.project_id}-${index}`}>
-                  排除 {item.project_id}：{renderPlanExclusion(item.reason)}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        <button
-          type="button"
-          className="btn btn--primary"
-          onClick={handleBuildPlan}
-          disabled={
-            planLoading ||
-            !authorized ||
-            !browseResult ||
-            (scopeMode === "custom" && selectedSessionKeys.size === 0)
-          }
-          data-testid="build-sync-plan-button"
-        >
-          {planLoading ? "生成中…" : "生成同步计划"}
-        </button>
-        <button
-          type="button"
-          className="btn"
-          disabled={!capabilities.sync_enabled || !syncPlan}
-          aria-disabled={!capabilities.sync_enabled || !syncPlan}
-          data-testid="sync-button"
-        >
-          检查并安全同步（后续任务包）
-        </button>
-      </div>
-
-      <p className="workbench__honest-status" role="status">
-        {honestStatus}
-      </p>
     </section>
   );
 }
 
-function renderPlanAction(action: SyncPlanDto["actions"][number]): string {
-  if (action.kind === "follow_project") {
-    return `跟随整个项目 ${action.project_id} 到账号 ${action.to_user_id}`;
-  }
-  return `挂接 ${action.session_ids.length} 条对话到项目 ${action.target_project_id}`;
+// ============================================================================
+// P5-8a 会话行（主列表与归档视图共用）：选择态显示勾选框，点击切换勾选
+// ============================================================================
+
+function SessionRow({
+  session,
+  testId,
+  selectMode,
+  checked,
+  onToggle,
+  onOpen,
+  legs,
+  currentUserId,
+}: {
+  session: MasterSessionEntryDto;
+  testId: string;
+  selectMode: boolean;
+  checked: boolean;
+  onToggle: (sessionId: string) => void;
+  onOpen: (session: MasterSessionEntryDto) => void;
+  legs: readonly RelayLeg[] | null;
+  currentUserId: string | null;
+}) {
+  return (
+    <button
+      type="button"
+      className={`sess-row ${selectMode ? "sess-row--select" : ""} ${checked ? "sess-row--checked" : ""}`}
+      onClick={() => (selectMode ? onToggle(session.session_id) : onOpen(session))}
+      aria-pressed={selectMode ? checked : undefined}
+      data-testid={testId}
+    >
+      {selectMode && (
+        <span className="sess-row__check" aria-hidden="true">
+          {checked ? <CheckSquare size={16} /> : <Square size={16} />}
+        </span>
+      )}
+      <span className="sess-row__main">
+        <span className="sess-row__title">{session.title?.trim() || "未命名会话"}</span>
+        <span className="sess-row__meta">
+          <span><Clock size={11} aria-hidden="true" />{formatSessionTime(session.updated_at_unix_seconds)}</span>
+          <span><MessageSquare size={11} aria-hidden="true" />{session.message_count} 条</span>
+        </span>
+      </span>
+      {legs && <RelayChain legs={legs} currentUserId={currentUserId} />}
+    </button>
+  );
 }
 
-function renderPlanExclusion(reason: string): string {
-  const labels: Record<string, string> = {
-    already_current: "已在当前账号",
-    project_identity_conflict: "项目身份冲突",
-    project_identity_unknown: "项目身份证据不足",
-    archived_only: "仅有归档内容",
-    deleted_project: "项目已删除",
-    schema_incompatible: "数据库结构不兼容",
-    session_version_unavailable: "对话版本不可用",
-    partial_project_requires_target: "目标无同项目，请选择整个项目",
+// ============================================================================
+// P5-8a 删除确认弹窗：列明规模，确认后执行真实删除（后端先备份）
+// ============================================================================
+
+function DeleteConfirmDialog({
+  sessions,
+  onCancel,
+  onConfirm,
+}: {
+  sessions: readonly MasterSessionEntryDto[];
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const totalMessages = sessions.reduce((sum, session) => sum + session.message_count, 0);
+  return (
+    <div
+      className="preview-veil preview-veil--open"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onCancel();
+      }}
+      data-testid="delete-confirm"
+    >
+      <div
+        className="preview confirm-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="确认删除会话"
+      >
+        <div className="preview__head">
+          <div className="preview__head-main">
+            <div className="preview__title">删除 {sessions.length} 个会话</div>
+            <div className="preview__meta">
+              <span>共 {totalMessages} 条消息</span>
+              <span>删除前会自动创建主库数据备份</span>
+            </div>
+          </div>
+          <button
+            className="btn"
+            type="button"
+            onClick={onCancel}
+            data-testid="delete-confirm-cancel"
+          >
+            <X size={15} aria-hidden="true" />取消
+          </button>
+        </div>
+        <div className="preview__body">
+          <p className="confirm-dialog__text">
+            删除后这些会话将从主库永久移除，无法在应用内恢复（备份文件保留，可人工恢复）。
+          </p>
+          <ul className="confirm-dialog__list">
+            {sessions.map((session) => (
+              <li key={session.session_id} data-testid={`delete-confirm-item-${session.session_id}`}>
+                {session.title?.trim() || "未命名会话"}
+                <span> · {session.message_count} 条消息</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div className="confirm-dialog__foot">
+          <button className="btn" type="button" onClick={onCancel}>
+            取消
+          </button>
+          <button
+            className="btn btn--danger"
+            type="button"
+            onClick={onConfirm}
+            data-testid="delete-confirm-ok"
+          >
+            <Trash2 size={15} aria-hidden="true" />确认删除
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// P5-8c 合并确认弹窗：选择保留的分组，其余分组会话全部并入（后端先备份）
+// ============================================================================
+
+function MergeConfirmDialog({
+  projects,
+  sessionCounts,
+  onCancel,
+  onConfirm,
+}: {
+  /** 待合并分组集合（其中一个被选为保留目标）。 */
+  projects: readonly MasterProjectEntryDto[];
+  /** 分组 → 会话数（含已归档，不含已删除；弹层规模展示）。 */
+  sessionCounts: ReadonlyMap<string, number>;
+  onCancel: () => void;
+  onConfirm: (target: MasterProjectEntryDto) => void;
+}) {
+  // 默认保留列表第一个分组；用户可在弹层内改选。
+  const [targetId, setTargetId] = useState(projects[0]?.project_id ?? "");
+  const target = projects.find((project) => project.project_id === targetId) ?? projects[0];
+  // 将被移动的会话总量 = 非保留分组的会话数之和。
+  const movedSessions = projects
+    .filter((project) => project.project_id !== target?.project_id)
+    .reduce((sum, project) => sum + (sessionCounts.get(project.project_id) ?? 0), 0);
+  return (
+    <div
+      className="preview-veil preview-veil--open"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onCancel();
+      }}
+      data-testid="merge-confirm"
+    >
+      <div
+        className="preview confirm-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="确认合并分组"
+      >
+        <div className="preview__head">
+          <div className="preview__head-main">
+            <div className="preview__title">合并 {projects.length} 个分组</div>
+            <div className="preview__meta">
+              <span>{movedSessions} 个会话将移入保留的分组（含已归档）</span>
+              <span>合并前会自动创建主库数据备份</span>
+            </div>
+          </div>
+          <button
+            className="btn"
+            type="button"
+            onClick={onCancel}
+            data-testid="merge-confirm-cancel"
+          >
+            <X size={15} aria-hidden="true" />取消
+          </button>
+        </div>
+        <div className="preview__body">
+          <p className="confirm-dialog__text">
+            选择要保留的分组：其余分组的全部会话都会移入它，移空的分组会被清理。误合并可用备份人工恢复。
+          </p>
+          <ul className="confirm-dialog__list confirm-dialog__list--choice">
+            {projects.map((project) => (
+              <li key={project.project_id}>
+                <label className="merge-choice">
+                  <input
+                    type="radio"
+                    name="merge-target"
+                    checked={project.project_id === target?.project_id}
+                    onChange={() => setTargetId(project.project_id)}
+                    data-testid={`merge-target-${project.project_id}`}
+                  />
+                  <span className="merge-choice__name">{project.name?.trim() || "未命名项目"}</span>
+                  <span className="merge-choice__meta">
+                    {sessionCounts.get(project.project_id) ?? 0} 个会话
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div className="confirm-dialog__foot">
+          <button className="btn" type="button" onClick={onCancel}>
+            取消
+          </button>
+          <button
+            className="btn btn--primary"
+            type="button"
+            onClick={() => target && onConfirm(target)}
+            data-testid="merge-confirm-ok"
+          >
+            <Merge size={15} aria-hidden="true" />确认合并
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 归档视图模式标签（work_mode 列值 → 展示名）。 */
+function modeLabel(mode: string): string {
+  if (mode === "work") return "Work 模式";
+  if (mode === "code") return "Code 模式";
+  if (mode === "未标注") return "未标注模式";
+  return mode;
+}
+
+// ============================================================================
+// 会话预览弹层：接力轨迹时间线 + 主库消息流
+// ============================================================================
+
+function SessionPreview({
+  preview,
+  projectName,
+  legs,
+  currentUserId,
+  onClose,
+}: {
+  preview: PreviewState;
+  projectName: string;
+  legs: readonly RelayLeg[] | null;
+  currentUserId: string | null;
+  onClose: () => void;
+}) {
+  const { session } = preview;
+  return (
+    <div
+      className="preview-veil preview-veil--open"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      data-testid="history-preview"
+    >
+      <div
+        className="preview"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`会话预览：${session.title || "未命名会话"}`}
+      >
+        <div className="preview__head">
+          <div className="preview__head-main">
+            <div className="preview__title">{session.title?.trim() || "未命名会话"}</div>
+            <div className="preview__meta">
+              <span>{projectName}</span>
+              <span>{session.message_count} 条消息</span>
+              <span>最后活动 {formatSessionTime(session.updated_at_unix_seconds)}</span>
+            </div>
+          </div>
+          <button
+            className="btn"
+            type="button"
+            onClick={onClose}
+            data-testid="history-preview-close"
+            aria-label="关闭预览"
+          >
+            <X size={15} aria-hidden="true" />关闭
+          </button>
+        </div>
+        <div className="preview__body" data-testid="preview-content">
+          {legs && legs.length > 0 && (
+            <>
+              <div className="preview__section">接力记录（谁在什么时候用过这条会话）</div>
+              <div className="leg-timeline">
+                {legs.map((leg, index) => (
+                  <div className="leg-step" key={`${leg.userId}-${index}`}>
+                    <div className="leg-step__rail">
+                      <span className="leg-step__dot">
+                        <RelayAvatar userId={leg.userId} name={leg.accountName} />
+                      </span>
+                      <span className="leg-step__line" />
+                    </div>
+                    <div className="leg-step__body">
+                      <div className="leg-step__name">
+                        {leg.accountName ?? "已移除账号"}
+                        {currentUserId !== null && leg.userId === currentUserId && (
+                          <span className="leg-step__badge">当前账号</span>
+                        )}
+                      </div>
+                      <div className="leg-step__meta">
+                        {formatLegSpan(leg)} · {leg.messages} 条消息
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="preview__section preview__section--gap">消息预览</div>
+            </>
+          )}
+          {preview.status === "loading" && <div className="sess-empty">正在读取消息…</div>}
+          {preview.status === "error" && (
+            <div className="sess-empty">消息暂时无法读取，请稍后重试。</div>
+          )}
+          {preview.status === "ready" && preview.messages.length === 0 && (
+            <div className="sess-empty">该会话没有可展示的消息。</div>
+          )}
+          {preview.status === "ready" &&
+            preview.messages.map((message) => (
+              <div
+                className={`msg ${message.role === "user" ? "msg--user" : ""}`}
+                key={message.message_id}
+              >
+                <div className="msg__role">{message.role === "user" ? "用户" : "AI"}</div>
+                {message.content.kind === "text" ? (
+                  <div className="msg__text">{message.content.text}</div>
+                ) : (
+                  <div className="msg__text msg__text--trace">
+                    任务轨迹 · {message.content.step_count} 步
+                    {message.content.thoughts.length > 0 && (
+                      <ul className="msg__thoughts">
+                        {message.content.thoughts.map((thought, index) => (
+                          <li key={index}>{thought}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// 接力轨迹徽章：头像链 + 悬停浮层（fixed 定位 + 视口钳制，末行不被裁剪）
+// ============================================================================
+
+function RelayChain({
+  legs,
+  currentUserId,
+}: {
+  legs: readonly RelayLeg[];
+  currentUserId: string | null;
+}) {
+  const chainRef = useRef<HTMLSpanElement>(null);
+  const popRef = useRef<HTMLSpanElement>(null);
+
+  const handleMouseEnter = () => {
+    const chain = chainRef.current;
+    const pop = popRef.current;
+    if (!chain || !pop) return;
+    const rect = chain.getBoundingClientRect();
+    // 先临时可见取实际尺寸（不触发重排闪烁：visibility 隐藏期间测量）。
+    pop.style.visibility = "hidden";
+    pop.classList.add("relay-pop--measuring");
+    const width = pop.offsetWidth || 240;
+    const height = pop.offsetHeight || 120;
+    pop.classList.remove("relay-pop--measuring");
+    pop.style.visibility = "";
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 12));
+    const top =
+      rect.bottom + 8 + height > window.innerHeight - 8
+        ? Math.max(8, rect.top - height - 8) // 下方放不下时向上展开
+        : rect.bottom + 8;
+    pop.style.left = `${left}px`;
+    pop.style.top = `${top}px`;
   };
-  return labels[reason] ?? reason;
+
+  const show = legs.slice(0, 3);
+  const rest = legs.length - show.length;
+
+  return (
+    <span
+      className="relay-chain"
+      ref={chainRef}
+      onMouseEnter={handleMouseEnter}
+      data-testid="history-relay-chain"
+    >
+      {show.map((leg, index) => (
+        <RelayAvatar
+          key={`${leg.userId}-${index}`}
+          userId={leg.userId}
+          name={leg.accountName}
+        />
+      ))}
+      {rest > 0 && <span className="relay-chain__more">+{rest}</span>}
+      <span className="relay-pop" ref={popRef}>
+        <span className="relay-pop__title">接力记录 · {legs.length} 个账号使用过</span>
+        {legs.map((leg, index) => (
+          <span className="relay-pop__row" key={`${leg.userId}-pop-${index}`}>
+            <RelayAvatar userId={leg.userId} name={leg.accountName} />
+            <span className="relay-pop__name">
+              {leg.accountName ?? "已移除账号"}
+              {currentUserId !== null && leg.userId === currentUserId && "（当前账号）"}
+            </span>
+            <span className="relay-pop__meta">
+              {formatLegSpan(leg)}
+              <br />
+              {leg.messages} 条消息
+            </span>
+          </span>
+        ))}
+      </span>
+    </span>
+  );
 }
 
-function countExcludedSessions(
-  plan: SyncPlanDto | null,
-  browseResult: BrowseResultDto | null,
-  include: (reason: string) => boolean,
-): number {
-  if (!plan || !browseResult) return 0;
-  const sessionKeys = new Set<string>();
-  for (const exclusion of plan.exclusions) {
-    if (!include(exclusion.reason)) continue;
-    if (exclusion.session_id) {
-      sessionKeys.add(
-        `${exclusion.session_id.product_history_namespace}:${exclusion.session_id.original_session_id}`,
-      );
-      continue;
-    }
-    for (const session of browseResult.sessions) {
-      if (session.project_id === exclusion.project_id) {
-        sessionKeys.add(
-          `${session.session_identity.product_history_namespace}:${session.session_identity.original_session_id}`,
-        );
-      }
-    }
+// ============================================================================
+// 工具：头像、时间格式化
+// ============================================================================
+
+/** 账号头像：首字符 + 按 user_id 哈希的稳定色调（同一账号跨页面颜色一致）。 */
+function RelayAvatar({ userId, name }: { userId: string; name: string | null }) {
+  const letter = (name ?? "").trim().charAt(0).toUpperCase() || "?";
+  let hash = 0;
+  for (let index = 0; index < userId.length; index += 1) {
+    hash = (hash * 31 + userId.charCodeAt(index)) >>> 0;
   }
-  return sessionKeys.size;
+  return (
+    <span className={`relay-avatar relay-avatar--t${hash % 6}`} aria-hidden="true">
+      {letter}
+    </span>
+  );
 }
 
-// 渲染扫描失败原因：结构化，不携带 secret
-function renderScanFailure(reason: string): string {
-  const reasonMap: Record<string, string> = {
-    not_authorized: "未授权扫描",
-    process_running: "TRAE 正在运行",
-    database_missing: "数据库文件不存在",
-    schema_incompatible: "schema 不兼容",
-    storage_root_unavailable: "存储根不可用",
-    source_set_drift: "捕获前后源文件集漂移",
-    catalog_transaction_failed: "目录库事务失败",
-    catalog_key_missing: "目录库密钥未配置",
-  };
-  return reasonMap[reason] ?? reason;
+/** 从台账反查账号显示名（项目参与头像用；无记录返回 null）。 */
+function nameOfLeg(ledger: readonly RelayLedgerEntryDto[], userId: string): string | null {
+  for (const entry of ledger) {
+    if (entry.from_user_id === userId) return entry.from_account_name;
+    if (entry.to_user_id === userId) return entry.to_account_name;
+  }
+  return null;
+}
+
+/** 会话时间：今天/昨天/MM-DD HH:mm（跨年补年份）。 */
+function formatSessionTime(unixSeconds: number | null): string {
+  if (!unixSeconds) return "时间未知";
+  const date = new Date(unixSeconds * 1000);
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const hhmm = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const dayDiff = Math.round((startOfDay(now) - startOfDay(date)) / 86_400_000);
+  if (dayDiff === 0) return `今天 ${hhmm}`;
+  if (dayDiff === 1) return `昨天 ${hhmm}`;
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const monthDay = `${date.getMonth() + 1}月${date.getDate()}日`;
+  return sameYear ? `${monthDay} ${hhmm}` : `${date.getFullYear()}年${monthDay} ${hhmm}`;
+}
+
+/** 接力腿时间段：交接时刻区间（进行中腿显示「至今」）。 */
+function formatLegSpan(leg: RelayLeg): string {
+  const from = leg.fromUnixSeconds === null ? "最早" : formatSessionTime(leg.fromUnixSeconds);
+  const to = leg.toUnixSeconds === null ? "至今" : formatSessionTime(leg.toUnixSeconds);
+  return `${from} → ${to}`;
 }

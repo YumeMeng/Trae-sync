@@ -10,12 +10,41 @@ dist/
 # ---- Rust / Tauri ----
 src-tauri/target/
 src-tauri/gen/
+# .scratch 下各探针工程（rust 等一次性项目）的编译产物同样忽略，防止进库
+.scratch/**/target/
+**/target/
 
 # ---- 本地开发环境 ----
 .env
 .env.local
 .env.*.local
+.scratch/dev-tauri/
 
 # ---- 操作系统杂项 ----
 .DS_Store
 Thumbs.db
+
+# ---- TRAE 启动临时日志 ----
+/debug.log
+# 修复 stdio 继承前，被启动的 TRAE 实例把 debug.log 写进了 src-tauri
+src-tauri/debug.log
+
+# ---- 敏感与本地材料（推送 GitHub 前确立的红线）----
+# .scratch 含真实 HTTP 实测证据与日志（令牌/凭据材料），永不入远端仓库
+.scratch/
+# Playwright 生成的报告与一次性运行日志
+playwright-report/
+test-results/
+# 构建产物：安装包（exe/msi）与 UI 验收截图，随发布流程另行归档
+artifacts/
+e2e-run.log
+# 本地排障时的 cargo 输出捕获
+src-tauri/check.err
+# lib.rs 的历史遗留副本（本地排障用）
+src-tauri/.git-lib-*.rs
+
+# Added by cargo
+
+/target
+# Added by code-review-graph
+.code-review-graph/

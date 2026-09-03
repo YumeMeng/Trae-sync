@@ -1,0 +1,63 @@
+/* 设计令牌（docs/DESIGN_TOKENS.md 契约的实现层）——U-5 W2 起为单一语义层：
+   换主题只需重定义本 :root 中的变量（旧桥接层已并入/删除，2026-08-28）。 */
+
+:root {
+  /* ============================================================
+     设计令牌（docs/DESIGN_TOKENS.md · 亮白通用玻璃，2026-08-26）
+     单一语义层：组件层引用本组；换主题仅重定义这些变量。
+     ============================================================ */
+  --text-1: #1a2233;                         /* 主文字 */
+  --text-2: #5b6478;                         /* 次文字（旧 --ink/--muted/--muted-strong 归一并档） */
+  --text-3: #9aa3b5;                         /* 弱文字/meta */
+  --muted-placeholder: #5f6d76;              /* 输入占位专用色（更深入一档保 WCAG AA，独立保留） */
+  --accent: #4f46e5;                         /* 靛蓝强调（唯一品牌色；-new 后缀已退役） */
+  --accent-soft: rgba(79, 70, 229, .09);
+  --accent-border: rgba(79, 70, 229, .38);
+  --accent-shadow: 0 4px 14px rgba(79, 70, 229, .28);  /* 主操作按钮品牌投影 */
+  --accent-hover: #4338ca;                   /* 强调色 hover 深一档 */
+  --warn: #b45309;                           /* 异常琥珀：需要用户动手 */
+  --warn-soft-bg: rgba(217, 119, 6, .09);
+  --warn-line: rgba(217, 119, 6, .35);
+  --warn-dot: #d97706;
+  --danger: #b4233c;                         /* 危险操作（仅独立危险分区） */
+  --danger-soft: rgba(180, 35, 60, .08);     /* 危险分区底（旧实色 #fff0f2 归一为玻璃系 rgba） */
+  --danger-line: rgba(180, 35, 60, .32);     /* 危险分区描边（按合同补齐定义，清剿悬空引用） */
+  --app-bg: #f4f6fa;                         /* 亮白画布 */
+  --mist: rgba(99, 102, 241, .2);            /* 靛蓝雾斑（单色，与 accent 同族；浓度约 20%） */
+  --glass: rgba(255, 255, 255, .62);         /* 标准玻璃面 */
+  --glass-strong: rgba(255, 255, 255, .78);  /* 强玻璃面（标题栏） */
+  --glass-rail: rgba(255, 255, 255, .5);     /* 导航栏玻璃面（轻一档，与标题栏成层级差） */
+  --glass-dense: rgba(255, 255, 255, .75);   /* 密集文本区玻璃面（历史工作台正文等，更实保可读） */
+  --glass-blur: blur(22px) saturate(135%);            /* 标准玻璃模糊 */
+  --glass-blur-strong: blur(18px) saturate(130%);     /* 强玻璃模糊（标题栏） */
+  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, .85);  /* 玻璃内高光 */
+  --glass-shadow: 0 6px 24px rgba(26, 34, 51, .07), 0 1px 3px rgba(26, 34, 51, .05);  /* 玻璃投影 */
+  --line-hair: rgba(26, 34, 51, .08);        /* 玻璃级细线（旧 --line #d8dee8 归一为发丝线） */
+  --line-control: rgba(26, 34, 51, .14);     /* 控件描边（旧 --line-strong #b6bfcc 归一） */
+
+  /* —— 辅助档（U-4 字面色值清剿批新增；历史页 rgba 近值按归一规则并档） —— */
+  --glass-hover: rgba(255, 255, 255, .65);   /* 次操作按钮底 / hover 白玻璃 */
+  --glass-active: rgba(255, 255, 255, .85);  /* 导航激活浮起底 */
+  --glass-solid: rgba(255, 255, 255, .97);   /* 移动端底部栏（高对比底） */
+  --fill-soft: rgba(26, 34, 51, .045);       /* 中性极淡底（旧 --surface-soft/-muted 多数语境归一） */
+  --fill: rgba(26, 34, 51, .08);             /* 中性淡填充（进度槽等） */
+  --fill-strong: rgba(26, 34, 51, .12);      /* 中性 hover 加深 */
+  --text-on-accent: #ffffff;                 /* 主操作/窗控白字（旧 --accent-fg 并档） */
+  --window-close: #e81123;                   /* Windows 窗控关闭红（平台约定原值保留） */
+
+  /* —— 投影/尺寸（自旧桥接层整档挪入，值不变） —— */
+  --shadow-float: 0 12px 32px rgba(20, 32, 42, 0.14);   /* 浮层投影 */
+  --shadow-panel: 0 1px 2px rgba(20, 32, 42, 0.06);    /* 面板静态投影 */
+  --radius-control: 12px;  /* 控件圆角（合同 12px，2026-08-27 由 4px 收敛） */
+  --radius-panel: 15px;  /* 面板圆角（合同 15px，U-4 B1 对齐；原 8px 与 DESIGN_TOKENS 舒展档不符） */
+  --control-height: 40px;
+  --rail-width: 52px;  /* 图标栏宽度（2026-08-27 由 176px 收敛） */
+  --space-panel: 20px;
+
+  /* —— 全局基底（随主题层一并重定义） —— */
+  font-family: "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text-1);
+  background: var(--app-bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}

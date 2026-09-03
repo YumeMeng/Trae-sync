@@ -1,0 +1,902 @@
+/* 历史页主库视图（P5-3，原型契约 .scratch/proto-20260830-env-model/index.html）
+   项目左栏 + 会话右栏两栏结构；数据源为主库 database.db（project.user_id 过滤）。
+   所有色值走语义令牌（tokens.css），换主题无需改本文件。 */
+
+/* —— 页面骨架：占满视口剩余高度，两栏各自内部滚动 —— */
+.history-page {
+  display: flex;
+  flex-direction: column;
+  /* 与旧工作台同口径：标题栏 + 呼吸带 + 主区内边距的合计预留 */
+  height: calc(100vh - 112px);
+  min-height: 0;
+}
+
+.history-page .page-header {
+  flex: none;
+}
+
+.history-page .page-header__actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* —— 空态/引导/错误（主库未启动、读取失败等居中卡） —— */
+.history-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 40px 20px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  color: var(--text-2);
+  font-size: 13.5px;
+  text-align: center;
+}
+
+.history-empty svg {
+  color: var(--text-3);
+}
+
+.history-empty__hint {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+/* —— 顶栏工具：会话标题搜索 + 时间范围 chips —— */
+.history-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-control);
+  border-radius: 999px;
+  background: var(--glass);
+  color: var(--text-3);
+}
+
+.history-search input {
+  width: 170px;
+  border: none;
+  background: transparent;
+  font-size: 12.5px;
+  color: var(--text-1);
+}
+
+/* 聚焦合同（同 workbench.css）：不写 outline:none —— 全局 focus ring 保留，
+   forced-colors 下焦点仍可见；wrapper 的 focus-within 提供 accent 外晕。 */
+.history-search:focus-within {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.history-chips {
+  display: flex;
+  gap: 6px;
+}
+
+.history-chip {
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--line-control);
+  border-radius: 999px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.history-chip:hover {
+  background: var(--fill-soft);
+}
+
+.history-chip--active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ============================================================
+   两栏主体（Q4：项目为中心扁平双栏）
+   ============================================================ */
+.history-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 14px;
+}
+
+/* —— 左栏：项目列表（密集玻璃面板） —— */
+.proj-panel {
+  flex: none;
+  width: 272px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass-dense);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  overflow: hidden;
+}
+
+.proj-panel__head {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 13px 16px 10px;
+  border-bottom: 1px solid var(--line-hair);
+}
+
+.proj-panel__head b {
+  font-size: 12.5px;
+}
+
+.proj-panel__head span {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* —— P5-8c 分组合并：左栏头部工具位（合并入口） —— */
+.proj-panel__tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 窄栏批量栏（272px）：允许换行收纳全选/计数/合并/退出。 */
+.batch-bar--proj {
+  flex-wrap: wrap;
+  padding: 8px 10px;
+}
+
+/* 选择态勾选的分组行（复用会话行勾选视觉令牌）。 */
+.proj-item--checked {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+.proj-item--checked .proj-item__icon {
+  color: var(--accent);
+}
+
+/* 合并完成回执（一句话，进入下一次分组选择时清除）。 */
+.batch-notice {
+  flex: none;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line-hair);
+  background: var(--accent-soft);
+  color: var(--text-1);
+  font-size: 12px;
+}
+
+.proj-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.proj-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 11px;
+  border: none;
+  border-radius: 11px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  transition: background 0.13s;
+}
+
+.proj-item:hover {
+  background: var(--fill-soft);
+}
+
+.proj-item--active {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+.proj-item__icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: 9px;
+  background: var(--fill-soft);
+  color: var(--text-2);
+}
+
+.proj-item--active .proj-item__icon {
+  background: #fff;
+  color: var(--accent);
+  box-shadow: var(--shadow-panel);
+}
+
+.proj-item__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.proj-item__name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.proj-item__meta {
+  margin-top: 1px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* —— 右栏：会话列表 —— */
+.sess-panel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass-dense);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  overflow: hidden;
+}
+
+.sess-panel__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 18px 11px;
+  border-bottom: 1px solid var(--line-hair);
+}
+
+.sess-panel__head b {
+  font-size: 13px;
+}
+
+.sess-panel__head span {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.sess-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.sess-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+  transition: background 0.13s, border-color 0.13s;
+}
+
+.sess-row:hover {
+  background: var(--fill-soft);
+  border-color: var(--line-hair);
+}
+
+.sess-row__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.sess-row__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sess-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.sess-row__meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sess-row__meta svg {
+  width: 11px;
+  height: 11px;
+}
+
+.sess-empty {
+  padding: 60px 20px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+/* ============================================================
+   会话预览弹层：接力轨迹时间线 + 消息流
+   ============================================================ */
+.preview-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(26, 34, 51, 0.18);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  width: min(680px, 92vw);
+  max-height: 82vh;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass-dense);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-float);
+  overflow: hidden;
+}
+
+.preview__head {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 20px 13px;
+  border-bottom: 1px solid var(--line-hair);
+}
+
+.preview__head-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.preview__title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.preview__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.preview__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+
+.preview__section {
+  margin: 4px 0 9px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-3);
+  letter-spacing: 0.5px;
+}
+
+.preview__section--gap {
+  margin-top: 18px;
+}
+
+/* 消息气泡：用户消息靛蓝底，AI 消息白玻璃底 */
+.msg {
+  margin-bottom: 8px;
+  padding: 10px 13px;
+  border: 1px solid var(--line-hair);
+  border-radius: 11px;
+  background: var(--glass-hover);
+}
+
+.msg--user {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.msg__role {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-3);
+}
+
+.msg__text {
+  font-size: 12.5px;
+  color: var(--text-1);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg__text--trace {
+  color: var(--text-2);
+}
+
+.msg__thoughts {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* 接力轨迹时间线（预览弹层内，时间正序逐腿） */
+.leg-timeline {
+  display: flex;
+  flex-direction: column;
+}
+
+.leg-step {
+  display: flex;
+  gap: 12px;
+}
+
+.leg-step__rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.leg-step__dot {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 50%;
+}
+
+.leg-step__dot .relay-avatar {
+  width: 26px;
+  height: 26px;
+  font-size: 11px;
+  border: 2px solid #fff;
+  box-shadow: var(--shadow-panel);
+}
+
+.leg-step__line {
+  width: 2px;
+  flex: 1;
+  margin: 3px 0;
+  background: var(--line-control);
+}
+
+.leg-step:last-child .leg-step__line {
+  display: none;
+}
+
+.leg-step__body {
+  padding-bottom: 14px;
+}
+
+.leg-step__name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.leg-step__badge {
+  padding: 1px 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.leg-step__meta {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* ============================================================
+   接力轨迹徽章：头像链 + 悬停浮层
+   浮层 fixed 定位 + JS 锚定（视口钳制），避免被滚动容器裁剪。
+   ============================================================ */
+.relay-avatar {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+/* 六档稳定色调：按 user_id 哈希取档，同一账号跨页面颜色一致 */
+.relay-avatar--t0 { background: #4f46e5; }  /* 靛蓝（品牌主色档） */
+.relay-avatar--t1 { background: #2e8f6e; }  /* 绿 */
+.relay-avatar--t2 { background: #c2653e; }  /* 橙棕 */
+.relay-avatar--t3 { background: #0e7490; }  /* 青 */
+.relay-avatar--t4 { background: #6d5bd0; }  /* 紫 */
+.relay-avatar--t5 { background: #b4556e; }  /* 玫红 */
+
+.relay-chain {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.relay-chain .relay-avatar {
+  margin-left: -7px;
+}
+
+.relay-chain .relay-avatar:first-child {
+  margin-left: 0;
+}
+
+/* 项目行的参与头像链：小一档 */
+.relay-chain--compact .relay-avatar {
+  width: 20px;
+  height: 20px;
+  font-size: 9.5px;
+  border-width: 1.5px;
+}
+
+.relay-chain__more {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-left: -7px;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  border-radius: 50%;
+  background: var(--fill-strong);
+  color: var(--text-2);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+/* 悬停浮层：默认隐藏，hover 显现（定位由 JS 写入 left/top） */
+.relay-pop {
+  position: fixed;
+  z-index: 70;
+  min-width: 230px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: 12px;
+  background: var(--glass-dense);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-float);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 0.15s, transform 0.15s;
+}
+
+/* 测量态：JS 取尺寸期间保持不可见（visibility 而非 display，保住布局） */
+.relay-pop--measuring {
+  visibility: hidden;
+  opacity: 1;
+  transform: none;
+}
+
+.relay-chain:hover .relay-pop {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.relay-pop__title {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-3);
+  letter-spacing: 0.4px;
+}
+
+.relay-pop__row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 0;
+}
+
+.relay-pop__row + .relay-pop__row {
+  border-top: 1px dashed var(--line-hair);
+}
+
+.relay-pop__name {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.relay-pop__meta {
+  margin-left: auto;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* —— 窄视口降级：左栏收窄，搜索框收缩 —— */
+@media (max-width: 1100px) {
+  .history-page {
+    /* 低于该宽度改为页面级滚动，避免两栏被过度压缩 */
+    height: auto;
+    min-height: calc(100vh - 112px);
+  }
+
+  .history-body {
+    flex-direction: column;
+  }
+
+  .proj-panel {
+    width: auto;
+    max-height: 320px;
+  }
+}
+
+/* 动效偏好：悬停浮层过渡关闭 */
+@media (prefers-reduced-motion: reduce) {
+  .relay-pop {
+    transition: none;
+  }
+
+  .history-chip {
+    transition: none;
+  }
+}
+
+/* ============================================================
+   主列表项目分组（全部项目视图：组头 = 项目名 + 会话数）
+   ============================================================ */
+.sess-group + .sess-group {
+  margin-top: 6px;
+}
+
+.sess-group__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.sess-group__head span:last-child {
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+/* ============================================================
+   P5-8a 会话归档：选择模式批量栏 + 归档视图 + 删除确认弹窗
+   ============================================================ */
+
+/* —— 右栏头部工具按钮（选择 / 已归档入口） —— */
+.sess-panel__head {
+  gap: 8px;
+}
+
+.sess-panel__tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* —— 选择态会话行：勾选框 + 选中高亮 —— */
+.sess-row--select {
+  gap: 10px;
+}
+
+.sess-row__check {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  color: var(--text-3);
+}
+
+.sess-row--checked .sess-row__check {
+  color: var(--accent);
+}
+
+.sess-row--checked {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+/* —— Gmail 式批量操作栏（选择态替换右栏头部） —— */
+.batch-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line-hair);
+  background: var(--accent-soft);
+}
+
+.batch-bar__count {
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.batch-bar__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+/* 批量操作失败提示条（安全文案，不影响已渲染列表） */
+.batch-error {
+  flex: none;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line-hair);
+  background: var(--fill-soft);
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+/* —— 归档视图：模式 → 项目分组 → 会话 层级 —— */
+.archive-list {
+  padding: 4px 8px 12px;
+}
+
+.archive-mode + .archive-mode {
+  margin-top: 6px;
+}
+
+.archive-mode__head {
+  padding: 10px 10px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-3);
+  letter-spacing: 0.5px;
+}
+
+.archive-group__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.archive-group__head span:last-child {
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+/* —— 删除二次确认弹窗（复用 preview 骨架 + 底部动作条） —— */
+.confirm-dialog {
+  width: min(460px, 92vw);
+}
+
+.confirm-dialog__text {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.confirm-dialog__list {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--line-hair);
+  border-radius: 10px;
+  background: var(--fill-soft);
+  list-style: none;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.confirm-dialog__list li {
+  padding: 4px 0;
+  color: var(--text-1);
+}
+
+.confirm-dialog__list li span {
+  color: var(--text-3);
+}
+
+/* —— P5-8c 合并弹层：保留分组单选行 —— */
+.confirm-dialog__list--choice li {
+  padding: 0;
+}
+
+.merge-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.merge-choice:hover {
+  background: var(--fill-soft);
+}
+
+.merge-choice__name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.merge-choice__meta {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.confirm-dialog__foot {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--line-hair);
+}

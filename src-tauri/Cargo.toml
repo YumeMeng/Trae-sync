@@ -8,8 +8,8 @@
 # 任何反向依赖会被 cargo 直接拒绝编译，构成 AC2 的自动检查。
 [package]
 name = "trae-sync"
-version = "0.1.0"
-description = "Trae Sync V1 受保护的桌面应用骨架"
+version = "0.2.2"
+description = "TRAE Work CN 本地历史浏览与安全同步预览桌面工具"
 edition = "2021"
 rust-version = "1.77"
 
@@ -28,6 +28,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sha2 = "0.10"
+hex = "0.4"
 traesync-domain = { path = "crates/domain" }
 traesync-application = { path = "crates/application" }
 traesync-infrastructure = { path = "crates/infrastructure" }

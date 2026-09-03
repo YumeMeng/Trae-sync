@@ -1,13 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
-import { StrictMode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { HistoryWorkbench } from "../src/components/HistoryWorkbench";
 import type {
-  BrowseResultDto,
-  ConversationPreviewDto,
-  ScanOutcomeDto,
-  SearchHitDto,
+  MasterHistoryDto,
+  RelayLedgerEntryDto,
 } from "../src/types/history";
 
 // mock Tauri invoke——前端测试不依赖真实后端
@@ -17,1232 +14,646 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 const mockInvoke = vi.mocked(invoke);
 
-const defaultProps = {
-  capabilities: { scan_enabled: true, sync_enabled: false },
-  honestStatus: "真实能力尚未启用",
-};
+const NOW = Date.now() / 1000;
+const DAY = 24 * 3600;
 
-// 合成浏览结果（两账号/两项目/两会话）
-function makeBrowseResult(): BrowseResultDto {
+function fingerprint(tag: number) {
   return {
-    accounts: [
-      { user_id: "user-A", display_label: "User A", project_count: 1, session_count: 2 },
-    ],
+    db: { mtime_secs: 1700000000 + tag, mtime_nanos: 0, size: 1000 + tag },
+    wal: null,
+    shm: null,
+  };
+}
+
+function historyDto(overrides: Partial<MasterHistoryDto> = {}): MasterHistoryDto {
+  return {
+    status: "ready",
+    current_user_id: "u-b",
     projects: [
-      {
-        project_id: "p1",
-        display_name: "Project 1",
-        display_owner: "user-A",
-        session_count: 2,
-      },
+      { project_id: "p1", name: "项目一", absolute_path: "d:\\work\\project-one" },
+      { project_id: "p2", name: "项目二", absolute_path: null },
     ],
     sessions: [
       {
-        session_identity: {
-          product_history_namespace: "work_cn",
-          original_session_id: "session-aaa",
-        },
-        title: "会话 AAA",
-        message_count: 2,
-        last_captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
+        session_id: "s1",
         project_id: "p1",
+        title: "会话一",
+        message_count: 10,
+        updated_at_unix_seconds: NOW - 60,
+        deleted: false,
+        hidden_status: null,
+        work_mode: "code",
       },
       {
-        session_identity: {
-          product_history_namespace: "work_cn",
-          original_session_id: "session-bbb",
-        },
-        title: "会话 BBB",
-        message_count: 1,
-        last_captured_at: { secs_since_epoch: 1700000001, nanos_since_epoch: 0 },
+        session_id: "s2",
         project_id: "p1",
+        title: "会话二",
+        message_count: 3,
+        updated_at_unix_seconds: NOW - 40 * DAY,
+        deleted: false,
+        hidden_status: null,
+        work_mode: "code",
+      },
+      {
+        // P5-8a：voice_discussion 借用为归档 → 不入主列表，进归档视图。
+        session_id: "s3",
+        project_id: "p2",
+        title: "旧归档会话",
+        message_count: 1,
+        updated_at_unix_seconds: NOW - 40 * DAY,
+        deleted: false,
+        hidden_status: "voice_discussion",
+        work_mode: "work",
       },
     ],
-    summary: {
-      visible_account_count: 1,
-      visible_project_count: 1,
-      visible_session_count: 2,
-      soft_deleted_project_count: 0,
-      soft_deleted_session_count: 0,
-      soft_deleted_message_count: 0,
-    },
+    fingerprint: fingerprint(1),
+    ...overrides,
   };
 }
 
-// 合成对话预览
-function makePreview(sessionId: string): ConversationPreviewDto {
+/** 两跳台账：s0(u-x→u-a) → s1(u-a→u-b)；s1 链回出 3 条腿。 */
+function ledgerEntries(): RelayLedgerEntryDto[] {
+  return [
+    {
+      session_id: "s0",
+      from_session_id: null,
+      project_id: "p1",
+      from_user_id: "u-x",
+      from_account_name: "小谢",
+      to_user_id: "u-a",
+      to_account_name: "账号A",
+      message_count_at_switch: 4,
+      switched_at_unix_seconds: Math.floor(NOW - 2 * 3600),
+    },
+    {
+      session_id: "s1",
+      from_session_id: "s0",
+      project_id: "p1",
+      from_user_id: "u-a",
+      from_account_name: "账号A",
+      to_user_id: "u-b",
+      to_account_name: "账号B",
+      message_count_at_switch: 7,
+      switched_at_unix_seconds: Math.floor(NOW - 3600),
+    },
+  ];
+}
+
+function sessionMessages(sessionId: string) {
   return {
-    session_identity: {
-      product_history_namespace: "work_cn",
-      original_session_id: sessionId,
-    },
-    title: sessionId === "session-aaa" ? "会话 AAA" : "会话 BBB",
-    messages:
-      sessionId === "session-aaa"
-        ? [
-            {
-              message_id: "m1",
-              session_id: sessionId,
-              role: "user",
-              content_excerpt: "hello world",
-              soft_deleted: false,
-              seq: 0,
-            },
-            {
-              message_id: "m2",
-              session_id: sessionId,
-              role: "assistant",
-              content_excerpt: "hi there",
-              soft_deleted: false,
-              seq: 1,
-            },
-          ]
-        : [
-            {
-              message_id: "m3",
-              session_id: sessionId,
-              role: "user",
-              content_excerpt: "world hello",
-              soft_deleted: false,
-              seq: 0,
-            },
-          ],
-    total_message_count: sessionId === "session-aaa" ? 2 : 1,
+    session_id: sessionId,
+    status: "ready",
+    messages: [
+      {
+        message_id: "m1",
+        role: "user",
+        message_type: "general",
+        created_at_unix_seconds: Math.floor(NOW - 120),
+        content: { kind: "text", text: "帮我看下这个报错", step_count: 0, thoughts: [] },
+      },
+      {
+        message_id: "m2",
+        role: "assistant",
+        message_type: "task",
+        created_at_unix_seconds: Math.floor(NOW - 60),
+        content: { kind: "task_trace", text: "", step_count: 2, thoughts: ["先定位", "再修复"] },
+      },
+    ],
   };
 }
 
-describe("T03 历史库工作台", () => {
+function setupHistory(history: MasterHistoryDto) {
+  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "get_master_history") return history;
+    if (command === "get_relay_ledger") return ledgerEntries();
+    if (command === "get_master_session_messages") {
+      return sessionMessages((args as { sessionId: string }).sessionId);
+    }
+    return undefined;
+  });
+}
+
+describe("HistoryWorkbench（P5-3 历史页主库视图）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // R12：默认 mock 返回已 resolve 的 Promise——组件卸载清理会调用
-    // revoke_scan_authorization，未设置实现的测试需返回 Promise 避免 .catch 崩溃。
-    // 各测试内部可用 mockImplementation 覆盖具体命令的返回值。
-    mockInvoke.mockResolvedValue(undefined);
   });
 
-  it("T05：自定义选择一条完整对话并生成绑定目标账号的计划", async () => {
-    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "scan_history") {
-        return {
-          kind: "success",
-          snapshot_id: "snapshot-1",
-          snapshot_meta: {},
-          catalog_updated: true,
-        };
-      }
-      if (cmd === "browse_history") return makeBrowseResult();
-      if (cmd === "build_sync_plan") {
-        return {
-          operation_id: "op-plan",
-          current_user_id: "user-B",
-          scope_snapshot: (args as { scope?: unknown } | undefined)?.scope,
-          actions: [
-            {
-              kind: "attach_sessions",
-              source_project_id: "p1",
-              target_project_id: "p2",
-              session_ids: [
-                {
-                  product_history_namespace: "work_cn",
-                  original_session_id: "session-aaa",
-                },
-              ],
-            },
-          ],
-          exclusions: [],
-        };
-      }
-      return undefined;
-    });
+  it("ready 状态渲染两栏：左栏项目 + 右栏会话 + 项目统计", async () => {
+    setupHistory(historyDto());
+    render(<HistoryWorkbench active />);
 
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => expect(screen.getByTestId("scan-history-button")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-    await screen.findByTestId("session-list");
+    // 左栏项目（含"全部项目"入口）；归档会话（s3）不计入项目统计
+    expect(await screen.findByTestId("history-project-all")).toBeInTheDocument();
+    expect(screen.getByTestId("history-project-p1")).toHaveTextContent("项目一");
+    expect(screen.getByTestId("history-project-p1")).toHaveTextContent("2 会话");
+    expect(screen.getByTestId("history-project-p2")).toHaveTextContent("0 会话");
 
-    fireEvent.click(screen.getByRole("radio", { name: "自定义选择" }));
-    expect(screen.getByTestId("build-sync-plan-button")).toBeDisabled();
-    fireEvent.click(screen.getByRole("checkbox", { name: "选择对话 会话 AAA" }));
-    expect(screen.getByTestId("plan-selected")).toHaveTextContent("1");
-    fireEvent.click(screen.getByTestId("build-sync-plan-button"));
+    // 右栏全部会话（默认未选项目 = 全部）；归档会话不入主列表，入口带计数
+    const list = screen.getByTestId("history-session-list");
+    expect(list).toHaveTextContent("会话一");
+    expect(list).toHaveTextContent("会话二");
+    expect(list).not.toHaveTextContent("旧归档会话");
+    expect(screen.getByTestId("history-archive-entry")).toHaveTextContent("已归档 1");
 
-    await screen.findByTestId("sync-plan-result");
-    expect(screen.getByTestId("plan-target-account")).toHaveTextContent("user-B");
-    expect(screen.getByTestId("plan-syncable")).toHaveTextContent("1");
-    expect(mockInvoke).toHaveBeenCalledWith("build_sync_plan", {
-      scope: {
-        kind: "custom",
-        account_ids: [],
-        project_ids: [],
-        session_ids: [
-          {
-            product_history_namespace: "work_cn",
-            original_session_id: "session-aaa",
-          },
-        ],
-      },
-    });
-  });
+    // 全部项目视图按项目分组：组头 = 项目名 + 会话数
+    expect(screen.getByTestId("history-session-group-p1")).toHaveTextContent("项目一");
+    expect(screen.getByTestId("history-session-group-p1")).toHaveTextContent("2 个会话");
 
-  it("T05：生成期间改变选择会丢弃旧计划响应", async () => {
-    let resolvePlan: (value: unknown) => void = () => undefined;
-    const pendingPlan = new Promise((resolve) => {
-      resolvePlan = resolve;
-    });
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "scan_history") {
-        return {
-          kind: "success",
-          snapshot_id: "snapshot-1",
-          snapshot_meta: {},
-          catalog_updated: true,
-        };
-      }
-      if (cmd === "browse_history") return makeBrowseResult();
-      if (cmd === "build_sync_plan") return pendingPlan;
-      return undefined;
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => expect(screen.getByTestId("scan-history-button")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-    await screen.findByTestId("session-list");
-    fireEvent.click(screen.getByRole("radio", { name: "自定义选择" }));
-    fireEvent.click(screen.getByRole("checkbox", { name: "选择对话 会话 AAA" }));
-    fireEvent.click(screen.getByTestId("build-sync-plan-button"));
-    expect(screen.getByTestId("build-sync-plan-button")).toHaveTextContent("生成中");
-
-    fireEvent.click(screen.getByRole("checkbox", { name: "选择对话 会话 BBB" }));
-    expect(screen.getByTestId("plan-selected")).toHaveTextContent("2");
-    expect(screen.getByTestId("build-sync-plan-button")).toHaveTextContent("生成同步计划");
-    resolvePlan({
-      operation_id: "stale-plan",
-      current_user_id: "user-B",
-      scope_snapshot: { kind: "custom" },
-      actions: [],
-      exclusions: [],
-    });
-
-    await waitFor(() => expect(screen.queryByTestId("sync-plan-result")).not.toBeInTheDocument());
-  });
-
-  // ============== TDD #1：初始不自动扫描 ==============
-
-  it("初始渲染不调用 scan_history（AC1）", () => {
-    render(<HistoryWorkbench {...defaultProps} />);
-    const scanCalls = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "scan_history",
-    );
-    expect(scanCalls.length).toBe(0);
-  });
-
-  it("初始渲染显示授权表单（idle 状态）", () => {
-    render(<HistoryWorkbench {...defaultProps} />);
-    expect(screen.getByTestId("auth-panel")).toBeInTheDocument();
-  });
-
-  // ============== TDD #2：未授权/运行中不发布快照 ==============
-
-  it("未授权时扫描按钮禁用（AC2）", () => {
-    render(<HistoryWorkbench {...defaultProps} />);
-    const scanButton = screen.getByTestId("scan-history-button");
-    expect(scanButton).toBeDisabled();
-  });
-
-  it("TRAE 运行中时扫描按钮禁用且不调用 scan_history（AC2）", async () => {
-    // R7：mock grant_scan_authorization 返回 canonical 路径
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    // 填写表单
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    // 取消"TRAE 已关闭"勾选 → processRunning = true
-    fireEvent.click(screen.getByTestId("trae-not-running-check"));
-    // 授权（R7：异步调用 grant_scan_authorization）
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待授权完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    // 扫描按钮仍应禁用（processRunning）
-    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
-    const scanCalls = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "scan_history",
-    );
-    expect(scanCalls.length).toBe(0);
-  });
-
-  // ============== TDD #18：UI 状态与交互覆盖 ==============
-
-  it("授权并扫描成功后显示浏览结果（success 状态）", async () => {
-    const successOutcome: ScanOutcomeDto = {
-      kind: "success",
-      snapshot_id: "snap-1",
-      snapshot_meta: {
-        snapshot_id: "snap-1",
-        platform_id: "work_cn",
-        data_location_id: "loc-1",
-        product_version: "1.0",
-        schema_fingerprint: "fp",
-        mapping_version: "work_cn_v1",
-        account_evidence_ref: null,
-        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        files: [],
-        fingerprint: "abc",
-      },
-      catalog_updated: true,
-    };
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      // R7：mock grant_scan_authorization 返回 canonical 路径
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") return successOutcome;
-      if (cmd === "browse_history") return makeBrowseResult();
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    // 填写并授权
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待 R7 异步授权完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    // 扫描
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-    // 应显示浏览结果
-    await waitFor(() => {
-      expect(screen.getByTestId("account-project-tree")).toBeInTheDocument();
-    });
-    // 摘要应显示账号/项目/对话数
-    const summary = screen.getByTestId("history-summary");
-    expect(within(summary).getByText("账号 1")).toBeInTheDocument();
-    expect(within(summary).getByText("项目 1")).toBeInTheDocument();
-    expect(within(summary).getByText("对话 2")).toBeInTheDocument();
-  });
-
-  it("扫描失败时显示结构化原因（failure 状态）", async () => {
-    const failedOutcome: ScanOutcomeDto = {
-      kind: "failed",
-      reason: "schema_incompatible",
-    };
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      // R7：mock grant_scan_authorization 返回 canonical 路径
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") return failedOutcome;
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待 R7 异步授权完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-
-    await waitFor(() => {
-      expect(screen.getByTestId("failure-state")).toBeInTheDocument();
-    });
-    // 结构化原因不携带 secret
-    expect(screen.getByTestId("failure-state")).toHaveTextContent(
-      "schema 不兼容",
+    // 项目文件夹路径收进悬浮提示，不占主视野
+    expect(screen.getByTestId("history-project-p1")).toHaveAttribute(
+      "title",
+      "d:\\work\\project-one",
     );
   });
 
-  it("扫描成功但目录库为空时显示 empty 状态", async () => {
-    const successOutcome: ScanOutcomeDto = {
-      kind: "success",
-      snapshot_id: "snap-1",
-      snapshot_meta: {
-        snapshot_id: "snap-1",
-        platform_id: "work_cn",
-        data_location_id: "loc-1",
-        product_version: "1.0",
-        schema_fingerprint: "fp",
-        mapping_version: "work_cn_v1",
-        account_evidence_ref: null,
-        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        files: [],
-        fingerprint: "abc",
-      },
-      catalog_updated: true,
-    };
-    const emptyBrowse: BrowseResultDto = {
-      accounts: [],
-      projects: [],
-      sessions: [],
-      summary: {
-        visible_account_count: 0,
-        visible_project_count: 0,
-        visible_session_count: 0,
-        soft_deleted_project_count: 0,
-        soft_deleted_session_count: 0,
-        soft_deleted_message_count: 0,
-      },
-    };
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      // R7：mock grant_scan_authorization 返回 canonical 路径
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") return successOutcome;
-      if (cmd === "browse_history") return emptyBrowse;
-      throw new Error(`未模拟: ${cmd}`);
-    });
+  it("P5-8a-2 embedded 模式：无页级标题，工具行（搜索/筛选/刷新）保留", async () => {
+    setupHistory(historyDto());
+    render(<HistoryWorkbench active embedded />);
 
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待 R7 异步授权完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    fireEvent.click(screen.getByTestId("scan-history-button"));
+    await screen.findByTestId("history-session-s1");
+    // 页级标题让位给宿主页（主库详情页），但两栏与工具行完整可用。
+    expect(screen.queryByRole("heading", { level: 1, name: "历史" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("history-search-input")).toBeInTheDocument();
+    expect(screen.getByTestId("history-time-week")).toBeInTheDocument();
+    expect(screen.getByTestId("history-refresh")).toBeInTheDocument();
+    expect(screen.getByTestId("history-project-p1")).toHaveTextContent("项目一");
+  });
 
+  it("接力徽章：沿 from_session_id 链回完整轨迹（3 账号 + 悬停明细）", async () => {
+    setupHistory(historyDto());
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    // s1 行上有接力徽章；无台账的会话（s2/s3）没有
+    expect(screen.getByTestId("history-session-s1")).toHaveTextContent("接力记录 · 3 个账号使用过");
+    expect(screen.queryByTestId("history-relay-chain")).toBeTruthy();
+
+    // 悬停浮层内容：三段腿（首腿小谢、中段账号A、当前腿账号B 标记当前账号）
+    const pop = screen.getByTestId("history-session-s1");
+    expect(pop).toHaveTextContent("小谢");
+    expect(pop).toHaveTextContent("账号A");
+    expect(pop).toHaveTextContent("账号B（当前账号）");
+  });
+
+  it("点击左栏项目：右栏只显示该项目会话", async () => {
+    setupHistory(historyDto());
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-list");
+
+    fireEvent.click(screen.getByTestId("history-project-p1"));
+    const list = screen.getByTestId("history-session-list");
+    expect(list).toHaveTextContent("会话一");
+    expect(list).toHaveTextContent("会话二");
+    expect(list).not.toHaveTextContent("旧归档会话");
+  });
+
+  it("搜索与时间范围筛选会话", async () => {
+    setupHistory(historyDto());
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-list");
+
+    // 搜索标题
+    fireEvent.change(screen.getByTestId("history-search-input"), { target: { value: "会话一" } });
+    let list = screen.getByTestId("history-session-list");
+    expect(list).toHaveTextContent("会话一");
+    expect(list).not.toHaveTextContent("会话二");
+
+    // 清空搜索，切"今天"：只保留最近更新的 s1
+    fireEvent.change(screen.getByTestId("history-search-input"), { target: { value: "" } });
+    fireEvent.click(screen.getByTestId("history-time-today"));
+    list = screen.getByTestId("history-session-list");
+    expect(list).toHaveTextContent("会话一");
+    expect(list).not.toHaveTextContent("会话二");
+    expect(list).not.toHaveTextContent("旧归档会话");
+  });
+
+  it("点击会话打开预览弹层：接力时间线 + 消息流，Esc 关闭", async () => {
+    setupHistory(historyDto());
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    fireEvent.click(screen.getByTestId("history-session-s1"));
+    const preview = await screen.findByTestId("history-preview");
+
+    // 接力时间线：三步 + 当前账号徽章
+    expect(preview).toHaveTextContent("接力记录（谁在什么时候用过这条会话）");
+    expect(preview).toHaveTextContent("当前账号");
+
+    // 消息流：文本消息 + 任务轨迹（含 thought 摘要）
     await waitFor(() => {
-      expect(screen.getByTestId("empty-state")).toBeInTheDocument();
+      expect(preview).toHaveTextContent("帮我看下这个报错");
+    });
+    expect(preview).toHaveTextContent("任务轨迹 · 2 步");
+    expect(preview).toHaveTextContent("先定位");
+    expect(mockInvoke).toHaveBeenCalledWith("get_master_session_messages", { sessionId: "s1" });
+
+    // Esc 关闭
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => {
+      expect(screen.queryByTestId("history-preview")).not.toBeInTheDocument();
     });
   });
 
-  it("点击对话标题只打开预览，不改变选择（AC9）", async () => {
-    const successOutcome: ScanOutcomeDto = {
-      kind: "success",
-      snapshot_id: "snap-1",
-      snapshot_meta: {
-        snapshot_id: "snap-1",
-        platform_id: "work_cn",
-        data_location_id: "loc-1",
-        product_version: "1.0",
-        schema_fingerprint: "fp",
-        mapping_version: "work_cn_v1",
-        account_evidence_ref: null,
-        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        files: [],
-        fingerprint: "abc",
-      },
-      catalog_updated: true,
-    };
-    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      // R7：mock grant_scan_authorization 返回 canonical 路径
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") return successOutcome;
-      if (cmd === "browse_history") return makeBrowseResult();
-      if (cmd === "read_conversation") {
-        const session = (args as { session: { original_session_id: string } })
-          .session;
-        return makePreview(session.original_session_id);
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
+  it("no_master_data：主库从未启动时显示引导并跳转环境页", async () => {
+    setupHistory(historyDto({ status: "no_master_data", projects: [], sessions: [] }));
+    const onNavigate = vi.fn();
+    render(<HistoryWorkbench active onNavigate={onNavigate} />);
 
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待 R7 异步授权完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-
-    // 等待会话列表渲染
-    await waitFor(() => {
-      expect(screen.getByTestId("session-session-aaa")).toBeInTheDocument();
-    });
-
-    // 点击第一个会话
-    fireEvent.click(screen.getByTestId("session-session-aaa"));
-    await waitFor(() => {
-      expect(screen.getByTestId("preview-content")).toBeInTheDocument();
-    });
-    // 预览内容正确
-    expect(screen.getByTestId("message-m1")).toBeInTheDocument();
-    expect(screen.getByTestId("message-m2")).toBeInTheDocument();
-
-    // 点击第二个会话——预览应切换，但不应改变"选择"
-    // 选择由 selectedAccount/selectedProject 控制，点击会话不影响这些
-    const sessionButtons = screen.getAllByRole("button", { name: /会话/ });
-    // 确保会话按钮存在且可点击
-    expect(sessionButtons.length).toBeGreaterThan(0);
+    fireEvent.click(await screen.findByTestId("history-guide-launch"));
+    expect(onNavigate).toHaveBeenCalledWith("environment");
+    // 引导态不拉台账
+    expect(mockInvoke).not.toHaveBeenCalledWith("get_relay_ledger");
   });
 
-  it("搜索显示结果并打开预览不改变选择（AC9）", async () => {
-    const successOutcome: ScanOutcomeDto = {
-      kind: "success",
-      snapshot_id: "snap-1",
-      snapshot_meta: {
-        snapshot_id: "snap-1",
-        platform_id: "work_cn",
-        data_location_id: "loc-1",
-        product_version: "1.0",
-        schema_fingerprint: "fp",
-        mapping_version: "work_cn_v1",
-        account_evidence_ref: null,
-        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        files: [],
-        fingerprint: "abc",
-      },
-      catalog_updated: true,
-    };
-    const searchHits: SearchHitDto[] = [
-      {
-        session_identity: {
-          product_history_namespace: "work_cn",
-          original_session_id: "session-aaa",
-        },
-        message_id: "m1",
-        project_id: "p1",
-        title: "会话 AAA",
-        content_excerpt: "hello world",
-        role: "user",
-      },
-    ];
-    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      // R7：mock grant_scan_authorization 返回 canonical 路径
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") return successOutcome;
-      if (cmd === "browse_history") return makeBrowseResult();
-      if (cmd === "search_history") return searchHits;
-      if (cmd === "read_conversation") {
-        const session = (args as { session: { original_session_id: string } })
-          .session;
-        return makePreview(session.original_session_id);
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待 R7 异步授权完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-
-    await waitFor(() => {
-      expect(screen.getByTestId("session-list")).toBeInTheDocument();
-    });
-
-    // 输入搜索并执行
-    fireEvent.change(screen.getByTestId("search-input"), {
-      target: { value: "hello" },
-    });
-    fireEvent.click(screen.getByTestId("search-button"));
-
-    // 搜索结果应显示
-    await waitFor(() => {
-      expect(screen.getByTestId("search-results")).toBeInTheDocument();
-    });
-    expect(screen.getByTestId("search-hit-m1")).toBeInTheDocument();
-
-    // 点击搜索结果打开预览
-    fireEvent.click(screen.getByTestId("search-hit-m1"));
-    await waitFor(() => {
-      expect(screen.getByTestId("preview-content")).toBeInTheDocument();
-    });
-    expect(screen.getByTestId("message-m1")).toBeInTheDocument();
-  });
-
-  it("扫描失败时不暴露 raw_key 或认证正文", async () => {
-    const failedOutcome: ScanOutcomeDto = {
-      kind: "failed",
-      reason: "catalog_key_missing",
-    };
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      // R7：mock grant_scan_authorization 返回 canonical 路径
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") return failedOutcome;
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待 R7 异步授权完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-
-    await waitFor(() => {
-      expect(screen.getByTestId("failure-state")).toBeInTheDocument();
-    });
-    const failureText = screen.getByTestId("failure-state").textContent ?? "";
-    // 不暴露 raw_key、认证正文或 secret
-    expect(failureText).not.toMatch(/raw_key|rawkey|secret|bearer|token/i);
-  });
-
-  // ============== R7：前端授权调用链反例测试 ==============
-
-  it("R7：未建立后端授权时扫描被拒绝（scan_history 不被调用）", async () => {
-    // grant_scan_authorization 抛错——后端授权未建立
-    // scan_history mock 抛错——若被调用则测试失败
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") {
-        throw new Error("授权失败：fixture 路径无效");
-      }
-      if (cmd === "scan_history") {
-        throw new Error("scan_history 不应被调用——未授权");
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    // 点击授权——grant_scan_authorization 抛错，授权失败
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待异步授权失败——应进入 failure 状态
-    await waitFor(() => {
-      expect(screen.getByTestId("failure-state")).toBeInTheDocument();
-    });
-    // 扫描按钮仍禁用（phase 不是 idle，但仍禁用）
-    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
-    // scan_history 未被调用——后端授权未建立
-    const scanCalls = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "scan_history",
-    );
-    expect(scanCalls.length).toBe(0);
-  });
-
-  it("R7：授权成功后才允许扫描", async () => {
-    const successOutcome: ScanOutcomeDto = {
-      kind: "success",
-      snapshot_id: "snap-1",
-      snapshot_meta: {
-        snapshot_id: "snap-1",
-        platform_id: "work_cn",
-        data_location_id: "loc-1",
-        product_version: "1.0",
-        schema_fingerprint: "fp",
-        mapping_version: "work_cn_v1",
-        account_evidence_ref: null,
-        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        files: [],
-        fingerprint: "abc",
-      },
-      catalog_updated: true,
-    };
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      // R7：grant_scan_authorization 成功返回 canonical 路径
-      if (cmd === "grant_scan_authorization") return "C:\\canonical-fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") return successOutcome;
-      if (cmd === "browse_history") return makeBrowseResult();
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    // 授权成功
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    // 扫描按钮启用
-    expect(screen.getByTestId("scan-history-button")).toBeEnabled();
-    // 执行扫描——应调用 scan_history 并使用授权返回的 canonical 路径
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-    await waitFor(() => {
-      expect(screen.getByTestId("account-project-tree")).toBeInTheDocument();
-    });
-    // 验证 scan_history 被调用时传入 authorizedFixtureRoot（canonical）
-    const scanCall = mockInvoke.mock.calls.find(
-      ([cmd]) => cmd === "scan_history",
-    );
-    expect(scanCall).toBeDefined();
-    const scanArgs = scanCall?.[1] as { fixtureRoot: string };
-    expect(scanArgs.fixtureRoot).toBe("C:\\canonical-fixture");
-  });
-
-  it("R7：路径变化后旧授权失效（调用 revoke_scan_authorization）", async () => {
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    // 第一次填写并授权
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    // 修改 fixture 路径——应触发撤销
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "D:\\other-fixture" },
-    });
-    // 等待异步撤销完成——checkbox 应取消选中
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).not.toBeChecked();
-    });
-    // revoke_scan_authorization 被调用
-    const revokeCalls = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "revoke_scan_authorization",
-    );
-    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
-  });
-
-  it("R7：撤销授权后再次扫描被拒绝", async () => {
-    const successOutcome: ScanOutcomeDto = {
-      kind: "success",
-      snapshot_id: "snap-1",
-      snapshot_meta: {
-        snapshot_id: "snap-1",
-        platform_id: "work_cn",
-        data_location_id: "loc-1",
-        product_version: "1.0",
-        schema_fingerprint: "fp",
-        mapping_version: "work_cn_v1",
-        account_evidence_ref: null,
-        captured_at: { secs_since_epoch: 1700000000, nanos_since_epoch: 0 },
-        files: [],
-        fingerprint: "abc",
-      },
-      catalog_updated: true,
-    };
-    let scanCalled = false;
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return "C:\\fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") {
-        scanCalled = true;
-        return successOutcome;
-      }
-      if (cmd === "browse_history") return makeBrowseResult();
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    // 授权
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-    // 取消授权
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).not.toBeChecked();
-    });
-    // 扫描按钮应禁用——未授权
-    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
-    // scan_history 不应被调用
-    expect(scanCalled).toBe(false);
-  });
-
-  // ============== R12：pending 授权异步竞态反例测试 ==============
-
-  // 辅助：构造可控 deferred 的 grant_scan_authorization mock
-  function makeDeferredGrant() {
-    let resolveFn!: (value: string) => void;
-    let rejectFn!: (reason: unknown) => void;
-    const promise = new Promise<string>((resolve, reject) => {
-      resolveFn = resolve;
-      rejectFn = reject;
-    });
-    return { promise, resolve: resolveFn, reject: rejectFn };
-  }
-
-  it("R12：授权 pending 时 fixtureRoot 变化会丢弃旧授权结果", async () => {
-    const grantA = makeDeferredGrant();
-    let scanCalled = false;
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return grantA.promise;
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") {
-        scanCalled = true;
-        return {} as ScanOutcomeDto;
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    // 输入 A 并点击授权——保持 pending
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture-A" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    // 等待 grant 被调用
-    await waitFor(() => {
-      expect(
-        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
-      ).toBe(true);
-    });
-
-    // 在 pending 期间将 fixtureRoot 改为 B
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "D:\\fixture-B" },
-    });
-
-    // 现在 resolve grant(A)——返回 canonical A
-    grantA.resolve("C:\\canonical-A");
-
-    // 等待 stale response 处理完成
-    await waitFor(() => {
-      // 应调用 revoke 清除后端过期授权
-      const revokeCalls = mockInvoke.mock.calls.filter(
-        ([cmd]) => cmd === "revoke_scan_authorization",
-      );
-      expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
-    });
-
-    // checkbox 仍未选中——过期结果不应设置已授权状态
-    expect(screen.getByTestId("authorize-check")).not.toBeChecked();
-    // 扫描按钮仍禁用
-    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
-    // scan_history 未被调用
-    expect(scanCalled).toBe(false);
-  });
-
-  it("R12：授权 pending 时 dbRelativePath 变化会丢弃旧授权结果", async () => {
-    const grantA = makeDeferredGrant();
-    let scanCalled = false;
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return grantA.promise;
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") {
-        scanCalled = true;
-        return {} as ScanOutcomeDto;
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(
-        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
-      ).toBe(true);
-    });
-
-    // pending 期间修改 dbRelativePath
-    fireEvent.change(screen.getByTestId("history-db-path-input"), {
-      target: { value: "other.db" },
-    });
-
-    grantA.resolve("C:\\canonical");
-
-    await waitFor(() => {
-      const revokeCalls = mockInvoke.mock.calls.filter(
-        ([cmd]) => cmd === "revoke_scan_authorization",
-      );
-      expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
-    });
-
-    expect(screen.getByTestId("authorize-check")).not.toBeChecked();
-    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
-    expect(scanCalled).toBe(false);
-  });
-
-  it("R12-A：pending 时用户点击 checkbox 取消会丢弃旧授权结果", async () => {
-    const grantA = makeDeferredGrant();
-    let scanCalled = false;
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return grantA.promise;
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") {
-        scanCalled = true;
-        return {} as ScanOutcomeDto;
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(
-        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
-      ).toBe(true);
-    });
-
-    // R12-A：pending 时 checkbox 选中——用户点击 checkbox 取消
-    // checkbox checked={authorized || authorizationPending}，pending 时为 true
-    expect(screen.getByTestId("authorize-check")).toBeChecked();
-    // 点击取消——触发 checked=false
-    fireEvent.click(screen.getByTestId("authorize-check"));
-
-    // 取消应立即生效——checkbox 未选中，扫描按钮禁用
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).not.toBeChecked();
-    });
-    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
-
-    // 应调用 revoke 清除后端可能已建立的授权
-    const revokeCalls = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "revoke_scan_authorization",
-    );
-    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
-
-    // resolve grant(A)——stale，不应恢复授权
-    grantA.resolve("C:\\canonical-A");
-    await new Promise((r) => setTimeout(r, 0));
-
-    // 仍为未授权状态
-    expect(screen.getByTestId("authorize-check")).not.toBeChecked();
-    expect(screen.getByTestId("scan-history-button")).toBeDisabled();
-    expect(scanCalled).toBe(false);
-  });
-
-  it("R12：A、B 两次授权乱序返回，只有 B 可以生效", async () => {
-    const grantA = makeDeferredGrant();
-    const grantB = makeDeferredGrant();
-    let grantCallCount = 0;
-    let scanCalled = false;
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") {
-        grantCallCount += 1;
-        // 第一次返回 grantA.promise，第二次返回 grantB.promise
-        return grantCallCount === 1 ? grantA.promise : grantB.promise;
-      }
-      if (cmd === "revoke_scan_authorization") return null;
-      if (cmd === "scan_history") {
-        scanCalled = true;
-        return {} as ScanOutcomeDto;
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    // 输入 A 并点击授权
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\A" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(grantCallCount).toBe(1);
-    });
-
-    // 改路径为 B——应触发 revoke + 旧 grant 失效
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "D:\\B" },
-    });
-    await waitFor(() => {
-      expect(
-        mockInvoke.mock.calls.some(([cmd]) => cmd === "revoke_scan_authorization"),
-      ).toBe(true);
-    });
-
-    // 再次点击授权——发起 grant(B)
-    // checkbox 当前未选中，点击触发 checked=true
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(grantCallCount).toBe(2);
-    });
-
-    // 乱序返回：先 resolve A（stale），再 resolve B（最新）
-    grantA.resolve("C:\\canonical-A");
-    grantB.resolve("D:\\canonical-B");
-
-    // 等待处理完成
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-
-    // 最终生效的应是 B
-    expect(screen.getByTestId("authorize-check")).toBeChecked();
-    // 验证 scan_history 调用时使用 B 的 canonical
-    // 触发扫描
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-    await waitFor(() => {
-      expect(scanCalled).toBe(true);
-    });
-    const scanCall = mockInvoke.mock.calls.find(
-      ([cmd]) => cmd === "scan_history",
-    );
-    const scanArgs = scanCall?.[1] as { fixtureRoot: string };
-    expect(scanArgs.fixtureRoot).toBe("D:\\canonical-B");
-  });
-
-  it("R12：组件卸载后旧响应不得更新状态，并应撤销可能建立的后端授权", async () => {
-    const grantA = makeDeferredGrant();
-    const { unmount } = render(<HistoryWorkbench {...defaultProps} />);
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return grantA.promise;
-      if (cmd === "revoke_scan_authorization") return null;
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(
-        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
-      ).toBe(true);
-    });
-
-    // 卸载组件
+  it("no_current_account / read_failed 状态提示", async () => {
+    setupHistory(historyDto({ status: "no_current_account", projects: [], sessions: [] }));
+    const { unmount } = render(<HistoryWorkbench active />);
+    expect(await screen.findByText("主库尚未登记登录账号。")).toBeInTheDocument();
     unmount();
 
-    // resolve grant(A)——不应有状态更新（无 React 警告），应调用 revoke
-    grantA.resolve("C:\\canonical-A");
-
-    // 等待微任务
-    await new Promise((r) => setTimeout(r, 0));
-
-    // 应调用 revoke 清除后端过期授权
-    const revokeCalls = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "revoke_scan_authorization",
-    );
-    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
+    setupHistory(historyDto({ status: "read_failed", projects: [], sessions: [] }));
+    render(<HistoryWorkbench active />);
+    expect(await screen.findByText("主库记录暂时无法读取，请稍后重试。")).toBeInTheDocument();
   });
 
-  // ============== R12-B：stale revoke 不得误伤新授权 ==============
+  it("读取失败显示错误与重试入口；active=false 不发起读取", async () => {
+    mockInvoke.mockRejectedValue(new Error("boom"));
+    render(<HistoryWorkbench active />);
+    expect(await screen.findByTestId("history-error")).toHaveTextContent("主库记录暂时不可读取");
 
-  it("R12-B：B 先返回建立授权后 A stale 返回不得 revoke B 的授权", async () => {
-    const grantA = makeDeferredGrant();
-    const grantB = makeDeferredGrant();
-    let grantCallCount = 0;
-    let scanCalled = false;
-    let scanFixtureRoot: string | null = null;
-    let backendGeneration = 0;
-    let backendAuthorizedRoot: string | null = null;
-    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "grant_scan_authorization") {
-        grantCallCount += 1;
-        backendGeneration += 1;
-        const generation = backendGeneration;
-        const pending = grantCallCount === 1 ? grantA.promise : grantB.promise;
-        return pending.then((canonical) => {
-          // 模拟后端服务端代次：旧 grant 晚完成时不得提交。
-          if (generation !== backendGeneration) {
-            throw new Error("授权请求已失效");
-          }
-          backendAuthorizedRoot = canonical;
-          return canonical;
+    mockInvoke.mockClear();
+    mockInvoke.mockResolvedValue(undefined);
+    render(<HistoryWorkbench active={false} />);
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it("轮询带 previous 指纹；unchanged 不刷新台账", async () => {
+    vi.useFakeTimers();
+    try {
+      const dto = historyDto();
+      const unchanged: MasterHistoryDto = {
+        status: "unchanged",
+        current_user_id: null,
+        projects: [],
+        sessions: [],
+        fingerprint: dto.fingerprint,
+      };
+      let calls = 0;
+      mockInvoke.mockImplementation(async (command: string) => {
+        if (command === "get_master_history") {
+          calls += 1;
+          return calls === 1 ? dto : unchanged;
+        }
+        if (command === "get_relay_ledger") return ledgerEntries();
+        return undefined;
+      });
+
+      render(<HistoryWorkbench active />);
+      // 初次加载完成（fake timers 下用 act 冲洗微任务，findBy 会卡在假定时器上）
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByTestId("history-session-s1")).toBeInTheDocument();
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_history", { previous: null });
+
+      // 5 秒轮询：带上一轮指纹；返回 unchanged 时不重拉台账、列表维持
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_history", { previous: dto.fingerprint });
+      expect(mockInvoke.mock.calls.filter(([c]) => c === "get_relay_ledger")).toHaveLength(1);
+      expect(screen.getByTestId("history-session-s1")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ============================================================================
+// P5-8a 会话归档：选择模式批量栏 + 归档视图 + 真实删除确认
+// ============================================================================
+
+/** 可变会话副本（归档/恢复/删除直接改状态，与真机两栏联动行为同构）。 */
+type MutableSession = {
+  session_id: string;
+  project_id: string;
+  title: string;
+  message_count: number;
+  updated_at_unix_seconds: number | null;
+  deleted: boolean;
+  hidden_status: string | null;
+  work_mode: string | null;
+};
+
+/** 可变历史 mock：批量命令直接改写状态，get_master_history 返回新引用触发刷新。 */
+function setupMutableHistory() {
+  const dto = historyDto();
+  const sessions = dto.sessions.map((session) => ({ ...session })) as MutableSession[];
+  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "get_master_history") return { ...dto, sessions: [...sessions] };
+    if (command === "get_relay_ledger") return ledgerEntries();
+    if (command === "get_master_session_messages") {
+      return sessionMessages((args as { sessionId: string }).sessionId);
+    }
+    if (command === "archive_master_sessions") {
+      const ids = new Set((args as { sessionIds: string[] }).sessionIds);
+      for (const session of sessions) {
+        if (ids.has(session.session_id)) session.hidden_status = "voice_discussion";
+      }
+      return { affected: ids.size };
+    }
+    if (command === "restore_master_sessions") {
+      const ids = new Set((args as { sessionIds: string[] }).sessionIds);
+      let affected = 0;
+      for (const session of sessions) {
+        if (ids.has(session.session_id) && session.hidden_status === "voice_discussion") {
+          session.hidden_status = null;
+          affected += 1;
+        }
+      }
+      return { affected };
+    }
+    if (command === "delete_master_sessions") {
+      const ids = new Set((args as { sessionIds: string[] }).sessionIds);
+      let messages = 0;
+      for (let index = sessions.length - 1; index >= 0; index -= 1) {
+        const session = sessions[index]!;
+        if (ids.has(session.session_id)) {
+          messages += session.message_count;
+          sessions.splice(index, 1);
+        }
+      }
+      return {
+        deleted_sessions: ids.size,
+        deleted_messages: messages,
+        removed_projects: 0,
+        backup_path: "backup-path",
+      };
+    }
+    if (command === "merge_master_projects") {
+      // P5-8c：源分组会话改挂目标分组（mock 与后端事务行为同构）。
+      const { sourceProjectIds, targetProjectId } = args as {
+        sourceProjectIds: string[];
+        targetProjectId: string;
+      };
+      let moved = 0;
+      for (const session of sessions) {
+        if (sourceProjectIds.includes(session.project_id)) {
+          session.project_id = targetProjectId;
+          moved += 1;
+        }
+      }
+      return {
+        moved_sessions: moved,
+        removed_projects: sourceProjectIds.length,
+        backup_path: "backup-path",
+      };
+    }
+    return undefined;
+  });
+  return sessions;
+}
+
+describe("HistoryWorkbench（P5-8a 会话归档与批量操作）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("选择模式 + 批量归档：归档后主列表消失、入口计数增加、退出选择态", async () => {
+    setupMutableHistory();
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    // 进入选择模式 → 浮出批量栏 → 勾选两个会话
+    fireEvent.click(screen.getByTestId("history-select-mode"));
+    expect(screen.getByTestId("session-batch-bar")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("history-session-s1"));
+    fireEvent.click(screen.getByTestId("history-session-s2"));
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 2 / 2 项");
+
+    // 归档所选（voice_discussion 写入 + 强制刷新）
+    fireEvent.click(screen.getByTestId("batch-archive"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("archive_master_sessions", {
+        sessionIds: ["s1", "s2"],
+      });
+    });
+
+    // 刷新后：主列表无归档会话、入口计数 3（s3 原有 + 新归档 2）、退出选择态
+    await waitFor(() => {
+      expect(screen.getByTestId("history-archive-entry")).toHaveTextContent("已归档 3");
+    });
+    expect(screen.queryByTestId("session-batch-bar")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("history-session-s1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("history-session-s2")).not.toBeInTheDocument();
+  });
+
+  it("Esc 退出选择模式并恢复会话预览行为", async () => {
+    setupMutableHistory();
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    fireEvent.click(screen.getByTestId("history-select-mode"));
+    fireEvent.click(screen.getByTestId("history-session-s1"));
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("session-batch-bar")).not.toBeInTheDocument();
+    });
+    // 退出后点击会话恢复打开预览（选择态点击是勾选，非预览）
+    fireEvent.click(screen.getByTestId("history-session-s1"));
+    expect(await screen.findByTestId("history-preview")).toBeInTheDocument();
+  });
+
+  it("归档视图：模式→分组层级展示 + 恢复所选归位主列表", async () => {
+    setupMutableHistory();
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    // 进入归档视图：Work 模式 → 项目二分组 → 会话行
+    fireEvent.click(screen.getByTestId("history-archive-entry"));
+    const archiveList = await screen.findByTestId("history-archive-list");
+    expect(archiveList).toHaveTextContent("Work 模式");
+    expect(archiveList).toHaveTextContent("项目二");
+    expect(screen.getByTestId("archive-session-s3")).toHaveTextContent("旧归档会话");
+
+    // 选择 → 恢复所选
+    fireEvent.click(screen.getByTestId("archive-select-mode"));
+    fireEvent.click(screen.getByTestId("archive-session-s3"));
+    fireEvent.click(screen.getByTestId("batch-restore"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("restore_master_sessions", {
+        sessionIds: ["s3"],
+      });
+    });
+
+    // 恢复后归档视图清空；返回主列表可见 s3 归位
+    await waitFor(() => {
+      expect(screen.getByTestId("archive-empty")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId("history-archive-back"));
+    expect(await screen.findByTestId("history-session-s3")).toBeInTheDocument();
+  });
+
+  it("删除所选：二次确认列明规模，取消不删除、确认后调用真实删除", async () => {
+    setupMutableHistory();
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    fireEvent.click(screen.getByTestId("history-archive-entry"));
+    await screen.findByTestId("archive-session-s3");
+
+    // 选择 → 删除所选 → 确认弹窗（列明会话数与消息量）
+    fireEvent.click(screen.getByTestId("archive-select-mode"));
+    fireEvent.click(screen.getByTestId("archive-session-s3"));
+    fireEvent.click(screen.getByTestId("batch-delete"));
+
+    const dialog = await screen.findByTestId("delete-confirm");
+    expect(dialog).toHaveTextContent("删除 1 个会话");
+    expect(dialog).toHaveTextContent("共 1 条消息");
+
+    // 取消路径：不触发删除命令
+    fireEvent.click(screen.getByTestId("delete-confirm-cancel"));
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "delete_master_sessions",
+      expect.anything(),
+    );
+
+    // 再次发起并确认 → 真实删除 + 归档视图清空
+    fireEvent.click(screen.getByTestId("batch-delete"));
+    fireEvent.click(await screen.findByTestId("delete-confirm-ok"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("delete_master_sessions", {
+        sessionIds: ["s3"],
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("archive-empty")).toBeInTheDocument();
+    });
+  });
+});
+
+// ============================================================================
+// P5-8c 分组合并：左栏选择态 + 确认弹层（选保留分组）+ 合并回执
+// ============================================================================
+
+describe("HistoryWorkbench（P5-8c 分组合并）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("合并流程：选择分组 → 弹层选保留目标 → 调用后端 → 回执与列表刷新", async () => {
+    setupMutableHistory();
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    // 进入左栏分组选择态：批量栏浮出，浏览态头部与"全部项目"入口让位
+    fireEvent.click(screen.getByTestId("project-merge-entry"));
+    expect(screen.getByTestId("project-batch-bar")).toBeInTheDocument();
+    expect(screen.queryByTestId("history-project-all")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-merge-entry")).not.toBeInTheDocument();
+
+    // 勾选两个分组（选择态点击 = 勾选而非筛选）
+    fireEvent.click(screen.getByTestId("history-project-p1"));
+    fireEvent.click(screen.getByTestId("history-project-p2"));
+    expect(screen.getByTestId("project-batch-count")).toHaveTextContent("已选 2 / 2");
+
+    // 打开确认弹层：列明分组数与会话量（默认保留第一个分组 → 移动 p2 的 1 个归档会话）
+    fireEvent.click(screen.getByTestId("batch-merge"));
+    const dialog = await screen.findByTestId("merge-confirm");
+    expect(dialog).toHaveTextContent("合并 2 个分组");
+    expect(dialog).toHaveTextContent("1 个会话将移入保留的分组（含已归档）");
+    expect(dialog).toHaveTextContent("项目一");
+    expect(dialog).toHaveTextContent("项目二");
+    expect(dialog).toHaveTextContent("合并前会自动创建主库数据备份");
+
+    // 改选保留分组为「项目二」：源 = p1（2 个会话移入）
+    fireEvent.click(screen.getByTestId("merge-target-p2"));
+    expect(dialog).toHaveTextContent("2 个会话将移入保留的分组（含已归档）");
+
+    // 确认合并 → 调用后端（备份 + 事务改挂）
+    fireEvent.click(screen.getByTestId("merge-confirm-ok"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("merge_master_projects", {
+        sourceProjectIds: ["p1"],
+        targetProjectId: "p2",
+      });
+    });
+
+    // 刷新后：会话全部归入项目二、左栏退出选择态、回执以数量表述
+    await waitFor(() => {
+      expect(screen.queryByTestId("project-batch-bar")).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("history-project-p2")).toHaveTextContent("2 会话");
+    const notice = screen.getByTestId("merge-notice");
+    expect(notice).toHaveTextContent("已把 2 个会话并入「项目二」，清理 1 个空分组。");
+
+    // 会话列表组头也随合并更新（p2 组含 s1/s2）
+    expect(screen.getByTestId("history-session-group-p2")).toHaveTextContent("2 个会话");
+  });
+
+  it("少于 2 个分组时合并按钮禁用；Esc 关闭弹层并保留选择态", async () => {
+    setupMutableHistory();
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
+
+    fireEvent.click(screen.getByTestId("project-merge-entry"));
+    // 只勾选 1 个分组：合并按钮禁用
+    fireEvent.click(screen.getByTestId("history-project-p1"));
+    expect(screen.getByTestId("batch-merge")).toBeDisabled();
+
+    // 勾选第二个后可发起；Esc 关闭弹层但保持选择态（勾选不丢）
+    fireEvent.click(screen.getByTestId("history-project-p2"));
+    fireEvent.click(screen.getByTestId("batch-merge"));
+    expect(await screen.findByTestId("merge-confirm")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("merge-confirm")).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("project-batch-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("project-batch-count")).toHaveTextContent("已选 2 / 2");
+
+    // 再次 Esc：退出分组选择态，浏览态恢复
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => {
+      expect(screen.queryByTestId("project-batch-bar")).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("history-project-all")).toBeInTheDocument();
+    // 未调用合并命令（未确认）
+    expect(mockInvoke).not.toHaveBeenCalledWith("merge_master_projects", expect.anything());
+  });
+
+  it("合并错误走安全文案：不吞失败、列表维持", async () => {
+    const sessions = setupMutableHistory();
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "merge_master_projects") {
+        // 模拟主库运行中拒绝合并（真实错误码走 safeUiError 映射）。
+        throw new Error("master_merge_running");
+      }
+      // 其余命令复用可变 mock 的行为
+      if (command === "get_master_history") {
+        return historyDto({
+          sessions: sessions.map((session) => ({ ...session })),
         });
       }
-      if (cmd === "revoke_scan_authorization") {
-        backendGeneration += 1;
-        backendAuthorizedRoot = null;
-        return null;
-      }
-      if (cmd === "scan_history") {
-        scanCalled = true;
-        const a = args as { fixtureRoot: string };
-        scanFixtureRoot = a.fixtureRoot;
-        if (a.fixtureRoot !== backendAuthorizedRoot) {
-          return { kind: "failed", reason: "not_authorized" } as ScanOutcomeDto;
-        }
-        return {
-          kind: "deduplicated",
-          existing_snapshot_id: "snapshot-r12-b",
-          fingerprint: "fingerprint-r12-b",
-        } as ScanOutcomeDto;
-      }
-      if (cmd === "browse_history") return makeBrowseResult();
-      throw new Error(`未模拟: ${cmd}`);
+      if (command === "get_relay_ledger") return ledgerEntries();
+      return undefined;
     });
+    render(<HistoryWorkbench active />);
+    await screen.findByTestId("history-session-s1");
 
-    render(<HistoryWorkbench {...defaultProps} />);
-    // 输入 A 并点击授权——grant(A) pending
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\A" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
+    fireEvent.click(screen.getByTestId("project-merge-entry"));
+    fireEvent.click(screen.getByTestId("history-project-p1"));
+    fireEvent.click(screen.getByTestId("history-project-p2"));
+    fireEvent.click(screen.getByTestId("batch-merge"));
+    fireEvent.click(await screen.findByTestId("merge-confirm-ok"));
+
+    // 错误以自然语言提示（master_merge_running 的映射文案）
     await waitFor(() => {
-      expect(grantCallCount).toBe(1);
+      expect(screen.getByTestId("batch-error")).toHaveTextContent("主库正在运行");
     });
-
-    // 改路径为 B——触发 revoke + 旧 grant 失效
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "D:\\B" },
-    });
-    await waitFor(() => {
-      expect(
-        mockInvoke.mock.calls.some(([cmd]) => cmd === "revoke_scan_authorization"),
-      ).toBe(true);
-    });
-
-    // 再次点击授权——发起 grant(B)
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(grantCallCount).toBe(2);
-    });
-
-    // R12-B 关键时序：先 resolve B（建立授权），再 resolve A（stale）
-    grantB.resolve("D:\\canonical-B");
-    // 等待 B 被接受
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-    });
-
-    // 记录此时 revoke 调用次数——A stale 返回前的基线
-    const revokeCountBeforeA = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "revoke_scan_authorization",
-    ).length;
-
-    // resolve A——stale，不应 revoke B 的授权
-    grantA.resolve("C:\\canonical-A");
-    await new Promise((r) => setTimeout(r, 10));
-
-    // A stale 返回后不应新增 revoke 调用——B 授权保持有效
-    const revokeCountAfterA = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "revoke_scan_authorization",
-    ).length;
-    expect(revokeCountAfterA).toBe(revokeCountBeforeA);
-
-    // B 仍已授权——checkbox 选中，扫描按钮启用
-    expect(screen.getByTestId("authorize-check")).toBeChecked();
-    expect(screen.getByTestId("scan-history-button")).toBeEnabled();
-
-    // 触发扫描——应使用 B 的 canonical
-    fireEvent.click(screen.getByTestId("scan-history-button"));
-    await waitFor(() => {
-      expect(scanCalled).toBe(true);
-    });
-    expect(scanFixtureRoot).toBe("D:\\canonical-B");
-    expect(backendAuthorizedRoot).toBe("D:\\canonical-B");
-  });
-
-  it("R12-B：新 grant 必须等待路径变化产生的旧 revoke 完成", async () => {
-    const grantA = makeDeferredGrant();
-    const revoke = makeDeferredGrant();
-    let grantCallCount = 0;
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") {
-        grantCallCount += 1;
-        if (grantCallCount === 1) return grantA.promise;
-        return "D:\\canonical-B";
-      }
-      if (cmd === "revoke_scan_authorization") return revoke.promise.then(() => undefined);
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(<HistoryWorkbench {...defaultProps} />);
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\A" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => expect(grantCallCount).toBe(1));
-
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "D:\\B" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-
-    // revoke 未完成前，B grant 不得进入后端。
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(grantCallCount).toBe(1);
-
-    revoke.resolve("");
-    await waitFor(() => expect(grantCallCount).toBe(2));
-    await waitFor(() => expect(screen.getByTestId("authorize-check")).toBeChecked());
-  });
-
-  // ============== R12-C：卸载后异步失败不得更新 React 状态 ==============
-
-  it("R12-C：卸载后 stale grant 返回时 revoke 失败不触发 setState", async () => {
-    const grantA = makeDeferredGrant();
-    const { unmount } = render(<HistoryWorkbench {...defaultProps} />);
-    // revoke 故意 reject——模拟后端 revoke 失败
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return grantA.promise;
-      if (cmd === "revoke_scan_authorization") {
-        throw new Error("revoke 后端失败");
-      }
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-    await waitFor(() => {
-      expect(
-        mockInvoke.mock.calls.some(([cmd]) => cmd === "grant_scan_authorization"),
-      ).toBe(true);
-    });
-
-    // 卸载组件
-    unmount();
-
-    // resolve grant(A)——stale，组件已卸载
-    // 卸载 cleanup 会调用 revoke（失败），stale 分支也会跳过（mountedRef=false）
-    // 不应产生任何 React setState 警告
-    grantA.resolve("C:\\canonical-A");
-
-    // 等待微任务和 revoke reject 传播
-    await new Promise((r) => setTimeout(r, 50));
-
-    // 验证：revoke 被调用（卸载 cleanup + 可能的 stale 分支）
-    const revokeCalls = mockInvoke.mock.calls.filter(
-      ([cmd]) => cmd === "revoke_scan_authorization",
-    );
-    // 只能有卸载 cleanup 的一次 revoke；grant 返回后不得再次进入 stale revoke 分支。
-    expect(revokeCalls).toHaveLength(1);
-  });
-
-  it("R12-C：StrictMode effect 重放后仍可完成授权", async () => {
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "grant_scan_authorization") return "C:\\canonical-fixture";
-      if (cmd === "revoke_scan_authorization") return null;
-      throw new Error(`未模拟: ${cmd}`);
-    });
-
-    render(
-      <StrictMode>
-        <HistoryWorkbench {...defaultProps} />
-      </StrictMode>,
-    );
-    fireEvent.change(screen.getByTestId("history-fixture-root-input"), {
-      target: { value: "C:\\fixture" },
-    });
-    fireEvent.click(screen.getByTestId("authorize-check"));
-
-    await waitFor(() => {
-      expect(screen.getByTestId("authorize-check")).toBeChecked();
-      expect(screen.getByTestId("scan-history-button")).toBeEnabled();
-    });
+    // 列表维持原状（会话未被移动）
+    expect(screen.getByTestId("history-project-p1")).toHaveTextContent("2 会话");
   });
 });

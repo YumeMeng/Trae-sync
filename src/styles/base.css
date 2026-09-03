@@ -1,0 +1,316 @@
+/* 全局基底：reset / 壳层布局 / 雾斑与颗粒 / stagger / 无障碍降级 */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  /* 不透明圆角窗口（2026-08-28 崩溃修复）：transparent: true 的
+     DirectComposition 路径与 TRAE(Electron) 实例启动时的前台合成冲突，
+     导致主进程被静默终止（无崩溃转储）。改回不透明窗口后，12px 呼吸带
+     露出的是窗口底色而非桌面，圆角/投影视觉保留；最大化时由
+     html.is-maximized 收回。 */
+  box-sizing: border-box;
+  height: 100%;
+  padding: 12px;
+  background: var(--app-bg);
+  color: var(--text-1);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button,
+input[type="checkbox"],
+input[type="radio"] {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button {
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible {
+  /* 靛蓝 focus ring（青色残留清剿，2026-08-27） */
+  outline: 2px solid var(--accent-border);
+  outline-offset: 2px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* 应用壳层：标题栏保持可见，主体只允许内容区域滚动。
+   圆角窗口：高度随 body 呼吸带收缩，圆角与投影在壳层上定义。 */
+.app-shell {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  /* 16px 圆角 + 投影 + 1px 描边圈定窗口边界（2026-08-28 崩溃修复后
+     窗口不透明，投影落在窗口底色的呼吸带上而非桌面）；maximized 一并收回。 */
+  border: 1px solid var(--line-control);
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(26, 34, 51, 0.16);
+}
+
+.app-loading,
+.app-error {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  padding: 24px;
+  color: var(--text-2);
+}
+
+.app-error {
+  gap: 12px;
+  text-align: center;
+  color: var(--danger);
+}
+
+.app-body {
+  display: grid;
+  grid-template-columns: var(--rail-width) minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app-main {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: 18px;
+  background: var(--app-bg);
+  overflow: auto;
+}
+
+.app-page {
+  width: 100%;
+  min-width: 0;
+  max-width: 1680px;
+  margin: 0 auto;
+}
+
+/* ============================================================
+   U-3 全局毛玻璃主题（DESIGN_TOKENS · 亮白通用玻璃）
+   画布雾斑 + 颗粒 → 标题栏/导航栏玻璃化 → 主内容透明化。
+   组件层仅引用 token；换主题只需重定义 :root 变量组。
+   ============================================================ */
+
+/* 画布：靛蓝雾斑（单色，与 accent 同族）+ 3.5% 颗粒防塑料感。
+   超大雾团（中心浓、外缘淡）从右上漂向左下，对角贯穿画布，
+   保证标题栏/导航栏背后全程有雾经过（玻璃有内容可糊）。
+   伪元素 fixed 定位铺满视口，pointer-events 穿透不影响交互。
+   isolation 建立 shell 层叠上下文：背景(底) → 雾斑(z0) → 内容(z1)。 */
+.app-shell {
+  position: relative;
+  isolation: isolate;
+  background: var(--app-bg);
+}
+
+/* 最大化态（TitleBar 置 html.is-maximized）：贴边铺满，收回呼吸带/圆角/投影。 */
+html.is-maximized body {
+  padding: 0;
+}
+
+html.is-maximized .app-shell {
+  border-radius: 0;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.app-shell::before {
+  content: "";
+  position: fixed;
+  /* 雾团以视口中心为原点居中，再由动画在对角线上平移 */
+  top: 50%;
+  left: 50%;
+  width: 1300px;
+  height: 1300px;
+  margin: -650px 0 0 -650px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--mist) 0%, var(--mist) 30%, transparent 70%);
+  filter: blur(90px);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.app-shell::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.035;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.4'/%3E%3C/svg%3E");
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .app-shell::before {
+    animation: mist-drift 36s ease-in-out infinite alternate;
+  }
+}
+
+@keyframes mist-drift {
+  /* 对角贯穿：右上 → 左下，36s alternate 往返（见上方动画声明） */
+  from { transform: translate(38%, -38%); }
+  to { transform: translate(-38%, 38%); }
+}
+
+/* 主内容透明化：让雾斑从内容下方透出（玻璃面板可糊）；z1 确保在雾斑之上。 */
+.app-main {
+  background: transparent;
+}
+
+.app-body {
+  position: relative;
+  z-index: 1;
+}
+
+@keyframes ui-rise {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 最大化态：窗口方角，关闭钮圆角同步收回 */
+html.is-maximized .title-bar__winctl--close {
+  border-radius: 0;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+}
+
+/* 1024-1199px：仍是桌面语义，但来源和计划改为可滚动的全宽区块，避免三栏挤压。 */
+/* 图标栏 52px 在所有桌面断点统一，不再分档收窄（2026-08-27）。 */
+@media (min-width: 1024px) and (max-width: 1199px) {
+  .app-main {
+    padding: 16px;
+  }
+
+}
+
+@media (max-width: 720px) {
+  .app-body {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .app-main {
+    order: 1;
+    padding: 10px 10px 82px;
+  }
+
+}
+
+@media (max-width: 480px) {
+  body {
+    font-size: 13px;
+  }
+
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+body {
+  overflow-x: visible;
+}
+
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: 100;
+  transform: translateY(-160%);
+  padding: 8px 12px;
+  /* 无障碍功能件保留高对比：靛蓝底白字，不玻璃化（U-4 B2 迁移） */
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-control);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: 14px;
+  font-weight: 700;
+  transition: transform 160ms ease-out;
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+  /* 跳过链接只在获得焦点时出现，因此 :focus（而非 :focus-visible）就必须带可见轮廓。 */
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.app-main {
+  min-height: 0;
+  overflow: auto;
+  padding: 20px;
+}
+
+.app-page {
+  min-height: 100%;
+}
+
+/* 动态状态只占一像素布局空间，但仍会被读屏器及时播报。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (min-width: 1024px) and (max-width: 1199px) {
+  /* 旧基线的标题栏收窄规则已删（38px 单行在所有断点统一，2026-08-27）。 */
+  .app-main {
+    padding: 16px;
+  }
+
+}
+
+@media (max-width: 720px) {
+  /* 手机不是产品目标，但保留可读降级，避免高 DPI CSS viewport 产生截断。 */
+  body {
+    font-size: 14px;
+  }
+
+}
+
+@media (forced-colors: active) {
+  button:focus-visible,
+  input:focus-visible,
+  .skip-link:focus {
+    outline: 2px solid Highlight;
+  }
+}
+

@@ -1,0 +1,598 @@
+﻿cargo : [1m[93mwarning[0m[1m[97m: unused import: `DeviceInfoBlock`[0m
+At line:15 char:2485
++ ...  d:\work\Trae-sync\src-tauri; cargo test --lib 2>&1 > err.txt; Select ...
++                                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1m[93mwarnin...eInfoBlock`[0m:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  [1m[96m--> [0mcrates\infrastructure\src\checkin_login.rs:30:49
+   [1m[96m|[0m
+[1m[96m30[0m [1m[96m|[0m     exchange_token_by_auth_code, get_user_info, DeviceInfoBlock, TokenGrant, UserInfoSum
+mary,
+   [1m[96m|[0m                                                 [1m[93m^^^^^^^^^^^^^^^[0m
+   [1m[96m|[0m
+   [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: unused import: `Path`[0m
+  [1m[96m--> [0mcrates\infrastructure\src\plugin_manifest.rs:13:17
+   [1m[96m|[0m
+[1m[96m13[0m [1m[96m|[0m use std::path::{Path, PathBuf};
+   [1m[96m|[0m                 [1m[93m^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: unused import: `ProcessRunningState`[0m
+  [1m[96m--> [0mcrates\infrastructure\src\snapshot_store.rs:28:5
+   [1m[96m|[0m
+[1m[96m28[0m [1m[96m|[0m     ProcessRunningState, ScanFailureReason, ScanOutcome, ScanRequest, SnapshotFileEntry,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `Token` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:496:5
+    [1m[96m|[0m
+[1m[96m496[0m [1m[96m|[0m     Token: Option<String>,
+    [1m[96m|[0m     [1m[93m^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `token`[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: structure field `RefreshToken` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:498:5
+    [1m[96m|[0m
+[1m[96m498[0m [1m[96m|[0m     RefreshToken: Option<String>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `refresh_token`[
+0m
+
+[1m[93mwarning[0m[1m[97m: structure field `TokenExpireAt` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:500:5
+    [1m[96m|[0m
+[1m[96m500[0m [1m[96m|[0m     TokenExpireAt: Option<u64>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `token_expire_at
+`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `RefreshExpireAt` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:502:5
+    [1m[96m|[0m
+[1m[96m502[0m [1m[96m|[0m     RefreshExpireAt: Option<u64>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `refresh_expir
+e_at`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `ResponseMetadata` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:508:5
+    [1m[96m|[0m
+[1m[96m508[0m [1m[96m|[0m     ResponseMetadata: Option<serde_json::Value>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `response_met
+adata`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `Result` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:510:5
+    [1m[96m|[0m
+[1m[96m510[0m [1m[96m|[0m     Result: Option<ExchangeResult>,
+    [1m[96m|[0m     [1m[93m^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `result`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `ResponseMetadata` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:577:5
+    [1m[96m|[0m
+[1m[96m577[0m [1m[96m|[0m     ResponseMetadata: Option<serde_json::Value>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `response_met
+adata`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `Result` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:579:5
+    [1m[96m|[0m
+[1m[96m579[0m [1m[96m|[0m     Result: Option<AuthCodeResult>,
+    [1m[96m|[0m     [1m[93m^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `result`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `AuthCode` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:585:5
+    [1m[96m|[0m
+[1m[96m585[0m [1m[96m|[0m     AuthCode: Option<String>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `auth_code`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `Result` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:705:5
+    [1m[96m|[0m
+[1m[96m705[0m [1m[96m|[0m     Result: Option<UserInfoResult>,
+    [1m[96m|[0m     [1m[93m^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `result`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `ScreenName` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:711:5
+    [1m[96m|[0m
+[1m[96m711[0m [1m[96m|[0m     ScreenName: Option<String>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `screen_name`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `AvatarUrl` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:713:5
+    [1m[96m|[0m
+[1m[96m713[0m [1m[96m|[0m     AvatarUrl: Option<String>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `avatar_url`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `NonPlainTextMobile` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_http.rs:715:5
+    [1m[96m|[0m
+[1m[96m715[0m [1m[96m|[0m     NonPlainTextMobile: Option<String>,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `non_plain_
+text_mobile`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `AuthCode` should have a snake case name[0m
+   [1m[96m--> [0mcrates\infrastructure\src\checkin_login.rs:186:9
+    [1m[96m|[0m
+[1m[96m186[0m [1m[96m|[0m         AuthCode: Option<String>,
+    [1m[96m|[0m         [1m[93m^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `auth_code`[0m
+
+[1m[93mwarning[0m: `traesync-infrastructure` (lib) generated 17 warnings (run `cargo fix --lib -p traesync-infrastru
+cture` to apply 3 suggestions)
+[1m[92m   Compiling[0m trae-sync v0.2.1 (D:\work\Trae-sync\src-tauri)
+[1m[93mwarning[0m[1m[97m: unused import: `HashMap`[0m
+  [1m[96m--> [0msrc\lib.rs:18:34
+   [1m[96m|[0m
+[1m[96m18[0m [1m[96m|[0m use std::collections::{BTreeMap, HashMap};
+   [1m[96m|[0m                                  [1m[93m^^^^^^^[0m
+   [1m[96m|[0m
+   [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: unused imports: `ApplySyncPlanService`, `AssignProjectSourceService`, `BrowseHistoryServ
+ice`, `BuildSyncPlanService`, `CatalogRepository`, and `ScanHistoryService`[0m
+  [1m[96m--> [0msrc\lib.rs:31:32
+   [1m[96m|[0m
+[1m[96m31[0m [1m[96m|[0m     AccountEvidenceReaderPort, ApplySyncPlanService, AssignProjectSourceService,
+   [1m[96m|[0m                                [1m[93m^^^^^^^^^^^^^^^^^^^^[0m  [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^^
+[0m
+[1m[96m32[0m [1m[96m|[0m     BrowseHistoryService, BuildSyncPlanService, CatalogRepository, checkin_transport_err
+or_code,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^[0m  [1m[93m^^^^^^^^^^^^^^^^^^^^[0m  [1m[93m^^^^^^^^^^^^^^^^^
+[0m
+[1m[96m33[0m [1m[96m|[0m     CheckinService, CheckinTransport, DatabaseProbePort,
+[1m[96m34[0m [1m[96m|[0m     ManagedAccountSwitchService, ProcessControllerPort, RemintCheckinRunner, ScanHistory
+Service,
+   [1m[96m|[0m                                                                              [1m[93m^^^^^^^^^^^^^^^
+^^^[0m
+
+[1m[93mwarning[0m[1m[97m: unused imports: `ConversationPreview`, `ScanOutcome`, and `SearchHit`[0m
+  [1m[96m--> [0msrc\lib.rs:43:25
+   [1m[96m|[0m
+[1m[96m43[0m [1m[96m|[0m     CompatibilityState, ConversationPreview, CurrentAccountEvidence, CurrentAccountState
+,
+   [1m[96m|[0m                         [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m44[0m [1m[96m|[0m     EvidenceState, HandoffIntent, HandoffIntentState, ManagedAccountRuntime, OperationCa
+ncellation,
+[1m[96m45[0m [1m[96m|[0m     OperationId, PlanAction, PlanExclusionReason, ProcessRunningState, ScanOutcome, Sear
+chHit,
+   [1m[96m|[0m                                                                        [1m[93m^^^^^^^^^^^[0m  [1m
+[93m^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: unused imports: `capture_fixture_failure_scene` and `reconcile_unfinished_manifests_for_
+location_with_recovery_handlers`[0m
+  [1m[96m--> [0msrc\lib.rs:50:5
+   [1m[96m|[0m
+[1m[96m50[0m [1m[96m|[0m     capture_fixture_failure_scene,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m51[0m [1m[96m|[0m     reconcile_unfinished_manifests_for_location_with_recovery_handlers,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: unused imports: `FilesystemSnapshotStore`, `SqlCipherCatalogRepository`, `WorkCnSourceNo
+rmalizer`, `WorkCnSyncExecutor`, `catalog_operation_matches`, `inspect_lock_status`, `list_operation_summaries`, `persi
+sted_record_matches`, and `reconcile_current_catalog_sidecar`[0m
+  [1m[96m--> [0msrc\lib.rs:54:58
+   [1m[96m|[0m
+[1m[96m54[0m [1m[96m|[0m     capture_location_identity, capture_location_witness, catalog_operation_matches,
+   [1m[96m|[0m                                                          [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m55[0m [1m[96m|[0m     compare_location_identity, ensure_catalog_initialized, fixture_path_error_text,
+[1m[96m56[0m [1m[96m|[0m     inspect_lock_status, list_operation_summaries, load_account_fingerprint_salt,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^[0m  [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m57[0m [1m[96m|[0m     load_or_create_account_fingerprint_salt, open_or_initialize_production_catalog,
+[1m[96m58[0m [1m[96m|[0m     reconcile_current_catalog_sidecar, resolve_current_catalog_generation_id,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m...[0m
+[1m[96m64[0m [1m[96m|[0m     FilesystemSnapshotStore, FixtureCheckinTransport, FixturePathError, FixturePathGuard
+,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m...[0m
+[1m[96m69[0m [1m[96m|[0m     SqlCipherCatalogRepository, SqlCipherProbe, StorageDeletionPlan, StorageMigrationRes
+ult,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m...[0m
+[1m[96m75[0m [1m[96m|[0m     WorkCnSourceNormalizer, WorkCnSyncExecutor, AutoCheckinBatchState, AutoCheckinLedger
+,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^[0m  [1m[93m^^^^^^^^^^^^^^^^^^[0m
+[1m[96m76[0m [1m[96m|[0m     AutoCheckinSettings, AutoCheckinStore, BASELINE_SOURCE_KEY_ID, DEFAULT_STORAGE_WARNI
+NG_BYTES,
+[1m[96m77[0m [1m[96m|[0m     get_user_info, persisted_record_matches, PersistedScanAuthorization,
+   [1m[96m|[0m                    [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: unused imports: `ThrottledProgressEmitter` and `read_progress_snapshot`[0m
+  [1m[96m--> [0msrc\lib.rs:85:64
+   [1m[96m|[0m
+[1m[96m85[0m [1m[96m|[0m     build_deletion_plan_with_lease, persist_progress_snapshot, read_progress_snapshot,
+   [1m[96m|[0m                                                                [1m[93m^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m86[0m [1m[96m|[0m     DeletionCandidate, DeletionTombstone, ProgressPhase, ProgressSnapshot,
+[1m[96m87[0m [1m[96m|[0m     ThrottledProgressEmitter,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: unused imports: `OperationDto` and `ReconcileUnfinishedOperationsDto`[0m
+   [1m[96m--> [0msrc\lib.rs:147:43
+    [1m[96m|[0m
+[1m[96m147[0m [1m[96m|[0m use operation_contract::{CommandErrorDto, OperationDto, ReconcileUnfinishedOperationsDt
+o};
+    [1m[96m|[0m                                           [1m[93m^^^^^^^^^^^^[0m  [1m[93m^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:8846:21
+     [1m[96m|[0m
+[1m[96m7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+     [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msim
+ilarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m8846[0m [1m[96m|[0m         let error = scan_history_inner(
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+     [1m[96m|[0m
+[1m[96m8846[0m [91m- [0m        let error = [91mscan_history_inner[0m(
+[1m[96m8846[0m [92m+ [0m        let error = [92mbrowse_history_inner[0m(
+     [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_default_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:8862:21
+     [1m[96m|[0m
+[1m[96m8862[0m [1m[96m|[0m         let error = scan_default_history_inner(&state).unwrap_err();
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_default_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:8876:21
+     [1m[96m|[0m
+[1m[96m8876[0m [1m[96m|[0m         let error = scan_default_history_inner(&state).unwrap_err();
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `grant_default_scan_authorization_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:8949:21
+     [1m[96m|[0m
+[1m[96m8949[0m [1m[96m|[0m         let error = grant_default_scan_authorization_inner(&state).unwrap_err();
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this 
+scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `persist_real_authorization` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:8986:9
+     [1m[96m|[0m
+[1m[96m8986[0m [1m[96m|[0m         persist_real_authorization(&state, &synthetic_location_witness(), "user-fp", "
+auth-fp");
+     [1m[96m|[0m         [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `persist_real_authorization` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9005:9
+     [1m[96m|[0m
+[1m[96m9005[0m [1m[96m|[0m         persist_real_authorization(&state, &synthetic_location_witness(), "user-fp", "
+auth-fp");
+     [1m[96m|[0m         [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `get_scan_authorization_precheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9017:13
+     [1m[96m|[0m
+[1m[96m9017[0m [1m[96m|[0m             get_scan_authorization_precheck(&state).unwrap(),
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `get_scan_authorization_precheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9031:13
+     [1m[96m|[0m
+[1m[96m9031[0m [1m[96m|[0m             get_scan_authorization_precheck(&state).unwrap(),
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `get_scan_authorization_precheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9054:13
+     [1m[96m|[0m
+[1m[96m9054[0m [1m[96m|[0m             get_scan_authorization_precheck(&state).unwrap(),
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `get_scan_authorization_precheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9065:21
+     [1m[96m|[0m
+[1m[96m9065[0m [1m[96m|[0m         let error = get_scan_authorization_precheck(&state).unwrap_err();
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[
+0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `get_scan_authorization_precheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9091:13
+     [1m[96m|[0m
+[1m[96m9091[0m [1m[96m|[0m             get_scan_authorization_precheck(&state).unwrap(),
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `revoke_persisted_scan_authorization_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9114:9
+     [1m[96m|[0m
+[1m[96m9114[0m [1m[96m|[0m         revoke_persisted_scan_authorization_inner(&state).unwrap();
+     [1m[96m|[0m         [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `revoke_persisted_scan_authorization_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9130:9
+     [1m[96m|[0m
+[1m[96m9130[0m [1m[96m|[0m         revoke_persisted_scan_authorization_inner(&state).unwrap();
+     [1m[96m|[0m         [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `revoke_persisted_scan_authorization_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9131:9
+     [1m[96m|[0m
+[1m[96m9131[0m [1m[96m|[0m         revoke_persisted_scan_authorization_inner(&state).unwrap();
+     [1m[96m|[0m         [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `apply_sync_plan_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9139:21
+     [1m[96m|[0m
+[1m[96m9139[0m [1m[96m|[0m         let error = apply_sync_plan_inner(&state, None).unwrap_err();
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `reconcile_unfinished_operations_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9192:21
+     [1m[96m|[0m
+[1m[96m9192[0m [1m[96m|[0m         let error = reconcile_unfinished_operations_inner(&state).unwrap_err();
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this s
+cope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `search_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9241:13
+     [1m[96m|[0m
+[1m[96m7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+     [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msim
+ilarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m9241[0m [1m[96m|[0m             search_history_inner("hello", None, &state).unwrap_err(),
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+     [1m[96m|[0m
+[1m[96m9241[0m [91m- [0m            [91msearch_history_inner[0m("hello", None, &state).unwrap_err(),
+[1m[96m9241[0m [92m+ [0m            [92mbrowse_history_inner[0m("hello", None, &state).unwrap_err(),
+     [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `read_conversation_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9245:13
+     [1m[96m|[0m
+[1m[96m9245[0m [1m[96m|[0m             read_conversation_inner(&SessionIdentity::new("work_cn", "session-1"), &st
+ate,)
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `assign_source_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9258:13
+     [1m[96m|[0m
+[1m[96m9258[0m [1m[96m|[0m             assign_source_inner("project-1", Some("user-1"), &state).unwrap_err(),
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `assign_source_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9268:13
+     [1m[96m|[0m
+[1m[96m9268[0m [1m[96m|[0m             assign_source_inner("project-1", Some("user-1"), &state).unwrap_err(),
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `assign_source_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9303:21
+     [1m[96m|[0m
+[1m[96m9303[0m [1m[96m|[0m         let error = assign_source_inner("project-1", Some("user-1"), &state).unwrap_er
+r();
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `assign_source_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9361:21
+     [1m[96m|[0m
+[1m[96m9361[0m [1m[96m|[0m         let error = assign_source_inner("project-drift", Some("user-drift"), &state)
+     [1m[96m|[0m                     [1m[91m^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `lock_status_dto` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9377:23
+     [1m[96m|[0m
+[1m[96m9377[0m [1m[96m|[0m         let preview = lock_status_dto(
+     [1m[96m|[0m                       [1m[91m^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `lock_status_dto` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9385:23
+     [1m[96m|[0m
+[1m[96m9385[0m [1m[96m|[0m         let fixture = lock_status_dto(RuntimeMode::Fixture, None, status, None);
+     [1m[96m|[0m                       [1m[91m^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `apply_cached_sync_plan` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9456:19
+     [1m[96m|[0m
+[1m[96m9456[0m [1m[96m|[0m         let err = apply_cached_sync_plan(&state, &OperationCancellation::new(), None).
+unwrap_err();
+     [1m[96m|[0m                   [1m[91m^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `apply_cached_sync_plan` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9467:19
+     [1m[96m|[0m
+[1m[96m9467[0m [1m[96m|[0m         let err = apply_cached_sync_plan(&state, &OperationCancellation::new(), None).
+unwrap_err();
+     [1m[96m|[0m                   [1m[91m^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `restore_operation_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9491:29
+     [1m[96m|[0m
+[1m[96m7241[0m [1m[96m|[0m [1m[96m/[0m fn restore_operation(
+[1m[96m7242[0m [1m[96m|[0m [1m[96m|[0m     _operation_id: String,
+[1m[96m7243[0m [1m[96m|[0m [1m[96m|[0m     _state: tauri::State<AppState>,
+[1m[96m7244[0m [1m[96m|[0m [1m[96m|[0m ) -> Result<(), CommandErrorDto> {
+[1m[96m...[0m    [1m[96m|[0m
+[1m[96m7247[0m [1m[96m|[0m [1m[96m|[0m     ))
+[1m[96m7248[0m [1m[96m|[0m [1m[96m|[0m }
+     [1m[96m|[0m [1m[96m|_-[0m [1m[96msimilarly named function `restore_operation` defined here[0m
+[1m[96m...[0m
+[1m[96m9491[0m [1m[96m|[0m           let restore_error = restore_operation_inner().unwrap_err();
+     [1m[96m|[0m                               [1m[91m^^^^^^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+     [1m[96m|[0m
+[1m[96m9491[0m [91m- [0m        let restore_error = [91mrestore_operation_inner[0m().unwrap_err();
+[1m[96m9491[0m [92m+ [0m        let restore_error = [92mrestore_operation[0m().unwrap_err();
+     [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `apply_sync_plan_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9559:13
+     [1m[96m|[0m
+[1m[96m9559[0m [1m[96m|[0m             apply_sync_plan_inner(&state, None).expect_err("已有写租约时第二实例必须被阻断");
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `apply_sync_plan_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9571:28
+     [1m[96m|[0m
+[1m[96m9571[0m [1m[96m|[0m         let retry_result = apply_sync_plan_inner(&state, None);
+     [1m[96m|[0m                            [1m[91m^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9608:22
+     [1m[96m|[0m
+[1m[96m7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+     [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msim
+ilarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m9608[0m [1m[96m|[0m         let result = scan_history_inner(
+     [1m[96m|[0m                      [1m[91m^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+     [1m[96m|[0m
+[1m[96m9608[0m [91m- [0m        let result = [91mscan_history_inner[0m(
+[1m[96m9608[0m [92m+ [0m        let result = [92mbrowse_history_inner[0m(
+     [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9666:26
+     [1m[96m|[0m
+[1m[96m7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+     [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msim
+ilarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m9666[0m [1m[96m|[0m             let result = scan_history_inner(
+     [1m[96m|[0m                          [1m[91m^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+     [1m[96m|[0m
+[1m[96m9666[0m [91m- [0m            let result = [91mscan_history_inner[0m(
+[1m[96m9666[0m [92m+ [0m            let result = [92mbrowse_history_inner[0m(
+     [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `build_sync_plan_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9762:22
+     [1m[96m|[0m
+[1m[96m9762[0m [1m[96m|[0m         let result = build_sync_plan_inner(SyncScope::AllHistory, &state);
+     [1m[96m|[0m                      [1m[91m^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `apply_sync_plan_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9814:25
+     [1m[96m|[0m
+[1m[96m9814[0m [1m[96m|[0m             let error = apply_sync_plan_inner(&state, None)
+     [1m[96m|[0m                         [1m[91m^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9914:22
+     [1m[96m|[0m
+[1m[96m7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+     [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msim
+ilarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m9914[0m [1m[96m|[0m         let result = scan_history_inner(
+     [1m[96m|[0m                      [1m[91m^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+     [1m[96m|[0m
+[1m[96m9914[0m [91m- [0m        let result = [91mscan_history_inner[0m(
+[1m[96m9914[0m [92m+ [0m        let result = [92mbrowse_history_inner[0m(
+     [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_history_inner` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9952:22
+     [1m[96m|[0m
+[1m[96m7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+     [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msim
+ilarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m9952[0m [1m[96m|[0m         let result = scan_history_inner(
+     [1m[96m|[0m                      [1m[91m^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+     [1m[96m|[0m
+[1m[96m9952[0m [91m- [0m        let result = [91mscan_history_inner[0m(
+[1m[96m9952[0m [92m+ [0m        let result = [92mbrowse_history_inner[0m(
+     [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_history_inner` in this scope[0m
+     [1m[96m--> [0msrc\lib.rs:10026:22
+      [1m[96m|[0m
+[1m[96m 7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+      [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msi
+milarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m10026[0m [1m[96m|[0m         let result = scan_history_inner(
+      [1m[96m|[0m                      [1m[91m^^^^^^^^^^^^^^^^^^[0m
+      [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+      [1m[96m|[0m
+[1m[96m10026[0m [91m- [0m        let result = [91mscan_history_inner[0m(
+[1m[96m10026[0m [92m+ [0m        let result = [92mbrowse_history_inner[0m(
+      [1m[96m|[0m
+
+[1m[91merror[E0425][0m[1m[97m: cannot find function `scan_history_inner` in this scope[0m
+     [1m[96m--> [0msrc\lib.rs:10054:22
+      [1m[96m|[0m
+[1m[96m 7287[0m [1m[96m|[0m fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
+      [1m[96m|[0m [1m[96m-------------------------------------------------------------------------[0m [1m[96msi
+milarly named function `browse_history_inner` defined here[0m
+[1m[96m...[0m
+[1m[96m10054[0m [1m[96m|[0m         let result = scan_history_inner(
+      [1m[96m|[0m                      [1m[91m^^^^^^^^^^^^^^^^^^[0m
+      [1m[96m|[0m
+[1m[96mhelp[0m: a function with a similar name exists
+      [1m[96m|[0m
+[1m[96m10054[0m [91m- [0m        let result = [91mscan_history_inner[0m(
+[1m[96m10054[0m [92m+ [0m        let result = [92mbrowse_history_inner[0m(
+      [1m[96m|[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find type `ScanAuthorizationPrecheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9018:13
+     [1m[96m|[0m
+[1m[96m9018[0m [1m[96m|[0m             ScanAuthorizationPrecheck::NotAuthorized
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ScanAuthorizati
+onPrecheck`[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a struct with a similar name exists
+     [1m[96m|[0m
+[1m[96m9018[0m [91m- [0m            [91mScanAuthorizationPrecheck[0m::NotAuthorized
+[1m[96m9018[0m [92m+ [0m            [92mScanAuthorizationStore[0m::NotAuthorized
+     [1m[96m|[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find type `ScanAuthorizationPrecheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9032:13
+     [1m[96m|[0m
+[1m[96m9032[0m [1m[96m|[0m             ScanAuthorizationPrecheck::NotAuthorized
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ScanAuthorizati
+onPrecheck`[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a struct with a similar name exists
+     [1m[96m|[0m
+[1m[96m9032[0m [91m- [0m            [91mScanAuthorizationPrecheck[0m::NotAuthorized
+[1m[96m9032[0m [92m+ [0m            [92mScanAuthorizationStore[0m::NotAuthorized
+     [1m[96m|[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find type `ScanAuthorizationPrecheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9055:13
+     [1m[96m|[0m
+[1m[96m9055[0m [1m[96m|[0m             ScanAuthorizationPrecheck::Restore(_)
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ScanAuthorizati
+onPrecheck`[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a struct with a similar name exists
+     [1m[96m|[0m
+[1m[96m9055[0m [91m- [0m            [91mScanAuthorizationPrecheck[0m::Restore(_)
+[1m[96m9055[0m [92m+ [0m            [92mScanAuthorizationStore[0m::Restore(_)
+     [1m[96m|[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find type `ScanAuthorizationPrecheck` in this scope[0m
+    [1m[96m--> [0msrc\lib.rs:9092:13
+     [1m[96m|[0m
+[1m[96m9092[0m [1m[96m|[0m             ScanAuthorizationPrecheck::Restore(_)
+     [1m[96m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ScanAuthorizati
+onPrecheck`[0m
+     [1m[96m|[0m
+[1m[96mhelp[0m: a struct with a similar name exists
+     [1m[96m|[0m
+[1m[96m9092[0m [91m- [0m            [91mScanAuthorizationPrecheck[0m::Restore(_)
+[1m[96m9092[0m [92m+ [0m            [92mScanAuthorizationStore[0m::Restore(_)
+     [1m[96m|[0m
+
+[1m[97mSome errors have detailed explanations: E0425, E0433.[0m
+[1m[97mFor more information about an error, try `rustc --explain E0425`.[0m
+[1m[93mwarning[0m: `trae-sync` (lib test) generated 7 warnings
+[1m[91merror[0m: could not compile `trae-sync` (lib test) due to 41 previous errors; 7 warnings emitted

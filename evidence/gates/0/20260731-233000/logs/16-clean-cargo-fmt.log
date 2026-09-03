@@ -1,5 +1,0 @@
-﻿Command: Clean: cargo fmt --check
-ExitCode: 0
-StartedAt: 08/01/2026 00:39:51
-EndedAt: 08/01/2026 00:39:52
-DurationSec: 1.2302749

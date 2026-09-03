@@ -20,7 +20,7 @@ use traesync_domain::{
 };
 use traesync_ports::ContentGraphHasher;
 
-/// R4：规范化 JSON 内容——解析后递归排序 key 再序列化。
+/// R4：规范化 JSON 内容——解析后排序 key 再序列化。
 /// 确保 `{"a":1,"b":2}` 与 `{"b":2,"a":1}` 产生相同哈希。
 /// 非 JSON 内容原样返回。
 fn canonicalize_json(content: &str) -> String {
@@ -28,33 +28,72 @@ fn canonicalize_json(content: &str) -> String {
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
         return content.to_string();
     }
-    // 尝试解析为 serde_json::Value 并规范化
+    // 尝试解析为 serde_json::Value 并规范化。
     match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(value) => {
-            let canonical = canonicalize_value(&value);
-            serde_json::to_string(&canonical).unwrap_or_else(|_| content.to_string())
-        }
+        Ok(value) => canonicalize_value(&value),
         Err(_) => content.to_string(),
     }
 }
 
-/// 递归规范化 JSON Value：对象 key 排序，数组保持顺序。
-fn canonicalize_value(value: &serde_json::Value) -> serde_json::Value {
+/// 使用显式任务栈规范化 JSON Value，避免深层内容触发 Rust 调用栈溢出。
+fn canonicalize_value(value: &serde_json::Value) -> String {
     use serde_json::Value;
-    use std::collections::BTreeMap;
-    match value {
-        Value::Object(map) => {
-            // BTreeMap 自动按 key 排序
-            let sorted: BTreeMap<&str, &Value> = map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            let mut result = serde_json::Map::new();
-            for (k, v) in sorted {
-                result.insert(k.to_string(), canonicalize_value(v));
-            }
-            Value::Object(result)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(canonicalize_value).collect()),
-        other => other.clone(),
+    enum Task<'a> {
+        Value(&'a Value),
+        Static(&'static str),
+        Owned(String),
     }
+
+    let mut output = String::new();
+    let mut tasks = vec![Task::Value(value)];
+
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Static(text) => output.push_str(text),
+            Task::Owned(text) => output.push_str(&text),
+            Task::Value(value) => match value {
+                Value::Null => output.push_str("null"),
+                Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+                Value::Number(value) => output.push_str(&value.to_string()),
+                Value::String(value) => {
+                    // 只序列化叶子字符串，避免再次递归处理整个 JSON 树。
+                    output.push_str(&serde_json::to_string(value).expect("字符串序列化不应失败"));
+                }
+                Value::Array(values) => {
+                    output.push('[');
+                    tasks.push(Task::Static("]"));
+                    for (index, value) in values.iter().enumerate().rev() {
+                        tasks.push(Task::Value(value));
+                        if index > 0 {
+                            tasks.push(Task::Static(","));
+                        }
+                    }
+                }
+                Value::Object(values) => {
+                    output.push('{');
+                    let mut entries: Vec<(&str, &Value)> = values
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value))
+                        .collect();
+                    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+
+                    tasks.push(Task::Static("}"));
+                    for (index, (key, value)) in entries.into_iter().enumerate().rev() {
+                        tasks.push(Task::Value(value));
+                        tasks.push(Task::Static(":"));
+                        tasks.push(Task::Owned(
+                            serde_json::to_string(key).expect("对象 key 序列化不应失败"),
+                        ));
+                        if index > 0 {
+                            tasks.push(Task::Static(","));
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    output
 }
 
 /// 确定性内容图哈希器。
@@ -451,6 +490,25 @@ mod tests {
         let h1 = DeterministicContentGraphHasher::new().hash_session_content(&msgs_a, &session());
         let h2 = DeterministicContentGraphHasher::new().hash_session_content(&msgs_b, &session());
         assert_eq!(h1, h2, "嵌套 JSON key 顺序不同应产生相同哈希");
+    }
+
+    #[test]
+    fn r4_deep_value_canonicalization_does_not_use_call_stack() {
+        // 深层 Value 直接构造，绕过解析器的深度限制，验证规范化本身不递归。
+        let mut value = serde_json::Value::String("leaf".to_string());
+        for depth in 0..4096 {
+            let mut object = serde_json::Map::new();
+            object.insert(format!("level-{depth}"), value);
+            value = serde_json::Value::Object(object);
+        }
+
+        let canonical = canonicalize_value(&value);
+        assert!(canonical.starts_with('{'));
+        assert!(canonical.ends_with('}'));
+        assert!(canonical.contains("\"leaf\""));
+
+        // 深层 Value 的析构也可能递归，测试结束前主动泄漏它，避免干扰回归结论。
+        std::mem::forget(value);
     }
 
     #[test]

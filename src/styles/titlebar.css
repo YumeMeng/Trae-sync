@@ -1,0 +1,321 @@
+/* 标题栏 + 导航图标栏 + 窗控 */
+
+/* 标题栏 38px 单行（2026-08-27 精简）：品牌 + 全局状态徽章。
+   证据信息（当前账号/重新检测）下沉总览页 overview-evidence。 */
+.title-bar {
+  position: relative;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 38px;
+  padding: 0 16px;
+}
+
+/* 标题栏玻璃化：强白玻璃 + 模糊（雾斑从其下方经过时被晕染）。 */
+.title-bar {
+  background: var(--glass-strong);
+  backdrop-filter: var(--glass-blur-strong);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  border-bottom: 1px solid var(--line-hair);
+}
+
+/* 导航栏玻璃化：轻白玻璃（与标题栏形成层级差）。 */
+.navigation-rail {
+  background: var(--glass-rail);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.title-bar__brand-block {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 拖拽穿透（T8）：Tauri drag-region 只认命中元素本身，
+   品牌区子元素关闭命中，让整块品牌区成为拖拽/双击最大化热区。 */
+.title-bar__brand-block > * {
+  pointer-events: none;
+}
+
+.title-bar__mark {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+.title-bar__brand {
+  font-size: 13.5px;
+  font-weight: 750;
+  line-height: 1.2;
+}
+
+.title-bar__subtitle {
+  color: var(--text-3);
+  font-size: 11px;
+  /* 38px 单行：平台名与品牌同行，弱化为辅助信息 */
+  white-space: nowrap;
+}
+
+.title-bar__mode,
+.workbench__read-only-badge,
+.status-badge,
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-hair);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.title-bar__mode {
+  /* 跟随品牌的第二信息位（38px 单行内紧凑化）；右缘定位由窗控组接管 */
+  padding: 3px 9px;
+  /* 色值由 status-badge--* modifier 提供（正常态中性 + 靛蓝点确认） */
+  border-color: var(--line-control);
+  background: var(--fill-soft);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.title-bar__mode small {
+  color: inherit;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* —— 自绘窗控（T8，decorations: false）——
+   Windows 语义：46px 命中宽 × 标题栏满高，hover 中性底，关闭 hover 红。
+   组容器推到标题栏右缘（取代徽章的右缘定位职责）。 */
+.title-bar__window-controls {
+  display: flex;
+  align-items: stretch;
+  margin-left: auto;
+  margin-right: -16px; /* 抵消标题栏 padding，贴住窗口右缘（圆角内） */
+}
+
+.title-bar__winctl {
+  display: grid;
+  width: 46px;
+  min-height: 100%;
+  place-items: center;
+  border: none;
+  padding: 0;
+  background: transparent;
+  color: var(--text-2);
+  cursor: default;
+}
+
+.title-bar__winctl:hover {
+  background: var(--fill);
+}
+
+.title-bar__winctl:active {
+  background: var(--fill-strong);
+}
+
+.title-bar__winctl--close {
+  /* 关闭钮 hover 红为 Windows 惯例色；右上角贴合窗口圆角 */
+  border-radius: 0 15px 0 0;
+}
+
+.title-bar__winctl--close:hover,
+.title-bar__winctl--close:active {
+  background: var(--window-close);
+  color: var(--text-on-accent);
+}
+
+/* 持久导航：52px 图标栏（文字由 aria-label + hover 玻璃 tooltip 承载）。
+   背景/模糊由上方玻璃版（.navigation-rail 玻璃化）提供，此处不再覆盖。 */
+.navigation-rail {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  padding: 12px 6px;
+  border-right: 1px solid var(--line-hair);
+}
+
+.navigation-rail__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 图标按钮：40px 方块居中，hover 玻璃底。 */
+.navigation-rail__item {
+  position: relative;
+  display: grid;
+  width: 100%;
+  min-height: 40px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background-color 160ms ease-out, border-color 160ms ease-out, color 160ms ease-out;
+}
+
+.navigation-rail__item:hover {
+  background: var(--glass-hover);
+}
+
+.navigation-rail__item:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: -2px;
+}
+
+.navigation-rail__item--active {
+  border-color: var(--line-control);
+  background: var(--glass-active);
+  color: var(--accent);
+}
+
+/* 激活指示条：贴栏左缘的 3px 靛蓝短条。 */
+.navigation-rail__item--active::before {
+  position: absolute;
+  top: 9px;
+  bottom: 9px;
+  left: -6px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+  content: "";
+}
+
+/* hover 玻璃 tooltip：栏右侧浮出的玻璃气泡（内容来自 data-label）。 */
+.navigation-rail__item::after {
+  position: absolute;
+  top: 50%;
+  left: calc(100% + 12px);
+  z-index: 30;
+  padding: 5px 10px;
+  border: 1px solid var(--line-hair);
+  border-radius: 10px;
+  background: var(--glass-strong);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  content: attr(data-label);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%) translateX(-4px);
+  transition: opacity 140ms ease-out, transform 140ms ease-out;
+}
+
+.navigation-rail__item:hover::after,
+.navigation-rail__item:focus-visible::after {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+/* 图标：无底纯线图标，激活态由父级 color 变靛蓝。 */
+.navigation-rail__icon {
+  display: grid;
+  place-items: center;
+}
+
+/* 导航文字：读屏可读的视觉隐藏（不用 display:none，保留无障碍名）。 */
+.navigation-rail__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .navigation-rail {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    display: flex;
+    height: 60px;
+    flex-direction: row;
+    align-items: stretch;
+    justify-content: center;
+    padding: 6px 8px;
+    background: var(--glass-solid);
+    border-top: 1px solid var(--line-hair);
+    border-right: 0;
+    box-shadow: var(--shadow-float);
+  }
+
+  /* 底部横排导航：5 个图标一格一个；无 hover，tooltip 气泡禁用。 */
+  .navigation-rail__nav {
+    display: grid;
+    width: min(100%, 430px);
+    grid-template-columns: repeat(5, 1fr);
+    gap: 4px;
+  }
+
+  .navigation-rail__item {
+    min-height: 48px;
+  }
+
+  .navigation-rail__item::after,
+  .navigation-rail__item--active::before {
+    display: none;
+  }
+
+  /* 38px 单行标题栏在窄屏保持 flex：左收内边距，右让窗控贴边 */
+  .title-bar {
+    padding: 0 0 0 10px;
+  }
+
+  .title-bar__subtitle {
+    display: none;
+  }
+
+  .title-bar__mode {
+    padding: 3px 8px;
+    margin-right: 10px; /* 徽章与窗控间留白（窗控已贴右缘） */
+  }
+
+  .title-bar__window-controls {
+    margin-right: 0;
+  }
+
+}
+
+@media (min-width: 1200px) {
+  .title-bar__context {
+    /* 宽桌面为当前账号与状态徽章预留更宽松的最小轨道。 */
+    grid-template-columns: minmax(270px, 1.35fr) minmax(180px, 1fr);
+  }
+}
+
+@media (forced-colors: active) {
+  .title-bar__mark,
+  .navigation-rail__item--active,
+  .workbench__node--active,
+  .workbench__session--active,
+  .btn--primary,
+  .title-bar__mode {
+    forced-color-adjust: none;
+    border-color: Highlight;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+}
+

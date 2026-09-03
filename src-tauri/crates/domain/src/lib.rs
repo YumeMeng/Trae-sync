@@ -7,10 +7,25 @@
 //! 账号证据与结构化只读原因。仅承载 T02 需要的纯值对象。
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod account_switch;
+pub mod checkin;
 pub mod history;
 pub mod sync_plan;
 pub mod workbench_read;
+
+pub use account_switch::{
+    AccountProfile, AccountSwitchPlan, AccountSwitchPreflight, AccountSwitchState,
+    AccountVerificationState, CurrentAccountEvidence, HandoffIntent, HandoffIntentState,
+    ManagedAccountRuntime, ManagedAccountsView, ACCOUNT_FINGERPRINT_VERSION,
+    LEGACY_ACCOUNT_FINGERPRINT_VERSION,
+};
+
+pub use checkin::{
+    CheckinBatchSummary, CheckinClaimSnapshot, CheckinOutcome, CheckinResult,
+    CheckinStatusSnapshot, CheckinTaskState, EntitlementPackSnapshot, EntitlementUsageSnapshot,
+};
 
 pub use sync_plan::{
     build_sync_plan, compare_project_identity, BuildSyncPlanInput, OperationCancellation,
@@ -55,8 +70,11 @@ pub use history::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct OperationId(String);
 
+// 进程内序号补足时间戳同刻碰撞，保证同一进程并发生成 ID 唯一。
+static NEXT_OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 impl OperationId {
-    /// 生成新的随机操作 ID（T01 阶段使用简单时间戳 + 进程 ID，不引入 uuid 依赖）。
+    /// 生成新的操作 ID（时间戳、进程 ID 与进程内原子序号，不引入 uuid 依赖）。
     ///
     /// 这是外部获得 `OperationId` 实例的唯一公开入口。不接受外部字符串，
     /// 因此随机 hex key、认证正文、恢复短语等无法进入 operation_id。
@@ -67,7 +85,8 @@ impl OperationId {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let pid = std::process::id();
-        Self(format!("op-{nanos}-{pid}"))
+        let sequence = NEXT_OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Self(format!("op-{nanos}-{pid}-{sequence}"))
     }
 
     /// 返回内部字符串的只读引用。
@@ -96,24 +115,12 @@ impl PlatformId {
 }
 
 /// 工作台能力开关：T01 全部为 false
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CapabilityFlags {
     pub scan_enabled: bool,
     pub sync_enabled: bool,
     pub backup_enabled: bool,
     pub restore_enabled: bool,
-}
-
-impl Default for CapabilityFlags {
-    fn default() -> Self {
-        // T01 骨架阶段：所有真实能力禁用
-        Self {
-            scan_enabled: false,
-            sync_enabled: false,
-            backup_enabled: false,
-            restore_enabled: false,
-        }
-    }
 }
 
 /// 历史库摘要：T01 始终为空
@@ -196,7 +203,7 @@ mod tests {
 
     #[test]
     fn operation_id_new_generates_valid_format() {
-        // new() 是唯一公开构造入口，生成 op-<nanos>-<pid> 格式
+        // new() 是唯一公开构造入口，生成 op-<nanos>-<pid>-<sequence> 格式
         let op_id = OperationId::new();
         let s = op_id.as_str();
         assert!(s.starts_with("op-"));
@@ -204,13 +211,44 @@ mod tests {
         // new() 生成的格式为 op-<数字>-<数字>，各部分全为数字
         let rest = &s[3..];
         let parts: Vec<&str> = rest.split('-').collect();
-        assert!(parts.len() >= 2, "new() 应生成 op-<nanos>-<pid> 格式");
+        assert!(parts.len() >= 2, "new() 应生成带进程序号的操作 ID 格式");
         for part in parts {
             assert!(
                 part.chars().all(|c| c.is_ascii_digit()),
                 "new() 生成的各部分应全为数字，实际: {part}"
             );
         }
+    }
+
+    #[test]
+    fn operation_id_new_is_unique_under_concurrent_batch() {
+        // 并发批量生成必须带进程内序号，不能依赖时间戳偶然不重复。
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const WORKERS: usize = 16;
+        const PER_WORKER: usize = 256;
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let handles = (0..WORKERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    (0..PER_WORKER)
+                        .map(|_| OperationId::new().as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("操作 ID 线程不应 panic"))
+            .collect::<Vec<_>>();
+
+        assert!(ids.iter().all(|value| value.split('-').count() == 4));
+        let unique = ids.iter().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), WORKERS * PER_WORKER);
     }
 
     // ============== R1 关键反例测试：任意字符串无法进入 operation_id ==============

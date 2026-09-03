@@ -6,7 +6,10 @@
 //! T03/T04 新增 `history` 模块：`ScanHistoryService`、`BrowseHistoryService`、
 //! `AssignProjectSourceService`，承载 P1 历史基础用例。
 
+pub mod account_switch;
+pub mod checkin;
 pub mod history;
+pub mod recovery_service;
 pub mod sync_apply;
 pub mod workbench_read;
 
@@ -16,14 +19,27 @@ use traesync_domain::WorkspaceState;
 pub use traesync_ports::WorkspaceStateProvider;
 // 重导出 T02 工作台只读 port，供 commands 层构造测试 fake 使用
 pub use traesync_ports::{AccountEvidenceReaderPort, DatabaseProbePort};
+pub use traesync_ports::{
+    ProcessControllerPort, ProcessIdentity, ProcessMatchEvidence, ProcessObservation,
+    ProcessObservationStatus,
+};
 // 重导出 T03/T04 历史库 port，供 commands 层构造测试 fake 使用
 pub use traesync_ports::{
-    CatalogRepository, ContentGraphHasher, FileIdentityProvider, SnapshotStore, SourceNormalizer,
-    SyncPlanEvidencePort, SyncPlanExecutorPort,
+    CatalogMutationOutcome, CatalogRepository, ContentGraphHasher, FileIdentityProvider,
+    SnapshotStore, SourceNormalizer, SyncPlanEvidencePort, SyncPlanExecutorPort,
 };
+// 重导出签到 transport port：重铸 factory 需要返回装箱 transport
+pub use traesync_ports::CheckinTransport;
+pub use traesync_ports::CheckinDeviceRemint;
 
+pub use account_switch::{ManagedAccountSwitchError, ManagedAccountSwitchService};
+pub use checkin::{checkin_transport_error_code, BatchCheckinRunner, CheckinService};
 pub use history::{
-    AssignProjectSourceService, BrowseHistoryService, BuildSyncPlanService, ScanHistoryService,
+    AssignProjectSourceService, BrowseHistoryError, BrowseHistoryService, BuildSyncPlanService,
+    ScanHistoryService,
+};
+pub use recovery_service::{
+    RecoveryImportResult, RecoveryImportService, RecoveryImportServiceError,
 };
 pub use sync_apply::ApplySyncPlanService;
 pub use workbench_read::WorkbenchReadService;

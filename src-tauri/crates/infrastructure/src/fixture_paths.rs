@@ -15,11 +15,16 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::operation_lease::{OperationLease, OperationLeaseError};
+
 /// 默认 Work CN 活动数据库相对 APPDATA 的路径片段
 const DEFAULT_WORK_CN_REL: &[&str] = &["TRAE SOLO CN", "ModularData", "ai-agent", "database.db"];
 
 /// 测试根相对 LOCALAPPDATA 的路径片段
 const TEST_ROOT_REL: &[&str] = &["Trae Sync", "tests"];
+
+/// 所有实例共用的固定恢复区命名空间。
+const RECOVERY_ROOT_REL: &[&str] = &["Trae Sync", "recovery"];
 
 /// 系统根解析错误：失败关闭，绝不静默放行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +61,8 @@ pub(crate) struct SystemRoots {
     /// 默认 Work CN 活动数据库的父目录（如 `%APPDATA%\TRAE SOLO CN\ModularData\ai-agent`）。
     /// None 表示该平台无默认路径（如非 Windows）。
     default_work_cn_dir: Option<PathBuf>,
+    /// 所有实例共享的恢复区命名空间；不接受调用方自定义根目录。
+    recovery_root: PathBuf,
 }
 
 impl SystemRoots {
@@ -82,6 +89,11 @@ impl SystemRoots {
             }
         })?;
 
+        let mut recovery_root = PathBuf::from(&local_appdata);
+        for segment in RECOVERY_ROOT_REL {
+            recovery_root.push(segment);
+        }
+
         let mut test_root = PathBuf::from(local_appdata);
         for segment in TEST_ROOT_REL {
             test_root.push(segment);
@@ -99,6 +111,7 @@ impl SystemRoots {
         Ok(Self {
             test_root: canonical_test_root,
             default_work_cn_dir,
+            recovery_root,
         })
     }
 }
@@ -117,6 +130,8 @@ pub enum FixturePathError {
     FixtureRootOutsideTestRoot { raw: String },
     /// fixture 存储根位于可信测试根之外
     StorageRootOutsideTestRoot { raw: String },
+    /// 恢复区位于固定共享命名空间之外
+    RecoveryRootOutsideNamespace { raw: String },
     /// 候选路径或其父目录不存在，无法规范化
     CannotCanonicalize { raw: String, source: String },
     /// 候选路径没有父目录
@@ -127,6 +142,8 @@ pub enum FixturePathError {
     FixtureRootIsDefaultWorkCnPath { raw: String },
     /// 系统根解析失败
     SystemRoots(SystemRootsError),
+    /// 共享操作租约获取失败
+    OperationLeaseUnavailable { source: String },
     /// R2：相对路径为空
     EmptyRelativePath,
     /// R2：相对路径是绝对路径（如 `C:\` 或 `/etc/passwd`）
@@ -156,6 +173,9 @@ impl std::fmt::Display for FixturePathError {
             Self::StorageRootOutsideTestRoot { raw } => {
                 write!(f, "fixture 存储根位于可信测试根之外: {raw}")
             }
+            Self::RecoveryRootOutsideNamespace { raw } => {
+                write!(f, "恢复区位于固定共享命名空间之外: {raw}")
+            }
             Self::CannotCanonicalize { raw, source } => {
                 write!(f, "无法规范化路径: {raw} ({source})")
             }
@@ -165,6 +185,9 @@ impl std::fmt::Display for FixturePathError {
                 write!(f, "fixture_root 自身命中默认 Work CN 路径: {raw}")
             }
             Self::SystemRoots(e) => write!(f, "系统根解析失败: {e}"),
+            Self::OperationLeaseUnavailable { source } => {
+                write!(f, "共享操作租约不可用: {source}")
+            }
             Self::EmptyRelativePath => write!(f, "数据库相对路径为空"),
             Self::AbsolutePathRejected { raw } => {
                 write!(f, "数据库相对路径是绝对路径: {raw}")
@@ -177,6 +200,34 @@ impl std::fmt::Display for FixturePathError {
 }
 
 impl std::error::Error for FixturePathError {}
+
+impl FixturePathError {
+    /// 返回跨 IPC 边界可公开的稳定错误码；不携带原始路径或底层 I/O 文本。
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::DefaultWorkCnPath { .. } | Self::FixtureRootIsDefaultWorkCnPath { .. } => {
+                "default_work_cn_path_rejected"
+            }
+            Self::OutsideFixtureRoot { .. } => "fixture_target_outside_root",
+            Self::FixtureRootOutsideTestRoot { .. } => "fixture_root_outside_test_root",
+            Self::StorageRootOutsideTestRoot { .. } => "storage_root_outside_test_root",
+            Self::RecoveryRootOutsideNamespace { .. } => "recovery_root_outside_namespace",
+            Self::CannotCanonicalize { .. } => "fixture_path_unavailable",
+            Self::NoParent => "fixture_path_invalid",
+            Self::NoFileName => "fixture_path_invalid",
+            Self::SystemRoots(_) => "fixture_system_roots_unavailable",
+            Self::OperationLeaseUnavailable { .. } => "operation_lease_unavailable",
+            Self::EmptyRelativePath => "database_relative_path_empty",
+            Self::AbsolutePathRejected { .. } => "database_relative_path_absolute",
+            Self::ParentTraversalRejected { .. } => "database_relative_path_traversal",
+        }
+    }
+}
+
+/// Tauri command 边界统一使用脱敏错误文本；详细路径仅允许留在受控本地诊断日志。
+pub fn fixture_path_error_text(error: &FixturePathError) -> String {
+    format!("fixture_path_error:{}", error.code())
+}
 
 impl From<SystemRootsError> for FixturePathError {
     fn from(e: SystemRootsError) -> Self {
@@ -326,6 +377,22 @@ impl PathPolicy {
         }
         Ok(canonical_candidate)
     }
+
+    /// 验证恢复区只能位于 LOCALAPPDATA 下的固定共享命名空间。
+    ///
+    /// 候选路径可以尚不存在，调用方随后负责创建；但其父目录必须已经存在，
+    /// 这样不会通过不存在路径或符号链接把锁写到任意位置。
+    fn validate_shared_recovery_root(&self, candidate: &Path) -> Result<PathBuf, FixturePathError> {
+        let namespace_root = canonicalize_or_parent(&self.system_roots.recovery_root)?;
+        let canonical_candidate = canonicalize_or_parent(candidate)?;
+        let is_namespace_root = canonical_candidate == namespace_root;
+        if !is_namespace_root && !path_strictly_inside(&canonical_candidate, &namespace_root) {
+            return Err(FixturePathError::RecoveryRootOutsideNamespace {
+                raw: candidate.to_string_lossy().into_owned(),
+            });
+        }
+        Ok(canonical_candidate)
+    }
 }
 
 /// Fixture 路径守卫：构造时固定 fixture_root，后续验证写目标。
@@ -376,6 +443,60 @@ impl FixturePathGuard {
         candidate: &Path,
     ) -> Result<PathBuf, FixturePathError> {
         self.policy.validate_fixture_storage_root(candidate)
+    }
+
+    /// 验证恢复区属于所有实例共享的固定命名空间。
+    pub fn validate_shared_recovery_root(
+        &self,
+        candidate: &Path,
+    ) -> Result<PathBuf, FixturePathError> {
+        self.policy.validate_shared_recovery_root(candidate)
+    }
+
+    /// 先验证固定恢复区，再取得跨进程租约；调用方不能注入任意锁目录。
+    pub fn acquire_operation_lease(
+        &self,
+        recovery_root: &Path,
+        data_location_id: &str,
+    ) -> Result<OperationLease, FixturePathError> {
+        let recovery_root = self.policy.validate_shared_recovery_root(recovery_root)?;
+        OperationLease::acquire(&recovery_root, data_location_id).map_err(|error| {
+            FixturePathError::OperationLeaseUnavailable {
+                source: match error {
+                    OperationLeaseError::CatalogBusy => "目录库锁忙".to_string(),
+                    OperationLeaseError::DataLocationBusy => "数据位置锁忙".to_string(),
+                    OperationLeaseError::LockDirectoryUnavailable => "锁目录不可用".to_string(),
+                    OperationLeaseError::InvalidLocationId => "数据位置标识无效".to_string(),
+                    OperationLeaseError::InvalidStorageRoot => "存储根无效".to_string(),
+                    OperationLeaseError::LeaseContextUnbound => "租约未绑定存储根".to_string(),
+                    OperationLeaseError::StorageRootMismatch => "租约与存储根不匹配".to_string(),
+                },
+            }
+        })
+    }
+
+    /// 取得与 fixture 存储根绑定的目录库租约；目录库 mutation/reconcile 必须使用此入口。
+    pub fn acquire_catalog_operation_lease(
+        &self,
+        recovery_root: &Path,
+        storage_root: &Path,
+        data_location_id: &str,
+    ) -> Result<OperationLease, FixturePathError> {
+        let recovery_root = self.policy.validate_shared_recovery_root(recovery_root)?;
+        let storage_root = self.policy.validate_fixture_storage_root(storage_root)?;
+        OperationLease::acquire_bound(&recovery_root, &storage_root, data_location_id).map_err(
+            |error| FixturePathError::OperationLeaseUnavailable {
+                source: match error {
+                    OperationLeaseError::CatalogBusy => "目录库锁忙".to_string(),
+                    OperationLeaseError::DataLocationBusy => "数据位置锁忙".to_string(),
+                    OperationLeaseError::LockDirectoryUnavailable => "锁目录不可用".to_string(),
+                    OperationLeaseError::InvalidLocationId => "数据位置标识无效".to_string(),
+                    OperationLeaseError::InvalidStorageRoot => "存储根无效".to_string(),
+                    OperationLeaseError::LeaseContextUnbound => "租约未绑定存储根".to_string(),
+                    OperationLeaseError::StorageRootMismatch => "租约与存储根不匹配".to_string(),
+                },
+            },
+        )
     }
 
     /// 返回规范化后的 fixture_root（仅供诊断使用）
@@ -632,6 +753,7 @@ mod tests {
         let roots = SystemRoots {
             test_root: test_root.path().to_path_buf(),
             default_work_cn_dir: Some(default_dir),
+            recovery_root: test_root.path().join("recovery"),
         };
         (test_root, appdata, roots)
     }
@@ -648,6 +770,22 @@ mod tests {
             .validate_write_target(&canonical_fixture_root, &candidate)
             .unwrap();
         assert!(result.starts_with(&canonical_fixture_root));
+    }
+
+    #[test]
+    fn shared_recovery_root_rejects_sibling_namespace() {
+        let (test_root, _appdata, roots) = synthetic_roots();
+        let recovery_root = test_root.path().join("recovery");
+        fs::create_dir_all(&recovery_root).unwrap();
+        let policy = PathPolicy::new(roots);
+
+        assert!(policy
+            .validate_shared_recovery_root(&recovery_root.join("instance-a"))
+            .is_ok());
+        assert!(matches!(
+            policy.validate_shared_recovery_root(&test_root.path().join("recovery-other")),
+            Err(FixturePathError::RecoveryRootOutsideNamespace { .. })
+        ));
     }
 
     #[test]
@@ -1005,6 +1143,29 @@ mod tests {
         let err = validate_db_relative_path_inside(&canonical_fixture_root, "nonexistent.db")
             .unwrap_err();
         assert!(matches!(err, FixturePathError::CannotCanonicalize { .. }));
+    }
+
+    #[test]
+    fn fixture_ipc_error_text_excludes_paths_and_io_details() {
+        let raw_path = r"C:\Users\example\AppData\Roaming\TRAE CN\database.db";
+        let io_detail = "Access is denied (os error 5)";
+        let errors = [
+            FixturePathError::CannotCanonicalize {
+                raw: raw_path.to_string(),
+                source: io_detail.to_string(),
+            },
+            FixturePathError::OperationLeaseUnavailable {
+                source: format!("{io_detail}: {raw_path}"),
+            },
+        ];
+
+        for error in errors {
+            let public = fixture_path_error_text(&error);
+            assert!(public.starts_with("fixture_path_error:"));
+            assert!(!public.contains(raw_path));
+            assert!(!public.contains("AppData"));
+            assert!(!public.contains(io_detail));
+        }
     }
 }
 

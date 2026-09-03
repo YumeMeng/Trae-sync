@@ -1,0 +1,506 @@
+/* 主库详情页（P5-8a-2）：顶部基础信息 + tabs（对话列表复用历史页两栏 / 插件占位）。
+   所有色值走语义令牌（tokens.css），换主题无需改本文件。 */
+
+/* —— 页面骨架：占满视口剩余高度，tab 内容内部滚动 —— */
+.master-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  /* 与历史页同口径：标题栏 + 呼吸带 + 主区内边距的合计预留 */
+  height: calc(100vh - 112px);
+  min-height: 0;
+}
+
+.master-detail .page-header {
+  flex: none;
+}
+
+.master-detail__title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* —— 基础信息卡：标签/值网格 + 计数条 —— */
+.master-detail__info {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px 20px;
+  padding: 16px 18px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+}
+
+.master-detail__info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(140px, auto));
+  gap: 10px 28px;
+}
+
+.master-info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.master-info-item__label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  letter-spacing: 0.3px;
+}
+
+.master-info-item__value {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.master-info-item--wide {
+  grid-column: 1 / -1;
+}
+
+/* 主库路径：等宽小字 + 横向滚动兜底（长路径不撑破信息卡） */
+.master-info-item__path {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 3px 8px;
+  border-radius: 8px;
+  background: var(--fill-soft);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* —— 计数条：项目/会话/消息（统计 ready 才渲染） —— */
+.master-detail__counts {
+  display: flex;
+  gap: 22px;
+  padding-left: 20px;
+  border-left: 1px solid var(--line-hair);
+}
+
+.master-count {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+
+.master-count b {
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.master-count span {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* —— tabs：tab 位稀缺（归档不占 tab，复用对话列表内的归档入口） —— */
+.master-detail__tabs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  width: fit-content;
+}
+
+.master-tab {
+  border: none;
+  border-radius: calc(var(--radius-control) - 3px);
+  padding: 7px 18px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.master-tab:hover {
+  background: var(--fill-soft);
+  color: var(--text-1);
+}
+
+.master-tab--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* —— tab 面板：占满剩余高度，内容（两栏视图）内部滚动 —— */
+.master-detail__tabpanels {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.master-detail__tabpanel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 嵌入态历史视图：高度由 tab 面板约束（页面高度计算交给详情页骨架） */
+.history-page--embedded {
+  height: 100%;
+  flex: 1;
+  gap: 12px;
+}
+
+/* —— 插件 tab（P5-8b）：分段控件 + 对账条 + 列表 + 确认弹窗 —— */
+.plugin-workbench {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  overflow-y: auto;
+}
+
+/* 工具行：分段控件靠左，刷新按钮靠右 */
+.plugin-workbench__bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.plugin-segment {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.plugin-segment__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  border-radius: calc(var(--radius-control) - 3px);
+  padding: 6px 14px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.plugin-segment__btn:hover {
+  color: var(--text-1);
+}
+
+.plugin-segment__btn--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* 操作回执（安装/移除/吸收成功提示）：轻量非阻断 */
+.plugin-workbench__notice {
+  flex: none;
+  padding: 8px 12px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--accent-soft);
+  color: var(--text-1);
+  font-size: 12.5px;
+}
+
+/* 对账提示条：TRAE 手动装/卸与清单基线的偏移（有差异才出现） */
+.plugin-drift {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.plugin-drift__copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.plugin-drift__copy b {
+  font-size: 13px;
+  color: var(--text-1);
+}
+
+.plugin-drift__copy span {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* 插件列表：行式布局（名称 + 元信息 | 徽章 + 动作） */
+.plugin-list {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plugin-empty {
+  padding: 30px 12px;
+  color: var(--text-3);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* 插件市场分组：按作用分类展示（组头 + 组内条目，行距与列表一致） */
+.plugin-market-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plugin-market-group__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 2px 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.plugin-market-group__head span:last-child {
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+.plugin-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.plugin-row__main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.plugin-row__name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-row__meta {
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-row__desc {
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-row__side {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plugin-badge {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--fill-soft);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+
+/* 「随主库/已安装」徽章：清单绑定态 */
+.plugin-badge--bound {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* 「未入清单」徽章：对账偏移态（与 drift 条呼应） */
+.plugin-badge--drift {
+  border: 1px dashed var(--line-hair);
+  color: var(--text-2);
+}
+
+/* —— 数据校验 tab（P5-7）：只读排查，异常才亮色（琥珀），正常态中性安静 —— */
+.verification-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  overflow-y: auto;
+}
+
+.verification-panel__toolbar {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* 校验区块：标题行（区块名 + 状态徽章）+ 摘要 + 明细 */
+.verification-block {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.verification-block__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.verification-block__heading h4 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.verification-block__summary {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+/* 异常行 / 丢失候选行：图标 + 可读描述；技术标识收悬浮提示 */
+.verification-issues {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.verification-issues__item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--glass);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.verification-issues__item svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--warn);
+}
+
+/* 丢失候选区：候选列表 + 人工恢复指引（wrapper 不加底色，靠行级玻璃区分） */
+.verification-missing {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 人工恢复指引：只报告不修复的边界说明（次级文字） */
+.verification-block__hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* 对比基准选择行：标签 + 时间戳下拉（链上备份点） */
+.verification-block__base {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.verification-block__base select {
+  padding: 4px 8px;
+  border: 1px solid var(--line-control);
+  border-radius: calc(var(--radius-control) - 3px);
+  background: var(--glass);
+  color: var(--text-1);
+  font-size: 12.5px;
+}
+
+/* 紧凑桌面：信息网格与计数条换行排列，不挤压路径行 */
+@media (max-width: 900px) {
+  .master-detail__info {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .master-detail__counts {
+    padding-left: 0;
+    border-left: none;
+  }
+}

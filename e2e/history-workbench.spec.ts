@@ -1,536 +1,415 @@
 // ============================================================================
-// T03/T04 历史库工作台 Playwright 端到端测试
+// P5-3 历史页主库视图 Playwright 端到端测试
 // ============================================================================
 //
-// 覆盖（交接文档 Playwright 章节）：
-// - 授权/空/扫描中/成功/失败状态
-// - 账号/项目/会话导航
-// - 完整对话预览
-// - 搜索结果导航
-// - 预览不改变选择
-// - 无文本重叠、裁剪或水平溢出
+// 覆盖：
+// - 两栏结构：左栏项目（统计 + 参与账号头像）/ 右栏会话（deleted 过滤）
+// - 项目联动筛选、时间范围筛选、标题搜索
+// - 接力轨迹徽章 + 预览弹层（轨迹时间线 + 消息流 + Esc 关闭）
+// - 主库引导态（no_master_data / no_current_account）与读取失败态
+// - 无水平溢出
 //
-// 桌面 + 移动视口由 playwright.config.ts 的两个 project 覆盖。
+// Windows 桌面视口由 playwright.config.ts 覆盖；移动端不属于当前产品目标。
 // 所有测试使用 mock 命令边界，绝不启动 Tauri 或访问真实 TRAE 数据。
 
 import { test, expect, type Page } from "@playwright/test";
-import { installMockBridge, setScenario, type MockScenario } from "./mock-bridge";
+import { installMockBridge, type MockScenario } from "./mock-bridge";
 
-// 每个 beforeEach 安装 mock bridge 并加载页面
+// 每个 beforeEach 安装 mock bridge 并加载页面；默认场景主库 ready。
 async function setup(page: Page, scenario: MockScenario = {}) {
   await installMockBridge(page, scenario);
   await page.goto("/");
-  // 等待工作台加载完成
-  await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
-}
-
-// 完成授权表单并点击扫描
-async function authorizeAndScan(page: Page) {
-  await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
-  await page.getByTestId("authorize-check").check();
-  await page.getByTestId("scan-history-button").click();
+  // 应用首页是总览页；历史页测试需要先切换导航。
+  await page.getByTestId("navigation-history").click();
+  await expect(page.getByRole("region", { name: "历史" })).toBeVisible();
 }
 
 // ============================================================================
-// 状态覆盖
+// 两栏结构与筛选
 // ============================================================================
 
-test.describe("历史库状态覆盖", () => {
-  test("idle 状态显示授权表单，不自动扫描", async ({ page }) => {
+test.describe("P5-3 历史页主库视图", () => {
+  test("ready 状态渲染两栏：左栏项目 + 右栏会话 + 项目统计", async ({ page }) => {
     await setup(page);
-    // 显示授权面板
-    await expect(page.getByTestId("auth-panel")).toBeVisible();
-    // 扫描按钮初始禁用（未授权）
-    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+
+    // 左栏：全部项目入口 + 两个项目（统计由会话实时聚合；归档会话不计入）。
+    await expect(page.getByTestId("history-project-all")).toBeVisible();
+    const p1 = page.getByTestId("history-project-p1");
+    await expect(p1).toContainText("项目阿尔法");
+    await expect(p1).toContainText("2 会话");
+    await expect(page.getByTestId("history-project-p2")).toContainText("项目贝塔");
+    await expect(page.getByTestId("history-project-p2")).toContainText("0 会话");
+
+    // 右栏：两个正常会话；deleted=true 的 s4 与已归档的 s3 不出现，入口带计数。
+    const list = page.getByTestId("history-session-list");
+    await expect(list).toContainText("会话一 关于构建稳定的历史库");
+    await expect(list).toContainText("会话二 软删除与版本图");
+    await expect(list).not.toContainText("旧归档会话");
+    await expect(list).not.toContainText("已删除会话");
+    await expect(page.getByTestId("history-archive-entry")).toContainText("已归档 1");
   });
 
-  test("授权后扫描成功显示浏览结果（success 状态）", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    // 应显示账号/项目树
-    await expect(page.getByTestId("account-project-tree")).toBeVisible();
-    // 摘要显示数量
-    await expect(page.getByTestId("history-summary")).toContainText("账号 2");
-    await expect(page.getByTestId("history-summary")).toContainText("项目 2");
-    await expect(page.getByTestId("history-summary")).toContainText("对话 2");
-  });
-
-  test("扫描中状态显示加载提示", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    // 填写并授权
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
-    await page.getByTestId("authorize-check").check();
-    await page.getByTestId("scan-history-button").click();
-    // 扫描中状态——可能很快过去，使用 or 条件
-    // 由于 mock 立即返回，scanning 状态可能不可见；验证成功状态作为 fallback
-    await expect(page.getByTestId("account-project-tree")).toBeVisible({ timeout: 10_000 });
-  });
-
-  test("扫描失败显示结构化原因（failure 状态）", async ({ page }) => {
-    await setup(page, {
-      scanOutcome: { failed: "schema_incompatible" },
-    });
-    await authorizeAndScan(page);
-    // 显示失败状态
-    await expect(page.getByTestId("failure-state")).toBeVisible();
-    await expect(page.getByTestId("failure-state")).toContainText("schema 不兼容");
-    // 不暴露 secret / raw_key / 认证正文
-    const text = await page.getByTestId("failure-state").textContent();
-    expect(text).not.toMatch(/raw_key|rawkey|secret|bearer|token/i);
-  });
-
-  test("扫描成功但目录库为空显示 empty 状态", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "empty" });
-    await authorizeAndScan(page);
-    await expect(page.getByTestId("empty-state")).toBeVisible();
-  });
-
-  test("TRAE 运行中时扫描按钮禁用且不发布快照", async ({ page }) => {
+  test("点击左栏项目，右栏只显示该项目会话", async ({ page }) => {
     await setup(page);
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
-    // 取消"TRAE 已关闭"勾选 → processRunning = true
-    await page.getByTestId("trae-not-running-check").uncheck();
-    await page.getByTestId("authorize-check").check();
-    // 扫描按钮仍应禁用
-    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
-  });
-});
+    await page.getByTestId("history-project-p2").click();
 
-// ============================================================================
-// 账号/项目/会话导航
-// ============================================================================
+    // p2 唯一会话已归档 → 项目视图空态。
+    const list = page.getByTestId("history-session-list");
+    await expect(list).not.toContainText("会话一");
+    await expect(list).not.toContainText("旧归档会话");
 
-test.describe("账号/项目/会话导航", () => {
-  test("点击账号展开项目列表", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    // 等待树渲染
-    await expect(page.getByTestId("account-user-A")).toBeVisible();
-    // 点击第一个账号
-    await page.getByTestId("account-user-A").click();
-    // 项目应出现
-    await expect(page.getByTestId("project-p1")).toBeVisible();
+    // 回到全部项目恢复完整列表。
+    await page.getByTestId("history-project-all").click();
+    await expect(list).toContainText("会话一");
+    await expect(list).toContainText("会话二");
   });
 
-  test("会话列表显示完整标题与消息数", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    // 会话应显示
-    await expect(page.getByTestId("session-session-aaa")).toBeVisible();
-    await expect(page.getByTestId("session-session-aaa")).toContainText(
-      "会话 AAA",
+  test("时间范围筛选：近 7 天隐藏 40 天前的旧会话", async ({ page }) => {
+    await setup(page);
+    await page.getByTestId("history-time-week").click();
+
+    const list = page.getByTestId("history-session-list");
+    await expect(list).toContainText("会话一");
+    await expect(list).not.toContainText("旧归档会话");
+
+    // 近 30 天同样隐藏 40 天前会话；全部恢复。
+    await page.getByTestId("history-time-month").click();
+    await expect(list).not.toContainText("旧归档会话");
+    await page.getByTestId("history-time-all").click();
+    await expect(list).toContainText("会话一");
+    await expect(list).toContainText("会话二");
+  });
+
+  test("标题搜索过滤会话且保留无结果的空态文案", async ({ page }) => {
+    await setup(page);
+    const input = page.getByTestId("history-search-input");
+    await input.fill("软删除");
+    const list = page.getByTestId("history-session-list");
+    await expect(list).toContainText("会话二");
+    await expect(list).not.toContainText("会话一");
+
+    await input.fill("不存在的关键词");
+    await expect(page.getByTestId("history-empty-sessions")).toBeVisible();
+    await expect(page.getByTestId("history-empty-sessions")).toContainText(
+      "没有符合条件的会话",
     );
-    await expect(page.getByTestId("session-session-aaa")).toContainText("2 条消息");
-    await expect(page.getByTestId("session-session-bbb")).toBeVisible();
-  });
-});
-
-test.describe("T05 同步计划", () => {
-  test("自定义选择一条对话后显示目标账号与可同步动作", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-
-    await page.getByRole("radio", { name: "自定义选择" }).check();
-    await expect(page.getByTestId("build-sync-plan-button")).toBeDisabled();
-    await page.getByRole("checkbox", { name: /选择对话 会话 AAA/ }).check();
-    await expect(page.getByTestId("plan-selected")).toHaveText("1");
-    await page.getByTestId("build-sync-plan-button").click();
-
-    await expect(page.getByTestId("sync-plan-result")).toBeVisible();
-    await expect(page.getByTestId("plan-target-account")).toHaveText("user-B");
-    await expect(page.getByTestId("plan-syncable")).toHaveText("1");
-    await expect(page.getByTestId("sync-plan-result")).toContainText("挂接 1 条对话");
-    await expect(page.getByText(/不会复制成两份账号历史/)).toBeVisible();
-    await expect(page.getByTestId("sync-button")).toBeDisabled();
   });
 });
 
 // ============================================================================
-// 完整对话预览
+// 接力轨迹与预览弹层
 // ============================================================================
 
-test.describe("完整对话预览", () => {
-  test("点击会话标题打开完整对话预览", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    await expect(page.getByTestId("session-session-aaa")).toBeVisible();
-    // 点击会话
-    await page.getByTestId("session-session-aaa").click();
-    // 预览内容应显示
-    await expect(page.getByTestId("preview-content")).toBeVisible();
-    await expect(page.getByTestId("message-m1")).toBeVisible();
-    await expect(page.getByTestId("message-m2")).toBeVisible();
-    // 消息内容包含合成文本
-    await expect(page.getByTestId("message-m1")).toContainText("hello world");
-    await expect(page.getByTestId("message-m2")).toContainText("确定性内容图");
+test.describe("接力轨迹与预览", () => {
+  test("接力徽章显示头像链，预览弹层展示完整轨迹时间线与消息", async ({ page }) => {
+    await setup(page);
+
+    // s1 三跳接力：徽章头像链可见（最多 3 个头像 + 溢出计数）。
+    const session = page.getByTestId("history-session-s1");
+    await expect(session).toBeVisible();
+    await expect(session.locator('[data-testid="history-relay-chain"]')).toBeVisible();
+
+    // 打开预览：轨迹时间线 + 消息流（文本 + 任务轨迹两种形态）。
+    await session.click();
+    const preview = page.getByTestId("history-preview");
+    await expect(preview).toBeVisible();
+    await expect(preview.locator(".preview__section").first()).toContainText("接力记录");
+    // 三跳链 → 4 条腿（首腿 + 中间两腿 + 当前腿）。
+    await expect(preview.locator(".leg-step")).toHaveCount(4);
+    // 当前账号徽章落在 user-B 持有的两段腿上（A→B 接收腿 + 最终当前腿）。
+    await expect(preview.locator(".leg-step__badge")).toHaveCount(2);
+
+    await expect(page.getByTestId("preview-content")).toContainText("如何跨账号接力这条会话？");
+    await expect(page.getByTestId("preview-content")).toContainText("通过主库交接把记录转移给接收账号。");
+    await expect(page.getByTestId("preview-content")).toContainText("任务轨迹 · 2 步");
+    await expect(page.getByTestId("preview-content")).toContainText("检索主库会话索引");
+
+    // 关闭按钮可用。
+    await page.getByTestId("history-preview-close").click();
+    await expect(preview).toHaveCount(0);
   });
 
-  test("切换会话预览不改变选择（AC9）", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    // 展开账号以选中项目
-    await page.getByTestId("account-user-A").click();
-    await page.getByTestId("project-p1").click();
-    // project-p1 应处于展开状态（aria-expanded=true）
-    await expect(page.getByTestId("project-p1")).toHaveAttribute("aria-expanded", "true");
-    // 点击会话 AAA 打开预览
-    await page.getByTestId("session-session-aaa").click();
-    await expect(page.getByTestId("preview-content")).toBeVisible();
-    // 点击会话 BBB 切换预览
-    await page.getByTestId("session-session-bbb").click();
-    await expect(page.getByTestId("message-m3")).toBeVisible();
-    // 项目选择应保持不变（仍为 p1）
-    await expect(page.getByTestId("project-p1")).toHaveAttribute("aria-expanded", "true");
-    // 账号选择也应保持
-    await expect(page.getByTestId("account-user-A")).toHaveAttribute("aria-expanded", "true");
-  });
-});
-
-// ============================================================================
-// 搜索结果导航
-// ============================================================================
-
-test.describe("搜索结果导航", () => {
-  test("搜索显示结果并显示账号/项目/会话上下文", async ({ page }) => {
-    await setup(page, {
-      scanOutcome: "success",
-      browseMode: "full",
-      searchMode: "hits",
-    });
-    await authorizeAndScan(page);
-    await expect(page.getByTestId("session-list")).toBeVisible();
-    // 输入搜索并执行
-    await page.getByTestId("search-input").fill("hello");
-    await page.getByTestId("search-button").click();
-    // 搜索结果应显示
-    await expect(page.getByTestId("search-results")).toBeVisible();
-    await expect(page.getByTestId("search-hit-m1")).toBeVisible();
-    // 命中应包含上下文：标题、role、内容
-    await expect(page.getByTestId("search-hit-m1")).toContainText("会话 AAA");
-    await expect(page.getByTestId("search-hit-m1")).toContainText("user");
-    await expect(page.getByTestId("search-hit-m1")).toContainText("hello world");
+  test("无台账记录的会话不显示接力徽章", async ({ page }) => {
+    await setup(page);
+    await expect(
+      page.getByTestId("history-session-s2").locator('[data-testid="history-relay-chain"]'),
+    ).toHaveCount(0);
   });
 
-  test("点击搜索结果打开预览不改变选择（AC9）", async ({ page }) => {
-    await setup(page, {
-      scanOutcome: "success",
-      browseMode: "full",
-      searchMode: "hits",
-    });
-    await authorizeAndScan(page);
-    // 选中账号与项目
-    await page.getByTestId("account-user-A").click();
-    await page.getByTestId("project-p1").click();
-    await expect(page.getByTestId("project-p1")).toHaveAttribute("aria-expanded", "true");
-    // 搜索
-    await page.getByTestId("search-input").fill("hello");
-    await page.getByTestId("search-button").click();
-    await expect(page.getByTestId("search-hit-m1")).toBeVisible();
-    // 点击搜索结果打开预览
-    await page.getByTestId("search-hit-m1").click();
-    await expect(page.getByTestId("preview-content")).toBeVisible();
-    await expect(page.getByTestId("message-m1")).toBeVisible();
-    // 选择应保持不变
-    await expect(page.getByTestId("project-p1")).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByTestId("account-user-A")).toHaveAttribute("aria-expanded", "true");
-  });
-
-  test("搜索无结果时显示无匹配", async ({ page }) => {
-    await setup(page, {
-      scanOutcome: "success",
-      browseMode: "full",
-      searchMode: "empty",
-    });
-    await authorizeAndScan(page);
-    await page.getByTestId("search-input").fill("zzzz");
-    await page.getByTestId("search-button").click();
-    await expect(page.getByTestId("search-results")).toBeVisible();
-    await expect(page.getByTestId("search-results")).toContainText("无匹配结果");
+  test("Esc 关闭预览弹层", async ({ page }) => {
+    await setup(page);
+    await page.getByTestId("history-session-s1").click();
+    await expect(page.getByTestId("history-preview")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("history-preview")).toHaveCount(0);
   });
 });
 
 // ============================================================================
-// 无文本重叠、裁剪或水平溢出
+// 引导态与错误态
 // ============================================================================
 
-test.describe("布局稳定性：无重叠、裁剪或水平溢出", () => {
+test.describe("主库引导态与错误态", () => {
+  test("no_master_data 显示去环境页引导", async ({ page }) => {
+    await setup(page, { masterHistory: "no_master_data" });
+    const guide = page.getByTestId("history-guide");
+    await expect(guide).toBeVisible();
+    await expect(guide).toContainText("主库还没有对话数据");
+    await expect(page.getByTestId("history-guide-launch")).toBeVisible();
+  });
+
+  test("no_current_account 显示登录引导", async ({ page }) => {
+    await setup(page, { masterHistory: "no_current_account" });
+    await expect(page.getByTestId("history-guide")).toContainText("主库尚未登记登录账号");
+  });
+
+  test("read_failed 显示错误与重试入口", async ({ page }) => {
+    await setup(page, { masterHistory: "read_failed" });
+    const error = page.getByTestId("history-error");
+    await expect(error).toBeVisible();
+    await expect(error).toContainText("主库记录暂时无法读取");
+    await expect(error.getByRole("button", { name: /重试/ })).toBeVisible();
+  });
+});
+
+// ============================================================================
+// 布局稳定性与页面切换保持
+// ============================================================================
+
+test.describe("布局与状态保持", () => {
   test("页面无水平溢出", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    // 等待三栏渲染
-    await expect(page.getByTestId("account-project-tree")).toBeVisible();
-    // 检查 body scrollWidth 不超过 viewport
-    const overflow = await page.evaluate(() => {
-      return {
-        scrollWidth: document.documentElement.scrollWidth,
-        clientWidth: document.documentElement.clientWidth,
-      };
-    });
+    await setup(page);
+    await expect(page.getByTestId("history-session-s1")).toBeVisible();
+    const overflow = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }));
     expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
   });
 
-  test("长中文标题不裁剪不溢出", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    // 会话标题为长中文，验证元素可见且无裁剪
-    const sessionBtn = page.getByTestId("session-session-aaa");
-    await expect(sessionBtn).toBeVisible();
-    // 检查按钮的滚动宽度不超过其父容器宽度
-    const box = await sessionBtn.boundingBox();
-    expect(box).not.toBeNull();
-    // 验证会话标题元素存在且可见
-    await expect(sessionBtn.locator(".workbench__session-title")).toBeVisible();
-  });
+  test("切换到总览页再回到历史页不丢失浏览状态", async ({ page }) => {
+    await setup(page);
+    await page.getByTestId("history-project-p1").click();
+    await expect(page.getByTestId("history-session-list")).toContainText("会话一");
 
-  test("对话预览长消息不溢出", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await authorizeAndScan(page);
-    await page.getByTestId("session-session-aaa").click();
-    await expect(page.getByTestId("preview-content")).toBeVisible();
-    // 检查预览区域不产生水平溢出
-    const overflow = await page.evaluate(() => {
-      const preview = document.querySelector(".workbench__preview");
-      if (!preview) return { ok: false };
-      return {
-        ok: preview.scrollWidth <= preview.clientWidth + 1,
-        scrollWidth: preview.scrollWidth,
-        clientWidth: preview.clientWidth,
-      };
-    });
-    expect(overflow.ok).toBe(true);
+    await page.getByTestId("navigation-overview").click();
+    await expect(page.getByRole("region", { name: "最近活动" })).toBeVisible();
+    await page.getByTestId("navigation-history").click();
+
+    // 组件保持挂载：项目筛选与列表维持原状。
+    await expect(page.getByTestId("history-session-list")).toContainText("会话一");
+    await expect(page.getByTestId("history-session-list")).not.toContainText("已删除会话");
   });
 });
 
 // ============================================================================
-// R7：前端授权调用链——mock 授权状态机验证
+// P5-8a 会话归档：选择模式批量栏 + 归档视图 + 真实删除确认
 // ============================================================================
 
-test.describe("R7 前端授权调用链", () => {
-  test("R7：未授权时 scan_history 返回 failed/not_authorized（mock 状态机）", async ({ page }) => {
-    // 安装 mock 但不点击授权 checkbox——直接尝试扫描
-    // 由于扫描按钮在未授权时禁用，无法直接点击 scan-history-button
-    // 验证：未授权时 authorize-check 未选中，scan-history-button 禁用
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
-    // authorize-check 未勾选
-    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
-    // 扫描按钮禁用
-    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+test.describe("P5-8a 会话归档与批量操作", () => {
+  test("选择模式批量归档：归档后主列表联动、入口计数增加", async ({ page }) => {
+    await setup(page);
+
+    // 进入选择模式：浮出批量栏，会话行点击变为勾选。
+    await page.getByTestId("history-select-mode").click();
+    await expect(page.getByTestId("session-batch-bar")).toBeVisible();
+    await page.getByTestId("history-session-s1").click();
+    await page.getByTestId("history-session-s2").click();
+    await expect(page.getByTestId("batch-count")).toContainText("已选 2 / 2 项");
+
+    // 归档所选 → 刷新后主列表仅剩空态，入口计数 3（s3 原有 + 新归档 2）。
+    await page.getByTestId("batch-archive").click();
+    await expect(page.getByTestId("history-archive-entry")).toContainText("已归档 3");
+    await expect(page.getByTestId("session-batch-bar")).toHaveCount(0);
+    await expect(page.getByTestId("history-session-s1")).toHaveCount(0);
   });
 
-  test("R7：授权成功后 scan_history 使用 canonical fixture_root", async ({ page }) => {
-    // 监听 mock invoke 调用——通过 window 对象记录
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    // 注入调用记录器
-    await page.addInitScript(() => {
-      (window as any).__invokeCalls = [];
-      const orig = (window as any).__TAURI_INTERNALS__.invoke;
-      (window as any).__TAURI_INTERNALS__.invoke = async function (cmd: string, args?: any) {
-        (window as any).__invokeCalls.push({ cmd, args });
-        return orig(cmd, args);
-      };
-    });
-    // 重新加载以使记录器生效
-    await page.reload();
-    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+  test("归档视图按模式→分组层级展示，恢复所选后归位主列表", async ({ page }) => {
+    await setup(page);
 
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
-    await page.getByTestId("authorize-check").check();
-    await page.getByTestId("scan-history-button").click();
-    await expect(page.getByTestId("account-project-tree")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("history-archive-entry").click();
+    const archiveList = page.getByTestId("history-archive-list");
+    await expect(archiveList).toContainText("Work 模式");
+    await expect(archiveList).toContainText("项目贝塔");
+    await expect(page.getByTestId("archive-session-s3")).toContainText("旧归档会话");
 
-    // 验证 grant_scan_authorization 被调用
-    const calls = await page.evaluate(() => (window as any).__invokeCalls);
-    const grantCall = calls.find((c: any) => c.cmd === "grant_scan_authorization");
-    expect(grantCall).toBeDefined();
-    // 验证 scan_history 被调用时传入授权返回的 canonical fixture_root
-    const scanCall = calls.find((c: any) => c.cmd === "scan_history");
-    expect(scanCall).toBeDefined();
-    expect(scanCall.args.fixtureRoot).toBe("C:\\fixture");
+    // 选择 → 恢复 → 归档视图清空，返回主列表可见归位。
+    await page.getByTestId("archive-select-mode").click();
+    await page.getByTestId("archive-session-s3").click();
+    await page.getByTestId("batch-restore").click();
+    await expect(page.getByTestId("archive-empty")).toBeVisible();
+
+    await page.getByTestId("history-archive-back").click();
+    await expect(page.getByTestId("history-session-s3")).toBeVisible();
   });
 
-  test("R7：路径变化后旧授权失效（调用 revoke_scan_authorization）", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    // 注入调用记录器
-    await page.addInitScript(() => {
-      (window as any).__invokeCalls = [];
-      const orig = (window as any).__TAURI_INTERNALS__.invoke;
-      (window as any).__TAURI_INTERNALS__.invoke = async function (cmd: string, args?: any) {
-        (window as any).__invokeCalls.push({ cmd, args });
-        return orig(cmd, args);
-      };
-    });
-    await page.reload();
-    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+  test("删除所选：二次确认列明规模，取消不删除、确认后执行", async ({ page }) => {
+    await setup(page);
 
-    // 第一次填写并授权
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
-    await page.getByTestId("authorize-check").check();
-    await expect(page.getByTestId("authorize-check")).toBeChecked();
+    await page.getByTestId("history-archive-entry").click();
+    await page.getByTestId("archive-session-s3").waitFor();
 
-    // 修改 fixture 路径——应触发撤销
-    await page.getByTestId("history-fixture-root-input").fill("D:\\other-fixture");
-    // 等待异步撤销完成——checkbox 应取消选中
-    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
+    await page.getByTestId("archive-select-mode").click();
+    await page.getByTestId("archive-session-s3").click();
+    await page.getByTestId("batch-delete").click();
 
-    // 验证 revoke_scan_authorization 被调用
-    const calls = await page.evaluate(() => (window as any).__invokeCalls);
-    const revokeCalls = calls.filter((c: any) => c.cmd === "revoke_scan_authorization");
-    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
-  });
+    // 确认弹窗列明会话数与消息量（s3 = 1 个会话 3 条消息）。
+    const dialog = page.getByTestId("delete-confirm");
+    await expect(dialog).toContainText("删除 1 个会话");
+    await expect(dialog).toContainText("共 3 条消息");
 
-  test("R7：撤销授权后 scan_history 按钮禁用", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture");
-    await page.getByTestId("authorize-check").check();
-    await expect(page.getByTestId("authorize-check")).toBeChecked();
-    // 扫描按钮启用
-    await expect(page.getByTestId("scan-history-button")).toBeEnabled();
-    // 取消授权
-    await page.getByTestId("authorize-check").uncheck();
-    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
-    // 扫描按钮应禁用
-    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+    // 取消：不执行删除。
+    await page.getByTestId("delete-confirm-cancel").click();
+    await expect(page.getByTestId("archive-session-s3")).toBeVisible();
+
+    // 确认：真实删除 → 归档视图清空。
+    await page.getByTestId("batch-delete").click();
+    await page.getByTestId("delete-confirm-ok").click();
+    await expect(page.getByTestId("archive-empty")).toBeVisible();
   });
 });
 
 // ============================================================================
-// R12：授权异步竞态——pending grant 期间路径变化后 stale 响应被丢弃
+// 账号页（沿用：与历史页共享 mock 边界）
 // ============================================================================
 
-test.describe("R12 授权异步竞态", () => {
-  test("R12：pending grant 期间路径变化后 stale 响应被丢弃并 revoke", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    // 注入调用记录器 + deferred grant 控制器
-    // R12：grant_scan_authorization 返回 pending promise，测试通过
-    // window.__grantDeferred.resolve 控制 resolve 时机，模拟异步竞态
-    await page.addInitScript(() => {
-      (window as any).__invokeCalls = [];
-      (window as any).__grantDeferred = null;
-      const orig = (window as any).__TAURI_INTERNALS__.invoke;
-      (window as any).__TAURI_INTERNALS__.invoke = async function (
-        cmd: string,
-        args?: any,
-      ) {
-        (window as any).__invokeCalls.push({ cmd, args });
-        if (cmd === "grant_scan_authorization") {
-          // R12：grant 返回 pending promise——测试通过 resolve 控制
-          return new Promise((resolve) => {
-            (window as any).__grantDeferred = { resolve, args };
-          });
-        }
-        return orig(cmd, args);
-      };
-    });
-    // 重新加载以使记录器与 deferred 控制器生效
-    await page.reload();
-    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+test.describe("账号档案", () => {
+  test("账号页展示已保存账号并保留本机切换边界", async ({ page }) => {
+    await installMockBridge(page);
+    await page.goto("/");
+    await page.getByTestId("navigation-accounts").click();
 
-    // 1. 输入 A 并点击授权——grant(A) 保持 pending
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture-A");
-    // 使用 click 而非 check——pending 时 checkbox 会回弹为未选中，
-    // check() 会反复重试导致多次触发 grant
-    await page.getByTestId("authorize-check").click();
-    // 等待 grant 被调用（pending promise 已建立）
-    await page.waitForFunction(
-      () => (window as any).__grantDeferred !== null,
-    );
+    // 账号页内还有子 region，主 region 必须精确匹配。
+    const accountCenter = page.getByRole("region", { name: "账号", exact: true });
+    await expect(accountCenter).toBeVisible();
+    await expect(accountCenter).toContainText("工作账号 A");
+    await expect(accountCenter).toContainText("工作账号 B");
+    // 旧外部切换入口（保存当前登录/切换账号）已随环境模型移除。
+    await expect(accountCenter.getByRole("button", { name: "保存当前登录" })).toHaveCount(0);
+    await expect(accountCenter.getByRole("button", { name: "切换账号" })).toHaveCount(0);
+  });
+});
 
-    // 2. 将 fixtureRoot 改为 B——应触发路径变化使旧授权失效
-    await page.getByTestId("history-fixture-root-input").fill("D:\\fixture-B");
+// ============================================================================
+// T09 操作、恢复和锁状态（总览页，沿用）
+// ============================================================================
 
-    // 3. resolve grant(A)——返回 canonical A（stale 响应）
-    await page.evaluate(() => {
-      (window as any).__grantDeferred.resolve("C:\\canonical-A");
-    });
+test.describe("T09 操作与恢复状态", () => {
+  test("总览页显示写入中、恢复已验证、未知总量和另一实例锁", async ({ page }) => {
+    await installMockBridge(page);
+    await page.goto("/");
+    await page.getByTestId("navigation-overview").click();
 
-    // 4. 等待 stale 响应处理完成——revoke 应被调用
-    await page.waitForFunction(
-      () =>
-        (window as any).__invokeCalls.some(
-          (c: any) => c.cmd === "revoke_scan_authorization",
-        ),
-    );
-
-    // 5. 断言 checkbox 仍未选中——stale 响应不得设置已授权
-    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
-    // 6. 断言扫描按钮仍禁用
-    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
-
-    // 7. 断言调用了 revoke_scan_authorization
-    const calls = await page.evaluate(() => (window as any).__invokeCalls);
-    const revokeCalls = calls.filter(
-      (c: any) => c.cmd === "revoke_scan_authorization",
-    );
-    expect(revokeCalls.length).toBeGreaterThanOrEqual(1);
-    // 8. 断言没有调用 scan_history——stale 授权不得触发扫描
-    const scanCalls = calls.filter((c: any) => c.cmd === "scan_history");
-    expect(scanCalls.length).toBe(0);
+    await expect(page.getByTestId("operations-list")).toBeVisible();
+    await expect(page.getByTestId("operations-list")).toContainText("正在写入");
+    await expect(page.getByTestId("operations-list")).toContainText("恢复已验证");
+    await expect(page.getByTestId("operation-lock-status")).toContainText("有操作进行中");
+    await expect(page.getByTestId("operation-lock-status")).not.toContainText("允许副作用");
+    await expect(page.getByTestId("operation-progress")).toContainText("正在写入");
+    // 总量未知时只显示已完成字节数（1024 B 格式化为 1.0 KiB），不伪造百分比。
+    await expect(page.getByTestId("operation-progress")).toContainText("1.0 KiB");
+    await expect(page.getByTestId("operation-progress")).toContainText("本阶段不可取消");
   });
 
-  test("R12-A：pending 时用户点击 checkbox 取消会丢弃旧授权结果", async ({ page }) => {
-    await setup(page, { scanOutcome: "success", browseMode: "full" });
-    // 注入调用记录器 + deferred grant 控制器
-    await page.addInitScript(() => {
-      (window as any).__invokeCalls = [];
-      (window as any).__grantDeferred = null;
-      const orig = (window as any).__TAURI_INTERNALS__.invoke;
-      (window as any).__TAURI_INTERNALS__.invoke = async function (
-        cmd: string,
-        args?: any,
-      ) {
-        (window as any).__invokeCalls.push({ cmd, args });
-        if (cmd === "grant_scan_authorization") {
-          return new Promise((resolve) => {
-            (window as any).__grantDeferred = { resolve, args };
-          });
-        }
-        return orig(cmd, args);
-      };
+  test("隔离副本可显式核对未完成操作，生产参数不进入前端", async ({ page }) => {
+    await installMockBridge(page, {
+      safeSyncPreview: true,
+      operationList: [
+        {
+          operation_id: "op-reconcile",
+          state: "backing_up",
+          data_location_id: "loc-fixture",
+          sequence: 7,
+          has_verified_target_file_evidence: false,
+        },
+      ],
+      lockStatus: {
+        data_location_id: "loc-fixture",
+        catalog_lock_held: false,
+        data_location_lock_held: false,
+        write_allowed: false,
+        reason: null,
+      },
+      progress: null,
     });
-    await page.reload();
-    await expect(page.getByRole("region", { name: "历史库" })).toBeVisible();
+    await page.goto("/");
+    await page.getByTestId("navigation-overview").click();
 
-    // 1. 输入 A 并点击授权——grant(A) 保持 pending
-    await page.getByTestId("history-fixture-root-input").fill("C:\\fixture-A");
-    await page.getByTestId("authorize-check").click();
-    // 等待 grant 被调用
-    await page.waitForFunction(
-      () => (window as any).__grantDeferred !== null,
+    const reconcile = page.getByRole("button", { name: "重新核对未完成操作" });
+    await expect(reconcile).toBeVisible();
+    await reconcile.click();
+
+    await expect(page.getByTestId("operation-reconcile-result")).toContainText(
+      "1 条确认未应用",
     );
+    await expect(page.getByTestId("operations-list")).toContainText("未应用");
+    await expect(reconcile).toHaveCount(0);
+  });
 
-    // R12-A：pending 时 checkbox 应选中——用户可点击取消
-    await expect(page.getByTestId("authorize-check")).toBeChecked();
-
-    // 2. 用户点击 checkbox 取消 pending 授权
-    await page.getByTestId("authorize-check").click();
-
-    // 3. 取消应立即生效——checkbox 未选中，扫描按钮禁用
-    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
-    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
-
-    // 4. 应调用 revoke 清除后端可能已建立的授权
-    await page.waitForFunction(
-      () =>
-        (window as any).__invokeCalls.some(
-          (c: any) => c.cmd === "revoke_scan_authorization",
-        ),
-    );
-
-    // 5. resolve grant(A)——stale，不应恢复授权
-    await page.evaluate(() => {
-      (window as any).__grantDeferred.resolve("C:\\canonical-A");
+  test("人工恢复和验证未完成状态不会伪装成同步成功", async ({ page }) => {
+    await installMockBridge(page, {
+      operationList: [
+        {
+          operation_id: "op-manual-recovery",
+          state: "manual_recovery_required",
+          data_location_id: "loc-fixture",
+          sequence: 4,
+          has_verified_target_file_evidence: false,
+        },
+        {
+          operation_id: "op-inconclusive",
+          state: "verification_inconclusive",
+          data_location_id: "loc-fixture",
+          sequence: 3,
+          has_verified_target_file_evidence: false,
+        },
+      ],
+      lockStatus: {
+        data_location_id: "loc-fixture",
+        catalog_lock_held: false,
+        data_location_lock_held: false,
+        write_allowed: false,
+        reason: "验证未完成，保持只读",
+      },
+      progress: {
+        operation_id: "op-manual-recovery",
+        phase: "recovering",
+        completed_bytes: 768,
+        total_bytes: 1024,
+        percent_basis_points: 7500,
+        cancellable: true,
+      },
     });
-    // 等待微任务
-    await page.waitForTimeout(50);
+    await page.goto("/");
+    await page.getByTestId("navigation-overview").click();
 
-    // 6. 仍为未授权状态
-    await expect(page.getByTestId("authorize-check")).not.toBeChecked();
-    await expect(page.getByTestId("scan-history-button")).toBeDisabled();
+    await expect(page.getByTestId("operations-list")).toContainText("需要人工恢复");
+    await expect(page.getByTestId("operations-list")).toContainText("验证未完成");
+    await expect(page.getByTestId("operation-lock-status")).toContainText("验证未完成");
+    await expect(page.getByTestId("operation-progress")).toContainText("正在恢复");
+    await expect(page.getByTestId("operation-progress")).toContainText("768 B / 1.0 KiB");
+    await expect(
+      page.getByRole("progressbar", { name: "操作进度" }),
+    ).toHaveAttribute("aria-valuenow", "75");
+    await expect(page.getByTestId("operation-progress")).toContainText("当前阶段可取消");
+  });
 
-    // 7. scan_history 未被调用
-    const calls = await page.evaluate(() => (window as any).__invokeCalls);
-    const scanCalls = calls.filter((c: any) => c.cmd === "scan_history");
-    expect(scanCalls.length).toBe(0);
+  test("空间不足时保留精确原因并禁止副作用", async ({ page }) => {
+    await installMockBridge(page, {
+      operationList: [],
+      lockStatus: {
+        data_location_id: "loc-fixture",
+        catalog_lock_held: false,
+        data_location_lock_held: false,
+        write_allowed: false,
+        reason: "空间不足：请迁移或手工管理存储",
+      },
+      progress: null,
+    });
+    await page.goto("/");
+    await page.getByTestId("navigation-overview").click();
+
+    await expect(page.getByTestId("operations-empty")).toBeVisible();
+    await expect(page.getByTestId("operation-lock-status")).toContainText("空间不足");
   });
 });

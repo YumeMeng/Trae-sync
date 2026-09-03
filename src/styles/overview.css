@@ -1,0 +1,381 @@
+/* 总览页 + 最近活动（operations-panel） */
+
+/* —— U-3 总览页签到摘要行（可插拔区块）—— */
+.overview-checkin {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  /* 玻璃面板标准组合（DESIGN_TOKENS）：玻璃底 + 模糊 + 细边 + 投影/内高光 */
+  border: 1px solid var(--line-hair);
+  border-radius: 16px;
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+}
+
+.overview-checkin > h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.overview-checkin__stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.overview-checkin__stat {
+  display: grid;
+  gap: 3px;
+  padding: 11px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: 12px;
+  background: var(--glass-hover);
+}
+
+.overview-checkin__stat strong {
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.overview-checkin__stat strong em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
+  margin-left: 2px;
+}
+
+.overview-checkin__stat span {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.overview-checkin__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* 操作与设置页共享同一层级。 */
+.operations-panel,
+.settings-panel,
+.workbench-read {
+  display: flex;
+  min-height: calc(100vh - 108px);
+  flex-direction: column;
+  gap: 20px;
+  padding: 24px;
+}
+
+.operations-panel__section-heading,
+.settings-panel__section-heading {
+  align-items: center;
+}
+
+.operations-panel__list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.operations-panel__list li {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 11px 13px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.operations-panel__item-main {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 14px;
+}
+
+.operations-panel__item-main strong {
+  color: var(--text-1);
+  font-size: 14px;
+}
+
+.operations-panel__item-meta {
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.operations-panel__item-details {
+  margin-top: 4px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.operations-panel__item-details summary {
+  min-height: 32px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.operations-panel__progress {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--accent-soft);
+}
+
+/* 进度条头部：阶段名靠左、字节数靠右，一行读完。 */
+.operations-panel__progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.operations-panel__progress-head strong {
+  color: var(--text-1);
+}
+
+.operations-panel__progress-head span {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.operations-panel__progress-track {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--fill);
+}
+
+.operations-panel__progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 240ms ease-out;
+}
+
+/* 总量未知时的不确定动画：保留活动感，不伪造百分比。 */
+.operations-panel__progress-track--indeterminate::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -36%;
+  width: 36%;
+  border-radius: 3px;
+  background: var(--accent);
+  content: "";
+  animation: operations-progress-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes operations-progress-slide {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(390%);
+  }
+}
+
+.operations-panel__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.operations-panel__reconcile-icon--busy {
+  animation: workbench-spin 900ms linear infinite;
+}
+
+@media (max-width: 720px) {
+  .operations-panel,
+  .settings-panel,
+  .workbench-read {
+    gap: 16px;
+    padding: 18px 16px;
+  }
+
+}
+
+.operations-panel,
+.settings-panel,
+.workbench-read {
+  min-height: calc(100vh - 120px);
+  padding: 24px;
+}
+
+.operations-panel__item-main,
+.operations-panel__item-main strong,
+.operations-panel__item-meta,
+.settings-item__state strong {
+  font-size: 14px;
+}
+
+.operations-panel__item-meta {
+  font-size: 12px;
+}
+
+/* 总览页：问候 + 三张统计卡 + 一个主操作，最近活动以内嵌紧凑面板收尾。 */
+.overview-page {
+  display: grid;
+  gap: 20px;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.overview-page__hero {
+  min-width: 0;
+}
+
+.overview-page__hero h1 {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.overview-page__hero-sub {
+  margin: 8px 0 0;
+  color: var(--text-2);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+/* 证据带（原标题栏下沉，2026-08-27）：当前账号 + 重新检测。
+   玻璃面板标准组合，信息密度低于签到摘要，作为 hero 的可复核补充。 */
+.overview-evidence {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+  color: var(--text-2);
+  flex-wrap: wrap;
+}
+
+.overview-evidence__label {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.overview-evidence strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-1);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.overview-evidence__redetect {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.overview-evidence__error {
+  flex-basis: 100%;
+  color: var(--danger);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* 统计卡：等宽三列，窄屏退化为单列，保持数字用表格数字对齐。 */
+.overview-page__stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.overview-stat {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  padding: 16px;
+  /* 统计卡玻璃标准组合（合同：圆角 15px / 玻璃面板） */
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+}
+
+.overview-stat__value {
+  color: var(--text-1);
+  font-size: 26px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.overview-stat__label {
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+/* 每屏一个主操作：主按钮独占视觉焦点，次级入口保持常规按钮。 */
+.overview-page__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.overview-page__empty-hint {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.overview-page__empty-hint svg {
+  flex: 0 0 auto;
+  color: var(--text-2);
+}
+
+/* 内嵌总览的最近活动：去掉整页内边距与最小高度，融入页面节奏。 */
+.operations-panel--compact {
+  min-height: 0;
+  padding: 16px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--fill-soft);
+}
+
+@media (max-width: 720px) {
+  .overview-page {
+    padding: 16px;
+  }
+
+  .overview-page__stats {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+}
+

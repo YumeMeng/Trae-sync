@@ -116,10 +116,11 @@ impl StorageRootId {
 /// 扫描授权状态：P1 fixture-only，默认关闭。
 ///
 /// 自动扫描默认关闭；未授权时不发布快照。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorizationState {
     /// 未授权（默认）
+    #[default]
     NotAuthorized,
     /// 已授权扫描指定 fixture 路径
     Authorized {
@@ -130,21 +131,19 @@ pub enum AuthorizationState {
     },
 }
 
-impl Default for AuthorizationState {
-    fn default() -> Self {
-        Self::NotAuthorized
-    }
-}
-
-/// TRAE 进程运行状态：扫描前置条件。
+/// TRAE 进程运行状态：扫描请求的观测上下文。
+///
+/// R1 修订（U-6 W3，依据 `.scratch/history-u6/w0-report.md` 实测 0/105 撕裂）：
+/// 读取统一走三件套快照副本路径，运行中不再构成扫描拒绝条件；
+/// 进程观测不确定态（WrongTarget/Ambiguous/Unknown）仍失败关闭。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessRunningState {
     /// 未知（fixture 模式下默认）
     Unknown,
-    /// 未运行（可扫描）
+    /// 未运行
     NotRunning,
-    /// 运行中（拒绝扫描）
+    /// 运行中（快照路径下可安全读取）
     Running,
 }
 
@@ -177,18 +176,20 @@ pub struct ScanRequest {
 pub enum ScanFailureReason {
     /// 未授权
     NotAuthorized,
-    /// TRAE 进程运行中
-    ProcessRunning,
     /// 数据库文件不存在
     DatabaseMissing,
     /// schema 不兼容
     SchemaIncompatible,
+    /// 账号证据缺失或未达到 Verified，不能发布历史快照
+    AccountEvidenceUnavailable,
     /// 存储根不可用
     StorageRootUnavailable,
     /// 捕获前后源文件集漂移
     SourceSetDrift,
     /// 目录库事务失败
     CatalogTransactionFailed,
+    /// 目录库业务事务已提交，但代次元数据发布失败；必须先重启协调，不能普通重试。
+    CatalogMetadataRepairRequired,
     /// 目录库密钥未配置
     CatalogKeyMissing,
 }
@@ -210,8 +211,10 @@ pub enum ScanOutcome {
     Deduplicated {
         existing_snapshot_id: SnapshotId,
         fingerprint: SnapshotFingerprint,
+        /// 已验证的既有快照元数据，用于目录库缺失时重新投影
+        snapshot_meta: SourceSnapshotMeta,
     },
-    /// 失败，未发布任何快照
+    /// 扫描未完成；捕获阶段已发布的不可变快照可作为失败证据保留
     Failed { reason: ScanFailureReason },
 }
 

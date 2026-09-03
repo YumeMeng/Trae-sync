@@ -15,11 +15,16 @@
 //! - FTS5 使用独立虚拟表（非 content=message_projection 外部内容表），
 //!   手动 DELETE+INSERT 同步索引，避免 rowid 关联复杂性，功能等价
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use traesync_domain::{
     BrowseAccountNode, BrowseProjectNode, BrowseResult, BrowseSessionNode, ContentGraphHash,
     ConversationPreview, DiagnosticIntegrityAssertion, HistoryBrowseSummary, MessageProjection,
@@ -27,9 +32,15 @@ use traesync_domain::{
     ScanFailureReason, SearchHit, SessionIdentity, SessionProjection, SessionVersion, SnapshotId,
     SourceSnapshotMeta, VersionClassification,
 };
-use traesync_ports::{CatalogRepository, ContentGraphHasher, SourceNormalizer};
+use traesync_ports::{
+    CatalogMutationOutcome, CatalogReadError, CatalogRepository, ContentGraphHasher,
+    SourceNormalizer,
+};
 
+use crate::catalog_path::CatalogCurrentPointer;
+pub use crate::catalog_path::{resolve_current_catalog_path, CatalogPathError};
 use crate::content_graph::DeterministicContentGraphHasher;
+use crate::operation_lease::OperationLease;
 
 /// SQLCipher 目录库实现。
 ///
@@ -40,18 +51,1034 @@ pub struct SqlCipherCatalogRepository {
     raw_key: String,
 }
 
+/// 目录库代次 sidecar 的唯一版本化结构。
+///
+/// 该结构同时供目录库投影和旁路升级使用。严格拒绝未知字段，避免新旧版本
+/// 静默互相覆盖不认识的元数据；字段缺失同样失败关闭。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogGenerationMetadata {
+    pub(crate) metadata_version: u32,
+    pub(crate) package_format_version: u32,
+    pub(crate) generation_id: String,
+    pub(crate) schema_version: u32,
+    pub(crate) catalog_schema_version: u32,
+    pub(crate) mapping_version: String,
+    pub(crate) key_wrapper_version: u32,
+    /// 目录库业务写入协议的单调修订号；用于区分可自动补偿的提交后窗口。
+    pub(crate) content_revision: u64,
+    pub(crate) catalog_sha256: String,
+    pub(crate) bytes: u64,
+    pub(crate) semantic_counts: BTreeMap<String, u64>,
+}
+
+/// 2026-08-16 之前发布的目录库 sidecar：没有内容修订号和当前版本矩阵。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCatalogGenerationMetadata {
+    generation_id: String,
+    schema_version: u32,
+    catalog_sha256: String,
+    bytes: u64,
+    semantic_counts: BTreeMap<String, u64>,
+}
+
+/// 2026-08-17 候选发布的目录库 sidecar：补有 content_revision，但仍没有版本矩阵。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCatalogGenerationMetadataWithRevision {
+    generation_id: String,
+    schema_version: u32,
+    catalog_sha256: String,
+    bytes: u64,
+    semantic_counts: BTreeMap<String, u64>,
+    content_revision: u64,
+}
+
+/// 读取磁盘 sidecar 时显式区分当前格式与两个已知 legacy 格式。
+///
+/// 每个变体都拒绝未知字段；不能使用 `flatten`，否则未来字段会被旧分支吞掉。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum CatalogGenerationMetadataOnDisk {
+    Current(CatalogGenerationMetadata),
+    LegacyWithRevision(LegacyCatalogGenerationMetadataWithRevision),
+    Legacy(LegacyCatalogGenerationMetadata),
+}
+
+pub(crate) const CONTENT_REVISION_KEY: &str = "content_revision";
+pub(crate) const GENERATION_METADATA_VERSION: u32 = 1;
+pub(crate) const GENERATION_PACKAGE_FORMAT_VERSION: u32 = 1;
+pub(crate) const CATALOG_MAPPING_VERSION: &str = "catalog-v1";
+pub(crate) const CATALOG_KEY_WRAPPER_VERSION: u32 = 1;
+pub(crate) const CATALOG_SCHEMA_VERSION: u32 = 1;
+
+impl CatalogGenerationMetadata {
+    pub(crate) fn new(
+        generation_id: &str,
+        schema_version: u32,
+        content_revision: u64,
+        catalog_sha256: String,
+        bytes: u64,
+        semantic_counts: BTreeMap<String, u64>,
+    ) -> Self {
+        Self {
+            metadata_version: GENERATION_METADATA_VERSION,
+            package_format_version: GENERATION_PACKAGE_FORMAT_VERSION,
+            generation_id: generation_id.to_string(),
+            schema_version,
+            catalog_schema_version: schema_version,
+            mapping_version: CATALOG_MAPPING_VERSION.to_string(),
+            key_wrapper_version: CATALOG_KEY_WRAPPER_VERSION,
+            content_revision,
+            catalog_sha256,
+            bytes,
+            semantic_counts,
+        }
+    }
+
+    pub(crate) fn version_matrix_matches(&self) -> bool {
+        self.version_matrix_matches_for(CATALOG_SCHEMA_VERSION)
+    }
+
+    /// 旁路升级在 staging 中可验证相邻目标 schema；生产当前代次仍只接受 V1。
+    pub(crate) fn version_matrix_matches_for(&self, expected_schema_version: u32) -> bool {
+        self.metadata_version == GENERATION_METADATA_VERSION
+            && self.package_format_version == GENERATION_PACKAGE_FORMAT_VERSION
+            && self.schema_version == expected_schema_version
+            && self.catalog_schema_version == self.schema_version
+            && self.mapping_version == CATALOG_MAPPING_VERSION
+            && self.key_wrapper_version == CATALOG_KEY_WRAPPER_VERSION
+    }
+}
+
+impl CatalogGenerationMetadataOnDisk {
+    fn generation_id(&self) -> &str {
+        match self {
+            Self::Current(metadata) => &metadata.generation_id,
+            Self::LegacyWithRevision(metadata) => &metadata.generation_id,
+            Self::Legacy(metadata) => &metadata.generation_id,
+        }
+    }
+
+    fn schema_version(&self) -> u32 {
+        match self {
+            Self::Current(metadata) => metadata.schema_version,
+            Self::LegacyWithRevision(metadata) => metadata.schema_version,
+            Self::Legacy(metadata) => metadata.schema_version,
+        }
+    }
+
+    fn content_revision(&self) -> Option<u64> {
+        match self {
+            Self::Current(metadata) => Some(metadata.content_revision),
+            Self::LegacyWithRevision(metadata) => Some(metadata.content_revision),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Current(metadata) => metadata.bytes,
+            Self::LegacyWithRevision(metadata) => metadata.bytes,
+            Self::Legacy(metadata) => metadata.bytes,
+        }
+    }
+
+    fn catalog_sha256(&self) -> &str {
+        match self {
+            Self::Current(metadata) => &metadata.catalog_sha256,
+            Self::LegacyWithRevision(metadata) => &metadata.catalog_sha256,
+            Self::Legacy(metadata) => &metadata.catalog_sha256,
+        }
+    }
+
+    fn semantic_counts(&self) -> &BTreeMap<String, u64> {
+        match self {
+            Self::Current(metadata) => &metadata.semantic_counts,
+            Self::LegacyWithRevision(metadata) => &metadata.semantic_counts,
+            Self::Legacy(metadata) => &metadata.semantic_counts,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        matches!(self, Self::Current(_))
+    }
+}
+
+/// 首次创建目录库并在完整初始化后发布 current 指针；已有布局只读解析。
+pub fn ensure_catalog_initialized(
+    storage_root: &Path,
+    raw_key: &str,
+    recovery_root: &Path,
+    operation_lease: &OperationLease,
+) -> Result<PathBuf, CatalogPathError> {
+    validate_catalog_lease_for_storage(storage_root, recovery_root, operation_lease)?;
+    match resolve_current_catalog_path(storage_root) {
+        Ok(path) => {
+            // 已有代次必须先完成 sidecar 协调；revision 落后时只修复已知提交窗口，
+            // 同 revision 的未知漂移则 fail-closed，避免把外部写入误当成正常刷新。
+            let repository = SqlCipherCatalogRepository::new(path.clone(), raw_key.to_string());
+            repository.reconcile_generation_metadata()?;
+            return Ok(path);
+        }
+        Err(CatalogPathError::Missing) => {}
+        Err(error) => return Err(error),
+    }
+
+    let catalog_root = storage_root.join("catalog");
+    match fs::symlink_metadata(&catalog_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CatalogPathError::Invalid)
+        }
+        Ok(_) => {
+            // 缺失指针但目录已有内容，说明上次发布可能中断；保留现场并拒绝猜测。
+            if fs::read_dir(&catalog_root)
+                .map_err(|_| CatalogPathError::Io)?
+                .next()
+                .is_some()
+            {
+                return Err(CatalogPathError::Invalid);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&catalog_root).map_err(|_| CatalogPathError::Io)?;
+        }
+        Err(_) => return Err(CatalogPathError::Io),
+    }
+
+    let generations_root = catalog_root.join("generations");
+    fs::create_dir_all(&generations_root).map_err(|_| CatalogPathError::Io)?;
+    let generation_id = format!("catalog-gen-{}-{}", now_nanos(), std::process::id());
+    let generation_dir = generations_root.join(&generation_id);
+    fs::create_dir(&generation_dir).map_err(|_| CatalogPathError::Io)?;
+    let catalog_path = generation_dir.join("catalog.db");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&catalog_path)
+        .map_err(|_| CatalogPathError::Io)?;
+
+    let catalog = SqlCipherCatalogRepository::new(catalog_path.clone(), raw_key.to_string());
+    if !catalog.ensure_initialized() {
+        return Err(CatalogPathError::InitializationFailed);
+    }
+    write_initial_generation_metadata(&generation_dir, &catalog, &generation_id)?;
+    publish_initial_current_pointer(&catalog_root, &generation_id)?;
+    resolve_current_catalog_path(storage_root)
+}
+
+/// 为首次创建的目录库写入稳定身份，并立即完成两层完整性验证。
+///
+/// 该函数只允许“两个身份字段都缺失”或“两个字段都与期望一致”；部分写入、
+/// 身份漂移和错误密钥都失败关闭，不能把旧目录库静默接管为新目录库。
+pub fn initialize_catalog_identity(
+    catalog_path: &Path,
+    catalog_key: &str,
+    catalog_id: &str,
+    key_generation: u32,
+    recovery_root: &Path,
+    operation_lease: &OperationLease,
+) -> Result<(), CatalogPathError> {
+    validate_catalog_lease_for_catalog_path(catalog_path, recovery_root, operation_lease)?;
+    validate_catalog_identity_input(catalog_key, catalog_id, key_generation)?;
+    let repository =
+        SqlCipherCatalogRepository::new(catalog_path.to_path_buf(), catalog_key.into());
+    // 先拒绝 sidecar，再以无 CREATE 的读写连接打开已有目录库。
+    reject_catalog_sidecars(catalog_path)?;
+    repository.verify_existing_catalog_write_protocol()?;
+    let mut connection = repository
+        .open_existing_catalog()
+        .ok_or(CatalogPathError::InitializationFailed)?;
+    verify_existing_catalog_write_protocol(&connection)?;
+    let existing = read_catalog_identity(&connection)?;
+    match existing {
+        None => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| CatalogPathError::InitializationFailed)?;
+            transaction
+                .execute(
+                    "INSERT INTO catalog_meta(key, value) VALUES ('catalog_id', ?1)",
+                    [catalog_id],
+                )
+                .map_err(|_| CatalogPathError::InitializationFailed)?;
+            transaction
+                .execute(
+                    "INSERT INTO catalog_meta(key, value) VALUES ('key_generation', ?1)",
+                    [key_generation.to_string()],
+                )
+                .map_err(|_| CatalogPathError::InitializationFailed)?;
+            bump_catalog_content_revision(&transaction)
+                .map_err(|_| CatalogPathError::InitializationFailed)?;
+            transaction
+                .commit()
+                .map_err(|_| CatalogPathError::InitializationFailed)?;
+        }
+        Some((existing_id, existing_generation))
+            if existing_id == catalog_id && existing_generation == key_generation => {}
+        Some(_) => return Err(CatalogPathError::Invalid),
+    }
+    verify_catalog_connection(&connection)?;
+    drop(connection);
+    repository.refresh_generation_metadata()
+}
+
+/// 使用 DPAPI 解出的目录库密钥复核已有目录库身份和完整性；
+/// 若 sidecar revision 落后，则在验证通过后原子刷新该 sidecar。
+pub fn verify_catalog_identity(
+    catalog_path: &Path,
+    catalog_key: &str,
+    expected_catalog_id: &str,
+    expected_key_generation: u32,
+    recovery_root: &Path,
+    operation_lease: &OperationLease,
+) -> Result<(), CatalogPathError> {
+    validate_catalog_lease_for_catalog_path(catalog_path, recovery_root, operation_lease)?;
+    validate_catalog_identity_input(catalog_key, expected_catalog_id, expected_key_generation)?;
+    let repository =
+        SqlCipherCatalogRepository::new(catalog_path.to_path_buf(), catalog_key.into());
+    // 身份复核是只读路径：先拒绝 sidecar，再用 READ_ONLY 且无 CREATE 的连接。
+    reject_catalog_sidecars(catalog_path)?;
+    let connection = repository.open_catalog_readonly_checked()?;
+    match read_catalog_identity(&connection)? {
+        Some((catalog_id, key_generation))
+            if catalog_id == expected_catalog_id && key_generation == expected_key_generation => {}
+        _ => return Err(CatalogPathError::Invalid),
+    }
+    verify_catalog_connection(&connection)?;
+    drop(connection);
+    repository.refresh_generation_metadata()
+}
+
+/// 解析固定 current 指针并协调其当前代次 sidecar。
+///
+/// 组合根必须先持有共享目录库租约；本函数只负责复核指针、目录库完整性和
+/// 当前代次元数据，不自行创建恢复区或绕过租约。
+pub fn reconcile_current_catalog_sidecar(
+    storage_root: &Path,
+    catalog_key: &str,
+    recovery_root: &Path,
+    operation_lease: &OperationLease,
+) -> Result<PathBuf, CatalogPathError> {
+    validate_catalog_lease_for_storage(storage_root, recovery_root, operation_lease)?;
+    let catalog_path = resolve_current_catalog_path(storage_root)?;
+    let repository = SqlCipherCatalogRepository::new(catalog_path.clone(), catalog_key.to_string());
+    repository.refresh_generation_metadata()?;
+    if resolve_current_catalog_path(storage_root)? != catalog_path {
+        return Err(CatalogPathError::Invalid);
+    }
+    Ok(catalog_path)
+}
+
+/// 目录库公开入口的最小运行时契约：租约必须在同一已验证存储根上取得，
+/// 不能只传入一个“看起来持有锁”的普通 OperationLease。
+fn validate_catalog_lease_for_storage(
+    storage_root: &Path,
+    recovery_root: &Path,
+    operation_lease: &OperationLease,
+) -> Result<(), CatalogPathError> {
+    operation_lease
+        .validate_storage_root(storage_root)
+        .map_err(|_| CatalogPathError::LeaseContextMismatch)?;
+    operation_lease
+        .validate_recovery_root(recovery_root)
+        .map_err(|_| CatalogPathError::LeaseContextMismatch)
+}
+
+fn validate_catalog_lease_for_catalog_path(
+    catalog_path: &Path,
+    recovery_root: &Path,
+    operation_lease: &OperationLease,
+) -> Result<(), CatalogPathError> {
+    let generation_dir = catalog_path.parent().ok_or(CatalogPathError::Invalid)?;
+    let generations_root = generation_dir.parent().ok_or(CatalogPathError::Invalid)?;
+    let catalog_root = generations_root.parent().ok_or(CatalogPathError::Invalid)?;
+    let storage_root = catalog_root.parent().ok_or(CatalogPathError::Invalid)?;
+    validate_catalog_lease_for_storage(storage_root, recovery_root, operation_lease)
+}
+
+fn validate_catalog_identity_input(
+    catalog_key: &str,
+    catalog_id: &str,
+    key_generation: u32,
+) -> Result<(), CatalogPathError> {
+    if catalog_id.is_empty()
+        || key_generation == 0
+        || catalog_key.len() != 64
+        || hex::decode(catalog_key)
+            .map(|bytes| bytes.len() != 32)
+            .unwrap_or(true)
+    {
+        return Err(CatalogPathError::Invalid);
+    }
+    Ok(())
+}
+
+fn read_catalog_identity(
+    connection: &Connection,
+) -> Result<Option<(String, u32)>, CatalogPathError> {
+    let catalog_id = connection
+        .query_row(
+            "SELECT value FROM catalog_meta WHERE key = 'catalog_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    let key_generation = connection
+        .query_row(
+            "SELECT value FROM catalog_meta WHERE key = 'key_generation'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    match (catalog_id, key_generation) {
+        (None, None) => Ok(None),
+        (Some(catalog_id), Some(key_generation)) => {
+            let key_generation = key_generation
+                .parse::<u32>()
+                .map_err(|_| CatalogPathError::Invalid)?;
+            Ok(Some((catalog_id, key_generation)))
+        }
+        _ => Err(CatalogPathError::Invalid),
+    }
+}
+
+/// 读取目录库内事务性内容修订号；旧版本目录库可能尚未创建该键。
+fn read_content_revision(connection: &Connection) -> Result<Option<u64>, CatalogPathError> {
+    let value = connection
+        .query_row(
+            "SELECT value FROM catalog_meta WHERE key = ?1",
+            [CONTENT_REVISION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    value
+        .map(|value| value.parse::<u64>().map_err(|_| CatalogPathError::Invalid))
+        .transpose()
+}
+
+/// 三方 schema 见证：目录库 metadata、SQLite user_version 和 sidecar 必须一致。
+fn read_catalog_schema_version(connection: &Connection) -> Result<u32, CatalogPathError> {
+    let catalog_meta_version: u32 = connection
+        .query_row(
+            "SELECT value FROM catalog_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| CatalogPathError::Invalid)?
+        .parse()
+        .map_err(|_| CatalogPathError::Invalid)?;
+    let user_version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|_| CatalogPathError::Invalid)?;
+    if catalog_meta_version != user_version {
+        return Err(CatalogPathError::Invalid);
+    }
+    Ok(catalog_meta_version)
+}
+
+/// 在同一 SQLite 事务中递增内容修订号；调用方必须在业务写入前后保持同一事务。
+pub(crate) fn bump_catalog_content_revision(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO catalog_meta(key, value) VALUES (?1, '0')",
+        [CONTENT_REVISION_KEY],
+    )?;
+    transaction.execute(
+        "UPDATE catalog_meta
+         SET value = CAST(value AS INTEGER) + 1
+         WHERE key = ?1",
+        [CONTENT_REVISION_KEY],
+    )?;
+    Ok(())
+}
+
+/// 为新建目录库/升级 staging 设置固定写协议。
+///
+/// 只有数据库尚未作为现有代次发布时才允许执行 `PRAGMA journal_mode = DELETE`。
+/// 对已有目录库必须使用下面的只验证函数，避免在校验失败前改写数据库 header。
+pub(crate) fn configure_new_catalog_write_protocol(
+    connection: &Connection,
+) -> rusqlite::Result<()> {
+    let journal_mode: String =
+        connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    connection.execute_batch("PRAGMA synchronous = FULL;")?;
+    let synchronous: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+    if synchronous != 2 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
+}
+
+/// 验证已有目录库的持久 journal 协议，并只设置当前连接的同步级别。
+///
+/// 该函数绝不改变持久 `journal_mode`；WAL、TRUNCATE 等非 DELETE 状态会直接失败。
+pub(crate) fn verify_existing_catalog_write_protocol(
+    connection: &Connection,
+) -> Result<(), CatalogPathError> {
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(CatalogPathError::CatalogWriteProtocolUpgradeRequired);
+    }
+    connection
+        .execute_batch("PRAGMA synchronous = FULL;")
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    let synchronous: i64 = connection
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    if synchronous != 2 {
+        return Err(CatalogPathError::InitializationFailed);
+    }
+    Ok(())
+}
+
+/// 只读启动/协调路径使用的 journal 协议见证。
+pub(crate) fn verify_catalog_read_protocol(
+    connection: &Connection,
+) -> Result<(), CatalogPathError> {
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(CatalogPathError::CatalogWriteProtocolUpgradeRequired);
+    }
+    Ok(())
+}
+
+/// 目录库使用 DELETE journal；只要发现任一 SQLite sidecar 就失败关闭。
+pub(crate) fn reject_catalog_sidecars(catalog_path: &Path) -> Result<(), CatalogPathError> {
+    let Some(file_name) = catalog_path.file_name().and_then(|name| name.to_str()) else {
+        return Err(CatalogPathError::Invalid);
+    };
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = catalog_path.with_file_name(format!("{file_name}{suffix}"));
+        match fs::symlink_metadata(sidecar) {
+            Ok(_) if suffix != "-journal" => {
+                return Err(CatalogPathError::CatalogWriteProtocolUpgradeRequired)
+            }
+            Ok(_) => return Err(CatalogPathError::Invalid),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(CatalogPathError::Io),
+        }
+    }
+    Ok(())
+}
+
+fn catalog_sidecars_snapshot(catalog_path: &Path) -> [bool; 3] {
+    ["-wal", "-shm", "-journal"].map(|suffix| {
+        let Some(file_name) = catalog_path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        catalog_path
+            .with_file_name(format!("{file_name}{suffix}"))
+            .exists()
+    })
+}
+
+fn cleanup_readonly_created_sidecars(catalog_path: &Path, existed_before: &[bool; 3]) {
+    let Some(file_name) = catalog_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    for (index, suffix) in ["-wal", "-shm", "-journal"].into_iter().enumerate() {
+        if existed_before[index] {
+            continue;
+        }
+        let sidecar = catalog_path.with_file_name(format!("{file_name}{suffix}"));
+        let Ok(metadata) = fs::symlink_metadata(&sidecar) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 32 * 1024 {
+            continue;
+        }
+        let _ = fs::remove_file(sidecar);
+    }
+}
+
+fn verify_catalog_connection(connection: &Connection) -> Result<(), CatalogPathError> {
+    let mut cipher_statement = connection
+        .prepare("PRAGMA cipher_integrity_check")
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    let cipher_error_count = cipher_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| CatalogPathError::InitializationFailed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CatalogPathError::InitializationFailed)?
+        .len();
+    if cipher_error_count != 0 {
+        return Err(CatalogPathError::InitializationFailed);
+    }
+    let sqlite_result = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    if sqlite_result != "ok" {
+        return Err(CatalogPathError::InitializationFailed);
+    }
+    Ok(())
+}
+
+fn publish_initial_current_pointer(
+    catalog_root: &Path,
+    generation_id: &str,
+) -> Result<(), CatalogPathError> {
+    let pointer = catalog_root.join("current.json");
+    let temporary = catalog_root.join(format!(
+        ".current.json.tmp-{}-{}",
+        now_nanos(),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| CatalogPathError::Io)?;
+    let result = (|| {
+        serde_json::to_writer_pretty(
+            &mut file,
+            &CatalogCurrentPointer {
+                generation_id: generation_id.to_string(),
+            },
+        )
+        .map_err(|_| CatalogPathError::Io)?;
+        file.write_all(b"\n").map_err(|_| CatalogPathError::Io)?;
+        file.sync_all().map_err(|_| CatalogPathError::Io)
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return result;
+    }
+    let result = fs::hard_link(&temporary, &pointer)
+        .map_err(|_| CatalogPathError::Io)
+        .and_then(|_| fs::remove_file(&temporary).map_err(|_| CatalogPathError::Io));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_initial_generation_metadata(
+    generation_dir: &Path,
+    catalog: &SqlCipherCatalogRepository,
+    generation_id: &str,
+) -> Result<(), CatalogPathError> {
+    let catalog_path = generation_dir.join("catalog.db");
+    let bytes = fs::metadata(&catalog_path)
+        .map_err(|_| CatalogPathError::Io)?
+        .len();
+    let catalog_sha256 = sha256_file(&catalog_path)?;
+    let connection = catalog
+        .open_catalog_readonly()
+        .ok_or(CatalogPathError::InitializationFailed)?;
+    verify_catalog_read_protocol(&connection)
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    let semantic_counts = read_semantic_counts(&connection)?;
+    let metadata = CatalogGenerationMetadata::new(
+        generation_id,
+        CATALOG_SCHEMA_VERSION,
+        read_content_revision(&connection)?.ok_or(CatalogPathError::Invalid)?,
+        catalog_sha256,
+        bytes,
+        semantic_counts,
+    );
+    drop(connection);
+    let path = generation_dir.join("generation.json");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| CatalogPathError::Io)?;
+    serde_json::to_writer_pretty(&mut file, &metadata).map_err(|_| CatalogPathError::Io)?;
+    file.write_all(b"\n").map_err(|_| CatalogPathError::Io)?;
+    file.sync_all().map_err(|_| CatalogPathError::Io)
+}
+
+/// 以临时文件加同卷原子替换更新完整性 sidecar；失败时不留下临时文件。
+fn write_generation_metadata_atomically(
+    path: &Path,
+    metadata: &CatalogGenerationMetadata,
+) -> Result<(), CatalogPathError> {
+    let parent = path.parent().ok_or(CatalogPathError::Invalid)?;
+    let temporary = parent.join(format!(
+        ".generation.json.tmp-{}-{}",
+        now_nanos(),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| CatalogPathError::Io)?;
+    let result = (|| {
+        serde_json::to_writer_pretty(&mut file, metadata).map_err(|_| CatalogPathError::Io)?;
+        file.write_all(b"\n").map_err(|_| CatalogPathError::Io)?;
+        file.sync_all().map_err(|_| CatalogPathError::Io)
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return result;
+    }
+    crate::atomic_publish::publish_replacing(&temporary, path).map_err(|_| CatalogPathError::Io)
+}
+
+fn read_semantic_counts(
+    connection: &Connection,
+) -> Result<BTreeMap<String, u64>, CatalogPathError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .map_err(|_| CatalogPathError::InitializationFailed)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| CatalogPathError::InitializationFailed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CatalogPathError::InitializationFailed)?
+        .into_iter()
+        .filter(|name| name != "catalog_meta" && name != "catalog_migration_log")
+        .collect::<Vec<_>>();
+    let mut counts = BTreeMap::new();
+    for table in names {
+        let quoted = table.replace('"', "\"\"");
+        let sql = format!("SELECT COUNT(*) FROM \"{quoted}\"");
+        let count: i64 = connection
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(|_| CatalogPathError::InitializationFailed)?;
+        if count < 0 {
+            return Err(CatalogPathError::InitializationFailed);
+        }
+        counts.insert(table, count as u64);
+    }
+    Ok(counts)
+}
+
+fn sha256_file(path: &Path) -> Result<String, CatalogPathError> {
+    let mut file = File::open(path).map_err(|_| CatalogPathError::Io)?;
+    let mut digest = sha2::Sha256::new();
+    // 大文件哈希缓冲区放在堆上，避免 Windows 默认线程栈因 1 MiB 局部数组溢出。
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count =
+            std::io::Read::read(&mut file, &mut buffer).map_err(|_| CatalogPathError::Io)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+/// 构造 SQLite 只读 URI，避免验证路径隐式启用 CREATE。
+fn sqlite_readonly_uri(path: &Path) -> Option<String> {
+    let absolute = fs::canonicalize(path).ok()?;
+    let raw = absolute.to_string_lossy();
+    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let normalized = raw.replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len());
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~' | b':') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    Some(format!("file:///{encoded}?mode=ro"))
+}
+
 impl SqlCipherCatalogRepository {
     pub fn new(db_path: PathBuf, raw_key: String) -> Self {
         Self { db_path, raw_key }
     }
 
-    /// 打开目录库连接并设置 raw key。
+    /// 以允许创建的读写方式打开目录库；仅供首次初始化路径使用。
     fn open_catalog(&self) -> Option<Connection> {
-        let conn = Connection::open(&self.db_path).ok()?;
+        self.open_catalog_with_flags(
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+    }
+
+    /// 以 READ_WRITE 且禁止 CREATE 的方式打开已有目录库。
+    ///
+    /// 当前代次必须先拒绝 SQLite sidecar，再打开连接，避免把缺失/漂移现场
+    /// 静默创建成新的空库。
+    fn open_existing_catalog(&self) -> Option<Connection> {
+        reject_catalog_sidecars(&self.db_path).ok()?;
+        let metadata = fs::symlink_metadata(&self.db_path).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return None;
+        }
+        self.open_catalog_with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    /// 以 READ_ONLY 且禁止 CREATE 的方式打开已有目录库，用于启动协调和完整性验证。
+    fn open_catalog_readonly(&self) -> Option<Connection> {
+        self.open_catalog_readonly_checked().ok()
+    }
+
+    /// 以结构化错误打开现有目录库，保留写协议不兼容的稳定错误码。
+    fn open_catalog_readonly_checked(&self) -> Result<Connection, CatalogPathError> {
+        reject_catalog_sidecars(&self.db_path)?;
+        let metadata =
+            fs::symlink_metadata(&self.db_path).map_err(|_| CatalogPathError::Invalid)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(CatalogPathError::Invalid);
+        }
+        let sidecars_before = catalog_sidecars_snapshot(&self.db_path);
+        let result = (|| {
+            let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+            let connection = if let Some(uri) = sqlite_readonly_uri(&self.db_path) {
+                Connection::open_with_flags(&uri, flags)
+                    .map_err(|_| CatalogPathError::InitializationFailed)?
+            } else {
+                self.open_catalog_with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .ok_or(CatalogPathError::InitializationFailed)?
+            };
+            let pragma = format!("PRAGMA key = \"x'{}'\";", self.raw_key);
+            connection
+                .execute_batch(&pragma)
+                .map_err(|_| CatalogPathError::InitializationFailed)?;
+            verify_catalog_read_protocol(&connection)?;
+            Ok(connection)
+        })();
+        if result.is_err() {
+            // WAL 头现场的只读关闭可能创建空锁文件；仅清理本次新生且无数据的普通文件。
+            cleanup_readonly_created_sidecars(&self.db_path, &sidecars_before);
+        }
+        result
+    }
+
+    /// 在切换到读写连接前，用无 CREATE 的只读连接完成持久写协议预检。
+    fn verify_existing_catalog_write_protocol(&self) -> Result<(), CatalogPathError> {
+        let connection = self.open_catalog_readonly_checked()?;
+        drop(connection);
+        Ok(())
+    }
+
+    /// 按指定 SQLite 打开标志设置 raw key。
+    fn open_catalog_with_flags(&self, flags: OpenFlags) -> Option<Connection> {
+        let conn = Connection::open_with_flags(&self.db_path, flags).ok()?;
         // raw key 语法：x'<hex>' —— 不进入日志
         let pragma = format!("PRAGMA key = \"x'{}'\";", self.raw_key);
         conn.execute_batch(&pragma).ok()?;
         Some(conn)
+    }
+
+    /// 刷新当前代次的完整性 sidecar；独立目录库测试路径没有 sidecar 时不做任何事。
+    ///
+    /// `content_revision` 与目录库业务事务一起提交。只有 revision 落后时才允许
+    /// 自动补发 sidecar；同 revision 但哈希/计数不一致属于未知漂移，必须拒绝覆盖。
+    fn refresh_generation_metadata(&self) -> Result<(), CatalogPathError> {
+        let Some((generation_dir, metadata_path)) = self.managed_generation_paths() else {
+            return Ok(());
+        };
+        let catalog_root = generation_dir
+            .parent()
+            .and_then(Path::parent)
+            .ok_or(CatalogPathError::Invalid)?;
+        let storage_root = catalog_root.parent().ok_or(CatalogPathError::Invalid)?;
+        if resolve_current_catalog_path(storage_root)? != self.db_path {
+            return Err(CatalogPathError::Invalid);
+        }
+
+        let generation_metadata =
+            fs::symlink_metadata(&generation_dir).map_err(|_| CatalogPathError::Invalid)?;
+        if generation_metadata.file_type().is_symlink() || !generation_metadata.is_dir() {
+            return Err(CatalogPathError::Invalid);
+        }
+        let metadata_file =
+            fs::symlink_metadata(&metadata_path).map_err(|_| CatalogPathError::Invalid)?;
+        if metadata_file.file_type().is_symlink() || !metadata_file.is_file() {
+            return Err(CatalogPathError::Invalid);
+        }
+        let metadata_on_disk: CatalogGenerationMetadataOnDisk = serde_json::from_reader(
+            File::open(&metadata_path).map_err(|_| CatalogPathError::Invalid)?,
+        )
+        .map_err(|_| CatalogPathError::Invalid)?;
+        let directory_generation_id = generation_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(CatalogPathError::Invalid)?;
+        if metadata_on_disk.generation_id() != directory_generation_id {
+            return Err(CatalogPathError::Invalid);
+        }
+        // 启动/普通写入只允许当前 V1；旁路升级使用 version_matrix_matches_for
+        // 在自己的 staging 校验中显式放宽到目标相邻版本。
+        if metadata_on_disk.schema_version() != CATALOG_SCHEMA_VERSION {
+            return Err(CatalogPathError::Invalid);
+        }
+        if let CatalogGenerationMetadataOnDisk::Current(metadata) = &metadata_on_disk {
+            if !metadata.version_matrix_matches() {
+                return Err(CatalogPathError::Invalid);
+            }
+        }
+
+        let catalog_file =
+            fs::symlink_metadata(&self.db_path).map_err(|_| CatalogPathError::Invalid)?;
+        if catalog_file.file_type().is_symlink() || !catalog_file.is_file() {
+            return Err(CatalogPathError::Invalid);
+        }
+        // 先拒绝 WAL/SHM/journal，再以 READ_ONLY 打开；协调路径不得创建连接或改写 DB header。
+        reject_catalog_sidecars(&self.db_path)?;
+        let connection = self.open_catalog_readonly_checked()?;
+        verify_catalog_connection(&connection)?;
+        let database_schema_version = read_catalog_schema_version(&connection)?;
+        if database_schema_version != CATALOG_SCHEMA_VERSION
+            || metadata_on_disk.schema_version() != database_schema_version
+        {
+            return Err(CatalogPathError::Invalid);
+        }
+        // 旧目录库可能没有 revision。按 0 读取即可，启动协调只升级 sidecar，
+        // 不向 catalog_meta 回写任何字段，避免一次只读启动改变目录库字节。
+        let (db_revision, database_has_revision) = match read_content_revision(&connection)? {
+            Some(revision) => (revision, true),
+            None => (0, false),
+        };
+        if metadata_on_disk
+            .content_revision()
+            .is_some_and(|revision| revision > db_revision)
+        {
+            return Err(CatalogPathError::Invalid);
+        }
+        let semantic_counts = read_semantic_counts(&connection)?;
+        drop(connection);
+
+        let bytes = fs::metadata(&self.db_path)
+            .map_err(|_| CatalogPathError::Io)?
+            .len();
+        let catalog_sha256 = sha256_file(&self.db_path)?;
+        let sidecar_matches_catalog = metadata_on_disk.bytes() == bytes
+            && metadata_on_disk.catalog_sha256() == catalog_sha256
+            && metadata_on_disk.semantic_counts() == &semantic_counts;
+        let metadata_revision = metadata_on_disk.content_revision();
+        let already_matches = metadata_on_disk.is_current()
+            && metadata_revision == Some(db_revision)
+            && sidecar_matches_catalog;
+        if already_matches {
+            return Ok(());
+        }
+
+        // 没有 content_revision 的 legacy sidecar 无法证明“提交后未发布”窗口；
+        // 只有其字节、哈希和语义计数与当前数据库完全一致时才允许补齐格式。
+        // 有 revision 的 current/legacy sidecar 则沿用 revision 单调规则：同 revision
+        // 的不一致是未知漂移，落后 revision 才是可自动补偿窗口。
+        if !sidecar_matches_catalog {
+            let repair_is_known_commit_window = database_has_revision
+                && metadata_revision.is_some_and(|revision| revision < db_revision);
+            if !repair_is_known_commit_window {
+                return Err(CatalogPathError::Invalid);
+            }
+        }
+
+        let metadata = CatalogGenerationMetadata::new(
+            directory_generation_id,
+            database_schema_version,
+            db_revision,
+            catalog_sha256,
+            bytes,
+            semantic_counts,
+        );
+        write_generation_metadata_atomically(&metadata_path, &metadata)?;
+
+        // 发布后重新读取，确保调用方不会继续使用半写入的 sidecar。
+        let published: CatalogGenerationMetadata = serde_json::from_reader(
+            File::open(&metadata_path).map_err(|_| CatalogPathError::Invalid)?,
+        )
+        .map_err(|_| CatalogPathError::Invalid)?;
+        if published != metadata {
+            return Err(CatalogPathError::Invalid);
+        }
+        if resolve_current_catalog_path(storage_root)? != self.db_path {
+            return Err(CatalogPathError::Invalid);
+        }
+        reject_catalog_sidecars(&self.db_path)?;
+        Ok(())
+    }
+
+    /// 启动或写入前协调已提交但尚未发布的 sidecar。
+    fn reconcile_generation_metadata(&self) -> Result<(), CatalogPathError> {
+        self.refresh_generation_metadata()
+    }
+
+    /// 只有标准 `<root>/catalog/generations/<id>/catalog.db` 布局才需要 sidecar。
+    fn managed_generation_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        let generation_dir = self.db_path.parent()?;
+        let generations_root = generation_dir.parent()?;
+        if generations_root.file_name() != Some(OsStr::new("generations")) {
+            return None;
+        }
+        Some((
+            generation_dir.to_path_buf(),
+            generation_dir.join("generation.json"),
+        ))
+    }
+
+    /// 执行 checked FTS 查询；目录库连接、SQL 或行映射失败均向上报告。
+    fn search_messages_with_project_checked(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+    ) -> Result<Vec<SearchHit>, CatalogReadError> {
+        let conn = self
+            .open_catalog_readonly()
+            .ok_or(CatalogReadError::Unavailable)?;
+        verify_catalog_connection(&conn).map_err(|_| CatalogReadError::Unavailable)?;
+        // FTS5 MATCH 查询，JOIN message_projection 获取 soft_deleted/role，
+        // JOIN session_projection 获取 project_id/title，
+        // JOIN project_identity 获取 project soft_deleted。
+        // R9：同时排除软删除消息、会话和项目——任一层级软删除都不出现在搜索结果。
+        let mut stmt = conn
+            .prepare(
+                "SELECT mp.message_id, mp.session_id, mp.role, mp.content_excerpt, mp.namespace, \
+                    sp.project_id, sp.active_title \
+             FROM message_fts \
+             JOIN message_projection mp \
+               ON message_fts.message_id = mp.message_id \
+              AND message_fts.session_id = mp.session_id \
+              AND message_fts.namespace = mp.namespace \
+             JOIN session_projection sp \
+               ON sp.namespace = mp.namespace AND sp.original_session_id = mp.session_id \
+             JOIN project_identity pi \
+               ON pi.project_id = sp.project_id \
+             WHERE message_fts MATCH ?1 \
+               AND mp.soft_deleted = 0 \
+               AND sp.soft_deleted = 0 \
+               AND pi.soft_deleted = 0 \
+               AND (?2 IS NULL OR sp.project_id = ?2)",
+            )
+            .map_err(|_| CatalogReadError::Unavailable)?;
+        let project_id = project_id.map(str::to_string);
+        let rows = stmt
+            .query_map(rusqlite::params![query, project_id], |row| {
+                let message_id: String = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let role: String = row.get(2)?;
+                let content_excerpt: String = row.get(3)?;
+                let namespace: String = row.get(4)?;
+                let project_id: String = row.get(5)?;
+                let title: String = row.get(6)?;
+                Ok(SearchHit {
+                    session_identity: SessionIdentity::new(&namespace, &session_id),
+                    message_id,
+                    project_id,
+                    title,
+                    content_excerpt,
+                    role,
+                })
+            })
+            .map_err(|_| CatalogReadError::Unavailable)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CatalogReadError::Unavailable)
     }
 }
 
@@ -73,6 +1100,13 @@ fn secs_to_system_time(s: i64) -> SystemTime {
     } else {
         UNIX_EPOCH
     }
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0)
 }
 
 /// VersionClassification -> 字符串（与 serde snake_case 一致）
@@ -102,7 +1136,7 @@ fn read_messages_for_session(
     namespace: &str,
     session_id: &str,
     exclude_soft_deleted: bool,
-) -> Vec<MessageProjection> {
+) -> rusqlite::Result<Vec<MessageProjection>> {
     let sql = if exclude_soft_deleted {
         "SELECT message_id, session_id, role, content_excerpt, soft_deleted, seq, turn_id \
          FROM message_projection WHERE namespace = ?1 AND session_id = ?2 AND soft_deleted = 0 \
@@ -112,11 +1146,8 @@ fn read_messages_for_session(
          FROM message_projection WHERE namespace = ?1 AND session_id = ?2 \
          ORDER BY seq ASC"
     };
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let rows = match stmt.query_map(rusqlite::params![namespace, session_id], |row| {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![namespace, session_id], |row| {
         Ok(MessageProjection {
             message_id: row.get(0)?,
             session_id: row.get(1)?,
@@ -124,29 +1155,56 @@ fn read_messages_for_session(
             content_excerpt: row.get(3)?,
             soft_deleted: row.get::<_, i64>(4)? != 0,
             seq: row.get::<_, i64>(5)? as u64,
-            turn_id: row.get(6).ok(),
+            turn_id: row.get(6)?,
         })
-    }) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    })?;
+    rows.collect()
 }
 
 impl CatalogRepository for SqlCipherCatalogRepository {
     fn ensure_initialized(&self) -> bool {
-        let conn = match self.open_catalog() {
+        if reject_catalog_sidecars(&self.db_path).is_err() {
+            return false;
+        }
+        let existing_file = match fs::symlink_metadata(&self.db_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return false;
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return false,
+        };
+        let conn = match if existing_file {
+            self.open_existing_catalog()
+        } else {
+            self.open_catalog()
+        } {
             Some(c) => c,
             None => return false,
         };
         // 检查是否已初始化（catalog_meta 有 schema_version）
-        let already: bool = conn
+        let already = match conn
             .query_row(
-                "SELECT 1 FROM catalog_meta WHERE key = 'schema_version' LIMIT 1",
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'catalog_meta' LIMIT 1",
                 [],
-                |_| Ok(true),
+                |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(false);
+            .optional()
+        {
+            Ok(value) => value.is_some(),
+            Err(_) => return false,
+        };
+        let protocol_valid = if already || existing_file {
+            // 已有文件只验证持久 journal，不执行 journal_mode 赋值。
+            verify_existing_catalog_write_protocol(&conn).is_ok()
+        } else {
+            configure_new_catalog_write_protocol(&conn).is_ok()
+        };
+        if !protocol_valid {
+            return false;
+        }
         if already {
             return false;
         }
@@ -200,6 +1258,16 @@ impl CatalogRepository for SqlCipherCatalogRepository {
         CREATE TABLE IF NOT EXISTS soft_deletion_marker (
             entity_kind TEXT, entity_id TEXT, deleted_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS operation_record (
+            operation_id TEXT PRIMARY KEY,
+            data_location_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            affected_rows INTEGER NOT NULL,
+            db_fingerprint TEXT NOT NULL,
+            wal_fingerprint TEXT,
+            shm_fingerprint TEXT,
+            updated_at INTEGER NOT NULL
+        );
         CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
             message_id, session_id, content_excerpt, namespace
         );
@@ -208,11 +1276,25 @@ impl CatalogRepository for SqlCipherCatalogRepository {
             return false;
         }
         // 写入 schema_version
-        conn.execute(
-            "INSERT OR REPLACE INTO catalog_meta (key, value) VALUES ('schema_version', '1')",
-            [],
-        )
-        .is_ok()
+        if conn
+            .execute(
+                "INSERT OR REPLACE INTO catalog_meta (key, value) VALUES ('schema_version', '1')",
+                [],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if conn
+            .execute(
+                "INSERT OR IGNORE INTO catalog_meta (key, value) VALUES (?1, '0')",
+                [CONTENT_REVISION_KEY],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        conn.execute_batch("PRAGMA user_version = 1;").is_ok()
     }
 
     fn project_snapshot(
@@ -221,24 +1303,101 @@ impl CatalogRepository for SqlCipherCatalogRepository {
         snapshot_dir: &Path,
         normalizer: &dyn SourceNormalizer,
     ) -> Result<(), ScanFailureReason> {
-        // 1. 事务前用 normalizer 读取全部快照数据（打开快照 DB，不涉及 catalog 事务）
-        let projects = normalizer.read_projects(snapshot_dir);
-        let sessions = normalizer.read_session_projections(snapshot_dir);
-        let messages = normalizer.read_messages(snapshot_dir);
-        // 读取每个项目的 owner（活动库 project.user_id）
-        let owners: HashMap<String, String> = projects
+        self.project_snapshot_with_validation(snapshot_meta, snapshot_dir, normalizer, &|| true)
+    }
+
+    fn project_snapshot_with_validation(
+        &self,
+        snapshot_meta: &SourceSnapshotMeta,
+        snapshot_dir: &Path,
+        normalizer: &dyn SourceNormalizer,
+        is_authorized: &dyn Fn() -> bool,
+    ) -> Result<(), ScanFailureReason> {
+        self.project_snapshot_with_context_validation(
+            snapshot_meta,
+            snapshot_dir,
+            normalizer,
+            is_authorized,
+            &|| true,
+        )
+    }
+
+    fn project_snapshot_with_context_validation(
+        &self,
+        snapshot_meta: &SourceSnapshotMeta,
+        snapshot_dir: &Path,
+        normalizer: &dyn SourceNormalizer,
+        is_authorized: &dyn Fn() -> bool,
+        validate_context: &dyn Fn() -> bool,
+    ) -> Result<(), ScanFailureReason> {
+        if !is_authorized() || !validate_context() {
+            return Err(ScanFailureReason::NotAuthorized);
+        }
+
+        // 1. 一次性读取全部快照数据；任一读取失败都不得发布部分投影。
+        let normalized = normalizer
+            .read_snapshot_checked(snapshot_dir)
+            .map_err(|_| ScanFailureReason::CatalogTransactionFailed)?;
+        let projects = normalized.projects;
+        let sessions = normalized.sessions;
+        let messages = normalized.messages;
+        if projects.is_empty() && sessions.is_empty() && messages.is_empty() {
+            // 空投影通常表示源数据库未被正确读取；禁止把 0/0/0 发布成成功历史。
+            return Err(ScanFailureReason::CatalogTransactionFailed);
+        }
+        // 读取每个项目的 owner；缺失 owner 会让归属证据不完整，直接失败。
+        let mut owners = HashMap::new();
+        for project in &projects {
+            let Some(owner) = normalizer.read_project_owner(snapshot_dir, &project.project_id)
+            else {
+                return Err(ScanFailureReason::CatalogTransactionFailed);
+            };
+            if owner.trim().is_empty() {
+                return Err(ScanFailureReason::CatalogTransactionFailed);
+            }
+            owners.insert(project.project_id.clone(), owner);
+        }
+
+        // 检查快照内部关联，防止项目、会话、消息任一层读取不完整后提交孤儿数据。
+        let project_ids: HashSet<&str> = projects
             .iter()
-            .filter_map(|p| {
-                normalizer
-                    .read_project_owner(snapshot_dir, &p.project_id)
-                    .map(|o| (p.project_id.clone(), o))
-            })
+            .map(|project| project.project_id.as_str())
             .collect();
+        if project_ids.len() != projects.len()
+            || sessions
+                .iter()
+                .any(|session| !project_ids.contains(session.project_id.as_str()))
+        {
+            return Err(ScanFailureReason::CatalogTransactionFailed);
+        }
+        let session_ids: HashSet<&str> = sessions
+            .iter()
+            .map(|session| session.session_identity.original_session_id.as_str())
+            .collect();
+        if session_ids.len() != sessions.len()
+            || messages
+                .iter()
+                .any(|message| !session_ids.contains(message.session_id.as_str()))
+        {
+            return Err(ScanFailureReason::CatalogTransactionFailed);
+        }
+
+        if !is_authorized() || !validate_context() {
+            return Err(ScanFailureReason::NotAuthorized);
+        }
 
         // 2. 打开 catalog 连接并开事务
+        reject_catalog_sidecars(&self.db_path)
+            .map_err(|_| ScanFailureReason::CatalogTransactionFailed)?;
         let conn = self
-            .open_catalog()
+            .open_existing_catalog()
             .ok_or(ScanFailureReason::CatalogTransactionFailed)?;
+        if verify_existing_catalog_write_protocol(&conn).is_err() {
+            return Err(ScanFailureReason::CatalogTransactionFailed);
+        }
+        if !validate_context() {
+            return Err(ScanFailureReason::NotAuthorized);
+        }
         if conn.execute_batch("BEGIN;").is_err() {
             return Err(ScanFailureReason::CatalogTransactionFailed);
         }
@@ -254,10 +1413,36 @@ impl CatalogRepository for SqlCipherCatalogRepository {
 
         match result {
             Ok(()) => {
+                // 提交前最后一次检查；授权失效时回滚事务，不留下半成功投影。
+                if !is_authorized() || !validate_context() {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return Err(ScanFailureReason::NotAuthorized);
+                }
+                if conn
+                    .execute(
+                        "INSERT OR IGNORE INTO catalog_meta(key, value) VALUES (?1, '0')",
+                        [CONTENT_REVISION_KEY],
+                    )
+                    .and_then(|_| {
+                        conn.execute(
+                            "UPDATE catalog_meta
+                             SET value = CAST(value AS INTEGER) + 1
+                             WHERE key = ?1",
+                            [CONTENT_REVISION_KEY],
+                        )
+                    })
+                    .is_err()
+                {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return Err(ScanFailureReason::CatalogTransactionFailed);
+                }
                 if conn.execute_batch("COMMIT;").is_err() {
                     let _ = conn.execute_batch("ROLLBACK;");
                     return Err(ScanFailureReason::CatalogTransactionFailed);
                 }
+                drop(conn);
+                self.refresh_generation_metadata()
+                    .map_err(|_| ScanFailureReason::CatalogMetadataRepairRequired)?;
                 Ok(())
             }
             Err(e) => {
@@ -268,36 +1453,38 @@ impl CatalogRepository for SqlCipherCatalogRepository {
     }
 
     fn browse(&self) -> BrowseResult {
-        let conn = match self.open_catalog() {
-            Some(c) => c,
-            None => {
-                return BrowseResult {
-                    accounts: vec![],
-                    projects: vec![],
-                    sessions: vec![],
-                    summary: HistoryBrowseSummary::default(),
-                }
-            }
-        };
-        // 全部项目（含 display_owner）
-        let projects = read_all_browse_projects(&conn, None);
-        // 全部会话（排除软删除）
-        let sessions = read_all_browse_sessions(&conn, None);
-        // 账号树
-        let accounts = build_account_nodes(&conn);
-        // 摘要
-        let summary = compute_history_summary(&conn);
+        self.browse_checked().unwrap_or_else(|_| BrowseResult {
+            accounts: vec![],
+            projects: vec![],
+            sessions: vec![],
+            summary: HistoryBrowseSummary::default(),
+        })
+    }
 
-        BrowseResult {
+    fn browse_checked(&self) -> Result<BrowseResult, CatalogReadError> {
+        let conn = self
+            .open_catalog_readonly()
+            .ok_or(CatalogReadError::Unavailable)?;
+        verify_catalog_connection(&conn).map_err(|_| CatalogReadError::Unavailable)?;
+        // 全部项目（含 display_owner）
+        let projects = read_all_browse_projects_checked(&conn, None)?;
+        // 全部会话（排除软删除）
+        let sessions = read_all_browse_sessions_checked(&conn, None)?;
+        // 账号树
+        let accounts = build_account_nodes_checked(&conn)?;
+        // 摘要
+        let summary = compute_history_summary_checked(&conn)?;
+
+        Ok(BrowseResult {
             accounts,
             projects,
             sessions,
             summary,
-        }
+        })
     }
 
     fn browse_projects_by_account(&self, user_id: &str) -> Vec<BrowseProjectNode> {
-        let conn = match self.open_catalog() {
+        let conn = match self.open_catalog_readonly() {
             Some(c) => c,
             None => return vec![],
         };
@@ -305,7 +1492,7 @@ impl CatalogRepository for SqlCipherCatalogRepository {
     }
 
     fn browse_sessions_by_project(&self, project_id: &str) -> Vec<BrowseSessionNode> {
-        let conn = match self.open_catalog() {
+        let conn = match self.open_catalog_readonly() {
             Some(c) => c,
             None => return vec![],
         };
@@ -313,9 +1500,21 @@ impl CatalogRepository for SqlCipherCatalogRepository {
     }
 
     fn read_conversation_preview(&self, session: &SessionIdentity) -> Option<ConversationPreview> {
-        let conn = self.open_catalog()?;
+        self.read_conversation_preview_checked(session)
+            .ok()
+            .flatten()
+    }
+
+    fn read_conversation_preview_checked(
+        &self,
+        session: &SessionIdentity,
+    ) -> Result<Option<ConversationPreview>, CatalogReadError> {
+        let conn = self
+            .open_catalog_readonly()
+            .ok_or(CatalogReadError::Unavailable)?;
+        verify_catalog_connection(&conn).map_err(|_| CatalogReadError::Unavailable)?;
         // 读取会话标题
-        let title: String = conn
+        let title: Option<String> = conn
             .query_row(
                 "SELECT active_title FROM session_projection \
                  WHERE namespace = ?1 AND original_session_id = ?2",
@@ -325,78 +1524,51 @@ impl CatalogRepository for SqlCipherCatalogRepository {
                 ],
                 |row| row.get(0),
             )
-            .unwrap_or_default();
+            .optional()
+            .map_err(|_| CatalogReadError::Unavailable)?;
+        let Some(title) = title else {
+            return Ok(None);
+        };
         // 读取消息（排除软删除，保留底层行用于诊断）
         let messages = read_messages_for_session(
             &conn,
             &session.product_history_namespace,
             &session.original_session_id,
             true,
-        );
+        )
+        .map_err(|_| CatalogReadError::Unavailable)?;
         let total = messages.len() as u64;
-        Some(ConversationPreview {
+        Ok(Some(ConversationPreview {
             session_identity: session.clone(),
             title,
             messages,
             total_message_count: total,
-        })
+        }))
     }
 
     fn search_messages(&self, query: &str) -> Vec<SearchHit> {
-        let conn = match self.open_catalog() {
-            Some(c) => c,
-            None => return vec![],
-        };
-        // FTS5 MATCH 查询，JOIN message_projection 获取 soft_deleted/role，
-        // JOIN session_projection 获取 project_id/title，
-        // JOIN project_identity 获取 project soft_deleted。
-        // R9：同时排除软删除消息、会话和项目——任一层级软删除都不出现在搜索结果。
-        let mut stmt = match conn.prepare(
-            "SELECT mp.message_id, mp.session_id, mp.role, mp.content_excerpt, mp.namespace, \
-                    sp.project_id, sp.active_title \
-             FROM message_fts \
-             JOIN message_projection mp \
-               ON message_fts.message_id = mp.message_id \
-              AND message_fts.session_id = mp.session_id \
-              AND message_fts.namespace = mp.namespace \
-             JOIN session_projection sp \
-               ON sp.namespace = mp.namespace AND sp.original_session_id = mp.session_id \
-             JOIN project_identity pi \
-               ON pi.project_id = sp.project_id \
-             WHERE message_fts MATCH ?1 \
-               AND mp.soft_deleted = 0 \
-               AND sp.soft_deleted = 0 \
-               AND pi.soft_deleted = 0",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let rows = match stmt.query_map(rusqlite::params![query], |row| {
-            let message_id: String = row.get(0)?;
-            let session_id: String = row.get(1)?;
-            let role: String = row.get(2)?;
-            let content_excerpt: String = row.get(3)?;
-            let namespace: String = row.get(4)?;
-            let project_id: String = row.get(5)?;
-            let title: String = row.get(6).unwrap_or_default();
-            Ok(SearchHit {
-                session_identity: SessionIdentity::new(&namespace, &session_id),
-                message_id,
-                project_id,
-                title,
-                content_excerpt,
-                role,
-            })
-        }) {
-            Ok(r) => r,
-            // FTS 查询语法错误或 FTS5 不可用时保守返回空
-            Err(_) => return vec![],
-        };
-        rows.filter_map(|r| r.ok()).collect()
+        self.search_messages_checked(query).unwrap_or_default()
+    }
+
+    fn search_messages_checked(&self, query: &str) -> Result<Vec<SearchHit>, CatalogReadError> {
+        self.search_messages_with_project_checked(query, None)
+    }
+
+    fn search_messages_in_project(&self, query: &str, project_id: &str) -> Vec<SearchHit> {
+        self.search_messages_in_project_checked(query, project_id)
+            .unwrap_or_default()
+    }
+
+    fn search_messages_in_project_checked(
+        &self,
+        query: &str,
+        project_id: &str,
+    ) -> Result<Vec<SearchHit>, CatalogReadError> {
+        self.search_messages_with_project_checked(query, Some(project_id))
     }
 
     fn read_project_observation(&self, project_id: &str) -> Option<ProjectObservation> {
-        let conn = self.open_catalog()?;
+        let conn = self.open_catalog_readonly()?;
         // project_identity（R6：含 soft_deleted）
         let identity: ProjectIdentity = conn
             .query_row(
@@ -452,27 +1624,36 @@ impl CatalogRepository for SqlCipherCatalogRepository {
     }
 
     fn read_all_project_observations(&self) -> Vec<ProjectObservation> {
-        let conn = match self.open_catalog() {
-            Some(c) => c,
-            None => return vec![],
-        };
-        let project_ids: Vec<String> =
-            match conn.prepare("SELECT project_id FROM project_identity ORDER BY project_id ASC") {
-                Ok(mut stmt) => stmt
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .ok()
-                    .map(|r| r.filter_map(|x| x.ok()).collect())
-                    .unwrap_or_default(),
-                Err(_) => return vec![],
-            };
+        self.read_all_project_observations_checked()
+            .unwrap_or_default()
+    }
+
+    fn read_all_project_observations_checked(
+        &self,
+    ) -> Result<Vec<ProjectObservation>, CatalogReadError> {
+        let conn = self
+            .open_catalog_readonly()
+            .ok_or(CatalogReadError::Unavailable)?;
+        verify_catalog_connection(&conn).map_err(|_| CatalogReadError::Unavailable)?;
+        let mut statement = conn
+            .prepare("SELECT project_id FROM project_identity ORDER BY project_id ASC")
+            .map_err(|_| CatalogReadError::Unavailable)?;
+        let project_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| CatalogReadError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CatalogReadError::Unavailable)?;
         project_ids
             .iter()
-            .filter_map(|pid| self.read_project_observation(pid))
+            .map(|project_id| {
+                self.read_project_observation(project_id)
+                    .ok_or(CatalogReadError::Unavailable)
+            })
             .collect()
     }
 
     fn read_all_session_versions(&self) -> Vec<SessionVersion> {
-        let conn = match self.open_catalog() {
+        let conn = match self.open_catalog_readonly() {
             Some(c) => c,
             None => return vec![],
         };
@@ -508,7 +1689,17 @@ impl CatalogRepository for SqlCipherCatalogRepository {
     }
 
     fn read_session_projection(&self, session: &SessionIdentity) -> Option<SessionProjection> {
-        let conn = self.open_catalog()?;
+        self.read_session_projection_checked(session).ok().flatten()
+    }
+
+    fn read_session_projection_checked(
+        &self,
+        session: &SessionIdentity,
+    ) -> Result<Option<SessionProjection>, CatalogReadError> {
+        let conn = self
+            .open_catalog_readonly()
+            .ok_or(CatalogReadError::Unavailable)?;
+        verify_catalog_connection(&conn).map_err(|_| CatalogReadError::Unavailable)?;
         conn.query_row(
             "SELECT active_content_graph_hash, active_title, soft_deleted, project_id \
              FROM session_projection WHERE namespace = ?1 AND original_session_id = ?2",
@@ -526,29 +1717,56 @@ impl CatalogRepository for SqlCipherCatalogRepository {
                 })
             },
         )
-        .ok()
+        .optional()
+        .map_err(|_| CatalogReadError::Unavailable)
     }
 
-    fn assign_project_source(&self, assignment: &ProjectSourceAssignment) -> bool {
-        let conn = match self.open_catalog() {
+    fn assign_project_source(
+        &self,
+        assignment: &ProjectSourceAssignment,
+    ) -> CatalogMutationOutcome {
+        if reject_catalog_sidecars(&self.db_path).is_err() {
+            return CatalogMutationOutcome::NotCommitted;
+        }
+        let mut conn = match self.open_existing_catalog() {
             Some(c) => c,
-            None => return false,
+            None => return CatalogMutationOutcome::NotCommitted,
         };
+        if verify_existing_catalog_write_protocol(&conn).is_err() {
+            return CatalogMutationOutcome::NotCommitted;
+        }
         // Gate E：仅写 project_source_assignment，不修改 project_observation 或快照
-        conn.execute(
-            "INSERT OR REPLACE INTO project_source_assignment \
-             (project_id, user_assigned_owner, assigned_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                assignment.project_id,
-                assignment.user_assigned_owner,
-                system_time_to_secs(assignment.assigned_at)
-            ],
-        )
-        .is_ok()
+        let transaction = match conn.transaction() {
+            Ok(transaction) => transaction,
+            Err(_) => return CatalogMutationOutcome::NotCommitted,
+        };
+        if transaction
+            .execute(
+                "INSERT OR REPLACE INTO project_source_assignment \
+                 (project_id, user_assigned_owner, assigned_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    assignment.project_id,
+                    assignment.user_assigned_owner,
+                    system_time_to_secs(assignment.assigned_at)
+                ],
+            )
+            .is_err()
+        {
+            return CatalogMutationOutcome::NotCommitted;
+        }
+        if bump_catalog_content_revision(&transaction).is_err() || transaction.commit().is_err() {
+            return CatalogMutationOutcome::NotCommitted;
+        }
+        drop(conn);
+        if self.refresh_generation_metadata().is_ok() {
+            CatalogMutationOutcome::Committed
+        } else {
+            CatalogMutationOutcome::CommittedMetadataRepairRequired
+        }
     }
 
     fn read_project_source_assignment(&self, project_id: &str) -> Option<ProjectSourceAssignment> {
-        let conn = self.open_catalog()?;
+        let conn = self.open_catalog_readonly()?;
         conn.query_row(
             "SELECT user_assigned_owner, assigned_at FROM project_source_assignment WHERE project_id = ?1",
             rusqlite::params![project_id],
@@ -566,7 +1784,7 @@ impl CatalogRepository for SqlCipherCatalogRepository {
     }
 
     fn diagnostic_integrity(&self) -> DiagnosticIntegrityAssertion {
-        let conn = match self.open_catalog() {
+        let conn = match self.open_catalog_readonly() {
             Some(c) => c,
             None => {
                 return DiagnosticIntegrityAssertion {
@@ -637,61 +1855,15 @@ impl CatalogRepository for SqlCipherCatalogRepository {
     }
 
     fn history_summary(&self) -> HistoryBrowseSummary {
-        let conn = match self.open_catalog() {
-            Some(c) => c,
-            None => return HistoryBrowseSummary::default(),
-        };
-        let account_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM seen_account", [], |row| row.get(0))
-            .unwrap_or(0);
-        // R6：visible 排除 soft_deleted，soft_deleted 单独计数
-        let visible_projects: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let soft_deleted_projects: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        // R9：visible_sessions 同时排除会话自身软删除和所属项目软删除
-        let visible_sessions: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_projection sp \
-                 JOIN project_identity pi ON pi.project_id = sp.project_id \
-                 WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let soft_deleted_sessions: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_projection WHERE soft_deleted = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let soft_deleted_messages: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message_projection WHERE soft_deleted = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        self.history_summary_checked().unwrap_or_default()
+    }
 
-        HistoryBrowseSummary {
-            visible_account_count: account_count as u64,
-            visible_project_count: visible_projects as u64,
-            visible_session_count: visible_sessions as u64,
-            soft_deleted_project_count: soft_deleted_projects as u64,
-            soft_deleted_session_count: soft_deleted_sessions as u64,
-            soft_deleted_message_count: soft_deleted_messages as u64,
-        }
+    fn history_summary_checked(&self) -> Result<HistoryBrowseSummary, CatalogReadError> {
+        let conn = self
+            .open_catalog_readonly()
+            .ok_or(CatalogReadError::Unavailable)?;
+        verify_catalog_connection(&conn).map_err(|_| CatalogReadError::Unavailable)?;
+        compute_history_summary_checked(&conn)
     }
 }
 
@@ -815,7 +1987,8 @@ fn project_snapshot_tx(
         .map_err(fail)?;
 
         // 读取旧消息（用于版本分类）——在 DELETE 前
-        let old_messages = read_messages_for_session(conn, namespace, original_session_id, false);
+        let old_messages =
+            read_messages_for_session(conn, namespace, original_session_id, false).map_err(fail)?;
 
         // 计算新内容图哈希
         let new_messages: Vec<MessageProjection> = messages
@@ -1009,6 +2182,13 @@ fn read_all_browse_projects(
     conn: &Connection,
     filter_account: Option<&str>,
 ) -> Vec<BrowseProjectNode> {
+    read_all_browse_projects_checked(conn, filter_account).unwrap_or_default()
+}
+
+fn read_all_browse_projects_checked(
+    conn: &Connection,
+    filter_account: Option<&str>,
+) -> Result<Vec<BrowseProjectNode>, CatalogReadError> {
     let sql = match filter_account {
         Some(_) => {
             "SELECT pi.project_id, pi.display_name, \
@@ -1034,20 +2214,19 @@ fn read_all_browse_projects(
              ORDER BY pi.display_name ASC"
         }
     };
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|_| CatalogReadError::Unavailable)?;
     let rows = match filter_account {
         Some(account) => stmt
             .query_map(rusqlite::params![account], map_project_row)
-            .ok(),
-        None => stmt.query_map([], map_project_row).ok(),
+            .map_err(|_| CatalogReadError::Unavailable)?,
+        None => stmt
+            .query_map([], map_project_row)
+            .map_err(|_| CatalogReadError::Unavailable)?,
     };
-    match rows {
-        Some(r) => r.filter_map(|x| x.ok()).collect(),
-        None => vec![],
-    }
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CatalogReadError::Unavailable)
 }
 
 /// 读取会话节点。filter_project 为 Some 时按 project_id 过滤，排除软删除。
@@ -1059,6 +2238,13 @@ fn read_all_browse_sessions(
     conn: &Connection,
     filter_project: Option<&str>,
 ) -> Vec<BrowseSessionNode> {
+    read_all_browse_sessions_checked(conn, filter_project).unwrap_or_default()
+}
+
+fn read_all_browse_sessions_checked(
+    conn: &Connection,
+    filter_project: Option<&str>,
+) -> Result<Vec<BrowseSessionNode>, CatalogReadError> {
     let sql = match filter_project {
         Some(_) => {
             "SELECT sp.namespace, sp.original_session_id, sp.active_title, \
@@ -1087,30 +2273,32 @@ fn read_all_browse_sessions(
              ORDER BY sp.active_title ASC"
         }
     };
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|_| CatalogReadError::Unavailable)?;
     let rows = match filter_project {
-        Some(pid) => stmt.query_map(rusqlite::params![pid], map_session_row).ok(),
-        None => stmt.query_map([], map_session_row).ok(),
+        Some(pid) => stmt
+            .query_map(rusqlite::params![pid], map_session_row)
+            .map_err(|_| CatalogReadError::Unavailable)?,
+        None => stmt
+            .query_map([], map_session_row)
+            .map_err(|_| CatalogReadError::Unavailable)?,
     };
-    match rows {
-        Some(r) => r.filter_map(|x| x.ok()).collect(),
-        None => vec![],
-    }
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CatalogReadError::Unavailable)
 }
 
-/// 构建账号树节点。
-fn build_account_nodes(conn: &Connection) -> Vec<BrowseAccountNode> {
-    let mut stmt = match conn.prepare("SELECT user_id FROM seen_account ORDER BY user_id ASC") {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let user_ids: Vec<String> = match stmt.query_map([], |row| row.get::<_, String>(0)) {
-        Ok(r) => r.filter_map(|x| x.ok()).collect(),
-        Err(_) => return vec![],
-    };
+fn build_account_nodes_checked(
+    conn: &Connection,
+) -> Result<Vec<BrowseAccountNode>, CatalogReadError> {
+    let mut stmt = conn
+        .prepare("SELECT user_id FROM seen_account ORDER BY user_id ASC")
+        .map_err(|_| CatalogReadError::Unavailable)?;
+    let user_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| CatalogReadError::Unavailable)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CatalogReadError::Unavailable)?;
     user_ids
         .iter()
         .map(|uid| {
@@ -1126,7 +2314,7 @@ fn build_account_nodes(conn: &Connection) -> Vec<BrowseAccountNode> {
                     rusqlite::params![uid],
                     |row| row.get(0),
                 )
-                .unwrap_or(0);
+                .map_err(|_| CatalogReadError::Unavailable)?;
             // 统计这些项目下的可见会话数
             // R9：排除软删除会话 + 排除所属项目已软删除的会话
             let session_count: i64 = conn
@@ -1143,69 +2331,60 @@ fn build_account_nodes(conn: &Connection) -> Vec<BrowseAccountNode> {
                     rusqlite::params![uid],
                     |row| row.get(0),
                 )
-                .unwrap_or(0);
-            BrowseAccountNode {
+                .map_err(|_| CatalogReadError::Unavailable)?;
+            Ok(BrowseAccountNode {
                 user_id: uid.clone(),
                 display_label: uid.clone(),
                 project_count: project_count as u64,
                 session_count: session_count as u64,
-            }
+            })
         })
         .collect()
 }
 
-/// 计算历史浏览摘要。
-fn compute_history_summary(conn: &Connection) -> HistoryBrowseSummary {
-    let account_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM seen_account", [], |row| row.get(0))
-        .unwrap_or(0);
+fn query_count_checked(conn: &Connection, sql: &str) -> Result<u64, CatalogReadError> {
+    let count: i64 = conn
+        .query_row(sql, [], |row| row.get(0))
+        .map_err(|_| CatalogReadError::Unavailable)?;
+    u64::try_from(count).map_err(|_| CatalogReadError::Unavailable)
+}
+
+fn compute_history_summary_checked(
+    conn: &Connection,
+) -> Result<HistoryBrowseSummary, CatalogReadError> {
+    let account_count = query_count_checked(conn, "SELECT COUNT(*) FROM seen_account")?;
     // R6：visible 排除 soft_deleted，soft_deleted 单独计数
-    let visible_projects: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let soft_deleted_projects: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let visible_projects = query_count_checked(
+        conn,
+        "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 0",
+    )?;
+    let soft_deleted_projects = query_count_checked(
+        conn,
+        "SELECT COUNT(*) FROM project_identity WHERE soft_deleted = 1",
+    )?;
     // R9：visible_sessions 同时排除会话自身软删除和所属项目软删除
-    let visible_sessions: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM session_projection sp \
-             JOIN project_identity pi ON pi.project_id = sp.project_id \
-             WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let soft_deleted_sessions: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM session_projection WHERE soft_deleted = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let soft_deleted_messages: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM message_projection WHERE soft_deleted = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    HistoryBrowseSummary {
-        visible_account_count: account_count as u64,
-        visible_project_count: visible_projects as u64,
-        visible_session_count: visible_sessions as u64,
-        soft_deleted_project_count: soft_deleted_projects as u64,
-        soft_deleted_session_count: soft_deleted_sessions as u64,
-        soft_deleted_message_count: soft_deleted_messages as u64,
-    }
+    let visible_sessions = query_count_checked(
+        conn,
+        "SELECT COUNT(*) FROM session_projection sp \
+         JOIN project_identity pi ON pi.project_id = sp.project_id \
+         WHERE sp.soft_deleted = 0 AND pi.soft_deleted = 0",
+    )?;
+    let soft_deleted_sessions = query_count_checked(
+        conn,
+        "SELECT COUNT(*) FROM session_projection WHERE soft_deleted = 1",
+    )?;
+    let soft_deleted_messages = query_count_checked(
+        conn,
+        "SELECT COUNT(*) FROM message_projection WHERE soft_deleted = 1",
+    )?;
+    Ok(HistoryBrowseSummary {
+        visible_account_count: account_count,
+        visible_project_count: visible_projects,
+        visible_session_count: visible_sessions,
+        soft_deleted_project_count: soft_deleted_projects,
+        soft_deleted_session_count: soft_deleted_sessions,
+        soft_deleted_message_count: soft_deleted_messages,
+    })
 }
 
 #[cfg(test)]
@@ -1220,8 +2399,84 @@ mod tests {
     const TEST_CATALOG_KEY: &str =
         "aaaabbbbccccdddd1111222233334444aaaabbbbccccdddd1111222233334444";
 
+    fn with_catalog_test_lease<T>(
+        storage_root: &Path,
+        action: impl FnOnce(&Path, &OperationLease) -> T,
+    ) -> T {
+        let recovery_root = tempdir().expect("创建目录库测试租约根");
+        let lease =
+            OperationLease::acquire_bound(recovery_root.path(), storage_root, "catalog-test")
+                .expect("取得目录库测试租约");
+        action(recovery_root.path(), &lease)
+    }
+
+    /// 保持既有单元测试聚焦目录库语义；公开生产 API 仍强制显式传入租约。
+    fn ensure_catalog_initialized(
+        storage_root: &Path,
+        raw_key: &str,
+    ) -> Result<PathBuf, CatalogPathError> {
+        with_catalog_test_lease(storage_root, |recovery_root, lease| {
+            super::ensure_catalog_initialized(storage_root, raw_key, recovery_root, lease)
+        })
+    }
+
+    fn catalog_storage_root(catalog_path: &Path) -> PathBuf {
+        catalog_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("测试目录库路径应位于 storage/catalog/generations/generation")
+            .to_path_buf()
+    }
+
+    fn initialize_catalog_identity(
+        catalog_path: &Path,
+        catalog_key: &str,
+        catalog_id: &str,
+        key_generation: u32,
+    ) -> Result<(), CatalogPathError> {
+        let storage_root = catalog_storage_root(catalog_path);
+        with_catalog_test_lease(&storage_root, |recovery_root, lease| {
+            super::initialize_catalog_identity(
+                catalog_path,
+                catalog_key,
+                catalog_id,
+                key_generation,
+                recovery_root,
+                lease,
+            )
+        })
+    }
+
+    fn verify_catalog_identity(
+        catalog_path: &Path,
+        catalog_key: &str,
+        expected_catalog_id: &str,
+        expected_key_generation: u32,
+    ) -> Result<(), CatalogPathError> {
+        let storage_root = catalog_storage_root(catalog_path);
+        with_catalog_test_lease(&storage_root, |recovery_root, lease| {
+            super::verify_catalog_identity(
+                catalog_path,
+                catalog_key,
+                expected_catalog_id,
+                expected_key_generation,
+                recovery_root,
+                lease,
+            )
+        })
+    }
+
     fn catalog_path(dir: &Path) -> PathBuf {
         dir.join("catalog.db")
+    }
+
+    fn remove_catalog_sidecars(path: &Path) {
+        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(path.with_file_name(format!("{file_name}{suffix}")));
+        }
     }
 
     /// 构造明文快照 fixture DB（可指定 project owner）
@@ -1280,6 +2535,467 @@ mod tests {
     }
 
     #[test]
+    fn browse_checked_surfaces_catalog_open_failure() {
+        let dir = tempdir().unwrap();
+        let repo = SqlCipherCatalogRepository::new(
+            dir.path().join("missing-catalog.db"),
+            TEST_CATALOG_KEY.to_string(),
+        );
+
+        assert_eq!(repo.browse_checked(), Err(CatalogReadError::Unavailable));
+    }
+
+    #[test]
+    fn catalog_layout_publishes_current_generation_after_initialization() {
+        let dir = tempdir().unwrap();
+        let catalog = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+
+        assert!(catalog.starts_with(dir.path().join("catalog").join("generations")));
+        assert!(catalog.is_file());
+        assert_eq!(resolve_current_catalog_path(dir.path()).unwrap(), catalog);
+        assert!(dir.path().join("catalog").join("current.json").is_file());
+    }
+
+    #[test]
+    fn generation_metadata_tracks_projection_after_scan() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        let repo =
+            SqlCipherCatalogRepository::new(catalog_path.clone(), TEST_CATALOG_KEY.to_string());
+        let snapshot_dir = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture(&snapshot_dir, "user-A");
+
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .expect("扫描投影应成功");
+
+        let generation_dir = catalog_path.parent().expect("目录库应位于代次目录");
+        let metadata: CatalogGenerationMetadata = serde_json::from_reader(
+            std::fs::File::open(generation_dir.join("generation.json")).unwrap(),
+        )
+        .expect("generation.json 应可读取");
+        let reopened_repo =
+            SqlCipherCatalogRepository::new(catalog_path.clone(), TEST_CATALOG_KEY.to_string());
+        let connection = reopened_repo.open_catalog().expect("重启后目录库应可打开");
+        let actual_bytes = std::fs::metadata(&catalog_path).unwrap().len();
+
+        assert_eq!(metadata.bytes, actual_bytes, "字节数必须与当前目录库一致");
+        assert_eq!(
+            metadata.catalog_sha256,
+            sha256_file(&catalog_path).unwrap(),
+            "哈希必须与当前目录库一致"
+        );
+        assert_eq!(
+            metadata.semantic_counts,
+            read_semantic_counts(&connection).unwrap(),
+            "语义计数必须与当前目录库一致"
+        );
+    }
+
+    #[test]
+    fn generation_metadata_tracks_catalog_identity_initialization() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        initialize_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1)
+            .expect("目录库身份初始化应成功");
+
+        let generation_dir = catalog_path.parent().expect("目录库应位于代次目录");
+        let metadata: CatalogGenerationMetadata = serde_json::from_reader(
+            std::fs::File::open(generation_dir.join("generation.json")).unwrap(),
+        )
+        .expect("generation.json 应可读取");
+        let repo = SqlCipherCatalogRepository::new(catalog_path.clone(), TEST_CATALOG_KEY.into());
+        let connection = repo.open_catalog().expect("目录库应可打开");
+
+        assert_eq!(
+            metadata.bytes,
+            std::fs::metadata(&catalog_path).unwrap().len()
+        );
+        assert_eq!(metadata.catalog_sha256, sha256_file(&catalog_path).unwrap());
+        assert_eq!(
+            metadata.semantic_counts,
+            read_semantic_counts(&connection).unwrap()
+        );
+    }
+
+    #[test]
+    fn verify_catalog_identity_repairs_stale_generation_metadata() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        initialize_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1)
+            .expect("目录库身份初始化应成功");
+        let repo = SqlCipherCatalogRepository::new(catalog_path.clone(), TEST_CATALOG_KEY.into());
+        let snapshot_dir = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        make_snapshot_fixture(&snapshot_dir, "user-A");
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &snapshot_dir, &normalizer)
+            .expect("扫描投影应成功");
+
+        let generation_dir = catalog_path.parent().expect("目录库应位于代次目录");
+        let metadata_path = generation_dir.join("generation.json");
+        let mut stale: CatalogGenerationMetadata =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap()).unwrap();
+        stale.content_revision = stale.content_revision.saturating_sub(1);
+        stale.bytes = 0;
+        stale.catalog_sha256 = "stale".to_string();
+        stale.semantic_counts.clear();
+        std::fs::write(&metadata_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        verify_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1)
+            .expect("重新打开目录库时应修复陈旧 sidecar");
+        let repaired: CatalogGenerationMetadata =
+            serde_json::from_reader(std::fs::File::open(metadata_path).unwrap()).unwrap();
+        let connection = repo.open_catalog().expect("目录库应可打开");
+
+        assert_eq!(
+            repaired.bytes,
+            std::fs::metadata(&catalog_path).unwrap().len()
+        );
+        assert_eq!(repaired.catalog_sha256, sha256_file(&catalog_path).unwrap());
+        assert_eq!(
+            repaired.semantic_counts,
+            read_semantic_counts(&connection).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_generation_metadata_without_revision_is_upgraded_to_current_shape() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+        let current: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "generation_id": current["generation_id"],
+            "schema_version": current["schema_version"],
+            "catalog_sha256": current["catalog_sha256"],
+            "bytes": current["bytes"],
+            "semantic_counts": current["semantic_counts"],
+        });
+        std::fs::write(&metadata_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY)
+            .expect("已知无 revision legacy sidecar 应可在启动协调时升级");
+        let repaired: CatalogGenerationMetadata =
+            serde_json::from_reader(std::fs::File::open(metadata_path).unwrap()).unwrap();
+        assert_eq!(repaired.metadata_version, GENERATION_METADATA_VERSION);
+        assert_eq!(
+            repaired.package_format_version,
+            GENERATION_PACKAGE_FORMAT_VERSION
+        );
+        assert_eq!(repaired.catalog_schema_version, CATALOG_SCHEMA_VERSION);
+        assert_eq!(repaired.mapping_version, CATALOG_MAPPING_VERSION);
+        assert_eq!(repaired.key_wrapper_version, CATALOG_KEY_WRAPPER_VERSION);
+    }
+
+    #[test]
+    fn legacy_database_without_revision_upgrades_sidecar_without_writing_database() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        let repo = SqlCipherCatalogRepository::new(catalog_path.clone(), TEST_CATALOG_KEY.into());
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+
+        // 模拟旧目录库：移除旧版本不存在的 revision 键，并记录删除后的确切字节见证。
+        let connection = repo
+            .open_existing_catalog()
+            .expect("旧目录库应可用无 CREATE 连接打开");
+        connection
+            .execute(
+                "DELETE FROM catalog_meta WHERE key = ?1",
+                [CONTENT_REVISION_KEY],
+            )
+            .unwrap();
+        let semantic_counts = read_semantic_counts(&connection).unwrap();
+        drop(connection);
+        let database_before = std::fs::read(&catalog_path).unwrap();
+        let current: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "generation_id": current["generation_id"],
+            "schema_version": current["schema_version"],
+            "catalog_sha256": sha256_file(&catalog_path).unwrap(),
+            "bytes": database_before.len() as u64,
+            "semantic_counts": semantic_counts,
+        });
+        std::fs::write(&metadata_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY)
+            .expect("无 revision 旧目录库应只升级 sidecar");
+
+        assert_eq!(
+            std::fs::read(&catalog_path).unwrap(),
+            database_before,
+            "旧目录库启动协调不得写入 catalog.db"
+        );
+        let repaired: CatalogGenerationMetadata =
+            serde_json::from_reader(std::fs::File::open(metadata_path).unwrap()).unwrap();
+        assert_eq!(repaired.content_revision, 0);
+        assert!(repaired.version_matrix_matches());
+    }
+
+    #[test]
+    fn legacy_generation_metadata_with_revision_is_upgraded_to_current_shape() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        initialize_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1).unwrap();
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+        let current: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "generation_id": current["generation_id"],
+            "schema_version": current["schema_version"],
+            "catalog_sha256": current["catalog_sha256"],
+            "bytes": current["bytes"],
+            "semantic_counts": current["semantic_counts"],
+            "content_revision": current["content_revision"],
+        });
+        std::fs::write(&metadata_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        verify_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1)
+            .expect("已知带 revision legacy sidecar 应可在启动协调时升级");
+        let repaired: CatalogGenerationMetadata =
+            serde_json::from_reader(std::fs::File::open(metadata_path).unwrap()).unwrap();
+        assert_eq!(repaired.metadata_version, GENERATION_METADATA_VERSION);
+        assert!(repaired.content_revision > 0);
+        assert!(repaired.version_matrix_matches());
+    }
+
+    #[test]
+    fn non_delete_journal_fails_closed_without_converting_database_or_sidecar() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        initialize_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1).unwrap();
+        let repo = SqlCipherCatalogRepository::new(catalog_path.clone(), TEST_CATALOG_KEY.into());
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+
+        let connection = repo
+            .open_existing_catalog()
+            .expect("目录库应可用无 CREATE 连接打开");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        drop(connection);
+        // 仅为模拟“活动 WAL 已被外部清理但 header 仍为 WAL”的损坏现场；
+        // 协调入口仍必须依据持久 journal_mode 拒绝，而不是切换回 DELETE。
+        remove_catalog_sidecars(&catalog_path);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !catalog_path
+                    .with_file_name(format!("catalog.db{suffix}"))
+                    .exists(),
+                "测试前应已清理 {suffix}"
+            );
+        }
+        let database_before = std::fs::read(&catalog_path).unwrap();
+        let sidecar_before = std::fs::read(&metadata_path).unwrap();
+
+        let result = verify_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1);
+        assert!(result.is_err(), "WAL 目录库必须 fail-closed");
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), database_before);
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), sidecar_before);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !catalog_path
+                    .with_file_name(format!("catalog.db{suffix}"))
+                    .exists(),
+                "协议拒绝不应创建 {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_is_rejected_before_open_without_creating_missing_catalog() {
+        let dir = tempdir().unwrap();
+        let catalog_path = catalog_path(dir.path());
+        std::fs::write(catalog_path.with_file_name("catalog.db-wal"), b"fixture").unwrap();
+        let repo = SqlCipherCatalogRepository::new(catalog_path.clone(), TEST_CATALOG_KEY.into());
+
+        assert_eq!(
+            repo.browse_checked(),
+            Err(CatalogReadError::Unavailable),
+            "存在 sidecar 时必须在打开前 fail-closed"
+        );
+        assert!(!catalog_path.exists(), "拒绝 sidecar 不得创建空 catalog.db");
+    }
+
+    #[test]
+    fn readonly_identity_reopen_does_not_create_missing_catalog() {
+        let dir = tempdir().unwrap();
+        let catalog_path = catalog_path(dir.path());
+
+        assert!(
+            verify_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1).is_err()
+        );
+        assert!(
+            !catalog_path.exists(),
+            "READ_ONLY 重开不得 CREATE 缺失目录库"
+        );
+    }
+
+    #[test]
+    fn unknown_generation_metadata_field_fails_closed() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap()).unwrap();
+        metadata["unknown_field"] = serde_json::json!(true);
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY),
+            Err(CatalogPathError::Invalid),
+            "未知 sidecar 字段不得被 legacy 分支吞掉"
+        );
+    }
+
+    #[test]
+    fn future_generation_schema_fails_closed_on_current_startup() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap()).unwrap();
+        metadata["schema_version"] = serde_json::json!(2);
+        metadata["catalog_schema_version"] = serde_json::json!(2);
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY),
+            Err(CatalogPathError::Invalid),
+            "当前 V1 启动不得接受未来目录库 schema"
+        );
+    }
+
+    #[test]
+    fn same_revision_generation_drift_fails_closed() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        initialize_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1)
+            .expect("目录库身份初始化应成功");
+
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+        let mut metadata: CatalogGenerationMetadata =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap()).unwrap();
+        metadata.catalog_sha256 = "unexpected-drift".to_string();
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        assert_eq!(
+            verify_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1),
+            Err(CatalogPathError::Invalid),
+            "同 revision 的未知漂移不得被自动覆盖"
+        );
+        let preserved: CatalogGenerationMetadata =
+            serde_json::from_reader(std::fs::File::open(metadata_path).unwrap()).unwrap();
+        assert_eq!(preserved.catalog_sha256, "unexpected-drift");
+    }
+
+    #[test]
+    fn refresh_generation_metadata_preserves_upgrade_extensions() {
+        let dir = tempdir().unwrap();
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        initialize_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1)
+            .expect("目录库身份初始化应成功");
+
+        let metadata_path = catalog_path
+            .parent()
+            .expect("目录库应位于代次目录")
+            .join("generation.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&metadata_path).unwrap())
+                .expect("generation.json 应可读取");
+        // 模拟目录库旁路升级写入的扩展元数据，刷新后不得丢失。
+        let extensions = [
+            ("metadata_version", serde_json::json!(1)),
+            ("package_format_version", serde_json::json!(1)),
+            ("catalog_schema_version", serde_json::json!(1)),
+            ("mapping_version", serde_json::json!("catalog-v1")),
+            ("key_wrapper_version", serde_json::json!(1)),
+        ];
+        let object = metadata.as_object_mut().expect("generation.json 应为对象");
+        // 让刷新真正重写 sidecar，验证扩展字段会跨序列化保留。
+        object.insert("content_revision".to_string(), serde_json::json!(0));
+        for (key, value) in &extensions {
+            object.insert((*key).to_string(), value.clone());
+        }
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        verify_catalog_identity(&catalog_path, TEST_CATALOG_KEY, "catalog-test", 1)
+            .expect("刷新 sidecar 应成功");
+        let repaired: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(metadata_path).unwrap())
+                .expect("修复后的 generation.json 应可读取");
+        for (key, expected) in extensions {
+            assert_eq!(repaired[key], expected, "扩展字段 {key} 不得被刷新丢失");
+        }
+    }
+
+    #[test]
+    fn missing_catalog_pointer_does_not_create_empty_database() {
+        let dir = tempdir().unwrap();
+
+        assert_eq!(
+            resolve_current_catalog_path(dir.path()),
+            Err(CatalogPathError::Missing)
+        );
+        assert!(!dir.path().join("catalog.db").exists());
+    }
+
+    #[test]
+    fn malformed_catalog_pointer_fails_closed_without_replacing_it() {
+        let dir = tempdir().unwrap();
+        let catalog_root = dir.path().join("catalog");
+        std::fs::create_dir_all(&catalog_root).unwrap();
+        std::fs::write(
+            catalog_root.join("current.json"),
+            b"{\"generation_id\":\"missing\"}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_current_catalog_path(dir.path()),
+            Err(CatalogPathError::Invalid)
+        );
+        assert_eq!(
+            std::fs::read(catalog_root.join("current.json")).unwrap(),
+            b"{\"generation_id\":\"missing\"}"
+        );
+        assert!(!catalog_root.join("catalog.db").exists());
+    }
+
+    #[test]
     fn ensure_initialized_creates_tables_then_returns_false() {
         let dir = tempdir().unwrap();
         let repo =
@@ -1288,6 +3004,11 @@ mod tests {
         assert!(repo.ensure_initialized(), "首次应返回 true");
         // 再次：已存在
         assert!(!repo.ensure_initialized(), "再次应返回 false");
+        let conn = repo.open_catalog().unwrap();
+        let user_version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 1);
     }
 
     #[test]
@@ -1356,6 +3077,12 @@ mod tests {
         let hits = repo.search_messages("hello");
         assert!(!hits.is_empty(), "应搜到 hello");
         assert!(hits.iter().any(|h| h.message_id == "m1"));
+
+        let project_hits = repo.search_messages_in_project("hello", "p1");
+        assert!(project_hits.iter().any(|h| h.message_id == "m1"));
+        assert!(repo
+            .search_messages_in_project("hello", "project-not-found")
+            .is_empty());
 
         // 搜索 "deleted" —— m3 软删除，应被排除
         let hits_deleted = repo.search_messages("deleted");
@@ -1459,7 +3186,8 @@ mod tests {
         std::fs::create_dir_all(&snapshot_dir).unwrap();
         make_snapshot_fixture(&snapshot_dir, "user-A");
 
-        let repo = setup_repo(dir.path());
+        let catalog_path = ensure_catalog_initialized(dir.path(), TEST_CATALOG_KEY).unwrap();
+        let repo = SqlCipherCatalogRepository::new(catalog_path, TEST_CATALOG_KEY.to_string());
         let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
         let meta = make_snapshot_meta();
         repo.project_snapshot(&meta, &snapshot_dir, &normalizer)
@@ -1474,7 +3202,11 @@ mod tests {
             user_assigned_owner: Some("user-X".to_string()),
             assigned_at: SystemTime::now(),
         };
-        assert!(repo.assign_project_source(&assignment), "分配应成功");
+        assert_eq!(
+            repo.assign_project_source(&assignment),
+            CatalogMutationOutcome::Committed,
+            "分配应成功"
+        );
 
         // Gate E：project_observation 不变
         let after = repo.read_project_observation("p1").unwrap();
@@ -1492,6 +3224,22 @@ mod tests {
         assert!(
             projects_a.is_empty(),
             "user-A 应不再有项目（已分配给 user-X）"
+        );
+
+        // 来源归类也是目录库写入口，完成后 sidecar 必须跟随当前 revision。
+        let generation_dir = repo.db_path.parent().expect("目录库应位于代次目录");
+        let metadata: CatalogGenerationMetadata = serde_json::from_reader(
+            std::fs::File::open(generation_dir.join("generation.json")).unwrap(),
+        )
+        .unwrap();
+        let connection = repo.open_catalog().unwrap();
+        assert_eq!(
+            metadata.content_revision,
+            read_content_revision(&connection).unwrap().unwrap()
+        );
+        assert_eq!(
+            metadata.semantic_counts,
+            read_semantic_counts(&connection).unwrap()
         );
     }
 
@@ -1641,13 +3389,50 @@ mod tests {
         // 不存在的快照目录——normalizer 返回空 Vec
         let bad_dir = dir.path().join("nonexistent-snapshot");
         let result = repo.project_snapshot(&make_snapshot_meta(), &bad_dir, &normalizer);
-        // 空数据不导致事务失败，但也不破坏已有数据
-        assert!(result.is_ok(), "空投影应成功");
+        // 空投影表示源数据库未成功读取，必须失败且不得污染既有数据。
+        assert_eq!(
+            result,
+            Err(ScanFailureReason::CatalogTransactionFailed),
+            "空投影必须 fail-closed"
+        );
 
         // 原有数据完好
         let browse = repo.browse();
         assert_eq!(browse.projects.len(), 1, "原有项目应完好");
         assert_eq!(browse.sessions.len(), 1, "原有会话应完好");
+    }
+
+    #[test]
+    fn partial_normalizer_read_fails_without_new_projection() {
+        let dir = tempdir().unwrap();
+        let existing_snapshot = dir.path().join("existing");
+        std::fs::create_dir_all(&existing_snapshot).unwrap();
+        make_snapshot_fixture(&existing_snapshot, "user-A");
+
+        let repo = setup_repo(dir.path());
+        let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
+        repo.project_snapshot(&make_snapshot_meta(), &existing_snapshot, &normalizer)
+            .unwrap();
+        assert_eq!(repo.browse().projects.len(), 1);
+
+        // 只保留 project 表，缺失 chat_session/chat_message；checked 读取必须失败。
+        let malformed_snapshot = dir.path().join("malformed");
+        std::fs::create_dir_all(&malformed_snapshot).unwrap();
+        Connection::open(malformed_snapshot.join("database.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE project (project_id TEXT, user_id TEXT, biz_project_id TEXT, deleted_at INTEGER); \
+                 INSERT INTO project VALUES ('p2', 'user-B', 'biz-2', 0);",
+            )
+            .unwrap();
+
+        assert_eq!(
+            repo.project_snapshot(&make_snapshot_meta(), &malformed_snapshot, &normalizer),
+            Err(ScanFailureReason::CatalogTransactionFailed)
+        );
+        let browse = repo.browse();
+        assert_eq!(browse.projects.len(), 1, "部分读取失败不得新增项目投影");
+        assert_eq!(browse.projects[0].project_id, "p1");
     }
 
     // ============== TDD #9：相同标题不同 session_id 保持独立 ==============
@@ -1711,7 +3496,7 @@ mod tests {
 
     #[test]
     fn a_b_a_ownership_preserves_first_observed_owner() {
-        // 三次扫描：A→B→A，first_observed_owner 始终为 A
+        // 五次扫描：A→B→A→B→A，first_observed_owner 始终为 A
         let dir = tempdir().unwrap();
         let repo = setup_repo(dir.path());
         let normalizer = WorkCnSourceNormalizer::new(TEST_CATALOG_KEY.to_string());
@@ -1737,21 +3522,50 @@ mod tests {
         repo.project_snapshot(&make_snapshot_meta(), &snap3, &normalizer)
             .unwrap();
 
+        // 第四次：owner 再次切到 user-B
+        let snap4 = dir.path().join("snap-4");
+        std::fs::create_dir_all(&snap4).unwrap();
+        make_snapshot_fixture(&snap4, "user-B");
+        repo.project_snapshot(&make_snapshot_meta(), &snap4, &normalizer)
+            .unwrap();
+
+        // 第五次：owner 最终回到 user-A
+        let snap5 = dir.path().join("snap-5");
+        std::fs::create_dir_all(&snap5).unwrap();
+        make_snapshot_fixture(&snap5, "user-A");
+        repo.project_snapshot(&make_snapshot_meta(), &snap5, &normalizer)
+            .unwrap();
+
         // Gate E：first_observed_owner 始终为 user-A
         let obs = repo.read_project_observation("p1").expect("应有观察记录");
         assert_eq!(
             obs.first_observed_owner, "user-A",
-            "first_observed_owner 应保持 user-A（A→B→A 后仍不变）"
+            "first_observed_owner 应保持 user-A（A→B→A→B→A 后仍不变）"
         );
         assert_eq!(
             obs.current_live_owner, "user-A",
             "current_live_owner 应为最后一次的 user-A"
         );
-        // 三次扫描应追加 3 条 owner 观察
+        // 五次扫描应追加 5 条 owner 观察
         assert_eq!(
             obs.owner_observations.len(),
+            5,
+            "应有 5 条 owner 观察（A→B→A→B→A）"
+        );
+        let owner_ids: Vec<&str> = obs
+            .owner_observations
+            .iter()
+            .map(|observation| observation.owner_user_id.as_str())
+            .collect();
+        assert_eq!(
+            owner_ids.iter().filter(|owner| **owner == "user-A").count(),
             3,
-            "应有 3 条 owner 观察（A→B→A）"
+            "A 应出现 3 次"
+        );
+        assert_eq!(
+            owner_ids.iter().filter(|owner| **owner == "user-B").count(),
+            2,
+            "B 应出现 2 次"
         );
     }
 

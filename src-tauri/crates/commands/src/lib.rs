@@ -12,7 +12,8 @@
 use std::path::Path;
 use std::time::SystemTime;
 use traesync_application::{
-    ApplySyncPlanService, BuildSyncPlanService, WorkbenchReadService, WorkspaceStateService,
+    ApplySyncPlanService, BuildSyncPlanService, CatalogMutationOutcome, WorkbenchReadService,
+    WorkspaceStateService,
 };
 use traesync_domain::{
     OperationCancellation, SyncPlan, SyncPlanContext, SyncPlanExecutionOutcome, SyncScope,
@@ -21,7 +22,9 @@ use traesync_domain::{
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::WorkspaceStateProvider;
 // T03/T04 历史命令所需的 application 服务与 domain 值对象
-use traesync_application::{AssignProjectSourceService, BrowseHistoryService, ScanHistoryService};
+use traesync_application::{
+    AssignProjectSourceService, BrowseHistoryError, BrowseHistoryService, ScanHistoryService,
+};
 use traesync_domain::{
     AuthorizationState, BrowseResult, ConversationPreview, ProcessRunningState, ScanOutcome,
     SearchHit, SessionIdentity,
@@ -105,12 +108,14 @@ pub enum HistoryCommandError {
     NotAuthorized,
     /// R1：授权不匹配——请求的 fixture_root/db_relative_path 与授权范围不一致
     AuthorizationMismatch,
-    /// R1：TRAE 进程运行中——在任何 DB/账号证据访问前早拒
-    ProcessRunning,
     /// R2：数据库相对路径是绝对路径
     DbRelativePathAbsolute,
     /// R2：数据库相对路径包含父目录遍历 (`..`)
     DbRelativePathParentTraversal,
+    /// 目录库无法打开或读取。
+    CatalogUnavailable,
+    /// 目录库写入已提交，但 generation.json 需要在重启时协调修复。
+    CatalogMetadataRepairRequired,
 }
 
 impl std::fmt::Display for HistoryCommandError {
@@ -123,10 +128,13 @@ impl std::fmt::Display for HistoryCommandError {
             Self::EmptyProjectId => write!(f, "项目 ID 不能为空"),
             Self::NotAuthorized => write!(f, "未授权扫描：后端未持有显式用户授权"),
             Self::AuthorizationMismatch => write!(f, "授权不匹配：请求范围与授权范围不一致"),
-            Self::ProcessRunning => write!(f, "TRAE 进程运行中：拒绝扫描"),
             Self::DbRelativePathAbsolute => write!(f, "数据库相对路径是绝对路径"),
             Self::DbRelativePathParentTraversal => {
                 write!(f, "数据库相对路径包含父目录遍历 (`..`)")
+            }
+            Self::CatalogUnavailable => write!(f, "目录库不可读"),
+            Self::CatalogMetadataRepairRequired => {
+                write!(f, "目录库写入已提交，但完整性元数据需要重启修复")
             }
         }
     }
@@ -134,18 +142,20 @@ impl std::fmt::Display for HistoryCommandError {
 
 impl std::error::Error for HistoryCommandError {}
 
-/// R1：检查扫描授权与进程边界——在任何 DB/账号证据/FS 访问之前执行。
+/// R1：检查扫描授权边界——在任何 DB/账号证据/FS 访问之前执行。
 ///
 /// 纯函数，可在不启动 Tauri 运行时的情况下测试反例：
 /// - 未授权（NotAuthorized）→ 拒绝
 /// - 授权范围不匹配（AuthorizationMismatch）→ 拒绝
-/// - TRAE 运行中（ProcessRunning）→ 拒绝
 ///
-/// 返回 Ok(()) 表示通过授权与进程边界检查，可进入 DB 探测阶段。
+/// R1 修订（U-6 W3，依据 `.scratch/history-u6/w0-report.md` 实测 0/105 撕裂）：
+/// 读取统一走三件套快照副本路径，TRAE 运行中不再构成拒绝条件，
+/// 进程门禁从本检查中移除（观测不确定态仍由组合根进程观测失败关闭）。
+///
+/// 返回 Ok(()) 表示通过授权边界检查，可进入 DB 探测阶段。
 pub fn check_scan_authorization(
     fixture_root: &Path,
     db_relative_path: &str,
-    process_state: ProcessRunningState,
     authorization: &AuthorizationState,
 ) -> Result<(), HistoryCommandError> {
     match authorization {
@@ -159,10 +169,6 @@ pub fn check_scan_authorization(
                 || db_relative_path != *authorized_db_path
             {
                 return Err(HistoryCommandError::AuthorizationMismatch);
-            }
-            // R1：运行中早拒——在任何 DB probing/account-evidence 读之前
-            if process_state == ProcessRunningState::Running {
-                return Err(HistoryCommandError::ProcessRunning);
             }
             Ok(())
         }
@@ -217,6 +223,67 @@ pub fn scan_history(
     authorization: &AuthorizationState,
     service: &ScanHistoryService,
 ) -> Result<ScanOutcome, HistoryCommandError> {
+    scan_history_with_validation(
+        fixture_root,
+        db_relative_path,
+        process_state,
+        storage_root,
+        now,
+        authorization,
+        service,
+        || true,
+    )
+}
+
+/// 扫描命令的带上下文复核版本。
+///
+/// 组合根提供的闭包只返回“当前授权仍有效”这一布尔结论，不把路径、账号或密钥
+/// 传入 commands/application；扫描服务在快照捕获前和目录库投影前调用它。
+pub fn scan_history_with_validation<F>(
+    fixture_root: &Path,
+    db_relative_path: &str,
+    process_state: ProcessRunningState,
+    storage_root: &Path,
+    now: SystemTime,
+    authorization: &AuthorizationState,
+    service: &ScanHistoryService,
+    is_authorized: F,
+) -> Result<ScanOutcome, HistoryCommandError>
+where
+    F: Fn() -> bool,
+{
+    scan_history_with_context_validation(
+        fixture_root,
+        db_relative_path,
+        process_state,
+        storage_root,
+        now,
+        authorization,
+        service,
+        is_authorized,
+        || true,
+    )
+}
+
+/// 扫描命令的完整上下文复核版本。
+///
+/// `is_authorized` 只负责分块期间的廉价撤销检查；`validate_context` 由组合根
+/// 提供，用于探测、快照发布和目录库事务边界的完整身份复核。
+pub fn scan_history_with_context_validation<F, V>(
+    fixture_root: &Path,
+    db_relative_path: &str,
+    process_state: ProcessRunningState,
+    storage_root: &Path,
+    now: SystemTime,
+    authorization: &AuthorizationState,
+    service: &ScanHistoryService,
+    is_authorized: F,
+    validate_context: V,
+) -> Result<ScanOutcome, HistoryCommandError>
+where
+    F: Fn() -> bool,
+    V: Fn() -> bool,
+{
     if fixture_root.as_os_str().is_empty() {
         return Err(HistoryCommandError::EmptyFixtureRoot);
     }
@@ -225,20 +292,59 @@ pub fn scan_history(
     }
     // R2：词法检查 db_relative_path——在任何 DB 探测/FS 访问之前拒绝绝对路径与 `..`
     check_db_relative_path_lexical(db_relative_path)?;
-    // R1：授权与进程边界检查——在任何 DB 探测之前
-    check_scan_authorization(fixture_root, db_relative_path, process_state, authorization)?;
-    Ok(service.scan(
+    // R1：授权边界检查——在任何 DB 探测之前（R1 修订后不再含进程门禁）
+    check_scan_authorization(fixture_root, db_relative_path, authorization)?;
+    Ok(service.scan_with_context_validation(
         fixture_root,
         db_relative_path,
         process_state,
         now,
         storage_root,
+        is_authorized,
+        validate_context,
+    ))
+}
+
+/// 本机库存扫描：不要求当前账号授权，账号归属由源库 `project.user_id` 发现。
+/// 路径仍由组合根固定，上下文漂移继续失败关闭；R1 修订（W0 实测）后
+/// 读取走快照副本路径，TRAE 运行中不再拒绝。
+pub fn scan_local_inventory_with_context_validation<F, V>(
+    source_root: &Path,
+    db_relative_path: &str,
+    process_state: ProcessRunningState,
+    storage_root: &Path,
+    now: SystemTime,
+    service: &ScanHistoryService,
+    is_active: F,
+    validate_context: V,
+) -> Result<ScanOutcome, HistoryCommandError>
+where
+    F: Fn() -> bool,
+    V: Fn() -> bool,
+{
+    if source_root.as_os_str().is_empty() {
+        return Err(HistoryCommandError::EmptyFixtureRoot);
+    }
+    if storage_root.as_os_str().is_empty() {
+        return Err(HistoryCommandError::EmptyStorageRoot);
+    }
+    check_db_relative_path_lexical(db_relative_path)?;
+    Ok(service.scan_with_context_validation(
+        source_root,
+        db_relative_path,
+        process_state,
+        now,
+        storage_root,
+        is_active,
+        validate_context,
     ))
 }
 
 /// `browse_history` 命令：浏览全部历史。
 pub fn browse_history(service: &BrowseHistoryService) -> Result<BrowseResult, HistoryCommandError> {
-    Ok(service.browse())
+    service.browse().map_err(|error| match error {
+        BrowseHistoryError::CatalogUnavailable => HistoryCommandError::CatalogUnavailable,
+    })
 }
 
 /// `search_history` 命令：搜索消息内容。
@@ -246,12 +352,22 @@ pub fn browse_history(service: &BrowseHistoryService) -> Result<BrowseResult, Hi
 /// 输入校验：query 非空。
 pub fn search_history(
     query: &str,
+    project_id: Option<&str>,
     service: &BrowseHistoryService,
 ) -> Result<Vec<SearchHit>, HistoryCommandError> {
     if query.is_empty() {
         return Err(HistoryCommandError::EmptyQuery);
     }
-    Ok(service.search_messages(query))
+    if project_id.is_some_and(str::is_empty) {
+        return Err(HistoryCommandError::EmptyProjectId);
+    }
+    service
+        .search_messages(query, project_id)
+        .map_err(|error| match error {
+            traesync_application::BrowseHistoryError::CatalogUnavailable => {
+                HistoryCommandError::CatalogUnavailable
+            }
+        })
 }
 
 /// `read_conversation` 命令：读取完整对话预览。
@@ -259,7 +375,13 @@ pub fn read_conversation(
     session: &SessionIdentity,
     service: &BrowseHistoryService,
 ) -> Result<Option<ConversationPreview>, HistoryCommandError> {
-    Ok(service.read_conversation_preview(session))
+    service
+        .read_conversation_preview(session)
+        .map_err(|error| match error {
+            traesync_application::BrowseHistoryError::CatalogUnavailable => {
+                HistoryCommandError::CatalogUnavailable
+            }
+        })
 }
 
 /// `assign_source` 命令：分配项目来源（Gate E）。
@@ -275,7 +397,13 @@ pub fn assign_source(
     if project_id.is_empty() {
         return Err(HistoryCommandError::EmptyProjectId);
     }
-    Ok(service.assign(project_id, user_assigned_owner, now))
+    match service.assign(project_id, user_assigned_owner, now) {
+        CatalogMutationOutcome::Committed => Ok(true),
+        CatalogMutationOutcome::NotCommitted => Ok(false),
+        CatalogMutationOutcome::CommittedMetadataRepairRequired => {
+            Err(HistoryCommandError::CatalogMetadataRepairRequired)
+        }
+    }
 }
 
 /// `build_sync_plan` 命令：使用后端固定的证据上下文生成只读计划预览。
@@ -284,7 +412,11 @@ pub fn build_sync_plan(
     context: SyncPlanContext,
     service: &BuildSyncPlanService,
 ) -> Result<SyncPlan, HistoryCommandError> {
-    Ok(service.build(context, scope))
+    service.build(context, scope).map_err(|error| match error {
+        traesync_application::BrowseHistoryError::CatalogUnavailable => {
+            HistoryCommandError::CatalogUnavailable
+        }
+    })
 }
 
 /// `apply_sync_plan` 命令：只委托 application 服务，计划和取消令牌均由组合根持有。
@@ -627,7 +759,7 @@ mod tests {
     /// 假目录库：记录 assign_project_source 调用
     struct FakeCatalog {
         project_calls: Mutex<Vec<ProjectSourceAssignment>>,
-        project_result: bool,
+        project_result: CatalogMutationOutcome,
         browse_result: BrowseResult,
         search_result: Vec<SearchHit>,
     }
@@ -636,7 +768,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 project_calls: Mutex::new(Vec::new()),
-                project_result: false,
+                project_result: CatalogMutationOutcome::NotCommitted,
                 browse_result: BrowseResult {
                     accounts: vec![],
                     projects: vec![],
@@ -696,7 +828,10 @@ mod tests {
         fn read_session_projection(&self, _session: &SessionIdentity) -> Option<SessionProjection> {
             None
         }
-        fn assign_project_source(&self, assignment: &ProjectSourceAssignment) -> bool {
+        fn assign_project_source(
+            &self,
+            assignment: &ProjectSourceAssignment,
+        ) -> CatalogMutationOutcome {
             self.project_calls.lock().unwrap().push(assignment.clone());
             self.project_result
         }
@@ -962,8 +1097,9 @@ mod tests {
     }
 
     #[test]
-    fn r1_running_state_rejected_before_db_access() {
-        // R1 反例：已授权但 TRAE 运行中 -> 在 DB probe 之前被拒绝
+    fn r1_running_state_allows_scan_with_snapshot_path() {
+        // R1 修订（W0 实测 0/105 撕裂）：已授权且 TRAE 运行中 -> 照常进入扫描
+        // （读取走三件套快照副本路径，运行中不再是拒绝条件）
         let probe = ProbeCallTracker {
             probed: Mutex::new(false),
             state: CompatibilityState::Verified {
@@ -993,9 +1129,108 @@ mod tests {
             &auth,
             &svc,
         );
-        assert_eq!(result, Err(HistoryCommandError::ProcessRunning));
-        assert!(!*probe.probed.lock().unwrap(), "运行中时不应访问数据库");
-        assert!(!*reader.read.lock().unwrap(), "运行中时不应读取账号证据");
+        assert!(result.is_ok(), "运行中应照常扫描，实际 {:?}", result);
+        assert!(*probe.probed.lock().unwrap(), "运行中应进入数据库探测");
+    }
+
+    #[test]
+    fn local_inventory_does_not_require_account_authorization() {
+        let probe = ProbeCallTracker {
+            probed: Mutex::new(false),
+            state: CompatibilityState::Verified {
+                schema_fingerprint: SchemaFingerprint("fp".to_string()),
+                counts: TableCounts::default(),
+            },
+        };
+        let reader = AccountReadTracker {
+            read: Mutex::new(false),
+        };
+        let store = FakeSnapshotStore {
+            outcome: scan_success_outcome(),
+        };
+        let catalog = FakeCatalog::default();
+        let normalizer = FakeNormalizer;
+        let service = ScanHistoryService::new_inventory(
+            &store,
+            &catalog,
+            &probe,
+            &reader,
+            &normalizer,
+            "rawkey",
+        );
+
+        let result = scan_local_inventory_with_context_validation(
+            Path::new("/tmp/work-cn"),
+            "database.db",
+            ProcessRunningState::NotRunning,
+            Path::new("/tmp/storage"),
+            std::time::SystemTime::UNIX_EPOCH,
+            &service,
+            || true,
+            || true,
+        );
+        assert!(result.is_ok());
+        assert!(
+            !*reader.read.lock().unwrap(),
+            "库存扫描不应读取当前账号证据"
+        );
+    }
+
+    #[test]
+    fn local_inventory_allows_running_and_rejects_path_escape_before_probe() {
+        let probe = ProbeCallTracker {
+            probed: Mutex::new(false),
+            state: CompatibilityState::Verified {
+                schema_fingerprint: SchemaFingerprint("fp".to_string()),
+                counts: TableCounts::default(),
+            },
+        };
+        let reader = AccountReadTracker {
+            read: Mutex::new(false),
+        };
+        let store = FakeSnapshotStore {
+            outcome: scan_success_outcome(),
+        };
+        let catalog = FakeCatalog::default();
+        let normalizer = FakeNormalizer;
+        let service = ScanHistoryService::new_inventory(
+            &store,
+            &catalog,
+            &probe,
+            &reader,
+            &normalizer,
+            "rawkey",
+        );
+
+        // 路径逃逸在 DB 探测之前拒绝（probe 不得被调用）
+        assert_eq!(
+            scan_local_inventory_with_context_validation(
+                Path::new("/tmp/work-cn"),
+                "../database.db",
+                ProcessRunningState::NotRunning,
+                Path::new("/tmp/storage"),
+                std::time::SystemTime::UNIX_EPOCH,
+                &service,
+                || true,
+                || true,
+            ),
+            Err(HistoryCommandError::DbRelativePathParentTraversal)
+        );
+        assert!(!*probe.probed.lock().unwrap(), "边界拒绝不得进入数据库探测");
+        // R1 修订（W0 实测）：运行中走快照路径，库存扫描照常执行
+        assert!(
+            scan_local_inventory_with_context_validation(
+                Path::new("/tmp/work-cn"),
+                "database.db",
+                ProcessRunningState::Running,
+                Path::new("/tmp/storage"),
+                std::time::SystemTime::UNIX_EPOCH,
+                &service,
+                || true,
+                || true,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1035,7 +1270,8 @@ mod tests {
 
     #[test]
     fn r1_check_scan_authorization_pure_function() {
-        // R1：纯函数测试——不依赖 service，验证授权边界逻辑
+        // R1：纯函数测试——不依赖 service，验证授权边界逻辑。
+        // R1 修订（W0 实测）后进程维度已移除，只验证授权状态与范围匹配。
         let auth_authorized = AuthorizationState::Authorized {
             canonical_fixture_root: "/tmp/fixture".to_string(),
             db_relative_path: "database.db".to_string(),
@@ -1045,43 +1281,22 @@ mod tests {
             check_scan_authorization(
                 Path::new("/tmp/fixture"),
                 "database.db",
-                ProcessRunningState::NotRunning,
                 &AuthorizationState::NotAuthorized,
             ),
             Err(HistoryCommandError::NotAuthorized)
         );
-        // 授权匹配 + 未运行 -> Ok
+        // 授权匹配 -> Ok
         assert!(check_scan_authorization(
             Path::new("/tmp/fixture"),
             "database.db",
-            ProcessRunningState::NotRunning,
             &auth_authorized,
         )
         .is_ok());
-        // 授权匹配 + Unknown -> Ok（fixture 模式下 Unknown 可接受）
-        assert!(check_scan_authorization(
-            Path::new("/tmp/fixture"),
-            "database.db",
-            ProcessRunningState::Unknown,
-            &auth_authorized,
-        )
-        .is_ok());
-        // 授权匹配 + 运行中 -> 拒绝
-        assert_eq!(
-            check_scan_authorization(
-                Path::new("/tmp/fixture"),
-                "database.db",
-                ProcessRunningState::Running,
-                &auth_authorized,
-            ),
-            Err(HistoryCommandError::ProcessRunning)
-        );
         // fixture_root 不匹配
         assert_eq!(
             check_scan_authorization(
                 Path::new("/tmp/other"),
                 "database.db",
-                ProcessRunningState::NotRunning,
                 &auth_authorized,
             ),
             Err(HistoryCommandError::AuthorizationMismatch)
@@ -1091,7 +1306,6 @@ mod tests {
             check_scan_authorization(
                 Path::new("/tmp/fixture"),
                 "other.db",
-                ProcessRunningState::NotRunning,
                 &auth_authorized,
             ),
             Err(HistoryCommandError::AuthorizationMismatch)
@@ -1127,8 +1341,18 @@ mod tests {
         let catalog = FakeCatalog::default();
         let svc = BrowseHistoryService::new(&catalog);
         assert_eq!(
-            search_history("", &svc),
+            search_history("", None, &svc),
             Err(HistoryCommandError::EmptyQuery)
+        );
+    }
+
+    #[test]
+    fn search_history_rejects_empty_project_id() {
+        let catalog = FakeCatalog::default();
+        let svc = BrowseHistoryService::new(&catalog);
+        assert_eq!(
+            search_history("hello", Some(""), &svc),
+            Err(HistoryCommandError::EmptyProjectId)
         );
     }
 
@@ -1136,13 +1360,28 @@ mod tests {
     fn assign_source_normal_path() {
         // assign_source 正常路径：构造 assignment 并调用 catalog
         let mut catalog = FakeCatalog::default();
-        catalog.project_result = true;
+        catalog.project_result = CatalogMutationOutcome::Committed;
         let svc = AssignProjectSourceService::new(&catalog);
         let result = assign_source("p1", Some("u1"), std::time::SystemTime::UNIX_EPOCH, &svc);
         assert_eq!(result, Ok(true));
         let calls = catalog.project_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].project_id, "p1");
+    }
+
+    #[test]
+    fn assign_source_reports_committed_metadata_repair_without_retry_signal() {
+        let mut catalog = FakeCatalog::default();
+        catalog.project_result = CatalogMutationOutcome::CommittedMetadataRepairRequired;
+        let svc = AssignProjectSourceService::new(&catalog);
+
+        let result = assign_source("p1", Some("u1"), std::time::SystemTime::UNIX_EPOCH, &svc);
+
+        assert_eq!(
+            result,
+            Err(HistoryCommandError::CatalogMetadataRepairRequired)
+        );
+        assert_eq!(catalog.project_calls.lock().unwrap().len(), 1);
     }
 
     // ============== R2：db_relative_path 逃逸反例测试 ==============

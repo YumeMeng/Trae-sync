@@ -1,0 +1,636 @@
+/* 环境页 + 主库切号弹层（P5-2，原型契约 .scratch/proto-20260830-env-model/index.html） */
+
+/* —— 环境页 —— */
+.environment-page {
+  display: grid;
+  gap: 16px;
+}
+
+.environment-page__message {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.environment-page__body {
+  display: grid;
+  gap: 14px;
+  max-width: 860px;
+}
+
+/* 主库实例卡：标准玻璃面板 */
+.env-card {
+  padding: 18px 20px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+}
+
+.env-card__head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.env-card__icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: var(--radius-control);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.env-card__title {
+  min-width: 0;
+  flex: 1;
+}
+
+.env-card__name-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.env-card__name {
+  font-size: 15.5px;
+  font-weight: 650;
+}
+
+.env-card__badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.env-card__status {
+  margin-top: 6px;
+}
+
+/* 当前登录账号块（头像 + 名称），原型 env-card__current */
+.env-card__current {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px 8px 8px;
+  flex: none;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.env-card__current-avatar {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.env-card__current-name {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.env-card__current-meta {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+/* P5-4 主库统计格（原型 env-stats 契约）：三格等分，玻璃内衬面板 */
+.env-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.env-stat {
+  padding: 12px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.env-stat__value {
+  color: var(--text-1);
+  font-size: 19px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.env-stat__label {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.env-card__hint {
+  margin: 14px 0 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.env-card__foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-hair);
+}
+
+/* ===== P5-5 主库体检区块（有滞留记录才渲染）===== */
+
+.env-checkup {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+
+.env-checkup__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-1);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.env-checkup__head svg {
+  flex: none;
+  color: var(--accent);
+}
+
+/* 滞留账号行：账号名（主信息）+ 规模（副信息）。 */
+.env-checkup__list {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.env-checkup__list li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: var(--glass);
+}
+
+.env-checkup__name {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.env-checkup__meta {
+  flex: none;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.env-checkup__note {
+  margin: 8px 0 0;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.env-checkup__action {
+  margin-top: 12px;
+}
+
+/* 卡片底部动作组（P5-8a-2：详情 + 启动/聚焦两枚按钮并排） */
+.env-card__foot-actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
+}
+
+.env-card__path {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+/* 副环境占位（Q7：规划中说明，无可点入口） */
+.env-placeholder {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 20px;
+  border: 1px dashed var(--line-control);
+  border-radius: var(--radius-panel);
+  background: var(--fill-soft);
+}
+
+.env-placeholder__icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--line-hair);
+  color: var(--text-3);
+}
+
+.env-placeholder__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text-2);
+}
+
+.env-placeholder__badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line-control);
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.env-placeholder__text {
+  margin: 4px 0 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* ===== P6-4 辅助环境区（列表 + 创建入口 + 生命周期弹层）===== */
+
+.env-section {
+  display: grid;
+  gap: 10px;
+}
+
+.env-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.env-section__title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text-2);
+}
+
+.env-list {
+  display: grid;
+  gap: 14px;
+}
+
+/* 创建/重命名弹层的名称输入框 */
+.env-name-input {
+  width: 100%;
+  height: var(--control-height);
+  padding: 0 12px;
+  border: 1px solid var(--line-control);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+  color: var(--text-1);
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.env-name-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 环境登录弹层的账号选择列表（单选行） */
+.env-login-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.env-login-account {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+  color: var(--text-1);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.env-login-account:hover {
+  border-color: var(--line-control);
+}
+
+.env-login-account--selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.env-login-account__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+/* ============================================================
+   主库切号弹层（MasterSwitchDialog）：五步进度 + busy 分支 + 回执。
+   ============================================================ */
+
+/* 遮罩：半透明暗底（弹层玻璃在其上成层级） */
+.switch-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(26, 34, 51, 0.32);
+}
+
+.switch-dialog {
+  display: grid;
+  gap: 14px;
+  width: min(460px, 100%);
+  padding: 22px 24px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass-strong);
+  backdrop-filter: var(--glass-blur-strong);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  box-shadow: var(--shadow-float);
+}
+
+.switch-dialog__title {
+  font-size: 15.5px;
+  font-weight: 650;
+}
+
+/* 目标账号头部：头像 + 名称 + 随行说明 */
+.switch-dialog__target {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px 10px 10px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.switch-dialog__avatar {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.switch-dialog__target-name {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.switch-dialog__target-meta {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+/* 完成回执行（成功绿点语义收敛为靛蓝，与全局一致） */
+.switch-dialog__done {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-control);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* 总进度条：玻璃轨道 + 靛蓝填充（与签到页同语言） */
+.switch-dialog__bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--fill);
+  overflow: hidden;
+}
+
+.switch-dialog__bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.35s ease;
+}
+
+/* 五步清单：完成（靛蓝实心勾）/ 进行中（靛蓝环）/ 待办（灰环） */
+.switch-dialog__steps {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.switch-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: var(--radius-control);
+  color: var(--text-3);
+  font-size: 13px;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.switch-step--run {
+  background: var(--fill-soft);
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.switch-step--done {
+  color: var(--text-2);
+}
+
+.switch-step__icon {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.switch-step--done .switch-step__icon {
+  color: var(--accent);
+}
+
+.switch-step__ring {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line-control);
+}
+
+.switch-step--run .switch-step__ring {
+  border-color: var(--accent);
+  animation: switch-step-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes switch-step-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(79, 70, 229, 0.25); }
+  50% { box-shadow: 0 0 0 5px rgba(79, 70, 229, 0); }
+}
+
+/* P7-3 交接细目进度（handing_over 阶段步骤列表下方） */
+.switch-dialog__subprogress {
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 0 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch-step--run .switch-step__ring { animation: none; }
+  .switch-dialog__bar-fill { transition: none; }
+}
+
+/* busy（生成中）/ 失败分支提示条 */
+.switch-dialog__notice {
+  display: flex;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius-control);
+  background: var(--warn-soft-bg);
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.switch-dialog__notice--danger {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.switch-dialog__notice strong {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 13.5px;
+}
+
+.switch-dialog__notice p {
+  margin: 0;
+  color: var(--text-2);
+}
+
+.switch-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* P5-8b-3 预检态提示行（差异核对中） */
+.switch-dialog__prepare {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+/* P5-8b-3 插件差异清单（+N/-M 确认，ADR-0023）：紧凑双态行，多差异内滚 */
+.switch-dialog__diff {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 8px 10px;
+  list-style: none;
+  max-height: 168px;
+  overflow-y: auto;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.switch-dialog__diff-item {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.switch-dialog__diff-item--install {
+  color: var(--accent);
+}
+
+.switch-dialog__diff-item--remove {
+  color: var(--danger);
+}
+
+/* 账号页「使用中」胶囊（当前账号，替代切换按钮） */
+.account-item__current-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--control-height);
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
