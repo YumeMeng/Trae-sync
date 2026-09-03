@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { BookOpen, CalendarCheck, Database, RefreshCw, ScanSearch, UserRound } from "lucide-react";
+import { BookOpen, CalendarCheck, Database, RefreshCw, UserRound } from "lucide-react";
 import type { AppPage } from "../components/NavigationRail";
 import type { WorkspaceStateDto } from "../types/workspace";
 import type {
@@ -8,7 +8,6 @@ import type {
   CheckinOverviewEntryDto,
 } from "../types/account_switch";
 import type { MasterLibraryStatsDto } from "../types/masterLibrary";
-import { OperationsPanel } from "../components/OperationsPanel";
 import { renderSafeTargetAccount } from "../utils/accountLabel";
 
 interface OverviewPageProps {
@@ -24,7 +23,7 @@ interface OverviewPageProps {
 /**
  * 总览页 = 综合门面（U-3 契约）：一眼知道工具的作用与当前状态，不繁杂，可扩展。
  * 结构：问候 + 证据带（当前账号，原标题栏下沉）+ 签到摘要行（四统计卡）
- * + 快捷操作（去签到/添加账号）+ 工作台状态（原有历史统计与操作面板保留）。
+ * + 快捷操作（去签到/添加账号）+ 工作台状态（统计卡与空态三分支，见下方注释）。
  * 签到摘要为区块化可插拔：真实签到能力不可用时该区块整体隐藏（fixture 预览不展示签到数据）。
  */
 export function OverviewPage({
@@ -77,6 +76,18 @@ export function OverviewPage({
   const hasHistory =
     state.history.account_count + state.history.project_count + state.history.session_count > 0;
 
+  // —— 空态三分支判定（G1）——
+  // ① 有数据：主库统计 ready 且任一计数 > 0（生产常态）；主库不可读时回落旧历史统计。
+  // ② 无数据 + 目录就绪：中性空态，引导去环境页查看主库。
+  // ③ 目录缺失：真实异常态（如 TRAE 未安装），只在 hero 副文案提示，不出统计与引导。
+  const hasMasterData =
+    masterStats !== null &&
+    masterStats.status === "ready" &&
+    (masterStats.session_count > 0 ||
+      masterStats.project_count > 0 ||
+      masterStats.participating_account_count > 0);
+  const hasOverviewData = masterStats?.status === "ready" ? hasMasterData : hasHistory;
+
   // 签到摘要口径：已签 = 缓存 checked_in === true；
   // 积分合计 = 各账号 usage_remaining_credits 求和（未查询账号不计入）。
   const checkedCount = checkinOverview?.filter((entry) => entry.checked_in === true).length ?? 0;
@@ -95,7 +106,7 @@ export function OverviewPage({
         <p className="overview-page__hero-sub">
           {state.data_location.selected
             ? "历史数据位置已就绪。"
-            : "尚未发现 TRAE 数据位置，去历史页开始扫描。"}
+            : "未找到 TRAE 数据目录，请确认 TRAE 已安装。"}
         </p>
       </header>
 
@@ -165,67 +176,88 @@ export function OverviewPage({
         </section>
       )}
 
-      {/* 工作台状态：主库统计可用时显示主库聚合（P5-4 联动）；否则回落
-          旧历史统计（fixture 预览路径）。两套互斥，避免双份统计数字。 */}
-      {masterStats?.status === "ready" ? (
-        <div className="overview-page__stats" data-testid="overview-stats-master">
-          <div className="overview-stat">
-            <span className="overview-stat__value">{masterStats.session_count}</span>
-            <span className="overview-stat__label">主库对话</span>
-          </div>
-          <div className="overview-stat">
-            <span className="overview-stat__value">{masterStats.project_count}</span>
-            <span className="overview-stat__label">主库项目</span>
-          </div>
-          <div className="overview-stat" title="主库内出现过的账号数（含历史归属）">
-            <span className="overview-stat__value">{masterStats.participating_account_count}</span>
-            <span className="overview-stat__label">参与账号</span>
-          </div>
-          {masterStats.last_active_unix_seconds !== null && (
+      {/* 工作台状态（G1 三分支）：有数据 → 统计卡（主库聚合优先，回落旧历史
+          统计）；无数据或目录缺失 → 不出统计，空态引导见下方空态行（互斥不同屏）。 */}
+      {state.data_location.selected && hasOverviewData ? (
+        masterStats?.status === "ready" ? (
+          <div className="overview-page__stats" data-testid="overview-stats-master">
             <div className="overview-stat">
-              <span className="overview-stat__value overview-stat__value--time">
-                {formatLastActive(masterStats.last_active_unix_seconds)}
-              </span>
-              <span className="overview-stat__label">最近活跃</span>
+              <span className="overview-stat__value">{masterStats.session_count}</span>
+              <span className="overview-stat__label">主库对话</span>
             </div>
-          )}
-        </div>
-      ) : (
-        <div className="overview-page__stats" data-testid="overview-stats">
-          <div className="overview-stat">
-            <span className="overview-stat__value">{state.history.account_count}</span>
-            <span className="overview-stat__label">账号</span>
+            <div className="overview-stat">
+              <span className="overview-stat__value">{masterStats.project_count}</span>
+              <span className="overview-stat__label">主库项目</span>
+            </div>
+            <div className="overview-stat" title="主库内出现过的账号数（含历史归属）">
+              <span className="overview-stat__value">{masterStats.participating_account_count}</span>
+              <span className="overview-stat__label">参与账号</span>
+            </div>
+            {masterStats.last_active_unix_seconds !== null && (
+              <div className="overview-stat">
+                <span className="overview-stat__value overview-stat__value--time">
+                  {formatLastActive(masterStats.last_active_unix_seconds)}
+                </span>
+                <span className="overview-stat__label">最近活跃</span>
+              </div>
+            )}
           </div>
-          <div className="overview-stat">
-            <span className="overview-stat__value">{state.history.project_count}</span>
-            <span className="overview-stat__label">项目</span>
+        ) : (
+          <div className="overview-page__stats" data-testid="overview-stats">
+            <div className="overview-stat">
+              <span className="overview-stat__value">{state.history.account_count}</span>
+              <span className="overview-stat__label">账号</span>
+            </div>
+            <div className="overview-stat">
+              <span className="overview-stat__value">{state.history.project_count}</span>
+              <span className="overview-stat__label">项目</span>
+            </div>
+            <div className="overview-stat">
+              <span className="overview-stat__value">{state.history.session_count}</span>
+              <span className="overview-stat__label">对话</span>
+            </div>
           </div>
-          <div className="overview-stat">
-            <span className="overview-stat__value">{state.history.session_count}</span>
-            <span className="overview-stat__label">对话</span>
-          </div>
-        </div>
+        )
+      ) : null}
+
+      {/* 空态行：目录就绪但无对话（与统计卡互斥），引导去环境页查看主库。 */}
+      {state.data_location.selected && !hasOverviewData && (
+        <p className="overview-page__empty-hint" data-testid="overview-empty-hint">
+          <BookOpen size={14} strokeWidth={2} aria-hidden="true" />
+          主库就绪，暂无对话。
+        </p>
       )}
 
-      {/* 每屏一个主操作：主库模型下历史页即主库视图；fixture 预览保留扫描动词 */}
+      {/* 每屏一个主操作：有数据 → 查看记录（主库模型下历史页即主库视图，
+          fixture 预览回落查看历史记录）；无数据但目录就绪 → 去环境页查看主库；
+          目录缺失 → 不出主操作（G1：异常态不加引导按钮）。 */}
       <div className="overview-page__actions">
-        <button
-          type="button"
-          className="btn btn--primary btn--large"
-          onClick={() => onNavigate("history")}
-          data-testid="overview-scan-cta"
-        >
-          {masterStats?.status === "ready" ? (
-            <Database size={17} strokeWidth={2} aria-hidden="true" />
+        {state.data_location.selected &&
+          (hasOverviewData ? (
+            <button
+              type="button"
+              className="btn btn--primary btn--large"
+              onClick={() => onNavigate("history")}
+              data-testid="overview-scan-cta"
+            >
+              {masterStats?.status === "ready" ? (
+                <Database size={17} strokeWidth={2} aria-hidden="true" />
+              ) : (
+                <BookOpen size={17} strokeWidth={2} aria-hidden="true" />
+              )}
+              {masterStats?.status === "ready" ? "查看主库记录" : "查看历史记录"}
+            </button>
           ) : (
-            <ScanSearch size={17} strokeWidth={2} aria-hidden="true" />
-          )}
-          {masterStats?.status === "ready"
-            ? "查看主库记录"
-            : hasHistory
-              ? "扫描本机最新记录"
-              : "开始扫描本机记录"}
-        </button>
+            <button
+              type="button"
+              className="btn btn--primary btn--large"
+              onClick={() => onNavigate("environment")}
+              data-testid="overview-master-cta"
+            >
+              <Database size={17} strokeWidth={2} aria-hidden="true" />
+              去环境页查看主库
+            </button>
+          ))}
         {!(checkinRealMode && checkinOverview !== null) && (
           <button
             type="button"
@@ -238,16 +270,6 @@ export function OverviewPage({
           </button>
         )}
       </div>
-
-      {!hasHistory && (
-        <p className="overview-page__empty-hint">
-          <BookOpen size={14} strokeWidth={2} aria-hidden="true" />
-          还没有任何历史记录。扫描后，这里会显示账号、项目和对话的统计。
-        </p>
-      )}
-
-      {/* 最近活动：操作记录与执行进度并入总览，不再单独占一页 */}
-      <OperationsPanel capabilities={state.capabilities} active={active} compact={true} />
     </section>
   );
 }

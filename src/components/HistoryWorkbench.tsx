@@ -1043,7 +1043,6 @@ export function HistoryWorkbench({ active, onNavigate, embedded = false }: Histo
         <header className="page-header">
           <div className="page-header__copy">
             <h1 data-page-title="history" tabIndex={-1}>历史</h1>
-            <p>主库对话记录 · 自动同步，无需授权扫描</p>
           </div>
           {actionsBar}
         </header>

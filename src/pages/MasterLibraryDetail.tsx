@@ -81,7 +81,6 @@ export function MasterLibraryDetail({ active, onNavigate }: MasterLibraryDetailP
             </button>
             <h1 data-page-title="master-library" tabIndex={-1}>主库</h1>
           </div>
-          <p>主库对话记录与插件 · 切换账号后全部保留</p>
         </div>
         <div className="page-header__actions">
           <button

@@ -1,24 +1,16 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Copy, Minus, ShieldCheck, Square, Waypoints, X } from "lucide-react";
-import type {
-  PlatformContextDto,
-  CurrentAccountStateDto,
-  CapabilityFlagsDto,
-} from "../types/workspace";
+import { Copy, Minus, Square, Waypoints, X } from "lucide-react";
+import type { PlatformContextDto } from "../types/workspace";
 
 interface TitleBarProps {
   platform: PlatformContextDto;
-  currentAccount: CurrentAccountStateDto;
-  capabilities: CapabilityFlagsDto;
 }
 
-// 标题栏 38px 单行（2026-08-27 精简）：品牌 + 全局状态徽章 + 自绘窗控。
+// 标题栏 38px 单行（2026-08-27 精简，2026-09-03 移除三态徽章）：品牌 + 自绘窗控。
 // 证据信息（当前账号/重新检测）下沉总览页（overview-evidence）。
 // 无系统装饰（decorations: false）时代码即标题栏：拖拽/双击最大化/窗控全在此。
-export function TitleBar({ platform, currentAccount, capabilities }: TitleBarProps) {
-  const modeLabel = renderModeLabel(currentAccount.unavailable_reason, capabilities.scan_enabled);
-  const modeTone = renderModeTone(currentAccount.unavailable_reason, capabilities.scan_enabled);
+export function TitleBar({ platform }: TitleBarProps) {
   const [maximized, setMaximized] = useState(false);
 
   // 最大化状态跟踪：窗口尺寸变化时重查（浏览器 preview 下 API 不可用则静默保持默认态）。
@@ -65,15 +57,6 @@ export function TitleBar({ platform, currentAccount, capabilities }: TitleBarPro
         <span className="title-bar__brand">Trae Sync</span>
         <span className="title-bar__subtitle">{platform.display_name}</span>
       </div>
-      {/* 全局唯一状态徽章：正常 / 需操作 / 未授权三态，全应用共享同一语义 */}
-      <span
-        className={`title-bar__mode status-badge--${modeTone}`}
-        data-testid="title-bar-mode"
-      >
-        <ShieldCheck size={13} strokeWidth={2} aria-hidden="true" />
-        <span>{modeLabel}</span>
-      </span>
-
       {/* 自绘窗控（无系统边框）：最小化 / 最大化切换 / 关闭。
           失败静默（浏览器 preview 无法执行窗口命令，真机才生效）。 */}
       <div className="title-bar__window-controls" aria-label="窗口控制">
@@ -114,20 +97,4 @@ export function TitleBar({ platform, currentAccount, capabilities }: TitleBarPro
       </div>
     </header>
   );
-}
-
-/// 全局状态徽章文案：三态统一（只读保护中 / 需要重新检测 / 读取未授权）。
-function renderModeLabel(reason: string | null, scanEnabled: boolean): string {
-  if (!scanEnabled || reason === "authorization_required" || reason === "authorization_mismatch") {
-    return "读取未授权";
-  }
-  return reason ? "需要重新检测" : "只读保护中";
-}
-
-/// 状态徽章色调：safe / warning / neutral，与全应用徽章语义一致。
-function renderModeTone(reason: string | null, scanEnabled: boolean): string {
-  if (!scanEnabled || reason === "authorization_required" || reason === "authorization_mismatch") {
-    return "neutral";
-  }
-  return reason ? "warning" : "safe";
 }

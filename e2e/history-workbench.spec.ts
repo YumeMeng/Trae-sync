@@ -193,7 +193,7 @@ test.describe("布局与状态保持", () => {
     await expect(page.getByTestId("history-session-list")).toContainText("会话一");
 
     await page.getByTestId("navigation-overview").click();
-    await expect(page.getByRole("region", { name: "最近活动" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "总览" })).toBeVisible();
     await page.getByTestId("navigation-history").click();
 
     // 组件保持挂载：项目筛选与列表维持原状。
@@ -287,129 +287,5 @@ test.describe("账号档案", () => {
     // 旧外部切换入口（保存当前登录/切换账号）已随环境模型移除。
     await expect(accountCenter.getByRole("button", { name: "保存当前登录" })).toHaveCount(0);
     await expect(accountCenter.getByRole("button", { name: "切换账号" })).toHaveCount(0);
-  });
-});
-
-// ============================================================================
-// T09 操作、恢复和锁状态（总览页，沿用）
-// ============================================================================
-
-test.describe("T09 操作与恢复状态", () => {
-  test("总览页显示写入中、恢复已验证、未知总量和另一实例锁", async ({ page }) => {
-    await installMockBridge(page);
-    await page.goto("/");
-    await page.getByTestId("navigation-overview").click();
-
-    await expect(page.getByTestId("operations-list")).toBeVisible();
-    await expect(page.getByTestId("operations-list")).toContainText("正在写入");
-    await expect(page.getByTestId("operations-list")).toContainText("恢复已验证");
-    await expect(page.getByTestId("operation-lock-status")).toContainText("有操作进行中");
-    await expect(page.getByTestId("operation-lock-status")).not.toContainText("允许副作用");
-    await expect(page.getByTestId("operation-progress")).toContainText("正在写入");
-    // 总量未知时只显示已完成字节数（1024 B 格式化为 1.0 KiB），不伪造百分比。
-    await expect(page.getByTestId("operation-progress")).toContainText("1.0 KiB");
-    await expect(page.getByTestId("operation-progress")).toContainText("本阶段不可取消");
-  });
-
-  test("隔离副本可显式核对未完成操作，生产参数不进入前端", async ({ page }) => {
-    await installMockBridge(page, {
-      safeSyncPreview: true,
-      operationList: [
-        {
-          operation_id: "op-reconcile",
-          state: "backing_up",
-          data_location_id: "loc-fixture",
-          sequence: 7,
-          has_verified_target_file_evidence: false,
-        },
-      ],
-      lockStatus: {
-        data_location_id: "loc-fixture",
-        catalog_lock_held: false,
-        data_location_lock_held: false,
-        write_allowed: false,
-        reason: null,
-      },
-      progress: null,
-    });
-    await page.goto("/");
-    await page.getByTestId("navigation-overview").click();
-
-    const reconcile = page.getByRole("button", { name: "重新核对未完成操作" });
-    await expect(reconcile).toBeVisible();
-    await reconcile.click();
-
-    await expect(page.getByTestId("operation-reconcile-result")).toContainText(
-      "1 条确认未应用",
-    );
-    await expect(page.getByTestId("operations-list")).toContainText("未应用");
-    await expect(reconcile).toHaveCount(0);
-  });
-
-  test("人工恢复和验证未完成状态不会伪装成同步成功", async ({ page }) => {
-    await installMockBridge(page, {
-      operationList: [
-        {
-          operation_id: "op-manual-recovery",
-          state: "manual_recovery_required",
-          data_location_id: "loc-fixture",
-          sequence: 4,
-          has_verified_target_file_evidence: false,
-        },
-        {
-          operation_id: "op-inconclusive",
-          state: "verification_inconclusive",
-          data_location_id: "loc-fixture",
-          sequence: 3,
-          has_verified_target_file_evidence: false,
-        },
-      ],
-      lockStatus: {
-        data_location_id: "loc-fixture",
-        catalog_lock_held: false,
-        data_location_lock_held: false,
-        write_allowed: false,
-        reason: "验证未完成，保持只读",
-      },
-      progress: {
-        operation_id: "op-manual-recovery",
-        phase: "recovering",
-        completed_bytes: 768,
-        total_bytes: 1024,
-        percent_basis_points: 7500,
-        cancellable: true,
-      },
-    });
-    await page.goto("/");
-    await page.getByTestId("navigation-overview").click();
-
-    await expect(page.getByTestId("operations-list")).toContainText("需要人工恢复");
-    await expect(page.getByTestId("operations-list")).toContainText("验证未完成");
-    await expect(page.getByTestId("operation-lock-status")).toContainText("验证未完成");
-    await expect(page.getByTestId("operation-progress")).toContainText("正在恢复");
-    await expect(page.getByTestId("operation-progress")).toContainText("768 B / 1.0 KiB");
-    await expect(
-      page.getByRole("progressbar", { name: "操作进度" }),
-    ).toHaveAttribute("aria-valuenow", "75");
-    await expect(page.getByTestId("operation-progress")).toContainText("当前阶段可取消");
-  });
-
-  test("空间不足时保留精确原因并禁止副作用", async ({ page }) => {
-    await installMockBridge(page, {
-      operationList: [],
-      lockStatus: {
-        data_location_id: "loc-fixture",
-        catalog_lock_held: false,
-        data_location_lock_held: false,
-        write_allowed: false,
-        reason: "空间不足：请迁移或手工管理存储",
-      },
-      progress: null,
-    });
-    await page.goto("/");
-    await page.getByTestId("navigation-overview").click();
-
-    await expect(page.getByTestId("operations-empty")).toBeVisible();
-    await expect(page.getByTestId("operation-lock-status")).toContainText("空间不足");
   });
 });

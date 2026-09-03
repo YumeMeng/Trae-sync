@@ -11,49 +11,6 @@
 // window.__TAURI_INTERNALS__.invoke(cmd, args, options)，因此 mock 该入口即可。
 
 import type { Page } from "@playwright/test";
-import type {
-  LockStatusDto,
-  OperationSummaryDto,
-  ProgressSnapshotDto,
-  ReconcileUnfinishedOperationsDto,
-} from "../src/types/operations";
-
-// T09 操作状态 fixture：同时覆盖进行中的写入操作和已验证的恢复结果。
-export const MOCK_OPERATION_LIST: OperationSummaryDto[] = [
-  {
-    operation_id: "op-fixture",
-    state: "target_writing",
-    data_location_id: "loc-fixture",
-    sequence: 2,
-    has_verified_target_file_evidence: false,
-  },
-  {
-    operation_id: "op-fixture-restored",
-    state: "restored_verified",
-    data_location_id: "loc-fixture",
-    sequence: 1,
-    has_verified_target_file_evidence: true,
-  },
-];
-
-// T09 锁 fixture：模拟另一项操作占用目录库和数据位置锁。
-export const MOCK_OPERATION_LOCK_STATUS: LockStatusDto = {
-  data_location_id: "loc-fixture",
-  catalog_lock_held: true,
-  data_location_lock_held: true,
-  write_allowed: false,
-  reason: null,
-};
-
-// T09 进度 fixture：写入阶段总量未知，且进入该阶段后不可取消。
-export const MOCK_OPERATION_PROGRESS: ProgressSnapshotDto = {
-  operation_id: "op-fixture",
-  phase: "writing",
-  completed_bytes: 1024,
-  total_bytes: null,
-  percent_basis_points: null,
-  cancellable: false,
-};
 
 // P5-3 主库历史读取状态（get_master_history.status 同构）。
 export type MasterHistoryMode =
@@ -66,15 +23,8 @@ export type MasterHistoryMode =
 export interface MockScenario {
   // RealReadPreview：生产只读 workspace，使用默认位置与命令。
   production?: boolean;
-  // SafeSyncPreview：只在隔离 fixture 中开放同步与未完成操作协调入口。
-  safeSyncPreview?: boolean;
   // P5-3：主库历史读取状态（默认 ready，两栏数据可见）。
   masterHistory?: MasterHistoryMode;
-  // T09：允许浏览器测试切换操作、锁和进度状态，不启动真实 Tauri。
-  operationList?: OperationSummaryDto[];
-  lockStatus?: LockStatusDto;
-  progress?: ProgressSnapshotDto | null;
-  reconcileResult?: ReconcileUnfinishedOperationsDto;
 }
 
 /**
@@ -85,18 +35,13 @@ export async function installMockBridge(
   page: Page,
   scenario: MockScenario = {},
 ) {
-  // 把场景和操作状态 fixture 序列化注入页面，作为初始 bridge 状态。
-  await page.addInitScript(
-    ({ scenario: initialScenario, operationList, lockStatus, progress }) => {
+  // 把场景容器序列化注入页面，作为初始 bridge 状态。
+  await page.addInitScript(({ scenario: initialScenario }) => {
     // 场景容器——测试运行时可通过 window.__setScenario 更新
     (window as any).__activeScenario = initialScenario;
     (window as any).__setScenario = (s: unknown) => {
       (window as any).__activeScenario = s;
     };
-
-    const OPERATION_LIST = operationList;
-    const OPERATION_LOCK_STATUS = lockStatus;
-    const OPERATION_PROGRESS = progress;
 
     // 预定义合成数据
     const PRODUCTION_LOCATION = "C:\\TRAE\\ModularData";
@@ -503,31 +448,12 @@ export async function installMockBridge(
       },
     ];
 
-    const isTerminalOperation = (state: OperationSummaryDto["state"]) =>
-      [
-        "completed",
-        "cancelled_before_write",
-        "failed_safe",
-        "not_applied",
-        "restored_verified",
-        "manual_recovery_required",
-      ].includes(state);
-
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
       const scn = (window as any).__activeScenario || {};
       if (cmd === "get_workspace_state") {
         if (scn.production) return PRODUCTION_WS;
-        return scn.safeSyncPreview
-          ? {
-              ...WS,
-              capabilities: {
-                ...WS.capabilities,
-                sync_enabled: true,
-                backup_enabled: true,
-              },
-            }
-          : WS;
+        return WS;
       }
       if (cmd === "get_managed_account_state") return MANAGED_ACCOUNT_STATE;
       if (cmd === "get_key_status") return KEY_STATUS;
@@ -842,49 +768,6 @@ export async function installMockBridge(
           probe_state: "verified_pending",
         };
       }
-      if (cmd === "list_operations") return scn.operationList ?? OPERATION_LIST;
-      if (cmd === "get_operation_lock_status") {
-        return scn.lockStatus ?? OPERATION_LOCK_STATUS;
-      }
-      if (cmd === "get_progress") {
-        // 未指定或请求当前 fixture 操作时返回稳定快照，未知操作保持无进度。
-        const currentProgress = scn.progress ?? OPERATION_PROGRESS;
-        if (!currentProgress) return null;
-        const operationId = args?.operationId;
-        if (operationId && operationId !== currentProgress.operation_id) return null;
-        return currentProgress;
-      }
-      if (cmd === "reconcile_unfinished_operations") {
-        if (!scn.safeSyncPreview) {
-          throw {
-            code: "gate_not_qualified",
-            message: "生产只读模式不开放未完成写操作协调。",
-            recommended_action: "当前保持只读。",
-            retryable: false,
-          };
-        }
-        const result =
-          scn.reconcileResult ??
-          ({
-            inspected_count: 1,
-            reconciled_count: 1,
-            not_applied_count: 1,
-            completed_count: 0,
-            manual_recovery_required_count: 0,
-            unrelated_data_location_count: 0,
-            status: "reconciled",
-          } satisfies ReconcileUnfinishedOperationsDto);
-        if (result.status === "reconciled") {
-          scn.operationList = (scn.operationList ?? OPERATION_LIST).map(
-            (operation: OperationSummaryDto) =>
-              isTerminalOperation(operation.state)
-                ? operation
-                : { ...operation, state: "not_applied", sequence: operation.sequence + 1 },
-          );
-          scn.progress = null;
-        }
-        return result;
-      }
       // Tauri event 插件 command 只返回句柄，不产生真实事件；页面会继续用轮询兜底。
       if (cmd === "plugin:event|listen") return 0;
       if (cmd === "plugin:event|unlisten") return null;
@@ -897,14 +780,9 @@ export async function installMockBridge(
       // 其他可能被 @tauri-apps/api 调用的入口
       convertFileSrc: (p: string) => p,
     };
-    },
-    {
-      scenario,
-      operationList: MOCK_OPERATION_LIST,
-      lockStatus: MOCK_OPERATION_LOCK_STATUS,
-      progress: MOCK_OPERATION_PROGRESS,
-    },
-  );
+  },
+  { scenario },
+);
 }
 
 /**

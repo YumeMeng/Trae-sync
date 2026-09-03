@@ -1,6 +1,6 @@
 /* 标题栏 + 导航图标栏 + 窗控 */
 
-/* 标题栏 38px 单行（2026-08-27 精简）：品牌 + 全局状态徽章。
+/* 标题栏 38px 单行（2026-08-27 精简，2026-09-03 移除三态徽章）：品牌 + 自绘窗控。
    证据信息（当前账号/重新检测）下沉总览页 overview-evidence。 */
 .title-bar {
   position: relative;
@@ -65,7 +65,6 @@
   white-space: nowrap;
 }
 
-.title-bar__mode,
 .workbench__read-only-badge,
 .status-badge,
 .badge {
@@ -77,26 +76,9 @@
   white-space: nowrap;
 }
 
-.title-bar__mode {
-  /* 跟随品牌的第二信息位（38px 单行内紧凑化）；右缘定位由窗控组接管 */
-  padding: 3px 9px;
-  /* 色值由 status-badge--* modifier 提供（正常态中性 + 靛蓝点确认） */
-  border-color: var(--line-control);
-  background: var(--fill-soft);
-  color: var(--text-2);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.title-bar__mode small {
-  color: inherit;
-  font-size: 12px;
-  font-weight: 500;
-}
-
 /* —— 自绘窗控（T8，decorations: false）——
    Windows 语义：46px 命中宽 × 标题栏满高，hover 中性底，关闭 hover 红。
-   组容器推到标题栏右缘（取代徽章的右缘定位职责）。 */
+   组容器推到标题栏右缘。 */
 .title-bar__window-controls {
   display: flex;
   align-items: stretch;
@@ -286,11 +268,6 @@
     display: none;
   }
 
-  .title-bar__mode {
-    padding: 3px 8px;
-    margin-right: 10px; /* 徽章与窗控间留白（窗控已贴右缘） */
-  }
-
   .title-bar__window-controls {
     margin-right: 0;
   }
@@ -309,8 +286,7 @@
   .navigation-rail__item--active,
   .workbench__node--active,
   .workbench__session--active,
-  .btn--primary,
-  .title-bar__mode {
+  .btn--primary {
     forced-color-adjust: none;
     border-color: Highlight;
     background: Canvas;

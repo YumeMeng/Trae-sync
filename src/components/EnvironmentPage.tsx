@@ -217,7 +217,6 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
       <header className="page-header">
         <div className="page-header__copy">
           <h1 data-page-title="environment" tabIndex={-1}>环境</h1>
-          <p>环境承载对话主库，账号是进入环境的门票。</p>
         </div>
         <div className="page-header__actions">
           <button

@@ -26,7 +26,6 @@
 /* 连续工作面：普通区域用分隔线建立结构，只有真正的浮层才使用阴影。
    玻璃化（DESIGN_TOKENS）：三大主面板切换玻璃标准组合。 */
 .workbench,
-.operations-panel,
 .settings-panel,
 .workbench-read {
   min-width: 0;
@@ -159,7 +158,6 @@
 
 .workbench__auth-header,
 .workbench__section-heading,
-.operations-panel__section-heading,
 .settings-panel__section-heading {
   display: flex;
   align-items: flex-start;
@@ -170,7 +168,6 @@
 
 .workbench__auth h3,
 .workbench__section-heading h3,
-.operations-panel__section-heading h3,
 .settings-panel__section-heading h3 {
   display: flex;
   align-items: center;
@@ -785,60 +782,6 @@
   opacity: 0.6;
 }
 
-.settings-list {
-  display: grid;
-  gap: 7px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.settings-item {
-  padding: 13px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--fill-soft);
-}
-
-.settings-item__state {
-  display: flex;
-  min-height: 40px;
-  align-items: center;
-  gap: 10px;
-}
-
-.settings-item__state > span:not(.status-badge) {
-  display: flex;
-  min-width: 0;
-  flex: 1;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.settings-item__state > svg {
-  flex: 0 0 auto;
-  color: var(--accent);
-}
-
-.settings-item__state strong {
-  font-size: 14px;
-}
-
-.settings-item__state small,
-.settings-panel__notice {
-  color: var(--text-2);
-  font-size: 14px;
-  line-height: 1.5;
-}
-
-.settings-panel__notice {
-  margin: 0;
-  padding: 11px 13px;
-  border-left: 3px solid var(--warn-line);
-  background: var(--warn-soft-bg);
-  color: var(--warn);
-}
-
 /* P5-4 主库数据备份分区：备份链列表 + 手动备份入口 + 人工恢复指引 */
 .settings-backup {
   display: grid;
@@ -1011,7 +954,6 @@
 
 @media (max-width: 720px) {
   .workbench,
-  .operations-panel,
   .settings-panel,
   .workbench-read {
     min-height: 0;
@@ -1122,7 +1064,6 @@
 
   .workbench__section-heading,
   .workbench__auth-header,
-  .operations-panel__section-heading,
   .settings-panel__section-heading {
     gap: 8px;
   }
@@ -1149,7 +1090,6 @@
 }
 
 .workbench,
-.operations-panel,
 .settings-panel,
 .workbench-read {
   border-radius: var(--radius-panel);
@@ -1191,16 +1131,8 @@
 
 .workbench__auth h3,
 .workbench__section-heading h3,
-.operations-panel__section-heading h3,
 .settings-panel__section-heading h3 {
   font-size: 16px;
-}
-
-.operations-panel__empty {
-  margin: 0;
-  color: var(--text-2);
-  font-size: 14px;
-  overflow-wrap: anywhere;
 }
 
 /* 下列 13px 字号组原始位置在 overview 域的 14px 规则之后（级联后者胜）；
@@ -1212,10 +1144,7 @@
 .workbench__search-scope,
 .workbench__empty,
 .workbench__error,
-.workbench__honest-status,
-.operations-panel__empty,
-.settings-item__state small,
-.settings-panel__notice {
+.workbench__honest-status {
   font-size: 13px;
 }
 
@@ -1276,10 +1205,6 @@
   max-height: 430px;
   overflow: auto;
   padding-right: 4px;
-}
-
-.settings-item__state {
-  min-height: 40px;
 }
 
 @media (min-width: 1024px) and (max-width: 1199px) {

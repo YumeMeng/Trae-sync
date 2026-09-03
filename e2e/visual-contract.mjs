@@ -46,7 +46,6 @@ async function mockInvoke(command) {
     case "get_trae_instance_states": return instanceStates;
     case "get_auto_checkin_settings": return { enabled: true, daily_time_hhmm: "10:00", ledger: null };
     case "get_managed_account_state": return { saved_accounts: [], switch_state: "idle" };
-    case "list_operations": return [];
     // P5-3 历史页主库视图：ready 两栏数据 + 接力台账 + 消息预览。
     case "get_master_history": return {
       status: "ready",

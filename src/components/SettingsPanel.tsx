@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CalendarClock, CircleOff, DatabaseBackup } from "lucide-react";
+import { CalendarClock, DatabaseBackup } from "lucide-react";
 import type { AutoCheckinStatusDto, KeyStatusDto } from "../types/account_switch";
 import type { BackupRetentionDto, MasterBackupChainDto } from "../types/masterLibrary";
 import { safeUiErrorMessage } from "../utils/safeUiError";
@@ -10,7 +10,7 @@ interface SettingsPanelProps {
   active: boolean;
 }
 
-// 设置页：固定安全默认值 + 自动签到偏好 + 密钥维护（自账号页迁入，账号页专注账号档案）。
+// 设置页：自动签到偏好 + 密钥维护（自账号页迁入，账号页专注账号档案）+ 主库备份。
 // 原始密钥只在后端内存中流转；界面只显示版本与探测结论，永不回显正文。
 export function SettingsPanel({ active }: SettingsPanelProps) {
   const [keyStatus, setKeyStatus] = useState<KeyStatusDto | null>(null);
@@ -152,32 +152,8 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
         <div className="page-header__copy">
           <span className="page-header__eyebrow">偏好与安全</span>
           <h1 data-page-title="settings" tabIndex={-1}>设置</h1>
-          <p>查看安全默认值并维护历史库密钥；尚未接入的选项不会显示为可编辑设置。</p>
         </div>
-        <span className="status-badge status-badge--neutral">固定安全值</span>
       </header>
-      <div className="settings-panel__section-heading">
-        <div>
-          <span className="workbench__eyebrow">应用行为</span>
-          <h3>安全默认值</h3>
-        </div>
-        <span className="section-caption">当前版本固定</span>
-      </div>
-      <ul className="settings-list">
-        <li className="settings-item">
-          <div className="settings-item__state">
-            <CircleOff size={17} aria-hidden="true" />
-            <span>
-              <strong>自动查找新历史</strong>
-              <small>默认关闭，避免在用户不知情时读取本地历史。</small>
-            </span>
-            <span className="status-badge status-badge--neutral">关闭</span>
-          </div>
-        </li>
-      </ul>
-      <p className="settings-panel__notice" data-testid="settings-readonly-notice">
-        当前版本使用固定安全值，不会把未接入的选项显示为可编辑配置。
-      </p>
 
       {/* 自动签到：总开关 + 每日时间点；每账号参与开关在账号详情页 */}
       <div className="settings-panel__section-heading">
@@ -191,17 +167,22 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       </div>
       {autoStatus ? (
         <div className="account-center__key-grid" data-testid="auto-checkin-settings">
-          <label className="account-center__target-field">
-            <span>每日自动签到</span>
-            <select
-              value={autoStatus.enabled ? "on" : "off"}
+          {/* 总开关用 checkbox 形态（与账号详情页的参与开关一致）；错峰与补偿细节收进悬浮提示 */}
+          <label
+            className="account-center__profile-select"
+            data-testid="auto-checkin-enabled-toggle"
+            title="到点后各账号在 0-15 分钟内随机错峰执行；迟于设定时间打开应用会自动补偿执行。"
+          >
+            <input
+              type="checkbox"
+              checked={autoStatus.enabled}
               disabled={autoBusy}
-              onChange={(event) => handleSaveAutoCheckin(event.target.value === "on", autoStatus.daily_time_hhmm)}
-              data-testid="auto-checkin-enabled-select"
-            >
-              <option value="on">开启（到点自动执行）</option>
-              <option value="off">关闭</option>
-            </select>
+              onChange={(event) => handleSaveAutoCheckin(event.target.checked, autoStatus.daily_time_hhmm)}
+            />
+            <span className="account-center__profile-copy">
+              <strong>每日自动签到</strong>
+              <span>开启后到点自动执行</span>
+            </span>
           </label>
           <label className="account-center__target-field">
             <span>触发时间</span>
@@ -222,9 +203,6 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       ) : (
         <p className="account-center__meta">正在读取自动签到设置…</p>
       )}
-      <p className="account-detail__hint">
-        到点后各账号在 0-15 分钟内随机错峰执行；迟于设定时间打开应用会自动补偿执行。
-      </p>
 
       {/* 密钥维护：自账号页「高级」区迁入；与账号档案无关，属于安全维护工具 */}
       <div className="settings-panel__section-heading">

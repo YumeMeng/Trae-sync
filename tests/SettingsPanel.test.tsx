@@ -25,14 +25,13 @@ describe("设置面板", () => {
 
   afterEach(() => vi.clearAllMocks());
 
-  it("只显示已生效的固定安全值，不伪装成可编辑表单", () => {
+  it("G25：安全默认值死区已删除，不再出现占位开关与开发声明", () => {
     render(<SettingsPanel active={false} />);
 
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
-    expect(screen.getByText("关闭")).toBeInTheDocument();
-    expect(screen.getByTestId("settings-readonly-notice")).toHaveTextContent(
-      /不会把未接入的选项显示为可编辑配置/,
-    );
+    expect(screen.queryByText("自动查找新历史")).not.toBeInTheDocument();
+    expect(screen.queryByText("固定安全值")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("settings-readonly-notice")).not.toBeInTheDocument();
+    expect(screen.queryByText(/尚未接入的选项/)).not.toBeInTheDocument();
   });
 
   it("不把存储根或其他技术参数伪装成日常设置", () => {
@@ -40,9 +39,7 @@ describe("设置面板", () => {
 
     expect(screen.queryByText("存储根")).not.toBeInTheDocument();
     expect(screen.queryByTestId("storage-root-state")).not.toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "设置" })).toHaveTextContent(
-      "自动查找新历史",
-    );
+    expect(screen.getByRole("region", { name: "设置" })).toBeInTheDocument();
     expect(screen.queryByText("读取完成后重新打开 TRAE")).not.toBeInTheDocument();
   });
 
@@ -129,8 +126,15 @@ describe("设置面板", () => {
     render(<SettingsPanel active={true} />);
 
     expect(await screen.findByText("已开启")).toBeInTheDocument();
-    expect(screen.getByTestId("auto-checkin-enabled-select")).toHaveValue("on");
+    // 总开关为 toggle（checkbox）形态，开启态勾选。
+    const toggle = screen.getByTestId("auto-checkin-enabled-toggle");
+    expect(toggle.querySelector("input")).toBeChecked();
     expect(screen.getByTestId("auto-checkin-time-input")).toHaveValue("10:30");
+    // 错峰与补偿说明收进悬浮提示，不再占界面正文。
+    expect(screen.getByTestId("auto-checkin-enabled-toggle")).toHaveAttribute(
+      "title",
+      expect.stringContaining("错峰"),
+    );
     // 台账含失败计数。
     expect(screen.getByTestId("auto-checkin-ledger")).toHaveTextContent("今日已完成（成功 4/5，失败 1）");
   });
@@ -152,7 +156,8 @@ describe("设置面板", () => {
     render(<SettingsPanel active={true} />);
     await screen.findByTestId("auto-checkin-settings");
 
-    fireEvent.change(screen.getByTestId("auto-checkin-enabled-select"), { target: { value: "off" } });
+    const toggle = screen.getByTestId("auto-checkin-enabled-toggle");
+    fireEvent.click(toggle.querySelector("input")!);
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("set_auto_checkin_settings", {

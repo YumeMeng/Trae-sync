@@ -11,7 +11,7 @@ import type {
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-// 事件插件 mock：捕获 listen 回调，供横幅测试手动触发（模式同 OperationsPanel.test）。
+// 事件插件 mock：捕获 listen 回调，供横幅测试手动触发。
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 
@@ -486,6 +486,8 @@ describe("CheckinPage", () => {
     expect(await screen.findByText("演示账号甲")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /全部签到（1）/ })).toBeEnabled();
     expect(mockInvoke).not.toHaveBeenCalledWith("get_checkin_overview");
+    // fixture 模式收敛为一行「演示模式」横幅，不再展示 transport 细节文案。
+    expect(screen.getByTestId("checkin-demo-banner")).toHaveTextContent("演示模式");
   });
 
   it("签到能力未启用时禁用执行按钮", async () => {
@@ -500,8 +502,23 @@ describe("CheckinPage", () => {
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
-    expect(await screen.findByText("未启用")).toBeInTheDocument();
+    expect(await screen.findByText("演示账号甲")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /全部签到/ })).toBeDisabled();
     expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
+  });
+
+  it("存储未就绪时显示异常提示，不显示演示模式横幅", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_checkin_capability") {
+        // 后端真实形态：RealReadPreview 且存储根为空 → disabled，池请求不发出。
+        return { enabled: false, transport: "disabled", real_http_enabled: false, message: "存储根不可用，真实签到未启用。" };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+
+    expect(await screen.findByTestId("checkin-unavailable")).toHaveTextContent("签到功能不可用：存储未就绪");
+    expect(screen.queryByTestId("checkin-demo-banner")).not.toBeInTheDocument();
   });
 });

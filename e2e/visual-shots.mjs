@@ -69,7 +69,6 @@ async function mockInvoke(command) {
     case "get_auto_checkin_settings":
       return { enabled: true, daily_time_hhmm: "10:00", ledger: { date: "2026-08-26", running: false, total: 5, completed: 4, failed: 0, skipped: 1 } };
     case "get_managed_account_state": return { saved_accounts: [], switch_state: "idle" };
-    case "list_operations": return [];
     default: return null;
   }
 }

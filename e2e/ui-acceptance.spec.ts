@@ -47,13 +47,6 @@ test.describe("桌面尺寸与滚动验收", () => {
       const metrics = await page.evaluate(() => {
         const root = document.documentElement;
         const titleBar = document.querySelector<HTMLElement>(".title-bar");
-        // 标题栏上下文区：当前账号项与状态徽章必须互不重叠。
-        const contextChildren = Array.from(
-          document.querySelectorAll<HTMLElement>(".title-bar__item, .title-bar__mode"),
-        ).map((child) => {
-          const rect = child.getBoundingClientRect();
-          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
-        });
         // P5-3 两栏：左栏项目列表 + 右栏会话列表，行须完整落在各自面板内。
         const panels = [".proj-panel", ".sess-panel"].map((selector) => {
           const panel = document.querySelector<HTMLElement>(selector);
@@ -80,7 +73,6 @@ test.describe("桌面尺寸与滚动验收", () => {
           titleBarHeight: titleBar?.getBoundingClientRect().height ?? 0,
           titleBarTop: titleBar?.getBoundingClientRect().top ?? Number.NaN,
           titleItems,
-          contextChildren,
           panels,
           rows,
         };
@@ -93,17 +85,6 @@ test.describe("桌面尺寸与滚动验收", () => {
       // 上界从贴边 1px 放宽到呼吸带常量 13px。
       expect(metrics.titleBarTop).toBeLessThanOrEqual(13);
       expect(metrics.titleItems.every((item) => item.width >= 80)).toBe(true);
-      expect(
-        metrics.contextChildren.every((child, index, children) =>
-          children.every((other, otherIndex) =>
-            index === otherIndex ||
-              child.right <= other.left + 1 ||
-              child.left >= other.right - 1 ||
-              child.bottom <= other.top + 1 ||
-              child.top >= other.bottom - 1,
-          ),
-        ),
-      ).toBe(true);
       // 两栏均渲染且行完整落在各自面板内（项目行→左栏，会话行→右栏）。
       expect(metrics.panels.every((panel) => panel !== null)).toBe(true);
       expect(metrics.rows.every((rows) => rows.length > 0)).toBe(true);
@@ -213,83 +194,6 @@ test.describe("桌面尺寸与滚动验收", () => {
       await accountCenter.scrollIntoViewIfNeeded();
       await page.screenshot({
         path: `artifacts/ui-acceptance/screenshots/accounts-${viewport.name}.png`,
-        fullPage: false,
-      });
-    }
-  });
-
-  test("总览页最近活动在目标桌面尺寸不溢出且关键状态可见", async ({ page }) => {
-    await installMockBridge(page, { safeSyncPreview: true });
-
-    for (const viewport of [
-      { name: "1024x600", width: 1024, height: 600 },
-      { name: "1280x800", width: 1280, height: 800 },
-      { name: "1920x1080", width: 1920, height: 1080 },
-    ]) {
-      await page.setViewportSize(viewport);
-      // 总览页是应用首页；最近活动内嵌其中。
-      await page.goto("/");
-
-      const panel = page.getByRole("region", { name: "最近活动" });
-      await expect(panel).toBeVisible();
-      await expect(page.getByTestId("operations-list")).toBeVisible();
-      await expect(page.getByTestId("reconcile-operations-button")).toBeVisible();
-
-      const metrics = await page.evaluate(() => {
-        const root = document.documentElement;
-        const panel = document.querySelector<HTMLElement>('[aria-label="最近活动"]');
-        const panelRect = panel?.getBoundingClientRect();
-        const visibleChildren = panel
-          ? Array.from(panel.querySelectorAll<HTMLElement>("button, summary, strong, p, span"))
-              .filter((element) => {
-                // .sr-only 是读屏器专用状态文本，1px 裁剪属预期行为，不算布局溢出。
-                if (element.closest(".sr-only")) {
-                  return false;
-                }
-                const rect = element.getBoundingClientRect();
-                const style = getComputedStyle(element);
-                return style.display !== "none" && rect.width > 0 && rect.height > 0;
-              })
-              .map((element) => ({
-                tag: element.tagName,
-                text: element.textContent?.slice(0, 24) ?? "",
-                scrollWidth: element.scrollWidth,
-                clientWidth: element.clientWidth,
-              }))
-          : [];
-        return {
-          scrollWidth: root.scrollWidth,
-          clientWidth: root.clientWidth,
-          panelRight: panelRect?.right ?? 0,
-          viewportWidth: window.innerWidth,
-          panelHeight: panelRect?.height ?? 0,
-          panelScrollWidth: panel?.scrollWidth ?? 0,
-          panelClientWidth: panel?.clientWidth ?? 0,
-          visibleChildren,
-        };
-      });
-      // 诊断输出：定位具体溢出的子元素，便于修复而非盲改断言。
-      const overflowChildren = metrics.visibleChildren.filter(
-        (element: { scrollWidth: number; clientWidth: number }) =>
-          element.scrollWidth > element.clientWidth + 1,
-      );
-      if (overflowChildren.length > 0) {
-        console.log(`[operations overflow ${viewport.name}]`, JSON.stringify(overflowChildren));
-      }
-
-      expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.clientWidth + 1);
-      expect(metrics.panelRight).toBeLessThanOrEqual(metrics.viewportWidth + 1);
-      expect(metrics.panelHeight).toBeGreaterThan(0);
-      expect(metrics.panelScrollWidth).toBeLessThanOrEqual(metrics.panelClientWidth + 1);
-      expect(
-        metrics.visibleChildren.every(
-          (element) => element.scrollWidth <= element.clientWidth + 1,
-        ),
-      ).toBe(true);
-
-      await resetMainScroll(page);
-      await page.screenshot({
-        path: `artifacts/ui-acceptance/screenshots/operations-${viewport.name}.png`,
         fullPage: false,
       });
     }
@@ -435,7 +339,8 @@ test.describe("签到页验收", () => {
 
 test.describe("P5-4 总览联动与设置页备份分区验收", () => {
   test("环境页统计格展示主库聚合，设置页备份链可见且手动备份使计数 +1", async ({ page }) => {
-    await installMockBridge(page);
+    // production 场景：数据位置就绪（主库统计 ready 的前提，G1 空态三分支）。
+    await installMockBridge(page, { production: true });
     await page.goto("/");
 
     // 总览：主库统计卡（mock ready）替换旧历史统计，主操作切换为「查看主库记录」。
@@ -452,11 +357,12 @@ test.describe("P5-4 总览联动与设置页备份分区验收", () => {
     await expect(stats).toContainText("16");
 
     // 设置页：备份分区（mock 初始 2 份）→ 立即备份 → 徽章 3 份 + 恢复指引可见。
+    // 提示文案与 SettingsPanel.test 同口径（P5-9 文案修订后的现行表述）。
     await page.getByTestId("navigation-settings").click();
     const section = page.getByTestId("master-backup-section");
     await expect(section).toBeVisible();
     await expect(page.getByText("现有 2 份")).toBeVisible();
-    await expect(page.getByTestId("master-backup-restore-hint")).toContainText(/工具永不自动删除/);
+    await expect(page.getByTestId("master-backup-restore-hint")).toContainText(/不会被自动删除/);
 
     await page.getByTestId("master-backup-create").click();
     await expect(page.getByText("现有 3 份")).toBeVisible();

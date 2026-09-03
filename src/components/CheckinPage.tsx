@@ -312,11 +312,7 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
       <header className="page-header">
         <div className="page-header__copy">
           <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
-          <p>四动作直达：一键全签、一键补签、勾选签、单账号行内签。串行执行，账号间自动随机间隔。</p>
         </div>
-        <span className={`status-badge status-badge--${capability?.enabled ? "safe" : "neutral"}`}>
-          {capability?.enabled ? "可用" : "未启用"}
-        </span>
       </header>
 
       {error && <p className="workbench__error" role="alert">{error}</p>}
@@ -334,7 +330,17 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
           {autoStatus.enabled ? ` · ${autoLedgerLabel(autoStatus)}` : ""}
         </p>
       )}
-      <p className="checkin-page__meta" role="status">{capability?.message ?? "正在读取签到能力…"}</p>
+      {/* 常驻提示只保留两类：fixture 演示模式标识（一行）与异常态（能力读取失败或存储根
+          不可用，统一显示存储未就绪并附带原因）。正常态不展示 capability.message——
+          其中是开发注释型自述，用户不可据此行动。capability 数据照常读取，仅不再常驻展示。 */}
+      {capability?.transport === "fixture" && (
+        <p className="checkin-page__meta" role="status" data-testid="checkin-demo-banner">演示模式</p>
+      )}
+      {capability && capability.transport !== "fixture" && !capability.enabled && (
+        <p className="workbench__error" role="alert" data-testid="checkin-unavailable">
+          签到功能不可用：存储未就绪
+        </p>
+      )}
 
       {poolIds.length > 0 ? (
         <section className="checkin-page__selection" aria-labelledby="checkin-selection-heading">

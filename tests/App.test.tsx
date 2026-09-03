@@ -47,17 +47,6 @@ describe("应用工作区入口", () => {
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_workspace_state") return workspace;
       if (command === "refresh_managed_current_account") return undefined;
-      if (command === "list_operations") return [];
-      if (command === "get_operation_lock_status") {
-        return {
-          data_location_id: "location-1",
-          catalog_lock_held: false,
-          data_location_lock_held: false,
-          write_allowed: false,
-          reason: null,
-        };
-      }
-      if (command === "get_progress") return null;
       if (command === "get_checkin_capability") {
         return {
           enabled: false,
@@ -73,7 +62,7 @@ describe("应用工作区入口", () => {
   it("历史页走主库直读，不存在授权扫描入口", async () => {
     render(<App />);
 
-    expect(await screen.findByTestId("title-bar-mode")).toBeInTheDocument();
+    expect(await screen.findByTestId("current-account-context")).toBeInTheDocument();
     // P5-3 起历史页直接读主库，授权勾选/扫描入口全部退役。
     expect(screen.queryByTestId("authorize-check")).not.toBeInTheDocument();
     expect(screen.queryByText("Work CN 只读入口")).not.toBeInTheDocument();
@@ -82,11 +71,10 @@ describe("应用工作区入口", () => {
     expect(mockInvoke).not.toHaveBeenCalledWith("read_work_cn_state", expect.anything());
   });
 
-  it("标题栏持续显示账号和只读状态，并提供重新检测", async () => {
+  it("总览证据带持续显示当前账号，并提供重新检测", async () => {
     render(<App />);
 
-    expect(await screen.findByTestId("title-bar-mode")).toHaveTextContent("只读保护中");
-    expect(screen.getByTestId("current-account-context")).toHaveTextContent(
+    expect(await screen.findByTestId("current-account-context")).toHaveTextContent(
       "当前账号 · acct-1234",
     );
 
@@ -97,7 +85,7 @@ describe("应用工作区入口", () => {
     expect(mockInvoke).toHaveBeenCalledWith("get_workspace_state");
   });
 
-  it("账号刷新失败仍重新读取工作区并清除旧标题栏账号", async () => {
+  it("账号刷新失败仍重新读取工作区并清除旧账号显示", async () => {
     let revoked = false;
     let workspaceReadCount = 0;
     const unauthorizedWorkspace: WorkspaceStateDto = {
@@ -124,17 +112,6 @@ describe("应用工作区入口", () => {
         revoked = true;
         throw new Error("account_profile_store_busy");
       }
-      if (command === "list_operations") return [];
-      if (command === "get_operation_lock_status") {
-        return {
-          data_location_id: "location-1",
-          catalog_lock_held: false,
-          data_location_lock_held: false,
-          write_allowed: false,
-          reason: null,
-        };
-      }
-      if (command === "get_progress") return null;
       throw new Error(`未模拟的命令: ${command}`);
     });
 
@@ -154,12 +131,11 @@ describe("应用工作区入口", () => {
         "未检测",
       );
       expect(screen.getByTestId("current-account-context")).not.toHaveTextContent("acct-1234");
-      expect(screen.getByTestId("title-bar-mode")).toHaveTextContent("读取未授权");
     });
     expect(workspaceReadCount).toBeGreaterThanOrEqual(2);
   });
 
-  it("读取授权未建立时显示读取未授权，不误导为账号重新检测", async () => {
+  it("读取授权未建立时证据带回落未检测，不渲染内部状态术语", async () => {
     const unauthorizedWorkspace: WorkspaceStateDto = {
       ...workspace,
       current_account: {
@@ -176,23 +152,12 @@ describe("应用工作区入口", () => {
     };
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_workspace_state") return unauthorizedWorkspace;
-      if (command === "list_operations") return [];
-      if (command === "get_operation_lock_status") {
-        return {
-          data_location_id: "location-1",
-          catalog_lock_held: false,
-          data_location_lock_held: false,
-          write_allowed: false,
-          reason: null,
-        };
-      }
-      if (command === "get_progress") return null;
       throw new Error(`未模拟的命令: ${command}`);
     });
 
     render(<App />);
 
-    expect(await screen.findByTestId("title-bar-mode")).toHaveTextContent("读取未授权");
+    expect(await screen.findByTestId("current-account-name")).toHaveTextContent("未检测");
     // 内部发布术语不进入用户界面（honest_status 已不再直接渲染）。
     expect(screen.queryByText(/RealReadPreview|真实只读 Preview/)).not.toBeInTheDocument();
   });
@@ -218,17 +183,103 @@ describe("应用工作区入口", () => {
     fireEvent.click(retryButton);
 
     await waitFor(() => {
-      expect(screen.getByTestId("title-bar-mode")).toBeInTheDocument();
+      expect(screen.getByTestId("current-account-context")).toBeInTheDocument();
     });
-    // 只统计工作区状态读取；总览页的活动面板会并行轮询其他只读命令。
+    // 只统计工作区状态读取；签到摘要等并行读取不计入。
     expect(
       mockInvoke.mock.calls.filter(([command]) => command === "get_workspace_state"),
     ).toHaveLength(2);
   });
 
+  it("总览页有主库数据时显示统计卡，不同屏出现空态引导", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_workspace_state") return workspace;
+      if (command === "refresh_managed_current_account") return undefined;
+      if (command === "get_checkin_capability") {
+        return {
+          enabled: false,
+          transport: "disabled",
+          real_http_enabled: false,
+          message: "签到能力当前不可读取。",
+        };
+      }
+      if (command === "get_master_library_stats") {
+        return {
+          status: "ready",
+          current_user_id: "u-1",
+          project_count: 4,
+          session_count: 16,
+          message_count: 128,
+          participating_account_count: 3,
+          last_active_unix_seconds: null,
+          size_bytes: 0,
+        };
+      }
+      throw new Error(`未模拟的命令: ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByTestId("overview-stats-master")).toBeInTheDocument();
+    // 空态与统计互斥（G1）：有数据时不出空态行与环境页引导按钮。
+    expect(screen.queryByTestId("overview-empty-hint")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-master-cta")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-scan-cta")).toHaveTextContent("查看主库记录");
+  });
+
+  it("总览页目录就绪但无对话时显示中性空态并引导去环境页", async () => {
+    // beforeEach 默认 mock 即该场景：目录就绪 + 历史全 0 + 主库统计读取失败回落 null。
+    render(<App />);
+
+    expect(await screen.findByTestId("overview-empty-hint")).toHaveTextContent(
+      "主库就绪，暂无对话",
+    );
+    expect(screen.getByTestId("overview-master-cta")).toHaveTextContent("去环境页查看主库");
+    // 空态与统计互斥：无数据时不出统计卡与查看记录主操作。
+    expect(screen.queryByTestId("overview-stats")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-stats-master")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-scan-cta")).not.toBeInTheDocument();
+  });
+
+  it("总览页目录缺失时只保留一行中性提示，不出统计与主操作", async () => {
+    const noLocationWorkspace: WorkspaceStateDto = {
+      ...workspace,
+      data_location: {
+        selected: false,
+        display_name: null,
+        unavailable_reason: "not_selected",
+      },
+    };
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_workspace_state") return noLocationWorkspace;
+      if (command === "refresh_managed_current_account") return undefined;
+      if (command === "get_checkin_capability") {
+        return {
+          enabled: false,
+          transport: "disabled",
+          real_http_enabled: false,
+          message: "签到能力当前不可读取。",
+        };
+      }
+      throw new Error(`未模拟的命令: ${command}`);
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("未找到 TRAE 数据目录，请确认 TRAE 已安装。"),
+    ).toBeInTheDocument();
+    // 异常态不加引导（G1）：不出统计、空态行与主操作按钮。
+    expect(screen.queryByTestId("overview-stats")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-stats-master")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-empty-hint")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-scan-cta")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-master-cta")).not.toBeInTheDocument();
+  });
+
   it("导航使用总览、历史、账号、签到、环境、设置六个工作区", async () => {
     render(<App />);
-    await screen.findByTestId("title-bar-mode");
+    await screen.findByTestId("current-account-context");
 
     expect(screen.getByRole("button", { name: "总览" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "历史" })).toBeInTheDocument();

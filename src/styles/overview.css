@@ -1,4 +1,4 @@
-/* 总览页 + 最近活动（operations-panel） */
+/* 总览页 */
 
 /* —— U-3 总览页签到摘要行（可插拔区块）—— */
 .overview-checkin {
@@ -62,8 +62,7 @@
   gap: 10px;
 }
 
-/* 操作与设置页共享同一层级。 */
-.operations-panel,
+/* 设置页与只读页共享同一层级。 */
 .settings-panel,
 .workbench-read {
   display: flex;
@@ -73,139 +72,11 @@
   padding: 24px;
 }
 
-.operations-panel__section-heading,
 .settings-panel__section-heading {
   align-items: center;
 }
 
-.operations-panel__list {
-  display: grid;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.operations-panel__list li {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 11px 13px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--fill-soft);
-}
-
-.operations-panel__item-main {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  min-width: 0;
-  color: var(--text-2);
-  font-size: 14px;
-}
-
-.operations-panel__item-main strong {
-  color: var(--text-1);
-  font-size: 14px;
-}
-
-.operations-panel__item-meta {
-  color: var(--text-2);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.operations-panel__item-details {
-  margin-top: 4px;
-  color: var(--text-2);
-  font-size: 12px;
-}
-
-.operations-panel__item-details summary {
-  min-height: 32px;
-  padding: 6px 0;
-  cursor: pointer;
-}
-
-.operations-panel__progress {
-  display: grid;
-  gap: 5px;
-  padding: 12px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--accent-soft);
-}
-
-/* 进度条头部：阶段名靠左、字节数靠右，一行读完。 */
-.operations-panel__progress-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  font-size: 13px;
-}
-
-.operations-panel__progress-head strong {
-  color: var(--text-1);
-}
-
-.operations-panel__progress-head span {
-  color: var(--text-2);
-  font-variant-numeric: tabular-nums;
-}
-
-.operations-panel__progress-track {
-  position: relative;
-  height: 6px;
-  overflow: hidden;
-  border-radius: 3px;
-  background: var(--fill);
-}
-
-.operations-panel__progress-fill {
-  height: 100%;
-  border-radius: 3px;
-  background: var(--accent);
-  transition: width 240ms ease-out;
-}
-
-/* 总量未知时的不确定动画：保留活动感，不伪造百分比。 */
-.operations-panel__progress-track--indeterminate::after {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: -36%;
-  width: 36%;
-  border-radius: 3px;
-  background: var(--accent);
-  content: "";
-  animation: operations-progress-slide 1.4s ease-in-out infinite;
-}
-
-@keyframes operations-progress-slide {
-  0% {
-    transform: translateX(0);
-  }
-  100% {
-    transform: translateX(390%);
-  }
-}
-
-.operations-panel__actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding-top: 4px;
-}
-
-.operations-panel__reconcile-icon--busy {
-  animation: workbench-spin 900ms linear infinite;
-}
-
 @media (max-width: 720px) {
-  .operations-panel,
   .settings-panel,
   .workbench-read {
     gap: 16px;
@@ -214,25 +85,13 @@
 
 }
 
-.operations-panel,
 .settings-panel,
 .workbench-read {
   min-height: calc(100vh - 120px);
   padding: 24px;
 }
 
-.operations-panel__item-main,
-.operations-panel__item-main strong,
-.operations-panel__item-meta,
-.settings-item__state strong {
-  font-size: 14px;
-}
-
-.operations-panel__item-meta {
-  font-size: 12px;
-}
-
-/* 总览页：问候 + 三张统计卡 + 一个主操作，最近活动以内嵌紧凑面板收尾。 */
+/* 总览页：问候 + 统计卡 + 空态行 + 主操作。 */
 .overview-page {
   display: grid;
   gap: 20px;
@@ -357,15 +216,6 @@
 .overview-page__empty-hint svg {
   flex: 0 0 auto;
   color: var(--text-2);
-}
-
-/* 内嵌总览的最近活动：去掉整页内边距与最小高度，融入页面节奏。 */
-.operations-panel--compact {
-  min-height: 0;
-  padding: 16px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-panel);
-  background: var(--fill-soft);
 }
 
 @media (max-width: 720px) {

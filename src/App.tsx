@@ -166,11 +166,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>
-      <TitleBar
-        platform={state.platform}
-        currentAccount={state.current_account}
-        capabilities={state.capabilities}
-      />
+      <TitleBar platform={state.platform} />
       <div className="app-body">
         <NavigationRail activePage={activePage} onPageChange={setActivePage} />
         <main id="main-content" className="app-main" ref={mainRef}>
