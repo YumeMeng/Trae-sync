@@ -9,18 +9,21 @@ import type {
 import { safeUiErrorMessage } from "../utils/safeUiError";
 
 // ============================================================================
-// P5-7 主库「数据校验」tab（只读排查，发现异常只报告不修复）：
-// 区块一 接力记录核对（台账条目 vs 库内实际归属）；
-// 区块二 备份对比（可切换链上任一备份点为基准，会话级差异）。
-// 进 tab 自动执行 + 刷新按钮（P5-5 体检同模式；tab 懒挂载由详情页负责）。
+// 主库只读校验面板（G20 重构后挂在库信息 tab）：
+// 区块一 接力记录核对（台账条目 vs 库内实际归属）——G20 起从库信息 tab
+//   移出，由 P8-5 主库自检（G18）承载；backupOnly 时不渲染。
+// 区块二 备份对比（可切换链上任一备份点为基准，会话级差异）——库信息 tab
+//   常驻区块。进 tab 自动执行 + 刷新按钮（P5-5 体检同模式）。
 // ============================================================================
 
 interface MasterVerificationPanelProps {
   /** tab 可见时才读取；不可见不发起请求（与详情页其他分区同口径）。 */
   active: boolean;
+  /** G20：仅渲染备份对比区块（库信息 tab 用）；false 渲染全部区块。 */
+  backupOnly?: boolean;
 }
 
-export function MasterVerificationPanel({ active }: MasterVerificationPanelProps) {
+export function MasterVerificationPanel({ active, backupOnly = false }: MasterVerificationPanelProps) {
   const [report, setReport] = useState<MasterVerificationDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -48,7 +51,7 @@ export function MasterVerificationPanel({ active }: MasterVerificationPanelProps
       setError(null);
     } catch (reason: unknown) {
       if (!mountedRef.current) return;
-      setError(safeUiErrorMessage(reason, "数据校验暂时无法执行，请稍后重试。"));
+      setError(safeUiErrorMessage(reason, "备份对比暂时无法执行，请稍后重试。"));
     } finally {
       if (mountedRef.current) setLoading(false);
     }
@@ -85,7 +88,8 @@ export function MasterVerificationPanel({ active }: MasterVerificationPanelProps
 
       {report && (
         <>
-          <LedgerBlock ledger={report.ledger} />
+          {/* G20：接力台账核对移入 P8-5 主库自检；库信息 tab 只渲染备份对比。 */}
+          {!backupOnly && <LedgerBlock ledger={report.ledger} />}
           <BackupBlock backup={report.backup} onChooseBase={chooseBase} loading={loading} />
         </>
       )}

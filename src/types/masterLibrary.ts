@@ -104,7 +104,7 @@ export interface BackupComparisonDto {
   readonly missing: readonly MissingSessionDto[];
 }
 
-/** 两层校验合并结果（「数据校验」tab 数据源）。 */
+/** 两层校验合并结果（G20：备份对比挂库信息 tab，台账核对归 P8-5 主库自检）。 */
 export interface MasterVerificationDto {
   readonly ledger: LedgerVerificationDto;
   readonly backup: BackupComparisonDto;

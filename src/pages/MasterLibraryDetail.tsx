@@ -10,14 +10,16 @@ import type { MasterBackupChainDto, MasterLibraryStatsDto } from "../types/maste
 import { safeUiErrorMessage } from "../utils/safeUiError";
 
 // ============================================================================
-// P5-8a-2 主库详情页 shell：顶部基础信息（路径/大小/账号/统计/最近活跃/最近备份）
-// + tabs（对话列表 · 插件 · 数据校验）。对话列表 tab 复用历史页两栏
-//（HistoryWorkbench embedded 模式，无页级标题）；插件 tab 由 P5-8b 填充；
-// 数据校验 tab 由 P5-7 填充（只读排查：接力记录核对 + 备份对比）。
+// 主库详情页 shell（G20 三 tab 平级结构，2026-09-04 重构）：
+// 顶部只留面包屑式标题（主库名 + 返回环境页）+ 刷新；
+// tabs = 对话列表（默认，HistoryWorkbench embedded 两栏）· 插件 · 库信息
+//（原基础信息：路径/大小/账号/统计/最近活跃/最近备份 + 备份对比）。
+// 原数据校验 tab 已取消：备份对比移入库信息 tab，接力台账核对由
+// P8-5 主库自检（G18）承载。
 // ============================================================================
 
-/** 详情页 tab：对话列表复用历史页；插件为 P5-8b；数据校验为 P5-7。 */
-type MasterDetailTab = "sessions" | "plugins" | "verification";
+/** 详情页 tab：对话列表复用历史页；插件为 P5-8b；库信息为 G20。 */
+type MasterDetailTab = "sessions" | "plugins" | "info";
 
 interface MasterLibraryDetailProps {
   /** 页面可见时才读取数据；隐藏时停止轮询（embedded 历史视图随 active 联动）。 */
@@ -97,66 +99,6 @@ export function MasterLibraryDetail({ active, onNavigate }: MasterLibraryDetailP
 
       {error && <p className="workbench__error" role="alert">{error}</p>}
 
-      {/* 基础信息（P5-8 契约）：路径/大小/当前账号/统计/最近活跃/最近备份 */}
-      <div className="master-detail__info" data-testid="master-detail-info">
-        <div className="master-detail__info-grid">
-          <div className="master-info-item">
-            <span className="master-info-item__label">当前账号</span>
-            <span className="master-info-item__value" data-testid="master-info-account">
-              {currentName ?? "未登录"}
-            </span>
-          </div>
-          <div className="master-info-item">
-            <span className="master-info-item__label">主库大小</span>
-            <span className="master-info-item__value" data-testid="master-info-size">
-              {stats && stats.size_bytes > 0 ? formatBytes(stats.size_bytes) : "—"}
-            </span>
-          </div>
-          <div className="master-info-item">
-            <span className="master-info-item__label">最近活跃</span>
-            <span className="master-info-item__value" data-testid="master-info-active">
-              {statsReady && stats.last_active_unix_seconds !== null
-                ? formatDateTime(stats.last_active_unix_seconds)
-                : "—"}
-            </span>
-          </div>
-          <div className="master-info-item">
-            <span className="master-info-item__label">最近备份</span>
-            <span className="master-info-item__value" data-testid="master-info-backup">
-              {latestBackup ? formatDateTime(latestBackup.stamp_unix_seconds) : "还没有备份"}
-            </span>
-          </div>
-          <div className="master-info-item master-info-item--wide">
-            <span className="master-info-item__label">主库路径</span>
-            {envState?.data_dir ? (
-              // 完整路径收进悬浮提示，主视野只显示末两段（界面表达纪律）。
-              <code
-                className="master-info-item__path"
-                data-testid="master-info-path"
-                title={envState.data_dir}
-              >
-                {dataDirTail(envState.data_dir)}
-              </code>
-            ) : (
-              <span className="master-info-item__value">—</span>
-            )}
-          </div>
-        </div>
-        {statsReady && (
-          <div className="master-detail__counts" data-testid="master-detail-counts">
-            <div className="master-count" title="当前账号可见的项目数">
-              <b>{stats.project_count}</b><span>项目</span>
-            </div>
-            <div className="master-count" title="当前账号可见的会话数">
-              <b>{stats.session_count}</b><span>会话</span>
-            </div>
-            <div className="master-count" title="当前账号会话的消息总数">
-              <b>{stats.message_count}</b><span>消息</span>
-            </div>
-          </div>
-        )}
-      </div>
-
       {/* tabs 内容懒挂载：未访问过详情页前不渲染（见 contentMounted 注释）。 */}
       {contentMounted && (
       <>
@@ -184,12 +126,12 @@ export function MasterLibraryDetail({ active, onNavigate }: MasterLibraryDetailP
         <button
           type="button"
           role="tab"
-          aria-selected={tab === "verification"}
-          className={`master-tab ${tab === "verification" ? "master-tab--active" : ""}`}
-          onClick={() => setTab("verification")}
-          data-testid="master-tab-verification"
+          aria-selected={tab === "info"}
+          className={`master-tab ${tab === "info" ? "master-tab--active" : ""}`}
+          onClick={() => setTab("info")}
+          data-testid="master-tab-info"
         >
-          数据校验
+          库信息
         </button>
       </div>
 
@@ -201,9 +143,68 @@ export function MasterLibraryDetail({ active, onNavigate }: MasterLibraryDetailP
         <div className="master-detail__tabpanel" hidden={tab !== "plugins"}>
           <PluginWorkbench active={active && tab === "plugins"} />
         </div>
-        {/* 数据校验 tab（P5-7）：进 tab 只读执行，异常只报告不修复。 */}
-        <div className="master-detail__tabpanel" hidden={tab !== "verification"}>
-          <MasterVerificationPanel active={active && tab === "verification"} />
+        {/* 库信息 tab（G20）：原基础信息 + 备份对比（原数据校验 tab 的
+            备份区块；接力台账核对由 P8-5 主库自检承载）。 */}
+        <div className="master-detail__tabpanel" hidden={tab !== "info"}>
+          <div className="master-detail__info" data-testid="master-detail-info">
+            <div className="master-detail__info-grid">
+              <div className="master-info-item">
+                <span className="master-info-item__label">当前账号</span>
+                <span className="master-info-item__value" data-testid="master-info-account">
+                  {currentName ?? "未登录"}
+                </span>
+              </div>
+              <div className="master-info-item">
+                <span className="master-info-item__label">主库大小</span>
+                <span className="master-info-item__value" data-testid="master-info-size">
+                  {stats && stats.size_bytes > 0 ? formatBytes(stats.size_bytes) : "—"}
+                </span>
+              </div>
+              <div className="master-info-item">
+                <span className="master-info-item__label">最近活跃</span>
+                <span className="master-info-item__value" data-testid="master-info-active">
+                  {statsReady && stats.last_active_unix_seconds !== null
+                    ? formatDateTime(stats.last_active_unix_seconds)
+                    : "—"}
+                </span>
+              </div>
+              <div className="master-info-item">
+                <span className="master-info-item__label">最近备份</span>
+                <span className="master-info-item__value" data-testid="master-info-backup">
+                  {latestBackup ? formatDateTime(latestBackup.stamp_unix_seconds) : "还没有备份"}
+                </span>
+              </div>
+              <div className="master-info-item master-info-item--wide">
+                <span className="master-info-item__label">主库路径</span>
+                {envState?.data_dir ? (
+                  // 完整路径收进悬浮提示，主视野只显示末两段（界面表达纪律）。
+                  <code
+                    className="master-info-item__path"
+                    data-testid="master-info-path"
+                    title={envState.data_dir}
+                  >
+                    {dataDirTail(envState.data_dir)}
+                  </code>
+                ) : (
+                  <span className="master-info-item__value">—</span>
+                )}
+              </div>
+            </div>
+            {statsReady && (
+              <div className="master-detail__counts" data-testid="master-detail-counts">
+                <div className="master-count" title="当前账号可见的项目数">
+                  <b>{stats.project_count}</b><span>项目</span>
+                </div>
+                <div className="master-count" title="当前账号可见的会话数">
+                  <b>{stats.session_count}</b><span>会话</span>
+                </div>
+                <div className="master-count" title="当前账号会话的消息总数">
+                  <b>{stats.message_count}</b><span>消息</span>
+                </div>
+              </div>
+            )}
+          </div>
+          <MasterVerificationPanel active={active && tab === "info"} backupOnly />
         </div>
       </div>
       </>
