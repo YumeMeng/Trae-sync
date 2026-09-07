@@ -259,12 +259,23 @@ export interface CheckinOverviewEntryDto {
   readonly display_name: string | null;
   /** 脱敏手机号（登录/刷新额度时自动采集）；空串 = 未采集。 */
   readonly masked_mobile: string;
+  /** 完整手机号（G11 手工补录，凭据包 DPAPI 加密存储）；null = 未补录（展示回退脱敏号）。 */
+  readonly mobile_full: string | null;
   /** 该账号是否参与自动签到（详情页复选框数据源）。 */
   readonly auto_checkin_enabled: boolean;
   /** 最近一次额度刷新失败原因码；成功后清除（卡片持续显示“刷新失败”标记）。 */
   readonly refresh_error_code: string | null;
   /** 凭据包属于已退役旧通道（client_id 非 SOLO）：登录态直接按“登录失效”处理，需重新登录。 */
   readonly credential_legacy: boolean;
+  /**
+   * 今日最近一次签到尝试的结果码（G10 签到槽状态机输入）：
+   * "business:9074" 形态 = 业务性失败（红·签到失败）；"transport:network_error" 形态 =
+   * 传输性失败（琥珀·待重试）；"not_eligible" = 服务端业务拒绝（灰·不可领取）。
+   * null = 今日尚无尝试记录（旧数据缺失时按 null 防御）。
+   */
+  readonly last_attempt_outcome: string | null;
+  /** 最近一次签到尝试的本地日期（YYYY-MM-DD，与 outcome 同一日界过滤输出）；用于判定“今日尝试”，跨日不残留。null = 今日无尝试。 */
+  readonly last_attempt_date: string | null;
 }
 
 /** get_auto_checkin_settings 返回：设置 + 今日台账。 */

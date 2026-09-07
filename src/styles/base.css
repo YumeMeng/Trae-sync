@@ -290,6 +290,17 @@ body {
   border: 0;
 }
 
+/* 图标旋转（G15 纯本地刷新按钮进行中态；两页共用）。 */
+.icon-spin {
+  animation: icon-spin 900ms linear infinite;
+}
+
+@keyframes icon-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @media (min-width: 1024px) and (max-width: 1199px) {
   /* 旧基线的标题栏收窄规则已删（38px 单行在所有断点统一，2026-08-27）。 */
   .app-main {

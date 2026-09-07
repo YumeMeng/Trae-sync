@@ -166,6 +166,17 @@ impl DeviceRemintService {
         new_private_key: &str,
         oauth_client: OAuthClient,
     ) -> Result<(), RemintError> {
+        // 重铸保留已补录的完整手机号（与新设备无绑定关系；旧包读取失败按未补录）。
+        let previous_mobile_full = self
+            .store
+            .load(&CheckinProfileBinding::new(
+                record.profile_id.clone(),
+                record.account_id.clone(),
+                record.device_id.clone(),
+                record.device_public_key.clone(),
+            ))
+            .ok()
+            .and_then(|bundle| bundle.mobile_full);
         let bundle = CheckinCredentialBundle {
             profile_id: record.profile_id.clone(),
             account_id: record.account_id.clone(),
@@ -178,6 +189,7 @@ impl DeviceRemintService {
             client_id: oauth_client.client_id().to_string(),
             access_token_expires_at_unix_seconds: grant.access_token_expires_at_unix_seconds,
             refresh_token_expires_at_unix_seconds: grant.refresh_token_expires_at_unix_seconds,
+            mobile_full: previous_mobile_full,
         };
         // save 为原子写（临时文件 + 替换）；失败时旧凭据保持不变。
         self.store

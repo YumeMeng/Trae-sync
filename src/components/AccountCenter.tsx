@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowDownAZ, ArrowLeftRight, HeartPulse, LayoutGrid, List, RefreshCw, ShieldCheck, UserPlus, UserRound } from "lucide-react";
 import type {
@@ -14,9 +13,16 @@ import type {
 } from "../types/account_switch";
 import type { EnvironmentStateDto } from "../types/environment";
 import { safeUiErrorMessage } from "../utils/safeUiError";
-import { effectiveDisplayName } from "../utils/accountDisplay";
+import { displayMobile, effectiveDisplayName } from "../utils/accountDisplay";
 import { AccountDetail } from "./AccountDetail";
-import { CheckinSlotBadge, LoginArchiveSlotBadge, tokenHealthText } from "./StatusBadges";
+import {
+  CheckinSlotBadge,
+  LoginArchiveSlotBadge,
+  deriveCheckinSlotState,
+  deriveLoginSlotState,
+  type LoginSlotState,
+} from "./StatusBadges";
+import { OperationResultCard, type OperationResultIssue } from "./OperationResultCard";
 import { MasterSwitchDialog, type MasterSwitchTarget } from "./MasterSwitchDialog";
 
 interface AccountCenterProps {
@@ -31,6 +37,8 @@ type LoginBrowserMode = "isolated" | "system";
 type AccountView = "list" | "card";
 // U-2 排序：added=添加序（注册表顺序）；name=名称；checkin=签到状态（未签在前）。
 type AccountSort = "added" | "name" | "checkin";
+// G14 账号过滤：all=全部（默认）；attention=需处理（只显示异常账号）。会话内状态，不持久化。
+type AccountFilter = "all" | "attention";
 
 const VIEW_STORAGE_KEY = "accounts.view";
 const SORT_STORAGE_KEY = "accounts.sort";
@@ -54,6 +62,12 @@ export function AccountCenter({ active }: AccountCenterProps) {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [checkinCapability, setCheckinCapability] = useState<CheckinCapabilityDto | null>(null);
+  // G9 结果卡：健康检测 / 刷新额度完成后的结构化回执（首行结论 + 异常清单）。
+  const [resultCard, setResultCard] = useState<{
+    title: string;
+    okCount: number;
+    issues: readonly OperationResultIssue[];
+  } | null>(null);
   // 账号总览（真实模式）：档案 + 积分缓存 + 令牌到期，驱动卡片与详情视图。
   const [overview, setOverview] = useState<readonly CheckinOverviewEntryDto[]>([]);
   const [loginBusy, setLoginBusy] = useState(false);
@@ -63,6 +77,8 @@ export function AccountCenter({ active }: AccountCenterProps) {
   const [creditsBusy, setCreditsBusy] = useState(false);
   // 一键健康检测进行中（本地检测 + 网络探测，按钮禁用 + 进度提示）。
   const [healthBusy, setHealthBusy] = useState(false);
+  // G15 纯本地刷新进行中（毫秒级本地读取，仅驱动按钮图标旋转）。
+  const [localRefreshBusy, setLocalRefreshBusy] = useState(false);
   // 选中的账号：非空时进入独立详情视图。
   const [selectedProfileId, setSelectedProfileId] = useState("");
   // U-2 双视图与排序：localStorage 记忆（脏值回退默认）。
@@ -70,12 +86,19 @@ export function AccountCenter({ active }: AccountCenterProps) {
     readStoredPreference(VIEW_STORAGE_KEY, "list", ["list", "card"] as const));
   const [accountSort, setAccountSort] = useState<AccountSort>(() =>
     readStoredPreference(SORT_STORAGE_KEY, "added", ["added", "name", "checkin"] as const));
+  // G14 需处理过滤：会话内状态（「需处理」是临时排查意图，不写偏好）。
+  const [accountFilter, setAccountFilter] = useState<AccountFilter>("all");
   // 登录凭据健康度（profile_id → 条目，P7-5 凭据包实调判定）：
   // login_state 为实调结果（驱动卡片徽章），archive_available 为存档次要信息。
   const [loginStates, setLoginStates] = useState<Record<string, TraeInstanceStateDto>>({});
   // P5-2 切号主面板：主库当前登录账号（环境档案）+ 切换目标（弹层打开中）。
   const [envCurrentProfileId, setEnvCurrentProfileId] = useState<string | null>(null);
   const [switchTarget, setSwitchTarget] = useState<MasterSwitchTarget | null>(null);
+  // G11 登录后手机号补录弹层：profileId + 展示名 + 服务端脱敏号（肉眼比对基准）。
+  const [mobilePrompt, setMobilePrompt] = useState<{ profileId: string; name: string; masked: string } | null>(null);
+  const [mobilePromptValue, setMobilePromptValue] = useState("");
+  const [mobilePromptBusy, setMobilePromptBusy] = useState(false);
+  const [mobilePromptError, setMobilePromptError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const nextView = await invoke<ManagedAccountsViewDto>("get_managed_account_state");
@@ -128,26 +151,30 @@ export function AccountCenter({ active }: AccountCenterProps) {
     return () => { cancelled = true; };
   }, [active, checkinCapability?.real_http_enabled]);
 
-  const refreshOverview = useCallback(async () => {
+  const refreshOverview = useCallback(async (): Promise<CheckinOverviewEntryDto[] | null> => {
     const entries = await invoke<CheckinOverviewEntryDto[]>("get_checkin_overview").catch(() => null);
     if (entries) setOverview(entries);
+    return entries;
   }, []);
 
-  // P6-2 登录存档健康度：真实模式且有账号时读取一次（无轮询——存档只在
-  // 登录/切号/保活写回时变化，页面重新可见或总览刷新时本 effect 自然重跑）。
+  // P6-2 登录存档健康度：真实模式且账号集合变化时读取（无轮询——存档只在
+  // 登录/切号/保活写回时变化）。依赖用 profile 集合签名而非数组身份：
+  // 纯本地刷新（G15）重读总览不触发凭据重探测（get_trae_instance_states
+  // 含逐账号 HTTP 实调，是有网络成本的操作，只有健康检测应触发）。
+  const overviewProfileKey = overview.map((entry) => entry.profile_id).join("\n");
   useEffect(() => {
-    if (!active || checkinCapability?.real_http_enabled !== true || overview.length === 0) {
+    if (!active || checkinCapability?.real_http_enabled !== true || overviewProfileKey === "") {
       return;
     }
     let cancelled = false;
-    const profileIds = overview.map((entry) => entry.profile_id);
+    const profileIds = overviewProfileKey.split("\n");
     void invoke<TraeInstanceStateDto[]>("get_trae_instance_states", { profileIds })
       .then((states) => {
         if (!cancelled) setLoginStates(toLoginStateMap(states));
       })
       .catch(() => undefined); // 读取失败保持现状徽章（未登录），不阻塞页面。
     return () => { cancelled = true; };
-  }, [active, checkinCapability?.real_http_enabled, overview]);
+  }, [active, checkinCapability?.real_http_enabled, overviewProfileKey]);
 
   // P5-2 环境档案：主库当前登录账号驱动「使用中」标记与切换按钮分布。
   // fixture 模式后端返回空档案（无当前账号），全部账号展示切换入口。
@@ -166,6 +193,15 @@ export function AccountCenter({ active }: AccountCenterProps) {
     await loadEnvironment();
     await refreshOverview();
   }, [loadEnvironment, refreshOverview]);
+
+  // G15 纯本地刷新：重读账号总览与环境档案（均为本机缓存，零网络请求）。
+  // 语义分工：刷新 = 重读缓存；健康检测 = 真实探测（含逐账号网络实调）。
+  const handleLocalRefresh = useCallback(() => {
+    if (localRefreshBusy) return;
+    setLocalRefreshBusy(true);
+    // 两个读取内部各自吞错（保持旧数据），完成后收起旋转动画。
+    void Promise.all([refreshOverview(), loadEnvironment()]).finally(() => setLocalRefreshBusy(false));
+  }, [localRefreshBusy, refreshOverview, loadEnvironment]);
 
   const realCheckinMode = checkinCapability?.real_http_enabled === true;
   // 添加账号是核心需求：除 fixture 测试模式外常驻显示，不依赖签到能力开关。
@@ -196,6 +232,28 @@ export function AccountCenter({ active }: AccountCenterProps) {
     });
   }, [overview, accountSort]);
 
+  // G14 需处理判定：口径与 G10 槽位一致——登录槽红/琥珀 或 签到槽红。
+  // 未签/未刷新（灰）不算异常；登录槽灰（未登录）也不算。
+  const needsAttention = useCallback((entry: CheckinOverviewEntryDto) => {
+    const credentialDead = entry.credential_legacy || entry.refresh_error_code === "credential_refresh_failed";
+    const loginSlot = deriveLoginSlotState({
+      login_state: effectiveCredentialState(entry, loginStates[entry.profile_id]),
+      relogin_only: credentialDead,
+    });
+    if (loginSlot === "relogin" || loginSlot === "expired" || loginSlot === "pending") return true;
+    return deriveCheckinSlotState(entry) === "failed";
+  }, [loginStates]);
+
+  // 角标数字按全量总览计（与当前过滤无关）。
+  const attentionCount = useMemo(
+    () => overview.filter((entry) => needsAttention(entry)).length,
+    [overview, needsAttention],
+  );
+  const visibleOverview = useMemo(
+    () => (accountFilter === "attention" ? sortedOverview.filter((entry) => needsAttention(entry)) : sortedOverview),
+    [accountFilter, sortedOverview, needsAttention],
+  );
+
   // OAuth 登录：后端按所选模式打开浏览器（隔离实例=默认；本机浏览器=复用
   // 系统已登录会话），随后阻塞等待回调（最长约 5 分钟）。
   // begin 失败时无副作用；complete 成功后凭据已加密入库（同一账号重复登录覆盖更新）。
@@ -208,8 +266,18 @@ export function AccountCenter({ active }: AccountCenterProps) {
     try {
       await invoke<CheckinLoginBeginDto>("begin_checkin_login", { useSystemBrowser });
       const receipt = await invoke<CheckinLoginReceiptDto>("complete_checkin_login");
-      await refreshOverview();
+      const entries = await refreshOverview();
       setMessage(`账号“${receipt.screen_name}”登录成功，已可用于签到。`);
+      // G11：登录成功即引导补录完整手机号（可跳过）；脱敏号取自刷新后的
+      // 总览条目（登录时已写入注册表）。已补录过的账号重复登录不再打扰。
+      const fresh = entries?.find((entry) => entry.profile_id === receipt.profile_id) ?? null;
+      if (!fresh?.mobile_full) {
+        setMobilePrompt({
+          profileId: receipt.profile_id,
+          name: effectiveDisplayName({ display_name: fresh?.display_name ?? null, screen_name: receipt.screen_name }),
+          masked: fresh?.masked_mobile ?? "",
+        });
+      }
     } catch (reason: unknown) {
       // 取消不是错误：以中性提示收尾（浏览器被关闭同样走此路径）。
       if (typeof reason === "string" && reason === "login_cancelled") {
@@ -221,6 +289,51 @@ export function AccountCenter({ active }: AccountCenterProps) {
       setLoginBusy(false);
     }
   }, [loginBusy, refreshOverview]);
+
+  // G11 保存补录手机号：第三层查重在前端提示确认（前两层格式/脱敏比对在后端命令）。
+  // 空串 = 清除补录（详情页“清空保存”路径；登录弹层保存按钮空值时禁用不会走到）。
+  // 返回 false = 用户取消（重复号拒绝保存）；错误原样抛出由调用方映射文案。
+  const saveMobileBackfill = useCallback(async (profileId: string, mobile: string) => {
+    const trimmed = mobile.trim();
+    if (trimmed !== "") {
+      const owner = overview.find(
+        (entry) => entry.profile_id !== profileId && entry.mobile_full === trimmed,
+      );
+      if (owner) {
+        const confirmed = window.confirm(
+          `该手机号已用于账号“${effectiveDisplayName(owner)}”，仍要保存到当前账号吗？`,
+        );
+        if (!confirmed) return false;
+      }
+    }
+    await invoke("set_account_mobile", { profileId, mobile: trimmed === "" ? null : trimmed });
+    await refreshOverview();
+    return true;
+  }, [overview, refreshOverview]);
+
+  // G11 补录弹层保存：成功后关弹层；失败保留弹层与输入值，映射后的文案就地展示。
+  const handleMobilePromptSave = useCallback(() => {
+    if (!mobilePrompt || mobilePromptBusy) return;
+    // 空输入不可保存：与保存按钮 disabled 同口径，防止 Enter 旁路触发清除路径
+    // （saveMobileBackfill 空串 = 清除已补录手机号）。
+    if (mobilePromptValue.trim() === "") return;
+    setMobilePromptBusy(true);
+    setMobilePromptError(null);
+    void (async () => {
+      try {
+        const saved = await saveMobileBackfill(mobilePrompt.profileId, mobilePromptValue);
+        if (saved) {
+          setMobilePrompt(null);
+          setMobilePromptValue("");
+          setMessage("手机号已补全，账号列表与详情页都会显示完整号码。");
+        }
+      } catch (reason: unknown) {
+        setMobilePromptError(safeUiErrorMessage(reason, "手机号保存失败，请稍后重试。"));
+      } finally {
+        setMobilePromptBusy(false);
+      }
+    })();
+  }, [mobilePrompt, mobilePromptBusy, mobilePromptValue, saveMobileBackfill]);
 
   // 取消进行中的登录（P7-4）：置位后端取消标记，等待中的 complete 会以
   // login_cancelled 收尾。取消请求本身失败不打断等待（仍有超时兜底）。
@@ -238,23 +351,22 @@ export function AccountCenter({ active }: AccountCenterProps) {
     setCreditsBusy(true);
     setError(null);
     setMessage(null);
+    setResultCard(null);
     void (async () => {
       try {
         const profileIds = overview.map((entry) => entry.profile_id);
         const results = await invoke<CreditsRefreshEntryDto[]>("refresh_checkin_credits", { profileIds });
         await refreshOverview();
-        const okCount = results.filter((item) => item.error_code === null).length;
-        const failedEntries = results.filter((item) => item.error_code !== null);
-        if (failedEntries.length > 0) {
-          // 失败账号直接列名（与健康检测汇总同款式）：错误详情见各账号卡片“刷新失败”标记与详情页。
-          const nameOf = new Map(overview.map((entry) => [entry.profile_id, effectiveDisplayName(entry)]));
-          const names = failedEntries
-            .map((item) => nameOf.get(item.profile_id) ?? item.screen_name)
-            .join("、");
-          setMessage(`额度已刷新：${okCount} 个成功，${failedEntries.length} 个失败（${names}）。`);
-        } else {
-          setMessage(`全部 ${okCount} 个账号额度已更新。`);
-        }
+        const nameOf = new Map(overview.map((entry) => [entry.profile_id, effectiveDisplayName(entry)]));
+        // G9 结果卡：异常账号列名 + 一句人话原因；正常账号不占空间。
+        const issues = results
+          .filter((item) => item.error_code !== null)
+          .map((item) => ({
+            key: item.profile_id,
+            name: nameOf.get(item.profile_id) ?? item.screen_name,
+            reason: safeUiErrorMessage(item.error_code, "网络或服务暂时不可用，请稍后重试。"),
+          }));
+        setResultCard({ title: "额度刷新", okCount: results.length - issues.length, issues });
       } catch (reason: unknown) {
         setError(safeUiErrorMessage(reason, "额度刷新未完成，请稍后重试。"));
       } finally {
@@ -265,12 +377,13 @@ export function AccountCenter({ active }: AccountCenterProps) {
 
   // 一键健康检测：登录存档深度检测（storage.json 键 + 最近启动日志证据，
   // 秒级）→ 签到会话网络探测（复用 refresh_checkin_credits 只读查询，顺带
-  // 刷新额度与令牌时间戳）→ 徽章即时更新 + 汇总消息。
+  // 刷新额度与令牌时间戳）→ 徽章即时更新 + G9 结果卡。
   const handleHealthCheck = useCallback(() => {
     if (healthBusy || overview.length === 0) return;
     setHealthBusy(true);
     setError(null);
     setMessage(null);
+    setResultCard(null);
     void (async () => {
       try {
         const profileIds = overview.map((entry) => entry.profile_id);
@@ -284,7 +397,7 @@ export function AccountCenter({ active }: AccountCenterProps) {
         // 网络探测：逐账号只读查询，error_code 非空即签到会话异常。
         const results = await invoke<CreditsRefreshEntryDto[]>("refresh_checkin_credits", { profileIds });
         await refreshOverview();
-        setMessage(summarizeHealth(states, results, overview));
+        setResultCard({ title: "健康检测", ...buildHealthResult(states, results, overview) });
       } catch (reason: unknown) {
         setError(safeUiErrorMessage(reason, "健康检测未完成，请稍后重试。"));
       } finally {
@@ -292,6 +405,67 @@ export function AccountCenter({ active }: AccountCenterProps) {
       }
     })();
   }, [healthBusy, overview, refreshOverview]);
+
+  // G11 登录后手机号补录弹层（共享 JSX）：列表视图与详情视图都渲染——
+  // 从详情页发起重新登录时弹层不再滞留到返回列表后才出现。
+  const mobilePromptDialog = mobilePrompt && (
+    <div className="switch-veil" role="presentation">
+      <div className="mobile-prompt" role="dialog" aria-modal="true" aria-labelledby="mobile-prompt-title" data-testid="mobile-backfill-dialog">
+        <h2 id="mobile-prompt-title" className="mobile-prompt__title">补全手机号</h2>
+        <p className="mobile-prompt__lead">
+          为账号「{mobilePrompt.name}」补录完整手机号，多账号时更易区分。可跳过，之后随时能在账号详情页补录。
+        </p>
+        <p className="mobile-prompt__masked">
+          服务端记录：{mobilePrompt.masked || "暂未采集（可先跳过，刷新额度后自动补全脱敏号）"}
+        </p>
+        <input
+          className="mobile-prompt__input"
+          type="tel"
+          inputMode="numeric"
+          value={mobilePromptValue}
+          maxLength={11}
+          placeholder="请输入 11 位完整手机号"
+          disabled={mobilePromptBusy}
+          data-testid="mobile-backfill-input"
+          aria-label="完整手机号"
+          onChange={(event) => setMobilePromptValue(event.target.value.replace(/[^\d]/g, ""))}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              handleMobilePromptSave();
+            }
+          }}
+        />
+        {mobilePromptError && (
+          <p className="mobile-prompt__error" role="alert" data-testid="mobile-backfill-error">{mobilePromptError}</p>
+        )}
+        <div className="mobile-prompt__actions">
+          <button
+            className="btn"
+            type="button"
+            disabled={mobilePromptBusy}
+            data-testid="mobile-backfill-skip"
+            onClick={() => {
+              setMobilePrompt(null);
+              setMobilePromptValue("");
+              setMobilePromptError(null);
+            }}
+          >
+            跳过
+          </button>
+          <button
+            className="btn btn--primary"
+            type="button"
+            disabled={mobilePromptBusy || mobilePromptValue.trim() === ""}
+            data-testid="mobile-backfill-save"
+            onClick={handleMobilePromptSave}
+          >
+            {mobilePromptBusy ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
   if (!active || loading) {
     return (
@@ -313,13 +487,17 @@ export function AccountCenter({ active }: AccountCenterProps) {
     : null;
   if (selectedEntry) {
     return (
-      <AccountDetail
-        entry={selectedEntry}
-        onRelogin={() => handleLogin(false)}
-        loginBusy={loginBusy}
-        onDataChanged={refreshOverview}
-        onBack={() => setSelectedProfileId("")}
-      />
+      <>
+        <AccountDetail
+          entry={selectedEntry}
+          onRelogin={() => handleLogin(false)}
+          loginBusy={loginBusy}
+          onDataChanged={refreshOverview}
+          onSaveMobile={(mobile) => saveMobileBackfill(selectedEntry.profile_id, mobile)}
+          onBack={() => setSelectedProfileId("")}
+        />
+        {mobilePromptDialog}
+      </>
     );
   }
 
@@ -335,6 +513,17 @@ export function AccountCenter({ active }: AccountCenterProps) {
           <span className="status-badge status-badge--neutral"><ShieldCheck size={14} aria-hidden="true" />登录信息仅本机加密保存</span>
           {realCheckinMode && overview.length > 0 && (
             <>
+              {/* G15 纯本地刷新：重读缓存零联网，与「健康检测」的真实探测分工。 */}
+              <button
+                className="btn"
+                type="button"
+                onClick={handleLocalRefresh}
+                disabled={localRefreshBusy}
+                data-testid="account-refresh-local"
+                title="重读本机缓存的账号信息（不联网）；需要探测真实状态请用健康检测"
+              >
+                <RefreshCw size={15} className={localRefreshBusy ? "icon-spin" : undefined} aria-hidden="true" />刷新
+              </button>
               <button className="btn" type="button" onClick={handleHealthCheck} disabled={healthBusy || creditsBusy || loginBusy} data-testid="account-health-check">
                 <HeartPulse size={15} aria-hidden="true" />{healthBusy ? "检测中…" : "健康检测"}
               </button>
@@ -368,6 +557,14 @@ export function AccountCenter({ active }: AccountCenterProps) {
 
       {error && <p className="workbench__error" role="alert">{error}</p>}
       {message && <p className="account-center__message" role="status">{message}</p>}
+      {/* G9 结果卡：健康检测 / 刷新额度共用形态（首行结论 + 异常清单）。 */}
+      {resultCard && (
+        <OperationResultCard
+          title={resultCard.title}
+          okCount={resultCard.okCount}
+          issues={resultCard.issues}
+        />
+      )}
       {loginBusy && (
         <div className="account-center__login-waiting" role="status">
           <p className="account-center__meta">
@@ -396,6 +593,30 @@ export function AccountCenter({ active }: AccountCenterProps) {
           <h3 id="account-mine-heading"><UserRound size={16} aria-hidden="true" />我的账号</h3>
           {realCheckinMode && overview.length > 0 && (
             <div className="account-center__list-controls">
+              {/* G14 过滤分段控件：全部 / 需处理（角标=异常账号数，正常时不显示）。 */}
+              <div className="seg-control" role="group" aria-label="账号过滤">
+                <button
+                  type="button"
+                  className={`seg-control__item${accountFilter === "all" ? " seg-control__item--active" : ""}`}
+                  aria-pressed={accountFilter === "all"}
+                  onClick={() => setAccountFilter("all")}
+                  data-testid="account-filter-all"
+                  title="显示全部账号"
+                >
+                  全部
+                </button>
+                <button
+                  type="button"
+                  className={`seg-control__item${accountFilter === "attention" ? " seg-control__item--active" : ""}`}
+                  aria-pressed={accountFilter === "attention"}
+                  onClick={() => setAccountFilter("attention")}
+                  data-testid="account-filter-attention"
+                  title="只显示需要处理的账号（需重登、已过期、待登录或签到失败）"
+                >
+                  需处理
+                  {attentionCount > 0 && <span className="seg-control__count">{attentionCount}</span>}
+                </button>
+              </div>
               {/* 排序：添加序 / 名称 / 签到状态（未签在前，补签场景优先）。 */}
               <label className="account-center__sort-field">
                 <ArrowDownAZ size={14} aria-hidden="true" />
@@ -439,24 +660,29 @@ export function AccountCenter({ active }: AccountCenterProps) {
         </div>
         {realCheckinMode ? (
           overview.length > 0 ? (
-            <ul className={accountView === "list" ? "account-list" : "account-card-grid"}>
-              {sortedOverview.map((entry) => (
-                <AccountCard
-                  key={entry.profile_id}
-                  entry={entry}
-                  variant={accountView}
-                  loginState={effectiveCredentialState(entry, loginStates[entry.profile_id])}
-                  archiveAvailable={loginStates[entry.profile_id]?.archive_available}
-                  isCurrentAccount={envCurrentProfileId === entry.profile_id}
-                  switchBusy={switchTarget !== null}
-                  onOpen={() => setSelectedProfileId(entry.profile_id)}
-                  onSwitch={() => setSwitchTarget({
-                    profile_id: entry.profile_id,
-                    display_name: effectiveDisplayName(entry),
-                  })}
-                />
-              ))}
-            </ul>
+            visibleOverview.length > 0 ? (
+              <ul className={accountView === "list" ? "account-list" : "account-card-grid"}>
+                {visibleOverview.map((entry) => (
+                  <AccountCard
+                    key={entry.profile_id}
+                    entry={entry}
+                    variant={accountView}
+                    loginState={effectiveCredentialState(entry, loginStates[entry.profile_id])}
+                    archiveAvailable={loginStates[entry.profile_id]?.archive_available}
+                    isCurrentAccount={envCurrentProfileId === entry.profile_id}
+                    switchBusy={switchTarget !== null}
+                    onOpen={() => setSelectedProfileId(entry.profile_id)}
+                    onSwitch={() => setSwitchTarget({
+                      profile_id: entry.profile_id,
+                      display_name: effectiveDisplayName(entry),
+                    })}
+                  />
+                ))}
+              </ul>
+            ) : (
+              // G14 过滤空态：有账号但当前过滤无匹配，与「还没有账号」区分。
+              <p className="account-center__empty">没有需要处理的账号。</p>
+            )
           ) : (
             <div className="account-center__empty-actions">
               <p className="account-center__empty">还没有账号。通过浏览器登录添加第一个账号，登录成功后即可签到。</p>
@@ -490,6 +716,9 @@ export function AccountCenter({ active }: AccountCenterProps) {
         onFinished={handleSwitchFinished}
         onClose={() => setSwitchTarget(null)}
       />
+
+      {/* G11 登录后手机号补录弹层：共享变量（详情视图同样渲染）。 */}
+      {mobilePromptDialog}
     </section>
   );
 }
@@ -528,16 +757,11 @@ function AccountCard({
   const displayName = effectiveDisplayName(entry);
   // 徽章失效后的恢复路径提示：旧通道凭据/续期被拒不会自动恢复（重新登录是唯一出路）。
   const credentialDead = entry.credential_legacy || entry.refresh_error_code === "credential_refresh_failed";
-  // meta 文字段：手机号 · 令牌 N 天 · 设备尾号（令牌 <=7 天整段转琥珀）。
-  const token = tokenHealthText(entry.access_token_expires_at_unix_seconds);
-  const refreshHint = entry.refresh_token_expires_at_unix_seconds !== null
-    ? `刷新令牌剩 ${Math.max(0, Math.ceil((entry.refresh_token_expires_at_unix_seconds - Date.now() / 1000) / 86400))} 天；过期后需重新登录`
-    : "";
-  const metaParts = [
-    entry.masked_mobile || null,
-    <span key="token" className={token.warn ? "account-item__meta-warn" : undefined} title={`${token.title}${refreshHint ? `；${refreshHint}` : ""}`}>{token.text}</span>,
-    entry.device_tail ? <span key="device" title="签到绑定设备的尾号（完整 ID 见详情）">设备 …{entry.device_tail}</span> : null,
-  ].filter(Boolean);
+  // G10 统一状态机：两槽位徽章都先经 derive* 纯函数求枚举态，再交徽章渲染。
+  const checkinState = deriveCheckinSlotState(entry);
+  const loginSlot = deriveLoginSlotState({ login_state: loginState, relogin_only: credentialDead });
+  // G13 meta 精简：卡片/列表只保留手机号；令牌天数与设备尾号在详情页
+  // （登录健康度 / 基础信息）展示，不再占主视野。
 
   const creditsBlock = (
     <div className="account-item__credits" title="TRAE 真实可用模型额度（积分包剩余总和，与 IDE 内显示一致）">
@@ -561,30 +785,46 @@ function AccountCard({
     </div>
   );
 
-  const actionButtons = (
-    <div className="account-item__actions">
-      {/* P5-2 切号主面板：当前账号展示「使用中」，其余账号一键切换（弹层见 MasterSwitchDialog）。 */}
-      {isCurrentAccount ? (
-        <span className="account-item__current-chip" data-testid={`account-current-${entry.profile_id}`} title="主库当前登录账号">
-          使用中
-        </span>
+  // G12 卡片视图独立积分块：左对齐大数字 + 标题小字（列表侧栏块为右对齐设计，不复用）。
+  const cardCredits = (
+    <div className="account-card__credits" title="TRAE 真实可用模型额度（积分包剩余总和，与 IDE 内显示一致）">
+      {entry.usage_remaining_credits != null ? (
+        <>
+          <span className="account-card__credits-value" data-testid={`account-usage-${entry.profile_id}`}>
+            {formatCreditsValue(entry.usage_remaining_credits)}
+          </span>
+          <span className="account-card__credits-label">模型积分{entry.usage_cached_at ? ` · ${formatShortDate(entry.usage_cached_at)}` : ""}</span>
+        </>
       ) : (
-        <button
-          className="btn btn--primary"
-          type="button"
-          disabled={switchBusy}
-          onClick={(event) => {
-            event.stopPropagation();
-            onSwitch();
-          }}
-          data-testid={`account-switch-${entry.profile_id}`}
-          title={`切换主库到 ${displayName}（全部对话记录随行）`}
+        <span className="account-card__credits-placeholder">未查询</span>
+      )}
+      {entry.refresh_error_code != null && (
+        <span
+          className="account-card__credits-failed"
+          title={safeUiErrorMessage(entry.refresh_error_code, "上次额度刷新未成功。")}
         >
-          <ArrowLeftRight size={14} aria-hidden="true" />
-          {switchBusy ? "切换中…" : "切换到此账号"}
-        </button>
+          刷新失败
+        </span>
       )}
     </div>
+  );
+
+  // G12 底部切换按钮通栏：当前账号的「使用中」标记已上移至名称行。
+  const cardSwitchButton = isCurrentAccount ? null : (
+    <button
+      className="btn btn--primary account-card__switch"
+      type="button"
+      disabled={switchBusy}
+      onClick={(event) => {
+        event.stopPropagation();
+        onSwitch();
+      }}
+      data-testid={`account-switch-${entry.profile_id}`}
+      title={`切换主库到 ${displayName}（全部对话记录保持不变）`}
+    >
+      <ArrowLeftRight size={14} aria-hidden="true" />
+      {switchBusy ? "切换中…" : "切换到此账号"}
+    </button>
   );
 
   return (
@@ -613,45 +853,63 @@ function AccountCard({
               <div className="account-item__id">
                 <div className="account-item__name-row">
                   <strong className="account-item__name" title={entry.screen_name}>{displayName}</strong>
-                  <CheckinSlotBadge checkedIn={entry.checked_in} />
-                  <LoginArchiveSlotBadge loginState={loginState} archiveAvailable={archiveAvailable} reloginOnly={credentialDead} />
+                  <CheckinSlotBadge state={checkinState} />
+                  <LoginArchiveSlotBadge state={loginSlot} archiveAvailable={archiveAvailable} />
                 </div>
-                <p className="account-item__meta">{intercalate(metaParts)}</p>
+                {/* G13：meta 只保留手机号（令牌/设备收进详情页）；G11 补录后显示全号。 */}
+                {displayMobile(entry) && <p className="account-item__meta">{displayMobile(entry)}</p>}
               </div>
             </div>
             <div className="account-item__side">
               {creditsBlock}
-              {actionButtons}
+              {/* P5-2 切号主面板：当前账号展示「使用中」，其余账号一键切换。 */}
+              {isCurrentAccount ? (
+                <span className="account-item__current-chip" data-testid={`account-current-${entry.profile_id}`} title="主库当前登录账号">
+                  使用中
+                </span>
+              ) : (
+                <button
+                  className="btn btn--primary"
+                  type="button"
+                  disabled={switchBusy}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSwitch();
+                  }}
+                  data-testid={`account-switch-${entry.profile_id}`}
+                  title={`切换主库到 ${displayName}（全部对话记录保持不变）`}
+                >
+                  <ArrowLeftRight size={14} aria-hidden="true" />
+                  {switchBusy ? "切换中…" : "切换到此账号"}
+                </button>
+              )}
             </div>
           </>
         ) : (
           <>
+            {/* G12 卡片独立纵向层级：头像+名称（含使用中 chip）→ 徽章行 →
+                积分大字 → 手机号 → 底部切换按钮通栏。 */}
             <div className="account-card__head">
               <span className="account-card__avatar" aria-hidden="true">{avatarLetter(displayName)}</span>
-              <div className="account-item__name-row">
-                <strong className="account-item__name" title={entry.screen_name}>{displayName}</strong>
-              </div>
+              <strong className="account-card__name" title={entry.screen_name}>{displayName}</strong>
+              {isCurrentAccount && (
+                <span className="account-item__current-chip" data-testid={`account-current-${entry.profile_id}`} title="主库当前登录账号">
+                  使用中
+                </span>
+              )}
             </div>
             <div className="account-card__slots">
-              <CheckinSlotBadge checkedIn={entry.checked_in} />
-              <LoginArchiveSlotBadge loginState={loginState} archiveAvailable={archiveAvailable} reloginOnly={credentialDead} />
+              <CheckinSlotBadge state={checkinState} />
+              <LoginArchiveSlotBadge state={loginSlot} archiveAvailable={archiveAvailable} />
             </div>
-            {creditsBlock}
-            <p className="account-item__meta">{intercalate(metaParts)}</p>
-            {actionButtons}
+            {cardCredits}
+            {displayMobile(entry) && <p className="account-card__meta">{displayMobile(entry)}</p>}
+            {cardSwitchButton}
           </>
         )}
       </div>
     </li>
   );
-}
-
-/** meta 分隔符拼接：元素之间以「 · 」相连（内容不含分隔符时原样返回）。 */
-function intercalate(parts: ReactNode[]): ReactNode {
-  return parts.reduce<ReactNode[]>((acc, part, index) => {
-    if (index === 0) return [part];
-    return [...acc, <span key={`sep-${index}`} className="account-item__meta-sep" aria-hidden="true"> · </span>, part];
-  }, []);
 }
 
 /** 登录凭据健康度列表转 profile_id → 条目映射（初始读取/健康检测共用，
@@ -678,59 +936,66 @@ function effectiveCredentialState(
 }
 
 /**
- * 健康检测汇总文案：登录存档四态分布 + 签到会话网络探测结果。
- * 存档部分未初始化=尚未保存登录凭据（预期状态而非异常）；
- * 网络部分按 error_code 区分正常/异常，异常账号附名字方便定位。
+ * G10 登录槽各态的一句人话原因（结果卡与徽章共用词源）。
+ * ok / signed_out 为 null：正常与“从未保存凭据”都不是需处理项
+ * （灰=中性无需动作，与 G14 needsAttention 排除 signed_out 同口径）。
  */
-function summarizeHealth(
+const LOGIN_SLOT_REASONS: Record<LoginSlotState, string | null> = {
+  ok: null,
+  expired: "登录态已过期，等待自动恢复",
+  relogin: "登录凭据已失效，请重新登录",
+  pending: "登录凭据不可用，请重新登录",
+  signed_out: null,
+};
+
+/**
+ * G9 健康检测结果：逐账号判定异常并求一句人话原因。
+ * 异常口径与徽章同源（G10 状态机）：登录槽非正常态 或 签到会话探测失败；
+ * 登录问题优先展示（会话异常多为同一根因——凭据坏了探测必然失败）。
+ * states 为 null（本地检测读取失败）时只依据会话探测结果，不臆测登录态。
+ */
+function buildHealthResult(
   states: readonly TraeInstanceStateDto[] | null,
   results: readonly CreditsRefreshEntryDto[],
   overview: readonly CheckinOverviewEntryDto[],
-): string {
-  const nameOf = new Map(overview.map((entry) => [entry.profile_id, entry.screen_name]));
-  // 汇总数字必须与卡片徽章逐个对应：统计口径同 effectiveCredentialState
-  // （旧通道本地判定 + 本次续期探测失败都计入“登录失效”）。
-  const entryOf = new Map(overview.map((entry) => [entry.profile_id, entry]));
+): { okCount: number; issues: OperationResultIssue[] } {
+  const nameOf = new Map(overview.map((entry) => [entry.profile_id, effectiveDisplayName(entry)]));
+  const stateOf = new Map((states ?? []).map((state) => [state.profile_id, state]));
+  const probeOf = new Map(results.map((result) => [result.profile_id, result]));
+  // 统计口径同 effectiveCredentialState：本次探测到续期被拒也计入“登录失效”。
   const renewalDead = new Set(
     results.filter((item) => item.error_code === "credential_refresh_failed").map((item) => item.profile_id),
   );
-  const loginCount = { valid: 0, stale: 0, pending: 0 };
-  let uninitialized = 0;
-  if (states) {
-    for (const state of states) {
-      const effective = effectiveCredentialState(
-        entryOf.get(state.profile_id),
-        renewalDead.has(state.profile_id)
-          ? { ...state, login_state: "stale" as const }
-          : state,
-      );
-      if (effective === "logged_in") loginCount.valid += 1;
-      else if (effective === "stale") loginCount.stale += 1;
-      else if (effective === "logged_out") loginCount.pending += 1;
-      else uninitialized += 1;
+  const issues: OperationResultIssue[] = [];
+  for (const entry of overview) {
+    const state = stateOf.get(entry.profile_id);
+    const effective = effectiveCredentialState(
+      entry,
+      renewalDead.has(entry.profile_id) && state ? { ...state, login_state: "stale" as const } : state,
+    );
+    // relogin_only 口径与卡片徽章一致：旧通道 / 续期被拒（本次探测或既有标记）。
+    const reloginOnly =
+      entry.credential_legacy ||
+      entry.refresh_error_code === "credential_refresh_failed" ||
+      renewalDead.has(entry.profile_id);
+    const loginReason = states
+      ? LOGIN_SLOT_REASONS[deriveLoginSlotState({ login_state: effective, relogin_only: reloginOnly })]
+      : null;
+    if (loginReason !== null) {
+      issues.push({ key: entry.profile_id, name: nameOf.get(entry.profile_id) ?? entry.screen_name, reason: loginReason });
+      continue;
+    }
+    // 登录正常才单独报会话异常（登录失效的探测失败是同一根因，不重复列）。
+    const probe = probeOf.get(entry.profile_id);
+    if (probe && probe.error_code !== null) {
+      issues.push({
+        key: entry.profile_id,
+        name: nameOf.get(entry.profile_id) ?? entry.screen_name,
+        reason: safeUiErrorMessage(probe.error_code, "网络或服务暂时不可用，请稍后重试。"),
+      });
     }
   }
-  const sessionOk = results.filter((item) => item.error_code === null).length;
-  const sessionFailed = results.filter((item) => item.error_code !== null);
-  // 分段拼装：登录存档段（仅在有存档数据时）+ 签到会话段。
-  // 词表与 LoginArchiveSlotBadge 一致（登录有效/待登录/登录失效/未登录），
-  // 保证汇总数字能逐个对应到列表行徽章。
-  const segments: string[] = [];
-  if (states) {
-    const parts: string[] = [];
-    if (loginCount.valid > 0) parts.push(`${loginCount.valid} 登录有效`);
-    if (loginCount.stale > 0) parts.push(`${loginCount.stale} 登录失效`);
-    if (loginCount.pending > 0) parts.push(`${loginCount.pending} 待登录`);
-    if (uninitialized > 0) parts.push(`${uninitialized} 未登录`);
-    segments.push(`登录存档：${parts.join("、")}`);
-  }
-  if (sessionFailed.length > 0) {
-    const names = sessionFailed.map((item) => nameOf.get(item.profile_id) ?? item.screen_name).join("、");
-    segments.push(`签到会话：${sessionOk} 正常、${sessionFailed.length} 异常（${names}）`);
-  } else {
-    segments.push(`签到会话：全部 ${sessionOk} 个正常`);
-  }
-  return `健康检测完成。${segments.join("；")}。`;
+  return { okCount: overview.length - issues.length, issues };
 }
 
 /** 额度数值格式化：保留 1 位小数（整数不带小数点），如 23.8604 -> 23.9、240 -> 240。 */

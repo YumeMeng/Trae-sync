@@ -134,6 +134,7 @@ fn real_account_readonly_acceptance() {
         client_id: TRAE_SOLO_CLIENT_ID.to_string(),
         access_token_expires_at_unix_seconds: sample.jwt_payload.exp,
         refresh_token_expires_at_unix_seconds: refresh_expires_at,
+        mobile_full: None,
     };
     println!(
         "== 样本概要：账号 {}… 设备 {}…（token {} 字节 / refreshToken {} 字节）",
@@ -327,6 +328,7 @@ fn import_real_account_into_app_store() {
         client_id: TRAE_SOLO_CLIENT_ID.to_string(),
         access_token_expires_at_unix_seconds: sample.jwt_payload.exp,
         refresh_token_expires_at_unix_seconds: refresh_expires_at,
+        mobile_full: None, // 实收样本不含补录手机号，保持与旧结构行为一致
     };
     store.save(&bundle).expect("凭据包加密入库失败");
 

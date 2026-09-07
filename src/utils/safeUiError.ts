@@ -74,6 +74,18 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "备注名过长，请控制在 64 字符以内。",
   ],
   [
+    /mobile_format_invalid/i,
+    "手机号格式不正确：请输入 11 位大陆手机号（1 开头）。",
+  ],
+  [
+    /mobile_masked_mismatch/i,
+    "手机号与该账号的服务端记录不一致（首尾号段不匹配），请核对后重新输入。",
+  ],
+  [
+    /mobile_save_failed/i,
+    "手机号保存失败，请稍后重试。",
+  ],
+  [
     /checkin_registry_invalid/i,
     "账号注册表不可读取，请重启应用后重试；若持续出现请保留数据目录后反馈。",
   ],

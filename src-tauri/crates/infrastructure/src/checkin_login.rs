@@ -29,7 +29,8 @@ use sha2::{Digest, Sha256};
 
 use crate::account_registry::{AccountRecord, AccountRegistry};
 use crate::checkin_credential::{
-    generate_device_keypair, CheckinCredentialBundle, CheckinCredentialStore,
+    generate_device_keypair, CheckinCredentialBundle, CheckinProfileBinding,
+    CheckinCredentialStore,
 };
 use crate::checkin_http::{
     exchange_token_by_auth_code, get_user_info, CheckinHttpError, DeviceInfoBlock, TokenGrant,
@@ -533,6 +534,26 @@ fn persist_login_result(
         Err(_) => return Err(LoginError::Storage),
     };
     let now = unix_now();
+    // 旧档案先读：重复登录时用于保留既有本地偏好（自动签到开关、备注名、
+    // 归档标记、脱敏手机号）与凭据包中已补录的完整手机号（G11）。
+    let previous = registry
+        .find(&effective_profile_id)
+        .map_err(|_| LoginError::Storage)?;
+    // 已补录的完整手机号跟随旧凭据包：重复登录覆盖凭据时不丢（用户手工录入
+    // 的数据，与新令牌无绑定关系）。读取失败（首次登录/旧包不可用）按未补录。
+    let previous_mobile_full = previous
+        .as_ref()
+        .and_then(|old| {
+            store
+                .load(&CheckinProfileBinding::new(
+                    old.profile_id.clone(),
+                    old.account_id.clone(),
+                    old.device_id.clone(),
+                    old.device_public_key.clone(),
+                ))
+                .ok()
+        })
+        .and_then(|bundle| bundle.mobile_full);
     // 6. 凭据包加密入库（DPAPI；敏感字段只在密文中落盘）。
     let bundle = CheckinCredentialBundle {
         profile_id: effective_profile_id.clone(),
@@ -547,14 +568,12 @@ fn persist_login_result(
         client_id: TRAE_SOLO_CLIENT_ID.to_string(),
         access_token_expires_at_unix_seconds: grant.access_token_expires_at_unix_seconds,
         refresh_token_expires_at_unix_seconds: grant.refresh_token_expires_at_unix_seconds,
+        mobile_full: previous_mobile_full,
     };
     store.save(&bundle).map_err(|_| LoginError::Storage)?;
     // 7. 非敏感档案 upsert（profile_id 唯一，重复登录覆盖旧记录；
     //    保留既有自动签到开关、本地备注名与归档标记——均为用户本地偏好；
     //    脱敏手机号取服务端最新值，服务端未返回时保留已采值）。
-    let previous = registry
-        .find(&effective_profile_id)
-        .map_err(|_| LoginError::Storage)?;
     let previous_auto_enabled = previous
         .as_ref()
         .map(|old| old.auto_checkin_enabled)

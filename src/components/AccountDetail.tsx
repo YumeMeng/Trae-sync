@@ -26,17 +26,22 @@ interface AccountDetailProps {
   loginBusy: boolean;
   /** 数据变更（签到/刷新/删除）后通知列表页重读总览。 */
   onDataChanged: () => Promise<void>;
+  /**
+   * G11 保存手机号补录（父组件持有总览数据，负责第三层查重提示）：
+   * 空串 = 清除补录（回退脱敏号展示）；返回 false = 用户取消（重复号未保存）。
+   */
+  onSaveMobile: (mobile: string) => Promise<boolean>;
   /** 账号删除成功或点击返回时回列表。 */
   onBack: () => void;
 }
 
-type DetailAction = "credits" | "checkin" | "remove" | "relogin" | "auto-checkin" | "reset-device" | "alias" | null;
+type DetailAction = "credits" | "checkin" | "remove" | "relogin" | "auto-checkin" | "reset-device" | "alias" | "mobile" | null;
 
 /**
  * 单账号详情独立视图：基础信息 -> 登录健康度 -> 操作区 -> 折叠技术细节。
  * 操作四件套：刷新额度（只读查询，不消耗签到资格）/ 立即签到（单账号批次）/ 重新登录（OAuth 覆盖更新）/ 删除账号（二次确认）。
  */
-export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onBack }: AccountDetailProps) {
+export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSaveMobile, onBack }: AccountDetailProps) {
   const [busy, setBusy] = useState<DetailAction>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -45,6 +50,11 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onBa
   useEffect(() => {
     setAliasDraft(entry.display_name ?? "");
   }, [entry.display_name, entry.profile_id]);
+  // G11 手机号补录草稿：与备注名同一模式（输入值 = 补录全号；占位 = 脱敏号）。
+  const [mobileDraft, setMobileDraft] = useState(entry.mobile_full ?? "");
+  useEffect(() => {
+    setMobileDraft(entry.mobile_full ?? "");
+  }, [entry.mobile_full, entry.profile_id]);
 
   const runAction = useCallback(async (action: Exclude<DetailAction, null>, task: () => Promise<void>) => {
     setBusy(action);
@@ -69,6 +79,15 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onBa
     await onDataChanged();
     setMessage(aliasDraft.trim() ? "备注名已保存。" : "备注名已清除，恢复服务端名称。");
   }), [aliasDraft, entry.profile_id, onDataChanged, runAction]);
+
+  // G11 保存手机号：非空 = 补录全号（父组件做查重提示）；空 = 清除（回退脱敏号）。
+  const mobileDirty = mobileDraft.trim() !== (entry.mobile_full ?? "").trim();
+  const handleSaveMobile = useCallback(() => void runAction("mobile", async () => {
+    const saved = await onSaveMobile(mobileDraft.trim());
+    if (saved) {
+      setMessage(mobileDraft.trim() ? "手机号已保存。" : "已清除补录的手机号，恢复显示脱敏号。");
+    }
+  }), [mobileDraft, onSaveMobile, runAction]);
 
   // 刷新额度：只读查询（不消耗签到资格），写回缓存后重读总览。
   const handleRefreshCredits = useCallback(() => void runAction("credits", async () => {
@@ -193,7 +212,39 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onBa
           <div className="account-detail__fact">
             <dt>手机号</dt>
             <dd data-testid="account-detail-mobile">
-              {entry.masked_mobile || "未采集（刷新额度后自动补全）"}
+              {/* G11：行内补录完整手机号（与备注名同款交互）；未补录时占位
+                  显示脱敏号，保存后显示全号；清空保存 = 回退脱敏号。 */}
+              <div className="account-detail__mobile-row">
+                <input
+                  type="tel"
+                  inputMode="numeric"
+                  value={mobileDraft}
+                  placeholder={entry.masked_mobile || "未采集"}
+                  maxLength={11}
+                  disabled={busy !== null || loginBusy}
+                  data-testid="account-detail-mobile-input"
+                  aria-label="完整手机号"
+                  onChange={(event) => setMobileDraft(event.target.value.replace(/[^\d]/g, ""))}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && mobileDirty) {
+                      event.preventDefault();
+                      handleSaveMobile();
+                    }
+                  }}
+                />
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={handleSaveMobile}
+                  disabled={!mobileDirty || busy !== null || loginBusy}
+                  data-testid="account-detail-mobile-save"
+                >
+                  {busy === "mobile" ? "保存中…" : "保存"}
+                </button>
+              </div>
+              {entry.masked_mobile && (
+                <p className="account-detail__mobile-hint">服务端脱敏号：{entry.masked_mobile}（输入需与其首尾号段一致）</p>
+              )}
             </dd>
           </div>
           <div className="account-detail__fact">

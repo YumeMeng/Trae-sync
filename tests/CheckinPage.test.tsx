@@ -50,9 +50,12 @@ function entry(profileId: string, screenName: string, overrides: Partial<Checkin
     device_id: null,
     display_name: null,
     masked_mobile: "138****0000",
+    mobile_full: null,
     auto_checkin_enabled: true,
     refresh_error_code: null,
     credential_legacy: false,
+    last_attempt_outcome: null,
+    last_attempt_date: null,
     ...overrides,
   };
 }
@@ -520,5 +523,29 @@ describe("CheckinPage", () => {
 
     expect(await screen.findByTestId("checkin-unavailable")).toHaveTextContent("签到功能不可用：存储未就绪");
     expect(screen.queryByTestId("checkin-demo-banner")).not.toBeInTheDocument();
+  });
+
+  it("G15 纯本地刷新：重读账号总览，不发签到或额度查询网络命令", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [entry("profile-login-1", "登录账号甲")];
+      if (command === "get_auto_checkin_settings") {
+        return { enabled: false, daily_time_hhmm: "10:00", ledger: null };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    await screen.findByText("登录账号甲");
+    const callsOf = (command: string) => mockInvoke.mock.calls.filter(([name]) => name === command).length;
+    const overviewBefore = callsOf("get_checkin_overview");
+
+    fireEvent.click(screen.getByTestId("checkin-refresh-local"));
+    // 总览（本地缓存读取）被重读。
+    await waitFor(() => expect(callsOf("get_checkin_overview")).toBeGreaterThan(overviewBefore));
+    // 等待一个宏任务回合，确认没有异步尾巴发出网络命令。
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credits", expect.anything());
   });
 });

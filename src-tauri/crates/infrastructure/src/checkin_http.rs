@@ -1234,6 +1234,7 @@ mod tests {
             client_id: "client-1".to_string(),
             access_token_expires_at_unix_seconds: now + 14 * 24 * 60 * 60,
             refresh_token_expires_at_unix_seconds: now + 180 * 24 * 60 * 60,
+            mobile_full: None,
         };
         store.save(&bundle).unwrap();
         let binding =

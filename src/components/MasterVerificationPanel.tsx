@@ -252,20 +252,20 @@ function BackupBlock({
   );
 }
 
-/** 徽章语义（两槽位契约）：正常=idle+空心点，待关注=warn+琥珀点，空态=unknown+灰点。 */
+/** 徽章语义（两槽位契约）：正常=idle+空心点，待关注=warn+琥珀点，空态=unloaded+灰点。 */
 function ledgerBadge(ledger: LedgerVerificationDto): { badge: string; dot: string } {
   if (ledger.status !== "ready") {
-    return { badge: "slot-badge--unknown", dot: "slot-badge__dot--muted" };
+    return { badge: "slot-badge--unloaded", dot: "slot-badge__dot--muted" };
   }
   return ledger.issues.length === 0
     ? { badge: "slot-badge--idle", dot: "slot-badge__dot--hollow" }
     : { badge: "slot-badge--warn", dot: "slot-badge__dot--warn" };
 }
 
-/** 备份对比徽章：丢失候选>0 = warn（需用户动手找回），否则 idle / unknown。 */
+/** 备份对比徽章：丢失候选>0 = warn（需用户动手找回），否则 idle / unloaded。 */
 function backupBadge(backup: BackupComparisonDto): { badge: string; dot: string } {
   if (backup.status !== "ready") {
-    return { badge: "slot-badge--unknown", dot: "slot-badge__dot--muted" };
+    return { badge: "slot-badge--unloaded", dot: "slot-badge__dot--muted" };
   }
   return backup.missing.length === 0
     ? { badge: "slot-badge--idle", dot: "slot-badge__dot--hollow" }

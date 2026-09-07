@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use traesync_domain::{CheckinResult, CheckinStatusSnapshot, EntitlementUsageSnapshot};
+use traesync_domain::{
+    CheckinOutcome, CheckinResult, CheckinStatusSnapshot, EntitlementUsageSnapshot,
+};
 use traesync_infrastructure::account_registry::AccountRegistry;
 use traesync_infrastructure::checkin_credential::{CheckinCredentialStore, CheckinProfileBinding};
 use traesync_infrastructure::checkin_http::TRAE_SOLO_CLIENT_ID;
@@ -38,6 +40,14 @@ pub struct CheckinOverviewEntryDto {
     /// 上次签到后缓存的“今日已签”状态；仅当缓存时刻落在本地今日时上报，
     /// 隔日缓存返回 None（签到是当日语义，跨日不滚动沿用）。
     pub checked_in: Option<bool>,
+    /// 今日最后一次签到尝试的结果码（"ok" = 签到成功；"business:9074" /
+    /// "transport:network_error" 等 = 今日尝试失败，供“签到失败/待重试”
+    /// 徽章判定）；None = 今日从未尝试（隔日尝试结果不滚动沿用，
+    /// 与 checked_in 同一日界口径）。
+    pub last_attempt_outcome: Option<String>,
+    /// 今日最后一次签到尝试的本地日期（YYYY-MM-DD；与 outcome 同一日界
+    /// 过滤输出）。前端据此判定“今日尝试，跨日不残留”；None = 今日无尝试。
+    pub last_attempt_date: Option<String>,
     /// access token 到期时刻（Unix 秒）；凭据包缺失/不可读时为 None。
     pub access_token_expires_at_unix_seconds: Option<u64>,
     /// refresh token 到期时刻（Unix 秒）。
@@ -51,6 +61,9 @@ pub struct CheckinOverviewEntryDto {
     pub display_name: Option<String>,
     /// 脱敏手机号（登录/补采写入）；空串 = 未采集。
     pub masked_mobile: String,
+    /// 完整手机号（G11 手工补录，凭据包 DPAPI 加密存储）；None = 未补录
+    /// （展示回退脱敏号）。展示口径：mobile_full ?? masked_mobile。
+    pub mobile_full: Option<String>,
     /// 该账号是否参与自动签到（详情页复选框数据源；grill 2026-08-23 决策 2）。
     pub auto_checkin_enabled: bool,
     /// 最近一次额度刷新失败原因码（成功刷新后清除）；卡片持续显示“刷新失败”标记。
@@ -83,6 +96,15 @@ struct CreditsCacheEntry {
     /// 最近一次额度刷新失败原因码；成功刷新/签到后清除（serde default 兼容旧文件）。
     #[serde(default)]
     refresh_error_code: Option<String>,
+    /// 今日最后一次签到尝试的日期（本地时区 YYYY-MM-DD）；None = 从未尝试。
+    /// 隔日不滚动沿用：build_overview 只在日期为本地今日时输出尝试结果。
+    #[serde(default)]
+    last_attempt_date: Option<String>,
+    /// 今日最后一次签到尝试的结果码（"ok" / "business:9074" /
+    /// "transport:network_error"）。铁律：失败证据只被新的尝试覆盖，
+    /// 不因只读查询/成功刷新而清除。
+    #[serde(default)]
+    last_attempt_outcome: Option<String>,
 }
 
 impl Default for CreditsCacheFile {
@@ -150,6 +172,13 @@ pub fn update_credits_cache(material_root: &Path, results: &[CheckinResult]) {
                     .and_then(|entry| entry.usage_cached_at_unix_seconds),
                 // 签到成功 = 凭据链路健康，清除历史失败标记。
                 refresh_error_code: None,
+                // 尝试证据由 update_last_attempt 随后写入；这里保留旧值防丢。
+                last_attempt_date: previous
+                    .as_ref()
+                    .and_then(|entry| entry.last_attempt_date.clone()),
+                last_attempt_outcome: previous
+                    .as_ref()
+                    .and_then(|entry| entry.last_attempt_outcome.clone()),
             },
         );
     }
@@ -201,6 +230,13 @@ pub fn update_credits_from_snapshots(
                     .and_then(|entry| entry.usage_cached_at_unix_seconds),
                 // 刷新成功：清除失败标记（持久化标记只在持续失败期间展示）。
                 refresh_error_code: None,
+                // 铁律：只读查询不得清除尝试证据（last_attempt_* 只被新尝试覆盖）。
+                last_attempt_date: previous
+                    .as_ref()
+                    .and_then(|entry| entry.last_attempt_date.clone()),
+                last_attempt_outcome: previous
+                    .as_ref()
+                    .and_then(|entry| entry.last_attempt_outcome.clone()),
             },
         );
     }
@@ -228,6 +264,8 @@ pub fn update_refresh_failures(material_root: &Path, failures: &[(String, String
                 usage_remaining_credits: None,
                 usage_cached_at_unix_seconds: None,
                 refresh_error_code: None,
+                last_attempt_date: None,
+                last_attempt_outcome: None,
             });
         cache.entries.insert(
             profile_id.clone(),
@@ -266,6 +304,8 @@ pub fn update_usage_cache(material_root: &Path, usages: &[(String, EntitlementUs
                 usage_remaining_credits: None,
                 usage_cached_at_unix_seconds: None,
                 refresh_error_code: None,
+                last_attempt_date: None,
+                last_attempt_outcome: None,
             });
         cache.entries.insert(
             profile_id.clone(),
@@ -288,6 +328,67 @@ pub fn remove_credits_cache_entry(material_root: &Path, profile_id: &str) {
     if cache.entries.remove(profile_id).is_none() {
         return;
     }
+    write_credits_cache(material_root, &cache);
+}
+
+/// 签到结果 -> 今日尝试结果码（写入 last_attempt_outcome，G10 状态机数据地基）。
+/// 映射规则：
+/// - 签到成功（claim 成功或 status 探测发现已签）→ "ok"
+/// - 业务码失败（HTTP 200 但 code 非 0，如 9074/9095）→ "business:{业务码}"
+///   （detail_code 形如 "business_9074"，取数值部分；9074 上下文标注
+///   device_too_new 语义仍是业务拒绝，原样保留）
+/// - 网络/凭据失败 → "transport:{映射码}"（复用 checkin_transport_error_code
+///   码表：network_error / auth_mismatch / credential_refresh_failed 等）
+pub fn checkin_last_attempt_outcome(result: &CheckinResult) -> String {
+    match result.outcome {
+        CheckinOutcome::Claimed | CheckinOutcome::AlreadyCheckedIn => "ok".to_string(),
+        CheckinOutcome::NotEligible => match result.detail_code.as_deref() {
+            Some(code) if code.starts_with("business_") => {
+                format!("business:{}", &code["business_".len()..])
+            }
+            Some(code) => format!("business:{code}"),
+            // 服务端判定不可领取但无业务码（如签到活动未开启）。
+            None => "not_eligible".to_string(),
+        },
+        // 网络/凭据等传输失败（含 VerificationFailed 结果待复核）：
+        // 透传 detail_code 中的现有映射码。待复核归入传输类按“待重试”呈现，
+        // 不当作确定性失败。
+        _ => format!(
+            "transport:{}",
+            result.detail_code.as_deref().unwrap_or("unknown")
+        ),
+    }
+}
+
+/// 记录账号今日最后一次签到尝试的结果（G10a：失败证据不丢）。
+/// 无论成败都写：last_attempt_* 只被新的尝试覆盖，不被只读查询清除。
+/// 条目可能尚不存在（从未签到就失败的账号）：其余字段按空值创建。
+pub fn update_last_attempt(material_root: &Path, profile_id: &str, outcome: &str) {
+    let mut cache = CreditsCacheFile {
+        entries: read_credits_cache(material_root),
+        ..CreditsCacheFile::default()
+    };
+    let previous = cache
+        .entries
+        .remove(profile_id)
+        .unwrap_or(CreditsCacheEntry {
+            credits: None,
+            checked_in: None,
+            cached_at_unix_seconds: 0,
+            usage_remaining_credits: None,
+            usage_cached_at_unix_seconds: None,
+            refresh_error_code: None,
+            last_attempt_date: None,
+            last_attempt_outcome: None,
+        });
+    cache.entries.insert(
+        profile_id.to_string(),
+        CreditsCacheEntry {
+            last_attempt_date: Some(local_today_string()),
+            last_attempt_outcome: Some(outcome.to_string()),
+            ..previous
+        },
+    );
     write_credits_cache(material_root, &cache);
 }
 
@@ -316,6 +417,8 @@ pub fn build_overview(material_root: &Path) -> Result<Vec<CheckinOverviewEntryDt
         .map_err(|_| "checkin_registry_invalid".to_string())?;
     let cache = read_credits_cache(material_root);
     let store = CheckinCredentialStore::new(material_root);
+    // 今日日期只算一次：last_attempt_* 的日界判定与 checked_in 同一自然日口径。
+    let today = local_today_string();
 
     let entries = records
         .into_iter()
@@ -328,7 +431,7 @@ pub fn build_overview(material_root: &Path) -> Result<Vec<CheckinOverviewEntryDt
                 record.device_id.clone(),
                 record.device_public_key.clone(),
             );
-            let (access_expires, refresh_expires, credential_legacy) = store
+            let (access_expires, refresh_expires, credential_legacy, mobile_full) = store
                 .load(&bundle)
                 .map(|bundle| {
                     (
@@ -337,9 +440,11 @@ pub fn build_overview(material_root: &Path) -> Result<Vec<CheckinOverviewEntryDt
                         // 旧 Work 通道（client_id 非 SOLO）已于 2026-09-02 退役：
                         // 本地零网络判定，登录态直接按“登录失效”处理。
                         bundle.client_id != TRAE_SOLO_CLIENT_ID,
+                        // G11 补录的完整手机号（凭据包密文内读出；未补录为 None）。
+                        bundle.mobile_full,
                     )
                 })
-                .unwrap_or((None, None, false));
+                .unwrap_or((None, None, false, None));
             let cached = cache.get(&record.profile_id);
             // 尾 4 位：与签到结果“兜底设备 …XXXX”同一展示口径。
             let device_tail = if record.device_id.len() >= 4 {
@@ -366,12 +471,22 @@ pub fn build_overview(material_root: &Path) -> Result<Vec<CheckinOverviewEntryDt
                 checked_in: cached
                     .filter(|entry| cached_on_local_today(entry.cached_at_unix_seconds))
                     .and_then(|entry| entry.checked_in),
+                // 今日尝试结果同样以日界过滤：昨日失败到了今天就是“未尝试”，
+                // 失败徽章只对今日的尝试生效（G10a）。
+                // date 与 outcome 同源输出：前端“今日尝试”判定需要两者成对出现。
+                last_attempt_outcome: cached
+                    .filter(|entry| entry.last_attempt_date.as_deref() == Some(today.as_str()))
+                    .and_then(|entry| entry.last_attempt_outcome.clone()),
+                last_attempt_date: cached
+                    .filter(|entry| entry.last_attempt_date.as_deref() == Some(today.as_str()))
+                    .and_then(|entry| entry.last_attempt_date.clone()),
                 access_token_expires_at_unix_seconds: access_expires,
                 refresh_token_expires_at_unix_seconds: refresh_expires,
                 device_tail,
                 device_id: Some(record.device_id),
                 display_name: record.display_name,
                 masked_mobile: record.masked_mobile,
+                mobile_full,
                 auto_checkin_enabled: record.auto_checkin_enabled,
                 refresh_error_code: cached.and_then(|entry| entry.refresh_error_code.clone()),
                 credential_legacy,
@@ -391,6 +506,12 @@ fn cached_on_local_today(cached_at_unix_seconds: u64) -> bool {
         return false;
     };
     cached.date_naive() == chrono::Local::now().date_naive()
+}
+
+/// 本地时区今日日期（YYYY-MM-DD）：与 checked_in 的自然日判定同一口径，
+/// 供 last_attempt_date 写入与日界过滤使用。
+fn local_today_string() -> String {
+    chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
 }
 
 /// Unix 秒 -> RFC3339；超界时间（注册表防御性允许 0）映射为 None 展示“尚未验证”。
@@ -536,6 +657,8 @@ mod tests {
                 usage_remaining_credits: None,
                 usage_cached_at_unix_seconds: None,
                 refresh_error_code: None,
+                last_attempt_date: None,
+                last_attempt_outcome: None,
             },
         );
         write_credits_cache(root, &cache);
@@ -579,6 +702,200 @@ mod tests {
             .find(|entry| entry.profile_id == "p1")
             .unwrap();
         assert_eq!(entry.checked_in, Some(true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ===== G10a：今日签到尝试结果（last_attempt_*）=====
+    // 账号页/签到页要区分"今日签到失败"与"从未尝试"（只有 checked_in 布尔
+    // 时失败账号显示"未签"，无法区分），失败证据必须落缓存。
+
+    /// 构造一个失败结果（无 after 快照）：映射规则测试用。
+    fn result_with_failure(
+        profile_id: &str,
+        outcome: CheckinOutcome,
+        detail_code: Option<&str>,
+    ) -> CheckinResult {
+        CheckinResult {
+            profile_id: profile_id.to_string(),
+            outcome,
+            state: CheckinTaskState::Completed,
+            claim_attempted: true,
+            before: None,
+            after: None,
+            detail_code: detail_code.map(str::to_string),
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+            finished_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn last_attempt_outcome_mapping_follows_ticket_rules() {
+        // 签到成功（claim 成功或 status 探测发现已签）→ "ok"。
+        assert_eq!(
+            checkin_last_attempt_outcome(&result_with_after("p1", 120, true)),
+            "ok"
+        );
+        assert_eq!(
+            checkin_last_attempt_outcome(&result_with_after("p2", 30, false)),
+            "ok"
+        );
+        // 业务码失败（HTTP 200 但 code 非 0）→ "business:{业务码}"。
+        assert_eq!(
+            checkin_last_attempt_outcome(&result_with_failure(
+                "p3",
+                CheckinOutcome::NotEligible,
+                Some("business_9074")
+            )),
+            "business:9074"
+        );
+        // 9074 上下文标注（device_too_new）语义仍是业务拒绝，原样保留。
+        assert_eq!(
+            checkin_last_attempt_outcome(&result_with_failure(
+                "p4",
+                CheckinOutcome::NotEligible,
+                Some("device_too_new")
+            )),
+            "business:device_too_new"
+        );
+        // 网络/凭据失败 → "transport:{映射码}"（复用现有错误码常量）。
+        assert_eq!(
+            checkin_last_attempt_outcome(&result_with_failure(
+                "p5",
+                CheckinOutcome::NetworkError,
+                Some("network_error")
+            )),
+            "transport:network_error"
+        );
+        assert_eq!(
+            checkin_last_attempt_outcome(&result_with_failure(
+                "p6",
+                CheckinOutcome::CredentialRefreshFailed,
+                Some("credential_refresh_failed")
+            )),
+            "transport:credential_refresh_failed"
+        );
+    }
+
+    #[test]
+    fn update_last_attempt_writes_outcome_and_keeps_other_fields() {
+        let root = temp_root("last-attempt");
+        update_credits_cache(&root, &[result_with_after("p1", 120, true)]);
+        update_last_attempt(&root, "p1", "business:9074");
+        let cache = read_credits_cache(&root);
+        let entry = cache.get("p1").unwrap();
+        assert_eq!(
+            entry.last_attempt_outcome.as_deref(),
+            Some("business:9074")
+        );
+        assert_eq!(
+            entry.last_attempt_date.as_deref(),
+            Some(local_today_string().as_str())
+        );
+        // 其他字段不丢：积分/已签状态仍来自签到写回。
+        assert_eq!(entry.credits, Some(120));
+        assert_eq!(entry.checked_in, Some(true));
+        // 从未签到过的账号也能单独记录尝试结果（其余字段按空值创建）。
+        update_last_attempt(&root, "p2", "transport:network_error");
+        let cache = read_credits_cache(&root);
+        let entry = cache.get("p2").unwrap();
+        assert_eq!(
+            entry.last_attempt_outcome.as_deref(),
+            Some("transport:network_error")
+        );
+        assert_eq!(entry.credits, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn status_refresh_does_not_clear_last_attempt() {
+        let root = temp_root("attempt-keep");
+        update_credits_cache(&root, &[result_with_after("p1", 120, true)]);
+        update_last_attempt(&root, "p1", "transport:network_error");
+        // 铁律：只读 status 刷新不得清除尝试证据（last_attempt_* 只被新尝试覆盖）。
+        update_credits_from_snapshots(
+            &root,
+            &[(
+                "p1".to_string(),
+                CheckinStatusSnapshot {
+                    enabled: true,
+                    checked_in: true,
+                    credits: Some(125),
+                    business_code: None,
+                },
+            )],
+        );
+        let cache = read_credits_cache(&root);
+        let entry = cache.get("p1").unwrap();
+        assert_eq!(entry.credits, Some(125));
+        assert_eq!(
+            entry.last_attempt_outcome.as_deref(),
+            Some("transport:network_error")
+        );
+        assert_eq!(
+            entry.last_attempt_date.as_deref(),
+            Some(local_today_string().as_str())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 直接落一份带指定日期尝试结果的缓存（绕开 update_last_attempt 的"now"取值）。
+    fn write_cache_with_attempt(root: &Path, profile_id: &str, date: &str, outcome: &str) {
+        let mut cache = CreditsCacheFile::default();
+        cache.entries.insert(
+            profile_id.to_string(),
+            CreditsCacheEntry {
+                credits: Some(120),
+                checked_in: Some(false),
+                cached_at_unix_seconds: 0,
+                usage_remaining_credits: None,
+                usage_cached_at_unix_seconds: None,
+                refresh_error_code: None,
+                last_attempt_date: Some(date.to_string()),
+                last_attempt_outcome: Some(outcome.to_string()),
+            },
+        );
+        write_credits_cache(root, &cache);
+    }
+
+    #[test]
+    fn last_attempt_from_previous_day_is_not_reported() {
+        let root = temp_root("attempt-stale-day");
+        register_minimal_account(&root, "p1");
+        let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        write_cache_with_attempt(&root, "p1", &yesterday, "business:9074");
+        let entry = build_overview(&root)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.profile_id == "p1")
+            .unwrap();
+        // 昨日的尝试结果不得当作今日状态：今日是否已尝试以日界为准。
+        assert_eq!(entry.last_attempt_outcome, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn last_attempt_from_today_is_reported() {
+        let root = temp_root("attempt-today");
+        register_minimal_account(&root, "p1");
+        write_cache_with_attempt(
+            &root,
+            "p1",
+            &local_today_string(),
+            "transport:network_error",
+        );
+        let entry = build_overview(&root)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.profile_id == "p1")
+            .unwrap();
+        assert_eq!(
+            entry.last_attempt_outcome.as_deref(),
+            Some("transport:network_error")
+        );
+        // date 与 outcome 成对输出：前端“今日尝试”判定依赖两者同现（G10a IPC 契约）。
+        assert_eq!(entry.last_attempt_date.as_deref(), Some(local_today_string().as_str()));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

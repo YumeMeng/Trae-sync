@@ -300,6 +300,58 @@
   line-height: 1.45;
 }
 
+/* G9 健康检测/刷新额度结果卡：首行结论 + 异常账号清单（正常账号不占空间）。 */
+.result-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.result-card__headline {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.result-card__issues {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* 异常行：名字 + 一句原因；琥珀左缘提示"需关注"，与徽章四色语义一致。 */
+.result-card__issue {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--warn, #b45309);
+  border-radius: 4px;
+  background: var(--glass-dense);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.result-card__issue-name {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.result-card__issue-reason {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-2);
+}
+
 .account-center__handoff,
 .account-center__key-status,
 .account-center__checkin {
@@ -591,15 +643,7 @@
   font-size: 13px;
 }
 
-/* 名称行：单行截断 + 徽章固定行尾，长名称不撑开卡片也不换行错位。 */
-.account-card__title-row {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: nowrap;
-}
-
+/* 卡片名称：单行截断，长名称不撑开卡片（G12 布局中与使用中 chip 同行）。 */
 .account-card__name {
   flex: 1 1 auto;
   min-width: 0;
@@ -608,73 +652,6 @@
   white-space: nowrap;
   font-size: 15px;
   font-weight: 650;
-}
-
-.account-card__title-row .status-badge {
-  flex: 0 0 auto;
-}
-
-/* 签到积分行：标签 + 大数值 + 时间标注，基线对齐形成扫读锚点。 */
-.account-card__credits {
-  display: flex;
-  margin: 0;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
-}
-
-.account-card__credits-label {
-  color: var(--text-2);
-  font-size: 12.5px;
-  flex: 0 0 auto;
-}
-
-.account-card__credits-value {
-  color: var(--text-1);
-  font-size: 20px;
-  font-weight: 750;
-  line-height: 1.1;
-  font-variant-numeric: tabular-nums;
-}
-
-.account-card__credits-meta {
-  color: var(--text-2);
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.account-card__credits-placeholder {
-  color: var(--muted-placeholder);
-  font-size: 13px;
-}
-
-/* 次级积分行（签到活动积分）：数值缩小降权，与主行“模型积分”形成层级。 */
-.account-card__credits--secondary .account-card__credits-value {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-2);
-}
-
-/* 卡片底部：健康度徽章靠左、设备尾号靠右，一行收口次要信息。 */
-.account-card__foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
-}
-
-.account-card__foot .status-badge {
-  min-width: 0;
-}
-
-.account-card__foot-meta {
-  flex: 0 0 auto;
-  color: var(--text-2);
-  font-size: 12px;
-  white-space: nowrap;
 }
 
 /* ============================================================
@@ -717,6 +694,22 @@
   background: var(--glass-hover);
   color: var(--text-1);
   box-shadow: 0 1px 3px rgba(26, 34, 51, 0.1);
+}
+
+/* G14 「需处理」数字角标：异常账号数（0 时元素不渲染，避免空占位）。 */
+.seg-control__count {
+  display: inline-grid;
+  min-width: 18px;
+  height: 18px;
+  place-items: center;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 
 /* 列表控制行：排序选择 + 视图切换（section heading 右侧） */
@@ -821,7 +814,7 @@
   text-overflow: ellipsis;
 }
 
-/* meta 行：手机号 · 令牌 N 天 · 设备尾号（弱化文字，令牌临期转琥珀） */
+/* meta 行：手机号（G13 精简后仅保留手机号，弱化文字） */
 .account-item__meta {
   display: flex;
   align-items: center;
@@ -832,11 +825,6 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.account-item__meta-warn {
-  color: var(--warn);
-  font-weight: 600;
 }
 
 /* 右列：积分块 + 操作按钮 */
@@ -878,18 +866,73 @@
   color: var(--warn);
 }
 
-.account-item__actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
 /* 卡片视图补充：槽位行与操作行布局（卡片基础样式沿用 account-card--clickable） */
 .account-item__slots {
   display: flex;
   align-items: center;
   gap: 7px;
   flex-wrap: wrap;
+}
+
+/* ===== G12 卡片视图独立布局 =====
+   纵向层级：头像+名称（含使用中 chip）→ 徽章行 → 积分大字 → 手机号 → 底部切换按钮通栏。
+   不复用列表右栏样式（justify-items:end 为侧栏设计，卡片内左对齐）。 */
+.account-card__slots {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+/* 卡片积分块：左对齐大数字 + 标题小字 + 失败标记。 */
+.account-card__credits {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.account-card__credits-value {
+  color: var(--text-1);
+  font-size: 22px;
+  font-weight: 750;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.account-card__credits-label {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.account-card__credits-placeholder {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+/* 持续失败标记（卡片形态）：与列表标记同语义，琥珀提醒。 */
+.account-card__credits-failed {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warn);
+}
+
+/* 卡片手机号行：中性小字。 */
+.account-card__meta {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 底部切换按钮通栏：沉到卡片底缘（grid align-content:start 时占满一行）。 */
+.account-card__switch {
+  width: 100%;
+  justify-content: center;
 }
 
 /* —— 两槽位徽章系统（全局统一状态语言，契约核心） —— */
@@ -934,13 +977,40 @@
 }
 
 /* 正常态（中性安静） */
-.slot-badge--done { /* 已签：靛蓝点确认 */ }
-.slot-badge--todo { /* 未签：空心点 */ }
-.slot-badge--unknown { color: var(--text-3); }
-.slot-badge--idle { /* 未启动：空心点 */ }
+.slot-badge--idle { /* 未签/未登录/不可领取：中性灰占位 */ }
 .slot-badge--run .slot-badge__dot { opacity: 1; }
 
-/* 异常态（琥珀 = 需要用户动手；全画面唯一暖色语义） */
+/* G10 四色语义（全局统一）：绿=确认正常；琥珀=需关注/可自动解决；
+   红=确定性失败必须人工处理；灰=中性无需动作。 */
+.slot-badge--ok {
+  border-color: var(--ok-line);
+  background: var(--ok-soft-bg);
+  color: var(--ok);
+}
+
+.slot-badge--ok .slot-badge__dot {
+  background: var(--ok-dot);
+  opacity: 1; /* 绿点实心：明确确认 */
+}
+
+.slot-badge--danger {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.slot-badge--danger .slot-badge__dot {
+  background: var(--danger);
+  opacity: 1; /* 红点实心：确定性失败 */
+}
+
+/* 未刷新（签到槽）：今日无服务端数据——弱化占位（灰空心 + 虚线边框示意缺数据） */
+.slot-badge--unloaded {
+  color: var(--text-3);
+  border-style: dashed;
+}
+
+/* 异常态（琥珀 = 需要用户动手） */
 .slot-badge--warn {
   border-color: var(--warn-line);
   background: var(--warn-soft-bg);
@@ -1057,7 +1127,20 @@
   gap: 8px;
 }
 
-.account-detail__fact dd[data-testid="account-detail-alias"] input {
+/* G11 手机号行内编辑：纵向两行（输入行 + 脱敏号比对提示）。 */
+.account-detail__fact dd[data-testid="account-detail-mobile"] {
+  display: grid;
+  gap: 4px;
+}
+
+.account-detail__mobile-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.account-detail__fact dd[data-testid="account-detail-alias"] input,
+.account-detail__fact dd[data-testid="account-detail-mobile"] input {
   width: 200px;
   padding: 5px 9px;
   /* 输入框合同（U-4 B2 迁移）：12px 圆角 + 中性淡底 */
@@ -1069,16 +1152,95 @@
   font-family: inherit;
 }
 
-.account-detail__fact dd[data-testid="account-detail-alias"] input:focus {
+.account-detail__fact dd[data-testid="account-detail-alias"] input:focus,
+.account-detail__fact dd[data-testid="account-detail-mobile"] input:focus {
   outline: none;
   /* 聚焦：靛蓝边 + accent-soft 外晕（合同） */
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
-.account-detail__fact dd[data-testid="account-detail-alias"] .btn {
+.account-detail__fact dd[data-testid="account-detail-alias"] .btn,
+.account-detail__fact dd[data-testid="account-detail-mobile"] .btn {
   padding: 4px 12px;
   font-size: 12px;
+}
+
+/* G11 手机号行：脱敏号比对提示（输入框下方次要信息，不占主视野）。 */
+.account-detail__mobile-hint {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+/* ============================================================
+   G11 登录后手机号补录弹层：遮罩复用 .switch-veil（environment.css），
+   卡片与切号弹层同款磨砂玻璃规格。
+   ============================================================ */
+
+.mobile-prompt {
+  display: grid;
+  gap: 12px;
+  width: min(420px, 100%);
+  padding: 22px 24px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass-strong);
+  backdrop-filter: var(--glass-blur-strong);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  box-shadow: var(--shadow-float);
+}
+
+.mobile-prompt__title {
+  margin: 0;
+  font-size: 15.5px;
+  font-weight: 650;
+}
+
+.mobile-prompt__lead {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.mobile-prompt__masked {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+  color: var(--text-1);
+  font-size: 12.5px;
+}
+
+.mobile-prompt__input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--line-control);
+  border-radius: 12px;
+  background: var(--fill-soft);
+  color: var(--text-1);
+  font-size: 13.5px;
+  font-family: inherit;
+}
+
+.mobile-prompt__input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.mobile-prompt__error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12.5px;
+}
+
+.mobile-prompt__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .account-detail__hint {

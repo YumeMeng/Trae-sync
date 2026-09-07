@@ -140,6 +140,9 @@ pub struct CheckinCredentialBundle {
     pub access_token_expires_at_unix_seconds: u64,
     /// refresh token 过期时刻（Unix 秒）。真实协议实测：签发后 180 天。
     pub refresh_token_expires_at_unix_seconds: u64,
+    /// 完整手机号（G11 手工补录）：None = 未补录（展示回退脱敏号）。
+    /// 敏感字段与令牌同级 DPAPI 加密存储；格式校验在命令层（三层校验）。
+    pub mobile_full: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -159,6 +162,9 @@ struct SerializableBundle {
     client_id: String,
     access_token_expires_at_unix_seconds: u64,
     refresh_token_expires_at_unix_seconds: u64,
+    /// 完整手机号（G11）：旧凭据包无此字段，default 兼容读取为 None。
+    #[serde(default)]
+    mobile_full: Option<String>,
 }
 
 /// 按 TRAE 既有顺序拼接 `DeviceProof` 签名输入：
@@ -442,6 +448,19 @@ impl CheckinCredentialStore {
             return Err(CheckinCredentialError::BindingMismatch);
         }
         Ok(bundle)
+    }
+
+    /// G11 手机号补录：更新凭据包中的完整手机号（None = 清除，回退脱敏号展示）。
+    /// 读-改-写整包（DPAPI 加密，与令牌同级安全存储）；格式与脱敏号比对等
+    /// 三层校验在命令层（lib.rs），此处只做长度防御（validate_bundle）。
+    pub fn set_mobile_full(
+        &self,
+        binding: &CheckinProfileBinding,
+        mobile: Option<&str>,
+    ) -> Result<(), CheckinCredentialError> {
+        let mut bundle = self.load(binding)?;
+        bundle.mobile_full = mobile.map(str::to_string);
+        self.save(&bundle)
     }
 
     /// 是否存在未收口的中断写回。
@@ -870,6 +889,7 @@ fn same_credentials(left: &CheckinCredentialBundle, right: &CheckinCredentialBun
         && left.client_id == right.client_id
         && left.access_token_expires_at_unix_seconds == right.access_token_expires_at_unix_seconds
         && left.refresh_token_expires_at_unix_seconds == right.refresh_token_expires_at_unix_seconds
+        && left.mobile_full == right.mobile_full
 }
 
 fn validate_bundle(bundle: &CheckinCredentialBundle) -> Result<(), CheckinCredentialError> {
@@ -882,6 +902,12 @@ fn validate_bundle(bundle: &CheckinCredentialBundle) -> Result<(), CheckinCreden
     // machine_id 允许为空（旧凭据包兼容），但不允许超长。
     if bundle.machine_id.len() > MAX_ID_FIELD_BYTES {
         return Err(CheckinCredentialError::Invalid);
+    }
+    // 补录手机号：格式校验在命令层（三层校验）；这里只做长度防御。
+    if let Some(mobile) = &bundle.mobile_full {
+        if mobile.len() > MAX_ID_FIELD_BYTES {
+            return Err(CheckinCredentialError::Invalid);
+        }
     }
     decode_key_field(&bundle.device_public_key)?;
     decode_key_field(&bundle.device_private_key)?;
@@ -983,6 +1009,7 @@ fn encode_bundle_payload(
         client_id: bundle.client_id.clone(),
         access_token_expires_at_unix_seconds: bundle.access_token_expires_at_unix_seconds,
         refresh_token_expires_at_unix_seconds: bundle.refresh_token_expires_at_unix_seconds,
+        mobile_full: bundle.mobile_full.clone(),
     };
     let plaintext = serde_json::to_vec(&serialized).map_err(|_| CheckinCredentialError::Invalid)?;
     let encrypted = protect_secret(&plaintext).map_err(map_key_wrapper_error)?;
@@ -1043,6 +1070,7 @@ fn decode_bundle_payload(
         client_id: serialized.client_id,
         access_token_expires_at_unix_seconds: serialized.access_token_expires_at_unix_seconds,
         refresh_token_expires_at_unix_seconds: serialized.refresh_token_expires_at_unix_seconds,
+        mobile_full: serialized.mobile_full,
     };
     validate_bundle(&bundle)?;
     Ok(bundle)
@@ -1315,6 +1343,7 @@ mod tests {
             // 模拟真实签发模式：同一时刻（1_800_000_000）签发 14 天/180 天。
             access_token_expires_at_unix_seconds: 1_800_000_000 + ACCESS_TOKEN_LIFETIME_SECONDS,
             refresh_token_expires_at_unix_seconds: 1_800_000_000 + REFRESH_TOKEN_LIFETIME_SECONDS,
+            mobile_full: None,
         }
     }
 

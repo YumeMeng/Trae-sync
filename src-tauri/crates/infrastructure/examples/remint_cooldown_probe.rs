@@ -264,6 +264,8 @@ fn remint_with_diagnostics(
         client_id: oauth_client.client_id().to_string(),
         access_token_expires_at_unix_seconds: grant.access_token_expires_at_unix_seconds,
         refresh_token_expires_at_unix_seconds: grant.refresh_token_expires_at_unix_seconds,
+        // 示例工具不涉及手机号补录，占位 None（展示回退脱敏号）。
+        mobile_full: None,
     };
     store
         .save(&new_bundle)

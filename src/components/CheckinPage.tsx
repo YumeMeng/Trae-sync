@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { CalendarCheck, Loader2, Timer, UserPlus } from "lucide-react";
+import { CalendarCheck, Loader2, RefreshCw, Timer, UserPlus } from "lucide-react";
 import type {
   AutoCheckinStatusDto,
   CheckinBatchSummaryDto,
@@ -14,7 +14,7 @@ import type {
 import type { AppPage } from "./NavigationRail";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
-import { CheckinSlotBadge } from "./StatusBadges";
+import { CheckinSlotBadge, deriveCheckinSlotState } from "./StatusBadges";
 
 /** 后端逐账号进度事件（checkin-progress）载荷；outcome 与 CheckinResultDto 同口径。 */
 interface CheckinProgressEvent {
@@ -274,6 +274,18 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
     await invoke("cancel_checkin").catch(() => undefined);
   }, [busy]);
 
+  // G15 纯本地刷新：重读账号总览（本机缓存，零网络请求）。语义分工：
+  // 刷新 = 重读缓存；签到/补签 = 真实网络操作。与账号页刷新按钮行为一致。
+  const [localRefreshBusy, setLocalRefreshBusy] = useState(false);
+  const handleLocalRefresh = useCallback(() => {
+    if (!realMode || localRefreshBusy) return;
+    setLocalRefreshBusy(true);
+    void invoke<CheckinOverviewEntryDto[]>("get_checkin_overview")
+      .then((entries) => setOverview(entries))
+      .catch(() => undefined) // 读取失败保持旧数据（初始加载失败已有可见口径）。
+      .finally(() => setLocalRefreshBusy(false));
+  }, [realMode, localRefreshBusy]);
+
   const toggle = useCallback((profileId: string) => {
     setSelection((current) => current.includes(profileId)
       ? current.filter((id) => id !== profileId)
@@ -313,6 +325,21 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
         <div className="page-header__copy">
           <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
         </div>
+        {/* G15 纯本地刷新：重读缓存零联网，与签到/补签的网络操作分工。 */}
+        {realMode && poolIds.length > 0 && (
+          <div className="page-header__actions">
+            <button
+              className="btn"
+              type="button"
+              onClick={handleLocalRefresh}
+              disabled={localRefreshBusy}
+              data-testid="checkin-refresh-local"
+              title="重读本机缓存的账号信息（不联网）"
+            >
+              <RefreshCw size={15} className={localRefreshBusy ? "icon-spin" : undefined} aria-hidden="true" />刷新
+            </button>
+          </div>
+        )}
       </header>
 
       {error && <p className="workbench__error" role="alert">{error}</p>}
@@ -501,6 +528,9 @@ function CheckinFlowRow({
   onInlineCheckin: () => void;
 }) {
   const unchecked = entry.checked_in !== true;
+  // G10 统一状态机：签到槽徽章由 derive* 纯函数求枚举态（今日尝试失败显示
+  // “签到失败/待重试”，与账号页同义同色）。
+  const checkinState = deriveCheckinSlotState(entry);
   const outcome = result?.outcome ?? null;
   const detailCode = result?.detail_code ?? null;
   // 结果语气：claimed/already 安静（中性）；其余琥珀（需要关注）。
@@ -512,7 +542,7 @@ function CheckinFlowRow({
         <span className="checkin-flow__id">
           <span className="checkin-flow__name-row">
             <strong>{effectiveDisplayName(entry)}</strong>
-            <CheckinSlotBadge checkedIn={entry.checked_in} />
+            <CheckinSlotBadge state={checkinState} />
           </span>
           <span className="checkin-flow__meta">{entryMeta(entry)}</span>
         </span>

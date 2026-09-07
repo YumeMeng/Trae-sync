@@ -4079,6 +4079,13 @@ fn run_real_checkin(
     // 签到结束写回积分缓存（含合成失败结果里带 after 快照的条目），
     // 供账号页/签到页离线展示最新积分与“今日已签”状态。
     checkin_overview::update_credits_cache(&material_root, &summary.results);
+    // 每个账号尝试结束都写今日结果（无论成败）：失败证据不丢，
+    // 账号页才能区分“今日签到失败”与“从未尝试”（G10 状态机数据地基）。
+    // 取消跳过的账号不在 results 里，不写——它们今日确实从未尝试。
+    for result in &summary.results {
+        let outcome = checkin_overview::checkin_last_attempt_outcome(result);
+        checkin_overview::update_last_attempt(&material_root, &result.profile_id, &outcome);
+    }
     Ok(summary)
 }
 
@@ -4791,6 +4798,98 @@ fn set_account_display_name(
         .set_display_name(&profile_id, alias)
         .map_err(|_| "checkin_registry_invalid".to_string())?;
     Ok(())
+}
+
+/// G11 手机号补录：写入/清除账号完整手机号（存凭据包，与令牌同级 DPAPI 加密）。
+/// 三层校验的前两层在本命令：①大陆手机号格式（11 位，1 开头第二位 3-9）
+/// ②与服务端脱敏号首尾比对（脱敏号前缀+后缀必须完全匹配，防串号录错账号）；
+/// 第三层查重提示由前端基于总览数据判断后向用户确认。
+/// mobile 为 None/空白 = 清除补录（展示回退脱敏号）。
+#[tauri::command]
+fn set_account_mobile(
+    profile_id: String,
+    mobile: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    if profile_id.is_empty() || profile_id.len() > 256 {
+        return Err("checkin_profile_invalid".to_string());
+    }
+    let trimmed = mobile.as_deref().map(str::trim).unwrap_or("");
+    let material_root = checkin_material_root(&state)?;
+    let registry = AccountRegistry::new(&material_root);
+    let record = registry
+        .load()
+        .map_err(|_| "checkin_registry_invalid".to_string())?
+        .into_iter()
+        .find(|record| record.profile_id == profile_id)
+        .ok_or_else(|| "checkin_profile_invalid".to_string())?;
+
+    // 清除路径：空输入 = 回退脱敏号展示（输入错了的后悔药）。
+    if trimmed.is_empty() {
+        let store = CheckinCredentialStore::new(&material_root);
+        let binding = CheckinProfileBinding::new(
+            record.profile_id,
+            record.account_id,
+            record.device_id,
+            record.device_public_key,
+        );
+        store
+            .set_mobile_full(&binding, None)
+            .map_err(|_| "mobile_save_failed".to_string())?;
+        return Ok(());
+    }
+
+    // 校验一：大陆手机号格式（1[3-9] 开头共 11 位数字）。
+    if !is_mainland_mobile(trimmed) {
+        return Err("mobile_format_invalid".to_string());
+    }
+    // 校验二：与服务端脱敏号首尾比对（如 "138****0000" → 前 3 后 4）。
+    // 脱敏号尚未采集（旧账号未刷新额度）时无基准，跳过比对只走格式校验。
+    if let Some((prefix, suffix)) = masked_mobile_parts(&record.masked_mobile) {
+        let mismatch = !trimmed.starts_with(prefix.as_str())
+            || !trimmed.ends_with(suffix.as_str());
+        if mismatch {
+            return Err("mobile_masked_mismatch".to_string());
+        }
+    }
+
+    let store = CheckinCredentialStore::new(&material_root);
+    let binding = CheckinProfileBinding::new(
+        record.profile_id,
+        record.account_id,
+        record.device_id,
+        record.device_public_key,
+    );
+    store
+        .set_mobile_full(&binding, Some(trimmed))
+        .map_err(|_| "mobile_save_failed".to_string())?;
+    Ok(())
+}
+
+/// 大陆手机号格式：1 开头、第二位 3-9、共 11 位数字。
+fn is_mainland_mobile(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 11
+        && bytes[0] == b'1'
+        && (b'3'..=b'9').contains(&bytes[1])
+        && bytes.iter().all(|byte| byte.is_ascii_digit())
+}
+
+/// 解析脱敏手机号的首尾明文段（"138****0000" → ("138", "0000")）。
+/// 非预期形态（空串、无星号、首尾非数字）返回 None，调用方跳过比对。
+fn masked_mobile_parts(masked: &str) -> Option<(String, String)> {
+    let star = masked.find('*')?;
+    let (prefix, rest) = masked.split_at(star);
+    let suffix = rest.trim_start_matches('*');
+    if prefix.is_empty() || suffix.is_empty() {
+        return None;
+    }
+    if !prefix.bytes().all(|byte| byte.is_ascii_digit())
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((prefix.to_string(), suffix.to_string()))
 }
 
 /// P2-2 实例启动结果：launched=本次新启动；focused=已在运行、已把窗口带到前台；
@@ -9365,6 +9464,8 @@ pub fn run() {
             set_account_auto_checkin,
             // U-1 数据层：本地备注名（脱敏手机号为登录/补采自动写入，无独立命令）。
             set_account_display_name,
+            // G11 手机号补录：完整手机号写凭据包（DPAPI 加密，与令牌同级）。
+            set_account_mobile,
             // U-6 W4：资产库三态筛选——归档开关 / 占用统计 / 彻底删除记录。
             set_account_archived,
             get_account_storage_footprint,
@@ -9457,6 +9558,75 @@ mod master_switch_rollback_tests {
     }
 }
 
+#[cfg(test)]
+mod set_account_mobile_tests {
+    use super::*;
+
+    /// 大陆手机号格式：1[3-9] 开头共 11 位数字。
+    #[test]
+    fn mainland_mobile_format() {
+        assert!(is_mainland_mobile("13812345678"));
+        assert!(is_mainland_mobile("19999999999"));
+        // 长度不对 / 非数字 / 号段外。
+        assert!(!is_mainland_mobile("1381234567"));
+        assert!(!is_mainland_mobile("138123456789"));
+        assert!(!is_mainland_mobile("1381234567a"));
+        assert!(!is_mainland_mobile("12812345678")); // 第二位 2 不在 3-9
+        assert!(!is_mainland_mobile("23812345678")); // 非 1 开头
+    }
+
+    /// 脱敏号首尾段解析：标准形态返回 (前缀, 后缀)，非预期形态返回 None。
+    #[test]
+    fn masked_mobile_parts_parsing() {
+        assert_eq!(
+            masked_mobile_parts("138****0000"),
+            Some(("138".to_string(), "0000".to_string()))
+        );
+        assert_eq!(masked_mobile_parts(""), None);
+        assert_eq!(masked_mobile_parts("13800001111"), None); // 无星号
+        assert_eq!(masked_mobile_parts("****0000"), None); // 前缀空
+        assert_eq!(masked_mobile_parts("138****"), None); // 后缀空
+    }
+
+    /// 凭据仓库读写往返：set_mobile_full 后 load 读出同值；None 清除。
+    /// （命令层校验在纯函数测试覆盖；这里只验证存储层落盘闭环。）
+    #[test]
+    fn store_mobile_full_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let (private_pem, public_pem) = traesync_infrastructure::generate_device_keypair().unwrap();
+        let bundle = traesync_infrastructure::CheckinCredentialBundle {
+            profile_id: "profile-mobile".to_string(),
+            account_id: "700100".to_string(),
+            device_id: "1234567890123456".to_string(),
+            machine_id: "machine-mobile".to_string(),
+            device_public_key: public_pem,
+            device_private_key: private_pem,
+            access_token: "token".to_string(),
+            refresh_token: "refresh".to_string(),
+            client_id: "client".to_string(),
+            access_token_expires_at_unix_seconds: u64::MAX,
+            refresh_token_expires_at_unix_seconds: u64::MAX,
+            mobile_full: None,
+        };
+        store.save(&bundle).unwrap();
+        let binding = CheckinProfileBinding::new(
+            bundle.profile_id.clone(),
+            bundle.account_id.clone(),
+            bundle.device_id.clone(),
+            bundle.device_public_key.clone(),
+        );
+        store.set_mobile_full(&binding, Some("13812345678")).unwrap();
+        assert_eq!(
+            store.load(&binding).unwrap().mobile_full.as_deref(),
+            Some("13812345678")
+        );
+        // 清除后回到 None（展示回退脱敏号）。
+        store.set_mobile_full(&binding, None).unwrap();
+        assert_eq!(store.load(&binding).unwrap().mobile_full, None);
+    }
+}
+
 /// P7-5 凭据包实调判定（credential_login_state）离线单测：
 /// live_probe 注入，覆盖三态 + 断网降级 + 无凭据包 + 存档可用性随行。
 #[cfg(test)]
@@ -9500,6 +9670,7 @@ mod credential_login_state_tests {
                 client_id: "client-health".to_string(),
                 access_token_expires_at_unix_seconds: u64::MAX,
                 refresh_token_expires_at_unix_seconds: u64::MAX,
+                mobile_full: None,
             })
             .unwrap();
         (record, store)
