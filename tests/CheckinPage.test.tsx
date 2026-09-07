@@ -31,6 +31,14 @@ const fixtureCapability = {
   message: "演示模式：使用本地已保存账号模拟签到。",
 };
 
+/** 本地日期串（YYYY-MM-DD）：与后端 local_today_string 同口径。 */
+function todayLocalDate(): string {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${month}-${day}`;
+}
+
 function entry(profileId: string, screenName: string, overrides: Partial<CheckinOverviewEntryDto> = {}): CheckinOverviewEntryDto {
   const now = Date.now() / 1000;
   return {
@@ -227,6 +235,36 @@ describe("CheckinPage", () => {
     // 四动作直达：全签计数与池一致；补签计数为未签数（乙未签 -> 1）。
     expect(screen.getByRole("button", { name: /一键全签（2）/ })).toBeEnabled();
     expect(screen.getByRole("button", { name: /一键补签（1）/ })).toBeEnabled();
+  });
+
+  it("P8-3 G10 接入：今日失败账号渲染「签到失败」红徽章，不再显示「未签」", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") {
+        return [
+          entry("profile-login-1", "登录账号甲"),
+          // 今日业务性失败（last_attempt_* 来自后端同一日界过滤）。
+          entry("profile-login-2", "登录账号乙", {
+            checked_in: false,
+            credits: null,
+            credits_cached_at: null,
+            usage_remaining_credits: null,
+            usage_cached_at: null,
+            last_attempt_outcome: "business:9074",
+            last_attempt_date: todayLocalDate(),
+          }),
+        ];
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+
+    expect(await screen.findByText("登录账号乙")).toBeInTheDocument();
+    // G10 签到槽：今日失败 → 红徽章「签到失败」（与账号页同义同色）。
+    expect(screen.getByText("签到失败")).toBeInTheDocument();
+    // 失败徽章悬浮提示透出原因（收进 title，不占主视野）。
+    expect(screen.getByText("签到失败")).toHaveAttribute("title", expect.stringContaining("拒绝"));
   });
 
   it("可切换账号选择并只对选中账号执行签到（签到所选）", async () => {

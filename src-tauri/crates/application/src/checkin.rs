@@ -256,13 +256,17 @@ impl<'a> BatchCheckinRunner<'a> {
             } else {
                 summary.failed += 1;
             }
+            // G16 错峰豁免：探测判定已签/不可领取（未尝试 claim）的账号
+            // 跳过等待——全已签批次不再逐个干等；只有真正执行了 claim 的
+            // 账号后才错峰（claim 是服务端可见的连发特征，探测不是）。
+            let claimed = result.claim_attempted;
             summary.results.push(result);
             // 逐账号完成即回调：串行批次期间 UI 仍有实时进度可反馈。
             if let Some(on_progress) = self.progress_callback {
                 on_progress(summary.results.last().expect("just pushed"));
             }
             // 账号间随机间隔（最后一个账号后不等待）。
-            if index + 1 < profile_ids.len() {
+            if claimed && index + 1 < profile_ids.len() {
                 if let Some((lo, hi)) = self.inter_account_delay_ms {
                     let wait_ms = pseudo_random_range(lo, hi);
                     // 等待开始即通知 UI（下一账号 + 秒数；前端本地倒计时）。
@@ -700,6 +704,89 @@ mod tests {
         assert_eq!(
             waits.lock().unwrap().as_slice(),
             [("b".to_string(), 1u64)]
+        );
+    }
+
+    #[test]
+    fn already_checked_in_accounts_skip_inter_account_wait() {
+        // G16：探测判定已签（未尝试 claim）的账号跳过错峰等待——
+        // 全已签批次不再逐个干等 3~8 秒。以回调零触发 + 墙钟双重验证。
+        let world = BatchWorld::new("dev-1");
+        world
+            .bindings
+            .lock()
+            .unwrap()
+            .insert("b".to_string(), "dev-2".to_string());
+        // 两账号均已签：探测即返回，无 claim。
+        world.checked.lock().unwrap().insert("a".to_string(), true);
+        world.checked.lock().unwrap().insert("b".to_string(), true);
+        let waits: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+        let factory = || -> Box<dyn CheckinTransport> {
+            Box::new(WorldTransport {
+                world: world.clone(),
+            })
+        };
+        let on_wait = |profile_id: &str, secs: u64| {
+            waits.lock().unwrap().push((profile_id.to_string(), secs));
+        };
+        let cancel = AtomicBool::new(false);
+        let runner = BatchCheckinRunner::new(&factory)
+            // 若未跳过，这里会真实 sleep 250ms 且触发回调。
+            .with_inter_account_delay((250, 250))
+            .with_inter_wait_callback(&on_wait);
+        let started = std::time::Instant::now();
+        let summary = runner.run(&["a".to_string(), "b".to_string()], &cancel);
+        let elapsed = started.elapsed();
+        assert_eq!(summary.completed, 2);
+        assert!(
+            waits.lock().unwrap().is_empty(),
+            "已签账号不得触发错峰等待回调"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "已签账号批次耗时 {elapsed:?} 应远小于单次错峰间隔"
+        );
+    }
+
+    #[test]
+    fn mixed_batch_waits_only_after_claim_attempted_accounts() {
+        // G16 混合批次：已签账号（a）后不等待，真正 claim 的账号（b）后
+        // 保留错峰；最后一账号（c）后本就不等待。
+        let world = BatchWorld::new("dev-1");
+        world
+            .bindings
+            .lock()
+            .unwrap()
+            .insert("b".to_string(), "dev-2".to_string());
+        world
+            .bindings
+            .lock()
+            .unwrap()
+            .insert("c".to_string(), "dev-3".to_string());
+        world.checked.lock().unwrap().insert("a".to_string(), true);
+        world.checked.lock().unwrap().insert("c".to_string(), true);
+        let waits: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+        let factory = || -> Box<dyn CheckinTransport> {
+            Box::new(WorldTransport {
+                world: world.clone(),
+            })
+        };
+        let on_wait = |profile_id: &str, secs: u64| {
+            waits.lock().unwrap().push((profile_id.to_string(), secs));
+        };
+        let cancel = AtomicBool::new(false);
+        let runner = BatchCheckinRunner::new(&factory)
+            .with_inter_account_delay((10, 10))
+            .with_inter_wait_callback(&on_wait);
+        let summary = runner.run(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &cancel,
+        );
+        assert_eq!(summary.completed, 3);
+        // 仅 b（真正 claim）后产生一次等待，目标账号是 c；a 后零等待。
+        assert_eq!(
+            waits.lock().unwrap().as_slice(),
+            [("c".to_string(), 1u64)]
         );
     }
 }
