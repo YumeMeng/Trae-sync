@@ -186,10 +186,21 @@ fn read_master_history_inner(
     } else {
         "0"
     };
+    // G19 会话可见性子查询：至少 1 个未删除会话的项目才进列表（0 会话
+    // 空壳——TRAE 自动创建的哈希名虚拟项目——被过滤，不删任何数据）。
+    // 归档会话（hidden_status 借用值）算可见：归档视图仍按项目分组展示。
+    let has_session_deleted = column_exists(&conn, "chat_session", "deleted_at");
+    let session_visible_expr = if has_session_deleted {
+        "COALESCE(s.deleted_at, 0) = 0"
+    } else {
+        "1 = 1"
+    };
     let mut statement = conn
         .prepare(&format!(
             "SELECT p.project_id, {name_expr}, {path_expr} FROM project p \
              WHERE p.user_id = ?1 AND {project_deleted_expr} = 0 \
+             AND EXISTS (SELECT 1 FROM chat_session s \
+                 WHERE s.project_id = p.project_id AND {session_visible_expr}) \
              ORDER BY p.project_id ASC"
         ))
         .ok()?;
@@ -213,7 +224,7 @@ fn read_master_history_inner(
     // work_mode 维度（P5-8a 归档通道，ADR-0022）。
     let has_title = column_exists(&conn, "chat_session", "session_title");
     let has_updated_at = column_exists(&conn, "chat_session", "updated_at");
-    let has_session_deleted = column_exists(&conn, "chat_session", "deleted_at");
+    // has_session_deleted 已在项目查询前判定（G19 EXISTS 子查询共用）。
     let has_message_deleted = column_exists(&conn, "chat_message", "deleted_at");
     let has_hidden_status = column_exists(&conn, "chat_session", "hidden_status");
     let has_session_work_mode = column_exists(&conn, "chat_session", "work_mode");
@@ -343,37 +354,157 @@ mod tests {
         dir
     }
 
+    /// G19：0 会话空壳项目被过滤——TRAE 自动创建的哈希名虚拟项目不再堆积。
+    #[test]
+    fn zero_session_projects_are_filtered_out() {
+        let dir = temp_master_dir("g19-zero-session");
+        let key = "11".repeat(32);
+        create_master_fixture(&master_database_path(&dir), &key);
+        // 追加两个 0 会话空壳项目：一个正常名，一个哈希名无路径。
+        {
+            let conn = Connection::open_with_flags(
+                master_database_path(&dir),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            let pragma = format!("PRAGMA key = \"x'{}'\";", key);
+            conn.execute_batch(&pragma).unwrap();
+            conn.execute(
+                "INSERT INTO project VALUES ('p7', '111', 'biz-7', '空壳项目', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project VALUES ('p8', '111', 'biz-8', '6a4b8379fdd775ba95fb7f63', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let status = read_master_history(&dir, &key, "111");
+        match status {
+            MasterHistoryStatus::Ready { projects, .. } => {
+                // p7/p8 无任何会话：不进列表（fixture 中 p4 哈希名真路径也无会话，
+                // 同被过滤；保留的是有会话的 p1 与空名有路径但同样无会话的
+                // p6——p6 也无会话，被过滤后只剩 p1）。
+                let ids: Vec<&str> = projects.iter().map(|p| p.project_id.as_str()).collect();
+                assert_eq!(ids, vec!["p1"], "0 会话项目必须全部被过滤");
+            }
+            other => panic!("期望 Ready，实际 {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G19：无路径但有会话的项目归并「未关联文件夹」分组（复用按名合并机制：
+    /// 展示名空串 + 无路径，前端按 name 分组时自然归并）。
+    #[test]
+    fn no_path_project_with_sessions_kept_for_unlinked_group() {
+        let dir = temp_master_dir("g19-unlinked");
+        let key = "22".repeat(32);
+        create_master_fixture(&master_database_path(&dir), &key);
+        // 无路径 + 空名项目，挂一个可见会话：必须保留（归并入口由前端处理）。
+        {
+            let conn = Connection::open_with_flags(
+                master_database_path(&dir),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            let pragma = format!("PRAGMA key = \"x'{}'\";", key);
+            conn.execute_batch(&pragma).unwrap();
+            conn.execute(
+                "INSERT INTO project VALUES ('p9', '111', 'biz-9', '', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s9', 'p9', '未关联会话', 1772000000000, 0, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let status = read_master_history(&dir, &key, "111");
+        match status {
+            MasterHistoryStatus::Ready { projects, sessions } => {
+                let p9 = projects
+                    .iter()
+                    .find(|p| p.project_id == "p9")
+                    .expect("有会话的无路径项目必须保留");
+                assert_eq!(p9.name, "");
+                assert_eq!(p9.absolute_path, None);
+                let s9 = sessions
+                    .iter()
+                    .find(|s| s.session_id == "s9")
+                    .expect("未关联项目的会话必须可见");
+                assert_eq!(s9.project_id, "p9");
+            }
+            other => panic!("期望 Ready，实际 {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reads_projects_and_sessions_filtered_by_current_user() {
         let dir = temp_master_dir("filter");
         let key = "aa".repeat(32);
         create_master_fixture(&master_database_path(&dir), &key);
+        // G19 后项目需至少 1 个会话才进列表：为 p4/p5/p6 各补一个会话，
+        // 保持名称回退规则在全读取链路中的断言覆盖。
+        {
+            let conn = Connection::open_with_flags(
+                master_database_path(&dir),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            let pragma = format!("PRAGMA key = \"x'{}'\";", key);
+            conn.execute_batch(&pragma).unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s4', 'p4', '会话四', 1773000000000, 0, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s5', 'p5', '会话五', 1774000000000, 0, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s6', 'p6', '会话六', 1775000000000, 0, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        }
 
         let status = read_master_history(&dir, &key, "111");
         match status {
             MasterHistoryStatus::Ready { projects, sessions } => {
-                // 只见当前账号的项目（软删项目与他人项目排除），按 project_id 排序。
+                // 只见当前账号且有会话的项目（软删/他人/0 会话项目排除），
+                // 按 project_id 排序。
                 assert_eq!(projects.len(), 4);
                 assert_eq!(projects[0].name, "项目甲");
                 assert_eq!(projects[0].absolute_path.as_deref(), Some("d:\\work\\甲"));
                 // 哈希名 + 真实路径：回退路径尾段。
                 assert_eq!(projects[1].name, "Zed");
-                // 哈希名 + 哈希路径（虚拟项目）：无可读名，空串交前端占位。
+                // 哈希名 + 哈希路径（虚拟项目）：无可读名，空串交前端占位
+                // （有会话仍保留，前端归并「未关联文件夹」分组）。
                 assert_eq!(projects[2].name, "");
                 // 空名 + 真实路径：回退路径尾段。
                 assert_eq!(projects[3].name, "Trae-sync");
-                // 只见项目甲下的会话（他人会话不可见）；毫秒时间归一化为秒。
-                assert_eq!(sessions.len(), 2);
-                assert_eq!(sessions[0].session_id, "s1");
-                assert_eq!(sessions[0].updated_at_unix_seconds, Some(1770000000));
+                // 只见当前账号的会话（他人会话不可见）；毫秒时间归一化为秒。
+                assert_eq!(sessions.len(), 5);
+                // 按更新时间倒序：新补的 s6 最新排首，s1/s2 用 find 定位断言。
+                assert_eq!(sessions[0].session_id, "s6");
+                let s1 = sessions.iter().find(|s| s.session_id == "s1").unwrap();
+                assert_eq!(s1.updated_at_unix_seconds, Some(1770000000));
                 // 软删消息（deleted_at=99）不计入消息数。
-                assert_eq!(sessions[0].message_count, 1);
+                assert_eq!(s1.message_count, 1);
                 // P5-8a 归档维度：hidden_status 借用值与会话/项目回退模式可读。
-                assert_eq!(sessions[0].hidden_status, None);
-                assert_eq!(sessions[0].work_mode.as_deref(), Some("code"));
-                assert_eq!(sessions[1].hidden_status.as_deref(), Some("voice_discussion"));
+                assert_eq!(s1.hidden_status, None);
+                assert_eq!(s1.work_mode.as_deref(), Some("code"));
+                let s2 = sessions.iter().find(|s| s.session_id == "s2").unwrap();
+                assert_eq!(s2.hidden_status.as_deref(), Some("voice_discussion"));
                 // 会话 work_mode 缺失时回退项目 work_mode（COALESCE 口径）。
-                assert_eq!(sessions[1].work_mode.as_deref(), Some("code"));
+                assert_eq!(s2.work_mode.as_deref(), Some("code"));
             }
             other => panic!("期望 Ready，实际 {:?}", other),
         }
