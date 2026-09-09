@@ -2,12 +2,12 @@
 
 > 2026-08-22 建立并清理。本目录只保留与现行方向一致的决策文档。
 
-## 现行 ADR（共 9 份，全部必读）
+## 现行 ADR（共 10 份，全部必读）
 
 | ADR | 主题 | 约束什么 |
 |-----|------|---------|
 | [0018](0018-data-redline-release.md) | 数据红线解除 | 可直接读写真实数据；数据安全 = 手动备份入口 + 破坏性操作单次确认；铁律不自动删证据 |
-| [0019](0019-checkin-virtual-device-and-account-source.md) | 签到虚拟设备与账号来源 | 每账号持久虚拟设备（随机 ID + EC 密钥对 + 随机 MachineID）；仅 OAuth 登录；打开时自动签；业务码不得压平；凭据原子写回（第 7 条） |
+| [0019](0019-checkin-virtual-device-and-account-source.md) | 签到虚拟设备与账号来源 | 每账号持久虚拟设备（随机 ID + EC 密钥对 + 随机 MachineID）；仅 OAuth 登录；打开时自动签；业务码不得压平；凭据原子写回（第 7 条）；续期 `20403` 例外见 ADR-0027 |
 | [0020](0020-master-library-and-instance-model.md) | 主库与实例模型 | 主库 = 目录级切换分两阶段；纯本地；并行多开（2026-08-23 修订），主库模式强制单实例。阶段 A/B 与收入/返还语义已被 ADR-0021 部分取代；决策 4 并行多开承载已由 ADR-0024 改为「环境」 |
 | [0021](0021-master-single-ownership.md) | 主库记录单一归属 | 主库 = 环境内全部对话集合，单一归属当前登录账号；切号即归一；收编 = 环境页体检 + 一键归入；插件为验收观察点 |
 | [0022](0022-session-archive-channel.md) | 会话级归档通道 | 出库 = 借用 hidden_status 原生枚举（voice_discussion）；恢复 = 还原 NULL；归档抽屉为对话列表子视图；批量走 Gmail 式选择态；合并为遗留清理工具 |
@@ -15,6 +15,7 @@
 | [0024](0024-account-environment-decoupling.md) | 账号-环境解耦 | 实例目录转型登录凭据存档（三件套即全部消费面，E1 实证）；启动实例功能退役；环境 = 独立目录 + 当前账号（多对多，主库环境默认不可删）；工具链缓存为可清理派生数据 |
 | [0025](0025-library-abstraction.md) | Library 抽象 | 主库/副库基地是「库」：前端注入 libraryId 引用（不注入密钥），后端命令按 id 解析库实例；HistoryWorkbench 改名 LibrarySessionsPanel |
 | [0026](0026-plugin-sync-policy.md) | 插件同步策略 | 新增零确认、移除单确认且全账号传播、切号静默应用（含移除才单确认）；取代 ADR-0023 决策 2 确认语义；对账条移除 |
+| [0027](0027-first-login-credential-acceptance.md) | 首次登录凭据验收与一次 OAuth 约束 | 首次 OAuth 必须通过真实续期验收；`20403` 最多同会话设备重铸一次；禁止静默第二次 OAuth；失败保留证据 |
 
 配套决策记录：`docs/DECISIONS-20260822-GRILL.md`（项目方向历史锚点，九问九答全量；部分决策已被本表 ADR 取代，见其头部标注）。
 
@@ -30,4 +31,4 @@
 1. **任务驱动创建**：后续每个 Phase 任务落地需要架构决策时，创建正式 ADR；不为推测性扩展预建。
 2. **一经接受不可废弃**：新 ADR 是"不可废弃"级别——推翻某决策必须新开 ADR 并在旧 ADR 状态行显式标注取代关系，不删除文件。
 3. **状态行即权威**：每份 ADR 顶部状态行声明日期、取代/依赖关系；本表与状态行不一致时以状态行为准并修复本表。
-4. **必读集合**：本表 7 份 ADR + `DECISIONS-20260822-GRILL.md`（注意其头部取代标注）；其余技术事实查 `TECHNICAL_BASELINE.md`，计划查 `tickets.new.md`（现行唯一计划文件；旧版 `tickets.md` 已于 2026-09-02 删除，git 历史可查）。
+4. **必读集合**：本表现行 ADR + `DECISIONS-20260822-GRILL.md`（注意其头部取代标注）；其余技术事实查 `TECHNICAL_BASELINE.md`，计划查 `tickets.new.md`（现行唯一计划文件；旧版 `tickets.md` 已于 2026-09-02 删除，git 历史可查）。
