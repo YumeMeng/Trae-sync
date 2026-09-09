@@ -459,7 +459,7 @@ export interface MasterSwitchRolledBackEvent {
   readonly rolled_back: boolean;
 }
 
-/** 云端插件预同步回执（fail-soft：失败只影响插件市场显示，不影响切号）。 */
+/** 云端插件同步回执（fail-soft：失败只影响插件市场显示，不影响切号）。 */
 export interface PluginCloudSyncDto {
   /** 切换前账号云端已装插件数。 */
   readonly source_count: number;
@@ -473,19 +473,18 @@ export interface PluginCloudSyncDto {
   readonly skipped: number;
   /** 整体未执行（账号凭据或网络不可用）。 */
   readonly aborted: boolean;
-  /** 用户选择保留目标账号插件现状：未执行对账。 */
-  readonly declined: boolean;
 }
 
-/** preview_master_switch_plugins 返回（切号弹层 +N/-M 差异确认，ADR-0023）。 */
+/** preview_master_switch_plugins 返回（ADR-0026：remove_names 非空才弹
+ * 一次移除确认；纯新增差异静默应用）。 */
 export interface MasterSwitchPluginPreviewDto {
   /** 当前账号云端市场插件数。 */
   readonly source_count: number;
   /** 目标账号云端市场插件数。 */
   readonly target_count: number;
-  /** 待安装到目标账号的插件名（+N）。 */
+  /** 待安装到目标账号的插件名（纯新增，静默应用不确认）。 */
   readonly install_names: readonly string[];
-  /** 待从目标账号移除的插件名（-M）。 */
+  /** 待从目标账号移除的插件名（非空才弹确认，列明移除哪些）。 */
   readonly remove_names: readonly string[];
   /** 预检未完成（凭据/网络不可用）：前端静默直过切号，不弹确认。 */
   readonly aborted: boolean;

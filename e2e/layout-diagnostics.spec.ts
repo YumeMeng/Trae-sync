@@ -1,8 +1,9 @@
 import { test, expect, type Page } from "@playwright/test";
 import { installMockBridge } from "./mock-bridge";
 
-// 布局诊断（P5-3 历史页主库视图）：主要工作区矩形不能真实重叠，
-// 紧凑桌面左栏项目列表滚动到底部时末项完整可见。
+// 布局诊断（主库详情页库对话面板，G21 两栏式）：主要工作区矩形不能真实重叠，
+// 紧凑桌面左栏项目树滚动到底部时末项完整可见。
+// 独立历史页实例常驻 DOM 但停留在加载态（不渲染 .lib-panel），选择器天然唯一。
 
 const viewports = [
   { name: "1024x600", width: 1024, height: 600 },
@@ -15,10 +16,14 @@ const viewports = [
   { name: "1920x1080", width: 1920, height: 1080 },
 ] as const;
 
-async function prepareHistory(page: Page) {
-  // 应用首页是总览页；布局诊断针对历史页两栏结构，需要先切换导航。
-  await page.getByTestId("navigation-history").click();
-  await expect(page.getByTestId("history-session-list")).toBeVisible();
+async function prepareMasterDetail(page: Page) {
+  // 应用首页是总览页；布局诊断针对主库详情页两栏结构，需经环境页进入。
+  await page.getByTestId("navigation-environment").click();
+  await page.getByTestId("env-master-detail").click();
+  await expect(page.getByRole("region", { name: "主库详情" })).toBeVisible();
+  // 展开项目让会话行进入树（行完整落栏诊断覆盖项目行与会话行）。
+  await expect(page.getByTestId("library-tree")).toBeVisible();
+  await page.getByTestId("library-project-p1").click();
 }
 
 test("布局诊断：主要工作区矩形不能真实重叠", async ({ page }) => {
@@ -27,25 +32,25 @@ test("布局诊断：主要工作区矩形不能真实重叠", async ({ page }) 
   for (const viewport of viewports) {
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
     await page.goto("/");
-    await prepareHistory(page);
+    await prepareMasterDetail(page);
 
     const snapshot = await page.evaluate(() => {
       // 诊断前复位内部滚动根，避免按钮聚焦后的自动滚动污染边界测量。
       const main = document.querySelector<HTMLElement>(".app-main");
-      const projList = document.querySelector<HTMLElement>(".proj-list");
+      const tree = document.querySelector<HTMLElement>(".lib-tree");
       if (main) {
         main.scrollTop = 0;
         main.scrollLeft = 0;
       }
-      if (projList) projList.scrollTop = 0;
+      if (tree) tree.scrollTop = 0;
 
       const selectors = {
         titleBar: ".title-bar",
         navigation: ".navigation-rail",
         main: ".app-main",
-        historyPage: ".history-page",
-        projPanel: ".proj-panel",
-        sessPanel: ".sess-panel",
+        masterDetail: ".master-detail",
+        libPanel: ".lib-panel",
+        viewerPanel: ".viewer-panel",
       } as const;
       const rects = Object.fromEntries(
         Object.entries(selectors).map(([name, selector]) => {
@@ -77,20 +82,22 @@ test("布局诊断：主要工作区矩形不能真实重叠", async ({ page }) 
           first.bottom > second.top
         );
       };
-      // 项目行必须完整落在左栏（两栏各自内部滚动，行不允许溢出面板）。
-      const projPanel = document.querySelector<HTMLElement>(".proj-panel");
-      const projRect = projPanel?.getBoundingClientRect();
-      const projItems = projPanel
-        ? Array.from(projPanel.querySelectorAll<HTMLElement>(".proj-item")).map((item) => {
-            const rect = item.getBoundingClientRect();
-            return {
-              top: Math.round(rect.top),
-              bottom: Math.round(rect.bottom),
-              fullyInsidePanel: Boolean(
-                projRect && rect.top >= projRect.top - 1 && rect.bottom <= projRect.bottom + 1,
-              ),
-            };
-          })
+      // 树内行（项目行与会话行）必须完整落在左栏（两栏各自内部滚动，行不允许溢出面板）。
+      const libPanel = document.querySelector<HTMLElement>(".lib-panel");
+      const libRect = libPanel?.getBoundingClientRect();
+      const treeRows = libPanel
+        ? Array.from(libPanel.querySelectorAll<HTMLElement>(".lib-project, .lib-session")).map(
+            (item) => {
+              const rect = item.getBoundingClientRect();
+              return {
+                top: Math.round(rect.top),
+                bottom: Math.round(rect.bottom),
+                fullyInsidePanel: Boolean(
+                  libRect && rect.top >= libRect.top - 1 && rect.bottom <= libRect.bottom + 1,
+                ),
+              };
+            },
+          )
         : [];
       const titleBar = document.querySelector<HTMLElement>(".title-bar");
       const titleBarRect = titleBar?.getBoundingClientRect();
@@ -100,13 +107,13 @@ test("布局诊断：主要工作区矩形不能真实重叠", async ({ page }) 
         overlaps: {
           titleMain: overlap("titleBar", "main"),
           navMain: overlap("navigation", "main"),
-          projSess: overlap("projPanel", "sessPanel"),
+          libViewer: overlap("libPanel", "viewerPanel"),
         },
-        projList: {
-          overflowY: projList ? getComputedStyle(projList).overflowY : null,
-          clientHeight: projList?.clientHeight ?? 0,
-          scrollHeight: projList?.scrollHeight ?? 0,
-          items: projItems,
+        libTree: {
+          overflowY: tree ? getComputedStyle(tree).overflowY : null,
+          clientHeight: tree?.clientHeight ?? 0,
+          scrollHeight: tree?.scrollHeight ?? 0,
+          rows: treeRows,
         },
         titleBar: {
           height: Math.round(titleBarRect?.height ?? 0),
@@ -126,9 +133,9 @@ test("布局诊断：主要工作区矩形不能真实重叠", async ({ page }) 
     console.log(`[layout ${viewport.name}] ${JSON.stringify(snapshot)}`);
     expect(snapshot.overlaps.titleMain).toBe(false);
     expect(snapshot.overlaps.navMain).toBe(false);
-    expect(snapshot.overlaps.projSess).toBe(false);
-    expect(snapshot.projList.items.length).toBeGreaterThan(0);
-    expect(snapshot.projList.items.every((item) => item.fullyInsidePanel)).toBe(true);
+    expect(snapshot.overlaps.libViewer).toBe(false);
+    expect(snapshot.libTree.rows.length).toBeGreaterThan(0);
+    expect(snapshot.libTree.rows.every((row) => row.fullyInsidePanel)).toBe(true);
     expect(snapshot.scroll.body).toBe(0);
     expect(snapshot.scroll.document).toBe(0);
     if (viewport.width >= 1200) {
@@ -140,34 +147,33 @@ test("布局诊断：主要工作区矩形不能真实重叠", async ({ page }) 
   }
 });
 
-test("紧凑桌面项目列表滚动到底部时末项完整可见", async ({ page }) => {
+test("紧凑桌面项目树滚动到底部时末项完整可见", async ({ page }) => {
   await installMockBridge(page);
   await page.setViewportSize({ width: 1024, height: 600 });
   await page.goto("/");
-  await prepareHistory(page);
+  await prepareMasterDetail(page);
 
   const metrics = await page.evaluate(() => {
-    const list = document.querySelector<HTMLElement>(".proj-list");
-    if (!list) return null;
+    const tree = document.querySelector<HTMLElement>(".lib-tree");
+    if (!tree) return null;
 
-    // 用长列表模拟真实主库中的大量项目，验证内部滚动不会裁掉末项。
+    // 用与真实树分支相同的 class 注入长列表，验证内部滚动不会裁掉末项。
     for (let index = 0; index < 24; index += 1) {
-      const item = document.createElement("button");
-      item.type = "button";
-      item.className = "proj-item";
-      item.innerHTML = `<span class="proj-item__main"><span class="proj-item__name">末项验证项目 ${index + 1}</span></span>`;
-      list.appendChild(item);
+      const branch = document.createElement("div");
+      branch.className = "lib-branch";
+      branch.innerHTML = `<div class="lib-project"><span class="lib-project__name">末项验证项目 ${index + 1}</span></div>`;
+      tree.appendChild(branch);
     }
 
-    list.scrollTop = list.scrollHeight;
-    const listRect = list.getBoundingClientRect();
-    const items = Array.from(list.querySelectorAll<HTMLElement>(".proj-item"));
-    const last = items.at(-1)?.getBoundingClientRect();
+    tree.scrollTop = tree.scrollHeight;
+    const treeRect = tree.getBoundingClientRect();
+    const rows = Array.from(tree.querySelectorAll<HTMLElement>(".lib-project"));
+    const last = rows.at(-1)?.getBoundingClientRect();
     return {
-      overflowY: getComputedStyle(list).overflowY,
-      clientHeight: list.clientHeight,
-      scrollHeight: list.scrollHeight,
-      lastInside: Boolean(last && last.bottom <= listRect.bottom + 1 && last.top >= listRect.top - 1),
+      overflowY: getComputedStyle(tree).overflowY,
+      clientHeight: tree.clientHeight,
+      scrollHeight: tree.scrollHeight,
+      lastInside: Boolean(last && last.bottom <= treeRect.bottom + 1 && last.top >= treeRect.top - 1),
     };
   });
 

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { WorkspaceStateDto } from "./types/workspace";
 import { TitleBar } from "./components/TitleBar";
-import { HistoryWorkbench } from "./components/HistoryWorkbench";
+import { LibrarySessionsPanel } from "./components/LibrarySessionsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { AccountCenter } from "./components/AccountCenter";
 import { CheckinPage } from "./components/CheckinPage";
@@ -181,7 +181,7 @@ export default function App() {
             />
           </div>
           <div className="app-page" hidden={activePage !== "history"}>
-            <HistoryWorkbench
+            <LibrarySessionsPanel
               active={activePage === "history"}
               onNavigate={setActivePage}
             />

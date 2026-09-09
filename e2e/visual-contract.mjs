@@ -1,7 +1,8 @@
 /**
  * U-2/U-3 视觉契约 DOM 断言（一次性工具）。
  * 验证 DESIGN_TOKENS 关键点在真实渲染中的落地：玻璃面板、两槽位徽章、
- * 四动作、危险分区、meta 文字化、历史页玻璃基底（U-4）。与 visual-shots 共用 mock 边界。
+ * 四动作、危险分区、meta 文字化、主库详情页玻璃基底（G21 两栏）。
+ * 与 visual-shots 共用 mock 边界。
  */
 import { chromium } from "@playwright/test";
 
@@ -10,7 +11,7 @@ const results = [];
 const check = (name, ok, extra = "") =>
   results.push(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? `  (${extra})` : ""}`);
 
-async function mockInvoke(command) {
+async function mockInvoke(command, args) {
   const NOW_LOCAL = Math.floor(Date.now() / 1000);
   const DAY_LOCAL = 86400;
   const overview = [
@@ -32,6 +33,18 @@ async function mockInvoke(command) {
     { profile_id: "p2", running: true, login_state: "logged_out" },
     { profile_id: "p5", running: false, login_state: "stale" },
   ];
+  // 库历史 fixture（G21：字段与 MasterHistoryDto 同构，含归档过滤字段）。
+  const masterHistory = {
+    status: "ready",
+    current_user_id: "u-b",
+    projects: [{ project_id: "p1", name: "项目阿尔法", absolute_path: null }],
+    sessions: [{
+      session_id: "s1", project_id: "p1", title: "会话一", message_count: 8,
+      updated_at_unix_seconds: NOW_LOCAL - 60, deleted: false,
+      hidden_status: null, work_mode: "code",
+    }],
+    fingerprint: { db: { mtime_secs: NOW_LOCAL, mtime_nanos: 0, size: 1000 }, wal: null, shm: null },
+  };
   switch (command) {
     case "get_workspace_state": return {
       platform: { platform_id: "work_cn", display_name: "TRAE Work CN", adapter_implemented: false },
@@ -46,17 +59,32 @@ async function mockInvoke(command) {
     case "get_trae_instance_states": return instanceStates;
     case "get_auto_checkin_settings": return { enabled: true, daily_time_hhmm: "10:00", ledger: null };
     case "get_managed_account_state": return { saved_accounts: [], switch_state: "idle" };
-    // P5-3 历史页主库视图：ready 两栏数据 + 接力台账 + 消息预览。
-    case "get_master_history": return {
-      status: "ready",
-      current_user_id: "u-b",
-      projects: [{ project_id: "p1", name: "项目阿尔法" }],
-      sessions: [{
-        session_id: "s1", project_id: "p1", title: "会话一", message_count: 8,
-        updated_at_unix_seconds: NOW_LOCAL - 60, deleted: false,
-      }],
-      fingerprint: { db: { mtime_secs: NOW_LOCAL, mtime_nanos: 0, size: 1000 }, wal: null, shm: null },
+    // 主库详情页链路（环境页 + 详情页 shell）。
+    case "get_environment_state": return {
+      env_id: "master",
+      current_profile_id: "p1",
+      current_account_name: "梦梦",
+      data_dir: "C:\\TraeSync\\data\\environments\\master",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 1750000000,
     };
+    case "get_master_library_stats": return {
+      status: "ready", current_user_id: "u-b", project_count: 6, session_count: 74,
+      message_count: 512, participating_account_count: 2,
+      last_active_unix_seconds: NOW_LOCAL - 60, size_bytes: 712 * 1024 * 1024,
+    };
+    case "get_master_backup_chain": return {
+      backups: [{ stamp_unix_seconds: NOW_LOCAL - 86400, total_bytes: 2 * 1024 * 1024, has_wal: true }],
+      backup_dir: "C:\\TraeSync\\data\\environments\\master\\ModularData\\ai-agent", keep_policy: 5,
+    };
+    // 库对话面板（G21）：ready 两栏数据 + 接力台账 + 消息查看。
+    case "get_master_history":
+      // 指纹预检：previous 一致 → unchanged（维持现有树）。
+      if (args?.previous && JSON.stringify(args.previous) === JSON.stringify(masterHistory.fingerprint)) {
+        return { status: "unchanged", current_user_id: null, projects: [], sessions: [], fingerprint: masterHistory.fingerprint };
+      }
+      return { ...masterHistory, sessions: masterHistory.sessions.map((session) => ({ ...session })) };
     case "get_relay_ledger": return [{
       session_id: "s1", from_session_id: null, project_id: "p1",
       from_user_id: "u-a", from_account_name: "账号A",
@@ -64,7 +92,7 @@ async function mockInvoke(command) {
       message_count_at_switch: 4, switched_at_unix_seconds: NOW_LOCAL - 3600,
     }];
     case "get_master_session_messages": return {
-      session_id: "s1", status: "ready",
+      session_id: String(args?.sessionId ?? "s1"), status: "ready",
       messages: [{ message_id: "m1", role: "user", message_type: "general", created_at_unix_seconds: NOW_LOCAL - 60, content: { kind: "text", text: "预览消息", step_count: 0, thoughts: [] } }],
     };
     default: return null;
@@ -204,11 +232,14 @@ check("行内单签按钮（未签可点）", (await page.locator('[data-testid=
 check("行内单签禁用（已签）", (await page.locator('[data-testid="checkin-inline-p1"][disabled]').count()) === 1);
 check("单列表演进式列表", (await page.locator(".checkin-flow__row").count()) === 3);
 
-// —— 历史页契约（P5-3 主库视图：两栏玻璃面板 + 接力徽章） ——
-await page.click('[data-testid="navigation-history"]');
-await page.locator('[data-testid="history-session-list"]').waitFor({ state: "visible", timeout: 10_000 });
-check("历史页导航可达（主库会话列表渲染）", true);
-const historyPanels = await page.evaluate(() => {
+// —— 主库详情页契约（G21 两栏：左栏项目树 + 右栏查看器玻璃面板） ——
+// 进入路径 = 环境页 → 主库卡「详情」（独立历史页 P8-6 将删除，不再作宿主）。
+await page.click('[data-testid="navigation-environment"]');
+await page.waitForTimeout(400);
+await page.click('[data-testid="env-master-detail"]');
+await page.locator('[data-testid="library-tree"]').waitFor({ state: "visible", timeout: 10_000 });
+check("主库详情可达（库对话面板项目树渲染）", true);
+const detailPanels = await page.evaluate(() => {
   const read = (sel) => {
     const el = document.querySelector(sel);
     const s = el ? getComputedStyle(el) : null;
@@ -220,22 +251,28 @@ const historyPanels = await page.evaluate(() => {
     const s = getComputedStyle(el);
     if (s.backdropFilter !== "none" && s.backdropFilter !== "") glass++;
   }
-  return { proj: read(".proj-panel"), sess: read(".sess-panel"), glass };
+  return { lib: read(".lib-panel"), viewer: read(".viewer-panel"), glass };
 });
 check(
-  "历史页左栏（项目）玻璃 blur + 背景透明",
-  historyPanels.proj.blur.includes("blur") && alphaOf(historyPanels.proj.bg) < 1,
-  `${historyPanels.proj.blur} / ${historyPanels.proj.bg}`,
+  "主库详情左栏（项目树）玻璃 blur + 背景透明",
+  detailPanels.lib.blur.includes("blur") && alphaOf(detailPanels.lib.bg) < 1,
+  `${detailPanels.lib.blur} / ${detailPanels.lib.bg}`,
 );
 check(
-  "历史页右栏（会话）玻璃 blur + 背景透明",
-  historyPanels.sess.blur.includes("blur") && alphaOf(historyPanels.sess.bg) < 1,
-  `${historyPanels.sess.blur} / ${historyPanels.sess.bg}`,
+  "主库详情右栏（查看器）玻璃 blur + 背景透明",
+  detailPanels.viewer.blur.includes("blur") && alphaOf(detailPanels.viewer.bg) < 1,
+  `${detailPanels.viewer.blur} / ${detailPanels.viewer.bg}`,
 );
-check("历史页玻璃面板覆盖（可见 ≥ 4 处）", historyPanels.glass >= 4, `${historyPanels.glass} 处`);
-check("历史页两栏圆角对齐", historyPanels.proj.radius === historyPanels.sess.radius, historyPanels.proj.radius);
-// 接力徽章：台账条目对应会话行渲染头像链。
-check("接力徽章头像链可见", (await page.locator('[data-testid="history-relay-chain"]').count()) >= 1);
+check("主库详情玻璃面板覆盖（可见 ≥ 4 处）", detailPanels.glass >= 4, `${detailPanels.glass} 处`);
+check("主库详情两栏圆角对齐", detailPanels.lib.radius === detailPanels.viewer.radius, detailPanels.lib.radius);
+// 接力轨迹：台账链在右栏查看器接力 tab 渲染腿时间线（G21 取代旧树内徽章）。
+await page.click('[data-testid="library-project-p1"]');
+await page.click('[data-testid="library-session-s1"]');
+await page.click('[data-testid="library-tab-relay"]');
+check(
+  "接力时间线可见（台账链渲染腿）",
+  (await page.locator('[data-testid="library-relay-tab"] .leg-step').count()) >= 2,
+);
 
 await browser.close();
 const failed = results.filter((r) => r.startsWith("FAIL"));

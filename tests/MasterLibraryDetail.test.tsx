@@ -167,31 +167,33 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     expect(screen.queryByTestId("verification-ledger-block")).not.toBeInTheDocument();
   });
 
-  it("默认对话列表 tab：复用历史页两栏（无页级标题，保留搜索工具行）", async () => {
+  it("默认对话列表 tab：复用库对话面板（无页级标题，左栏搜索可用）", async () => {
     setupDetail();
     render(<MasterLibraryDetail active onNavigate={() => undefined} />);
 
-    // 嵌入态不渲染历史页页级标题，但工具行（搜索）保留。
-    await screen.findByTestId("history-session-s1");
+    // 嵌入态不渲染页级标题；左栏项目树可展开到会话子级。
+    fireEvent.click(await screen.findByTestId("library-project-p1"));
+    await screen.findByTestId("library-session-s1");
     expect(screen.queryByRole("heading", { level: 1, name: "历史" })).not.toBeInTheDocument();
-    expect(screen.getByTestId("history-search-input")).toBeInTheDocument();
+    expect(screen.getByTestId("library-search-input")).toBeInTheDocument();
   });
 
   it("切换插件 tab 显示插件工作台，切回对话列表恢复两栏", async () => {
     setupDetail();
     render(<MasterLibraryDetail active onNavigate={() => undefined} />);
-    await screen.findByTestId("history-session-s1");
+    fireEvent.click(await screen.findByTestId("library-project-p1"));
+    await screen.findByTestId("library-session-s1");
 
     fireEvent.click(screen.getByTestId("master-tab-plugins"));
     // 插件 tab 激活后才发起状态读取（active 联动，不预取）。
     await screen.findByTestId("plugin-workbench");
     expect(screen.getByTestId("plugin-row-rec-1")).toBeVisible();
     // 切走后对话列表隐藏（hidden 属性），不再占据 tab 面板。
-    expect(screen.queryByTestId("history-session-s1")).not.toBeVisible();
+    expect(screen.queryByTestId("library-session-s1")).not.toBeVisible();
 
     fireEvent.click(screen.getByTestId("master-tab-sessions"));
     await waitFor(() => {
-      expect(screen.getByTestId("history-session-s1")).toBeVisible();
+      expect(screen.getByTestId("library-session-s1")).toBeVisible();
     });
     expect(screen.queryByTestId("plugin-workbench")).not.toBeVisible();
   });
@@ -220,7 +222,8 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     render(<MasterLibraryDetail active onNavigate={() => undefined} />);
 
     // 默认 tab 是对话列表：信息网格随库信息 tab 渲染但不可见（hidden 属性）。
-    await screen.findByTestId("history-session-s1");
+    fireEvent.click(await screen.findByTestId("library-project-p1"));
+    await screen.findByTestId("library-session-s1");
     expect(screen.getByTestId("master-detail-info")).not.toBeVisible();
     expect(screen.getByTestId("master-info-account")).not.toBeVisible();
   });
@@ -229,7 +232,8 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     setupDetail();
     const visited: AppPage[] = [];
     render(<MasterLibraryDetail active onNavigate={(page) => visited.push(page)} />);
-    await screen.findByTestId("history-session-s1");
+    fireEvent.click(await screen.findByTestId("library-project-p1"));
+    await screen.findByTestId("library-session-s1");
 
     fireEvent.click(screen.getByTestId("master-detail-back"));
     expect(visited).toEqual(["environment"]);

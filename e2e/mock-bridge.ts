@@ -1,11 +1,13 @@
 // ============================================================================
-// Playwright mock 命令边界（P5-3 历史页主库视图）
+// Playwright mock 命令边界（库对话面板，G21/G22 + ADR-0025 库实例参数化）
 // ============================================================================
 //
 // 关键约束：
 // - 使用确定性 mock 命令边界，绝不启动 Tauri 或访问真实 TRAE 数据
 // - 通过 page.addInitScript 在应用加载前安装 window.__TAURI_INTERNALS__.invoke
 // - 所有返回数据为合成 fixture，不含真实账号/会话/认证正文
+// - 库命令（get_master_history / archive / merge 等）全部带 libraryId 参数，
+//   mock 按 libraryId === "master" 路由（V1 唯一库实例）
 //
 // Tauri 2 中 @tauri-apps/api/core 的 invoke 最终调用
 // window.__TAURI_INTERNALS__.invoke(cmd, args, options)，因此 mock 该入口即可。
@@ -25,6 +27,8 @@ export interface MockScenario {
   production?: boolean;
   // P5-3：主库历史读取状态（默认 ready，两栏数据可见）。
   masterHistory?: MasterHistoryMode;
+  // 会话消息窗口：bulk = 首页 2000 条，滚到顶部可继续取一页更早消息。
+  sessionMessages?: "normal" | "bulk";
 }
 
 /**
@@ -192,7 +196,9 @@ export async function installMockBridge(
       },
     ];
 
-    // ===== P5-3 主库历史 fixture：两项目 + 三会话（含一条三跳接力链）=====
+    // ===== 库历史 fixture（G21 两栏式）：三项目 + 六会话（含一条三跳接力链）=====
+    // 项目覆盖三种树分组形态：具名双会话（p1）/ 具名单会话（p2）/ 空名项目
+    // （p3 → 「未关联文件夹」末位合并组，G19）。
 
     // 环境页 mock 用的账号名录（profile ↔ user_id ↔ 显示名）。
     const ACCOUNTS = [
@@ -260,6 +266,8 @@ export async function installMockBridge(
       projects: [
         { project_id: "p1", name: "项目阿尔法", absolute_path: null },
         { project_id: "p2", name: "项目贝塔", absolute_path: null },
+        // 空名项目：会话归并「未关联文件夹」末位分组（G19）。
+        { project_id: "p3", name: "", absolute_path: null },
       ],
       sessions: [
         {
@@ -283,6 +291,28 @@ export async function installMockBridge(
           work_mode: "code",
         },
         {
+          // p2 的正常会话：让 p2 出现在项目树（也作为合并源断言数据）。
+          session_id: "s5",
+          project_id: "p2",
+          title: "会话五 环境目录扫描",
+          message_count: 4,
+          updated_at_unix_seconds: NOW_LOCAL - 5 * DAY,
+          deleted: false,
+          hidden_status: null,
+          work_mode: "work",
+        },
+        {
+          // 空名项目 p3 的会话：归并「未关联文件夹」组。
+          session_id: "s6",
+          project_id: "p3",
+          title: "零散会话 无项目落点",
+          message_count: 2,
+          updated_at_unix_seconds: NOW_LOCAL - 6 * DAY,
+          deleted: false,
+          hidden_status: null,
+          work_mode: null,
+        },
+        {
           session_id: "s3",
           project_id: "p2",
           title: "旧归档会话",
@@ -294,7 +324,7 @@ export async function installMockBridge(
           work_mode: "work",
         },
         {
-          // 已删除会话：右栏必须过滤（deleted=false 的三会话可见）。
+          // 已删除会话：树内必须过滤（deleted 会话不入任何视图）。
           session_id: "s4",
           project_id: "p1",
           title: "已删除会话",
@@ -451,6 +481,12 @@ export async function installMockBridge(
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
       const scn = (window as any).__activeScenario || {};
+      // ADR-0025 库实例参数化：所有库命令按 libraryId 路由（V1 唯一 master）。
+      const assertMasterLibrary = () => {
+        if (args?.libraryId !== "master") {
+          throw new Error(`mock bridge: 未知库实例 ${args?.libraryId}`);
+        }
+      };
       if (cmd === "get_workspace_state") {
         if (scn.production) return PRODUCTION_WS;
         return WS;
@@ -528,7 +564,6 @@ export async function installMockBridge(
             failed: 0,
             skipped: 0,
             aborted: false,
-            declined: false,
           },
           relaunch_outcome: "launched",
         };
@@ -558,8 +593,9 @@ export async function installMockBridge(
         });
         return "C:\\TraeSync\\data\\environments\\master\\ModularData\\ai-agent\\.switch-bak-manual";
       }
-      // ===== P5-3 历史页主库视图 =====
+      // ===== 库对话面板（G21/G22，ADR-0025：命令带 libraryId）=====
       if (cmd === "get_master_history") {
+        assertMasterLibrary();
         const mode = scn.masterHistory ?? "ready";
         // 指纹预检：previous 与当前指纹一致 → unchanged（前端维持现有列表）。
         if (
@@ -576,7 +612,7 @@ export async function installMockBridge(
           };
         }
         if (mode === "ready") {
-          // 返回浅拷贝（新引用）：归档/恢复/删除 mock 会改写 sessions，
+          // 返回浅拷贝（新引用）：归档/恢复/删除/合并 mock 会改写 sessions，
           // 同一引用会被 React 状态比较 bail out，列表不刷新。
           return {
             ...MASTER_HISTORY_READY,
@@ -591,10 +627,14 @@ export async function installMockBridge(
           fingerprint: MASTER_HISTORY_READY.fingerprint,
         };
       }
-      if (cmd === "get_relay_ledger") return RELAY_LEDGER;
-      // ===== P5-8a 会话归档三命令（主列表归档 / 归档视图恢复与删除）=====
+      if (cmd === "get_relay_ledger") {
+        assertMasterLibrary();
+        return RELAY_LEDGER;
+      }
+      // ===== 会话批量操作（归档 / 恢复 / 删除 / 合并，均带 libraryId）=====
       // 可变副本：归档/恢复直接改 hidden_status，刷新后两栏联动（与真机行为同构）。
       if (cmd === "archive_master_sessions") {
+        assertMasterLibrary();
         const ids = new Set(Array.isArray(args?.sessionIds) ? args.sessionIds : []);
         for (const session of MASTER_HISTORY_READY.sessions) {
           if (ids.has(session.session_id) && !session.deleted) {
@@ -604,6 +644,7 @@ export async function installMockBridge(
         return { affected: ids.size };
       }
       if (cmd === "restore_master_sessions") {
+        assertMasterLibrary();
         const ids = new Set(Array.isArray(args?.sessionIds) ? args.sessionIds : []);
         let affected = 0;
         for (const session of MASTER_HISTORY_READY.sessions) {
@@ -615,6 +656,7 @@ export async function installMockBridge(
         return { affected };
       }
       if (cmd === "delete_master_sessions") {
+        assertMasterLibrary();
         const ids = new Set(Array.isArray(args?.sessionIds) ? args.sessionIds : []);
         let deletedMessages = 0;
         MASTER_HISTORY_READY.sessions = MASTER_HISTORY_READY.sessions.filter(
@@ -633,7 +675,65 @@ export async function installMockBridge(
           backup_path: "C:\\TraeSync\\data\\environments\\master\\ModularData\\ai-agent\\.switch-bak-del",
         };
       }
+      if (cmd === "merge_master_projects") {
+        // G22 项目合并：源项目全部会话改挂保留项目，移空的项目清理。
+        // 移动量口径与前端弹层规模一致（mergeSessionCounts：含已归档、不含已删除）。
+        assertMasterLibrary();
+        const sourceIds = new Set(Array.isArray(args?.sourceProjectIds) ? args.sourceProjectIds : []);
+        const targetId = String(args?.targetProjectId ?? "");
+        if (sourceIds.size === 0 || !targetId || sourceIds.has(targetId)) {
+          throw new Error("mock bridge: merge_master_projects 参数不合法");
+        }
+        let moved = 0;
+        for (const session of MASTER_HISTORY_READY.sessions) {
+          if (sourceIds.has(session.project_id) && !session.deleted) {
+            session.project_id = targetId;
+            moved += 1;
+          }
+        }
+        const before = MASTER_HISTORY_READY.projects.length;
+        MASTER_HISTORY_READY.projects = MASTER_HISTORY_READY.projects.filter(
+          (project: { project_id: string }) => !sourceIds.has(project.project_id),
+        );
+        return {
+          moved_sessions: moved,
+          removed_projects: before - MASTER_HISTORY_READY.projects.length,
+        };
+      }
       if (cmd === "get_master_session_messages") {
+        assertMasterLibrary();
+        // bulk 场景：按 offset 模拟后端分页，覆盖 2000 条窗口与向上加载。
+        if (scn.sessionMessages === "bulk") {
+          const offset = Number(args?.offset ?? 0);
+          if (offset > 0) {
+            return {
+              session_id: String(args?.sessionId ?? ""),
+              status: "ready",
+              has_more: false,
+              messages: [
+                {
+                  message_id: "bulk-older-0",
+                  role: "user",
+                  message_type: "general",
+                  created_at_unix_seconds: NOW_LOCAL - 2001 * 60,
+                  content: { kind: "text", text: "更早的合成消息", step_count: 0, thoughts: [] },
+                },
+              ],
+            };
+          }
+          return {
+            session_id: String(args?.sessionId ?? ""),
+            status: "ready",
+            has_more: true,
+            messages: Array.from({ length: 2000 }, (_, index) => ({
+              message_id: `bulk-${index}`,
+              role: index % 2 === 0 ? "user" : "assistant",
+              message_type: "general",
+              created_at_unix_seconds: NOW_LOCAL - (2000 - index) * 60,
+              content: { kind: "text", text: `合成消息 ${index + 1}`, step_count: 0, thoughts: [] },
+            })),
+          };
+        }
         return makeMasterMessages(String(args?.sessionId ?? ""));
       }
       // ===== P5-8b 插件 tab（ADR-0023 环境插件清单）=====
@@ -656,6 +756,8 @@ export async function installMockBridge(
             ...entry,
             installed_in_cloud: cloudIds.has(entry.marketplace_plugin_id),
           })),
+          // ADR-0026：卸载确认文案的账号数（已知账号 = mock 池 2 个）。
+          known_account_count: 2,
         };
       }
       if (cmd === "browse_plugin_market") return PLUGIN_MARKET;
@@ -688,7 +790,8 @@ export async function installMockBridge(
         ];
         return null;
       }
-      if (cmd === "uninstall_plugin") {
+      if (cmd === "uninstall_plugin_everywhere") {
+        // ADR-0026 决策 2：当前账号卸载 + 清单移除 + 其他账号逐个 fail-soft 传播。
         const recordId = String(args?.recordId ?? "");
         const item = pluginInstalled.find((entry) => entry.record_id === recordId);
         if (!item) throw new Error("plugin_not_found");
@@ -697,21 +800,15 @@ export async function installMockBridge(
         pluginManifest = pluginManifest.filter(
           (entry) => entry.marketplace_plugin_id !== item.marketplace_plugin_id,
         );
-        return null;
-      }
-      if (cmd === "absorb_plugin_manifest") {
-        // 吸收语义：以当前账号云端现状为准重写清单（手动装的入清单，手动卸的出清单）。
-        pluginManifest = pluginInstalled
-          .filter((item) => !item.builtin && item.marketplace_plugin_id !== null)
-          .map((item) => ({
-            marketplace_plugin_id: item.marketplace_plugin_id as string,
-            name: item.name,
-            display_name: item.display_name,
-            version: item.version,
-            registry: item.registry,
-            installed_in_cloud: true,
-          }));
-        return null;
+        // 逐账号回执：与 mock 账号池一致（2 账号全成功）。
+        return {
+          accounts: ACCOUNTS.map((entry) => ({
+            display_name: entry.screen_name,
+            removed: true,
+            failed: false,
+            error_code: null,
+          })),
+        };
       }
       // 自动签到设置 + 今日台账（U-4 A1：签到页状态行 e2e 数据源，结构与 AutoCheckinStatusDto 同构）。
       if (cmd === "get_auto_checkin_settings") {

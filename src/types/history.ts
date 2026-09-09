@@ -67,6 +67,8 @@ export interface MasterSessionMessagesDto {
   readonly session_id: string;
   readonly status: MasterSessionMessagesStatus;
   readonly messages: readonly SessionMessageDto[];
+  /** 当前页之后是否还有更早消息；查看器滚动到顶部时继续加载。 */
+  readonly has_more: boolean;
 }
 
 /** merge_master_projects 返回（P5-8c 分组合并回执）。 */

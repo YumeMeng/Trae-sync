@@ -53,19 +53,19 @@ use traesync_infrastructure::operation_manifest::{
 use traesync_infrastructure::{
     capture_location_identity, capture_location_witness, catalog_operation_matches,
     compare_location_identity, ensure_catalog_initialized, fetch_installed_plugins,
-    fetch_market_plugins, fixture_path_error_text, get_user_info, inspect_lock_status,
-    install_market_plugin, list_operation_summaries, load_account_fingerprint_salt,
-    load_or_create_account_fingerprint_salt, open_or_initialize_production_catalog,
-    persisted_record_matches, reconcile_current_catalog_sidecar, reconcile_plan,
-    resolve_current_catalog_generation_id, resolve_current_catalog_path,
-    salted_user_id_fingerprint, storage_space_status, sync_account_cloud_plugins,
-    uninstall_cloud_plugin, user_id_binding_fingerprint, user_id_display_fingerprint,
-    AccountEvidenceReader, AccountRegistry, AutoCheckinBatchState, AutoCheckinLedger,
-    AutoCheckinSettings, AutoCheckinStore, CatalogPathError, CheckinCredentialError,
-    CheckinCredentialStore, CheckinProfileBinding, CloudPluginItem, CredentialApplyOutcome,
-    CredentialBinding, CredentialState, CredentialStatus, CredentialVault, CredentialVaultError,
-    DeviceRemintService, FilesystemSnapshotStore, FixtureCheckinTransport, FixturePathError,
-    FixturePathGuard, FixtureWorkspaceStateProvider, JsonHandoffIntentStore,
+    fetch_market_plugins, find_uninstall_target, fixture_path_error_text, get_user_info,
+    inspect_lock_status, install_market_plugin, list_operation_summaries,
+    load_account_fingerprint_salt, load_or_create_account_fingerprint_salt,
+    open_or_initialize_production_catalog, persisted_record_matches,
+    reconcile_current_catalog_sidecar, reconcile_plan, resolve_current_catalog_generation_id,
+    resolve_current_catalog_path, salted_user_id_fingerprint, storage_space_status,
+    sync_account_cloud_plugins, uninstall_cloud_plugin, user_id_binding_fingerprint,
+    user_id_display_fingerprint, AccountEvidenceReader, AccountRegistry, AutoCheckinBatchState,
+    AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, CatalogPathError,
+    CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding, CloudPluginItem,
+    CredentialApplyOutcome, CredentialBinding, CredentialState, CredentialStatus, CredentialVault,
+    CredentialVaultError, DeviceRemintService, FilesystemSnapshotStore, FixtureCheckinTransport,
+    FixturePathError, FixturePathGuard, FixtureWorkspaceStateProvider, JsonHandoffIntentStore,
     JsonManagedAccountProfileStore, MarketPluginItem, OperationLease, OperationLockStatus,
     PersistedScanAuthorization, PlatformFileIdentityProvider, PluginCloudSyncOutcome,
     PluginManifest, PluginManifestEntry, ProductionCatalogError, ProductionCatalogRuntime,
@@ -124,7 +124,9 @@ use traesync_infrastructure::backup_retention::{
 // U-6 W4 追加 SessionIndexCacheStore：彻底删除记录时清理会话索引缓存。
 use traesync_infrastructure::account_session_index::{InstanceFingerprint, SessionIndexCacheStore};
 // P5-3 历史页主库视图：项目/会话两栏数据源 + 指纹轮询预检 + 主库消息预览。
-use traesync_infrastructure::account_session_content::read_master_session_messages;
+use traesync_infrastructure::account_session_content::{
+    read_master_session_messages_page, MAX_MESSAGES_PER_SESSION,
+};
 use traesync_infrastructure::master_history::{
     read_master_history, stat_master_fingerprint, MasterHistoryStatus,
 };
@@ -5919,16 +5921,14 @@ struct MasterAccountSwitchDto {
 /// - `force`：Q1.2 生成中切换——检测到主库 DB 活跃（回复生成中）时，
 ///   非 force 返回 `master_switch_busy` 交前端弹窗「等它完成还是强制切换」；
 ///   force=true 中断回复按失败轮次保留（备份先行，不丢弃证据）。
-/// - `apply_plugins`：P5-8b-3 插件对账确认结果（ADR-0023 决策 2）——
-///   true = 弹层确认过差异（或无差异/预检失败静默直过），执行「吸收后应用」；
-///   false = 用户选择「保留目标账号插件现状」，跳过对账（declined 回执）。
+/// - 插件对账（第 4.5 步）按 ADR-0026 静默执行：差异直达目标账号云端；
+///   含移除的差异由前端预检弹一次确认后才走到这里（纯新增不确认）。
 /// - 前置条件：主库已启动并登录过一次（Q2）；目标账号实例已登录过
 ///   （供体登录凭据来源）。
 #[tauri::command]
 async fn switch_master_account(
     profile_id: String,
     force: bool,
-    apply_plugins: bool,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterAccountSwitchDto, String> {
@@ -5954,7 +5954,6 @@ async fn switch_master_account(
             &raw_key,
             &profile_id,
             force,
-            apply_plugins,
         )
     })
     .await
@@ -6093,7 +6092,6 @@ fn switch_master_account_inner(
     raw_key: &str,
     profile_id: &str,
     force: bool,
-    apply_plugins: bool,
 ) -> Result<MasterAccountSwitchDto, String> {
     // 前置：目标账号在注册表（account_id 即 TRAE user_id，交接与台账都要用）。
     let records = AccountRegistry::new(material_root)
@@ -6245,10 +6243,11 @@ fn switch_master_account_inner(
         profile_id,
     );
 
-    // 第 4.5 步：云端插件对账（ADR-0023「吸收后应用」，fail-soft）：
-    // 吸收切换前账号云端现状进环境清单，再把差异应用到目标账号——
-    // 缺的装上、多的卸掉，重启后 TRAE 调和本地安装时无事发生。
-    // 任何失败都不阻断切号——插件可手动重装，切号本身必须完成。
+    // 第 4.5 步：云端插件对账（ADR-0026 决策 3 静默应用，fail-soft）：
+    // 吸收切换前账号云端现状进环境清单，再把差异静默应用到目标账号
+    // ——缺的装上、多的卸掉，重启后 TRAE 调和本地安装时无事发生。
+    // 含移除的差异已在切号弹层预检确认（单次）；任何失败都不阻断切号
+    // ——插件可手动重装，切号本身必须完成。
     emit("syncing_plugins");
     let plugin_sync = sync_plugins_for_switch(
         material_root,
@@ -6256,7 +6255,6 @@ fn switch_master_account_inner(
         &records,
         &identity.from_user_id,
         record,
-        apply_plugins,
     );
 
     // 第 5 步：重启主库（新登录身份 + 新窗口标题；官方目录带参启动，
@@ -6333,32 +6331,19 @@ fn finish_switch_failure_with_rollback(
     }
 }
 
-/// 切号编排的云端插件对账入口（ADR-0023「吸收后应用」，fail-soft）：
+/// 切号编排的云端插件对账入口（ADR-0026 决策 3 静默应用，fail-soft）：
 /// 源 = 切换前主库登录账号（凭据互换观察到的 from_user_id），
-/// 目标 = 切换目标账号。apply=false（用户选择保留目标账号插件现状）
-/// 时直接返回 declined 回执，不执行对账、环境清单保持原状。
-/// 源账号不在注册表或任一凭据包读取失败（含 token 失效场景由列表
-/// 拉取 401 兜底）→ aborted 回执，不报错。
+/// 目标 = 切换目标账号。含移除的差异已由前端预检弹一次确认，这里
+/// 始终执行完整对账（吸收后应用）。源账号不在注册表或任一凭据包
+/// 读取失败（含 token 失效场景由列表拉取 401 兜底）→ aborted 回执，
+/// 不报错。
 fn sync_plugins_for_switch(
     material_root: &Path,
     storage_root: &Path,
     records: &[traesync_infrastructure::account_registry::AccountRecord],
     from_user_id: &str,
     target_record: &traesync_infrastructure::account_registry::AccountRecord,
-    apply: bool,
 ) -> PluginCloudSyncOutcome {
-    if !apply {
-        return PluginCloudSyncOutcome {
-            source_count: 0,
-            installed: 0,
-            removed: 0,
-            failed: 0,
-            skipped: 0,
-            aborted: false,
-            declined: true,
-            absorbed: Vec::new(),
-        };
-    }
     let aborted = || PluginCloudSyncOutcome {
         source_count: 0,
         installed: 0,
@@ -6366,7 +6351,6 @@ fn sync_plugins_for_switch(
         failed: 0,
         skipped: 0,
         aborted: true,
-        declined: false,
         absorbed: Vec::new(),
     };
     // 源账号：主库切换前实际登录的账号（可能是未注册进 App 的账号）
@@ -6399,16 +6383,17 @@ fn sync_plugins_for_switch(
     outcome
 }
 
-/// 切号插件差异预检 DTO（P5-8b-3，ADR-0023 决策 2：弹层 +N/-M 一次确认）。
+/// 切号插件差异预检 DTO（ADR-0026 决策 3：remove_names 非空时前端弹
+/// 一次移除确认；纯新增差异静默应用，不弹确认）。
 #[derive(Clone, Serialize)]
 struct MasterSwitchPluginPreviewDto {
     /// 源账号云端市场插件数（吸收后的清单基数）。
     source_count: usize,
     /// 目标账号云端市场插件数。
     target_count: usize,
-    /// 待安装到目标账号的插件名（+N；展示名优先）。
+    /// 待安装到目标账号的插件名（纯新增，静默应用不确认）。
     install_names: Vec<String>,
-    /// 待从目标账号移除的插件名（-M；破坏性差异单列）。
+    /// 待从目标账号移除的插件名（破坏性差异单列；非空才弹确认）。
     remove_names: Vec<String>,
     /// 预检未完成（环境档案/注册表/凭据/列表任一不可用）：
     /// 前端据此静默直过切号，不弹确认。
@@ -6417,7 +6402,7 @@ struct MasterSwitchPluginPreviewDto {
 
 /// 切号插件差异预检（P5-8b-3）：源 = 环境档案当前账号（与插件 tab 同源），
 /// 目标 = 切换目标账号；对账计划与执行侧共用 `reconcile_plan`，保证
-/// 「弹层确认的差异 = 实际应用的差异」。预检永不返回 Err（fail-soft）。
+/// 「确认的移除清单 = 实际应用的移除」。预检永不返回 Err（fail-soft）。
 #[tauri::command]
 async fn preview_master_switch_plugins(
     profile_id: String,
@@ -6437,6 +6422,43 @@ async fn preview_master_switch_plugins(
     })
     .await
     .map_err(|_| "plugin_preview_join_failed".to_string())?
+}
+
+/// 双方云端列表 → 预检 DTO（纯函数，tests 复用）：吸收集口径与执行侧
+/// 一致（非 builtin 且有市场 ID）；remove_names 非空 = 需要移除确认。
+fn switch_plugin_preview_from_lists(
+    source_items: &[CloudPluginItem],
+    target_items: &[CloudPluginItem],
+) -> MasterSwitchPluginPreviewDto {
+    let source_market: Vec<CloudPluginItem> = source_items
+        .iter()
+        .filter(|item| !item.builtin && item.marketplace_plugin_id.is_some())
+        .cloned()
+        .collect();
+    let (install, remove) = reconcile_plan(&source_market, target_items);
+    let display_of = |item: &CloudPluginItem| {
+        let fallback = item
+            .marketplace_plugin_id
+            .clone()
+            .unwrap_or_else(|| item.record_id.clone());
+        if !item.display_name.is_empty() {
+            item.display_name.clone()
+        } else if !item.name.is_empty() {
+            item.name.clone()
+        } else {
+            fallback
+        }
+    };
+    MasterSwitchPluginPreviewDto {
+        source_count: source_market.len(),
+        target_count: target_items
+            .iter()
+            .filter(|item| !item.builtin && item.marketplace_plugin_id.is_some())
+            .count(),
+        install_names: install.iter().map(display_of).collect(),
+        remove_names: remove.iter().map(display_of).collect(),
+        aborted: false,
+    }
 }
 
 /// 预检主体（阻塞上下文）：拉取双方云端列表 → 对账计划 → 差异名集合。
@@ -6494,36 +6516,7 @@ fn preview_master_switch_plugins_inner(
     ) else {
         return aborted;
     };
-    // 吸收集口径与执行侧一致：非 builtin 且有市场 ID。
-    let source_market: Vec<CloudPluginItem> = source_items
-        .iter()
-        .filter(|item| !item.builtin && item.marketplace_plugin_id.is_some())
-        .cloned()
-        .collect();
-    let (install, remove) = reconcile_plan(&source_market, &target_items);
-    let display_of = |item: &CloudPluginItem| {
-        let fallback = item
-            .marketplace_plugin_id
-            .clone()
-            .unwrap_or_else(|| item.record_id.clone());
-        if !item.display_name.is_empty() {
-            item.display_name.clone()
-        } else if !item.name.is_empty() {
-            item.name.clone()
-        } else {
-            fallback
-        }
-    };
-    MasterSwitchPluginPreviewDto {
-        source_count: source_market.len(),
-        target_count: target_items
-            .iter()
-            .filter(|item| !item.builtin && item.marketplace_plugin_id.is_some())
-            .count(),
-        install_names: install.iter().map(display_of).collect(),
-        remove_names: remove.iter().map(display_of).collect(),
-        aborted: false,
-    }
+    switch_plugin_preview_from_lists(&source_items, &target_items)
 }
 
 /// 交接成功后的接力台账追加（Q3/Q5）：无会话交接视为无需记录（true）；
@@ -6857,14 +6850,31 @@ struct MasterHistoryDto {
     fingerprint: InstanceFingerprint,
 }
 
+/// ADR-0025 Library 抽象：库 id → 数据目录解析。
+///
+/// 库是基地概念：主库与副库都是「库」的实例，库内模块面向库编程。
+/// V1 库注册表只有 master 一个条目（`None` 缺省兼容既有调用）；
+/// 其他 id 一律 `library_not_found`（副库落地时新增注册表条目即可，
+/// 模块代码零改动）。
+fn resolve_library_dir(library_id: Option<&str>) -> Result<PathBuf, String> {
+    match library_id {
+        None | Some("master") => {
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())
+        }
+        Some(_) => Err("library_not_found".to_string()),
+    }
+}
+
 /// P5-3：读取主库历史（当前账号可见的项目 + 会话）。
 ///
 /// 当前账号 = 环境注册表 current_profile_id → 账号注册表 account_id；
 /// `project.user_id` 过滤（E1b 可见性口径）。`previous` 为前端保存的
 /// 上一轮指纹，未变化时返回 unchanged（避免轮询全量重读）。
+/// `library_id` 为库实例引用（ADR-0025，缺省主库）。
 #[tauri::command]
 async fn get_master_history(
     previous: Option<InstanceFingerprint>,
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterHistoryDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -6881,9 +6891,9 @@ async fn get_master_history(
         let record = EnvironmentRegistry::new(&storage_root)
             .ensure_master()
             .map_err(|_| "environment_registry_invalid".to_string())?;
-        let fingerprint = stat_master_fingerprint(
-            &master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?,
-        );
+        // ADR-0025：库目录统一走 resolve_library_dir（指纹与读取同源）。
+        let master_dir = resolve_library_dir(library_id.as_deref())?;
+        let fingerprint = stat_master_fingerprint(&master_dir);
         if previous == Some(fingerprint.clone()) {
             return Ok(MasterHistoryDto {
                 status: "unchanged",
@@ -6916,8 +6926,6 @@ async fn get_master_history(
             });
         };
         let current_user_id = account.account_id.clone();
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
         let (status, projects, sessions) =
             match read_master_history(&master_dir, &raw_key, &current_user_id) {
                 MasterHistoryStatus::Ready { projects, sessions } => ("ready", projects, sessions),
@@ -6943,15 +6951,20 @@ struct MasterSessionMessagesDto {
     /// ready=读取成功；no_master_data=主库从未启动过；read_failed=打开或读取失败。
     status: &'static str,
     messages: Vec<SessionMessageDto>,
+    /// 当前页之后是否还有更早消息；前端到顶部时按页继续读取。
+    has_more: bool,
 }
 
 /// P5-3：读取主库单个会话的消息流（历史页预览弹层数据源）。
 ///
 /// 与账号实例读取共用解析路径；通过隔离三件套副本只读打开，
-/// 主库实例运行中可随时读取。
+/// 主库实例运行中可随时读取。`library_id` 为库实例引用
+/// （ADR-0025，缺省主库）。
 #[tauri::command]
 async fn get_master_session_messages(
     session_id: String,
+    library_id: Option<String>,
+    offset: Option<u32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterSessionMessagesDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -6961,22 +6974,24 @@ async fn get_master_session_messages(
         return Err("source_key_unavailable".to_string());
     }
     let raw_key = state.source_raw_key.clone();
+    let offset = offset.unwrap_or(0) as usize;
     tauri::async_runtime::spawn_blocking(move || {
         use traesync_infrastructure::account_session_content::SessionMessagesStatus;
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-        let (status, messages) =
-            match read_master_session_messages(&master_dir, &session_id, &raw_key) {
+        let master_dir = resolve_library_dir(library_id.as_deref())?;
+        let (status, messages, has_more) =
+            match read_master_session_messages_page(&master_dir, &session_id, &raw_key, offset) {
                 SessionMessagesStatus::Ready(entries) => {
-                    ("ready", map_session_message_entries(entries))
+                    let has_more = entries.len() == MAX_MESSAGES_PER_SESSION;
+                    ("ready", map_session_message_entries(entries), has_more)
                 }
-                SessionMessagesStatus::NoInstanceData => ("no_master_data", Vec::new()),
-                SessionMessagesStatus::ReadFailed => ("read_failed", Vec::new()),
+                SessionMessagesStatus::NoInstanceData => ("no_master_data", Vec::new(), false),
+                SessionMessagesStatus::ReadFailed => ("read_failed", Vec::new(), false),
             };
         Ok(MasterSessionMessagesDto {
             session_id,
             status,
             messages,
+            has_more,
         })
     })
     .await
@@ -7855,6 +7870,9 @@ struct ManifestPluginDto {
 struct PluginTabStateDto {
     installed: Vec<InstalledPluginDto>,
     manifest: Vec<ManifestPluginDto>,
+    /// 工具已知账号数（含当前账号；ADR-0026 决策 2 卸载确认文案
+    /// 「将同时从 N 个账号移除」的 N）。
+    known_account_count: usize,
 }
 
 /// 插件 tab 当前账号凭据解析：环境档案 current_profile_id → 账号注册表
@@ -7990,9 +8008,16 @@ async fn get_plugin_tab_state(
                 installed_in_cloud: cloud_ids.contains(entry.marketplace_plugin_id.as_str()),
             })
             .collect();
+        // 已知账号数：账号注册表全量（含归档账号——凭据仍在，云端可能
+        // 装着该插件；卸载传播同样遍历全量，口径一致）。
+        let known_account_count = AccountRegistry::new(&material_root)
+            .load()
+            .map(|records| records.len())
+            .unwrap_or(0);
         Ok(PluginTabStateDto {
             installed: installed_dto,
             manifest: manifest_dto,
+            known_account_count,
         })
     })
     .await
@@ -8100,13 +8125,34 @@ async fn install_plugin(
     .map_err(|_| "plugin_install_join_failed".to_string())?
 }
 
-/// 卸载云端插件（ADR-0023 决策 3：即时改云端 + 清单同步移除）。
-/// record_id = 列表项不透明记录 ID；builtin 条目拒绝（云端无记录）。
+/// 卸载全账号传播的逐账号回执（ADR-0026 决策 2）。
+#[derive(Clone, Serialize)]
+struct PluginUninstallAccountDto {
+    /// 账号展示名（备注名优先，回退服务端昵称；不含内部 ID）。
+    display_name: String,
+    /// true = 已从云端移除；false = 无需移除（该账号没装）。
+    removed: bool,
+    /// 移除失败 true（fail-soft：只记失败不中断其他账号）。
+    failed: bool,
+    /// 失败原因码（成功时 None；技术细节收悬浮提示，不进主视野）。
+    error_code: Option<String>,
+}
+
+/// uninstall_plugin_everywhere 返回：逐账号成败回执。
+#[derive(Clone, Serialize)]
+struct PluginUninstallEverywhereDto {
+    accounts: Vec<PluginUninstallAccountDto>,
+}
+
+/// 卸载插件并传播到全部已知账号（ADR-0026 决策 2，前端已单次确认）：
+/// 当前账号云端卸载（失败即整单报错，不传播）→ 清单移除 → 其他已知
+/// 账号云端逐个卸载（fail-soft，逐账号尽力；builtin 跳过）。
+/// 自装条目（无市场 UUID）只处理当前账号——没有跨账号的可靠匹配键。
 #[tauri::command]
-async fn uninstall_plugin(
+async fn uninstall_plugin_everywhere(
     state: tauri::State<'_, AppState>,
     record_id: String,
-) -> Result<(), String> {
+) -> Result<PluginUninstallEverywhereDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("trae_real_mode_required".to_string());
     }
@@ -8114,7 +8160,7 @@ async fn uninstall_plugin(
     let storage_root = PathBuf::from(&state.storage_root);
     tauri::async_runtime::spawn_blocking(move || {
         let token = plugin_tab_account_token(&material_root, &storage_root)?;
-        // 先查条目：校验非 builtin，并取市场 UUID 供清单移除。
+        // 先查条目：校验非 builtin，并取市场 UUID 供清单移除与传播匹配。
         let items = fetch_installed_plugins(&token)
             .map_err(|_| "plugin_tab_cloud_unavailable".to_string())?;
         let item = items
@@ -8124,11 +8170,23 @@ async fn uninstall_plugin(
         if item.builtin {
             return Err("plugin_builtin_uninstallable".to_string());
         }
+        // 当前账号云端卸载：操作主体，失败整单报错（与安装对称的即时语义）。
         let removed_ok = uninstall_cloud_plugin(&token, &record_id)
             .map_err(|_| "plugin_uninstall_failed".to_string())?;
         if !removed_ok {
             return Err("plugin_uninstall_failed".to_string());
         }
+        // 当前账号回执展示名：注册表账号名（备注名优先）；读不到时
+        // 用通用兜底（回执是账号维度结果，不塞插件名）。
+        let current_name = current_account_record(&material_root, &storage_root)
+            .map(|record| account_display_name(&record))
+            .unwrap_or_else(|| "当前账号".to_string());
+        let mut accounts = vec![PluginUninstallAccountDto {
+            display_name: current_name,
+            removed: true,
+            failed: false,
+            error_code: None,
+        }];
         // 清单移除该插件（无市场 UUID 的自装条目本就不在清单内）。
         if let Some(market_id) = &item.marketplace_plugin_id {
             let manifest = PluginManifest::new(&storage_root);
@@ -8141,33 +8199,139 @@ async fn uninstall_plugin(
                     .save(&entries)
                     .map_err(|_| "plugin_manifest_write_failed".to_string())?;
             }
+            // 传播到其他已知账号：逐账号尽力，失败不中断（fail-soft）。
+            let records = AccountRegistry::new(&material_root)
+                .load()
+                .map_err(|_| "checkin_registry_invalid".to_string())?;
+            let current_profile_id = EnvironmentRegistry::new(&storage_root)
+                .load()
+                .ok()
+                .flatten()
+                .and_then(|env| env.current_profile_id);
+            let others = propagate_uninstall_to_accounts(
+                &records,
+                current_profile_id.as_deref(),
+                market_id,
+                &material_root,
+            );
+            accounts.extend(others);
         }
-        Ok(())
+        Ok(PluginUninstallEverywhereDto { accounts })
     })
     .await
     .map_err(|_| "plugin_uninstall_join_failed".to_string())?
 }
 
-/// 吸收云端变化进清单（ADR-0023 决策 2 前半）：以当前账号云端现状为准
-/// 重写清单——用户在 TRAE 内的手动装/卸视为真实意图。
-#[tauri::command]
-async fn absorb_plugin_manifest(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
+/// 环境档案当前账号 → 注册表档案（找不到返回 None，回执降级用通用名）。
+fn current_account_record(
+    material_root: &Path,
+    storage_root: &Path,
+) -> Option<traesync_infrastructure::account_registry::AccountRecord> {
+    let profile_id = EnvironmentRegistry::new(storage_root)
+        .load()
+        .ok()
+        .flatten()
+        .and_then(|env| env.current_profile_id)?;
+    AccountRegistry::new(material_root)
+        .load()
+        .ok()?
+        .into_iter()
+        .find(|record| record.profile_id == profile_id)
+}
+
+/// 账号展示名：备注名优先，回退服务端昵称（界面纪律：内部 ID 不进主视野）。
+fn account_display_name(
+    record: &traesync_infrastructure::account_registry::AccountRecord,
+) -> String {
+    record
+        .display_name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| record.screen_name.clone())
+}
+
+/// 移除传播执行器（ADR-0026 决策 2，依赖注入版供 tests 验证 fail-soft）：
+/// 逐账号 load_token → fetch 列表 → 按市场 UUID 定位（builtin 跳过）→
+/// uninstall。任一账号失败只记回执不中断后续；未装不算失败。
+/// current_profile_id 对应账号已单独处理，跳过。
+fn propagate_uninstall_with(
+    records: &[traesync_infrastructure::account_registry::AccountRecord],
+    current_profile_id: Option<&str>,
+    marketplace_plugin_id: &str,
+    mut load_token: impl FnMut(
+        &traesync_infrastructure::account_registry::AccountRecord,
+    ) -> Option<String>,
+    mut fetch: impl FnMut(&str) -> Option<Vec<CloudPluginItem>>,
+    mut uninstall: impl FnMut(&str, &str) -> bool,
+) -> Vec<PluginUninstallAccountDto> {
+    let mut results = Vec::new();
+    for record in records {
+        if Some(record.profile_id.as_str()) == current_profile_id {
+            continue;
+        }
+        let display_name = account_display_name(record);
+        let mut entry = PluginUninstallAccountDto {
+            display_name,
+            removed: false,
+            failed: false,
+            error_code: None,
+        };
+        match load_token(record).filter(|token| !token.is_empty()) {
+            None => {
+                entry.failed = true;
+                entry.error_code = Some("plugin_propagate_credential_unavailable".to_string());
+            }
+            Some(token) => match fetch(&token) {
+                None => {
+                    entry.failed = true;
+                    entry.error_code = Some("plugin_propagate_cloud_unavailable".to_string());
+                }
+                Some(items) => match find_uninstall_target(&items, marketplace_plugin_id) {
+                    // 该账号没装：无需移除（不是失败）。
+                    None => {}
+                    Some(other_record_id) => {
+                        if uninstall(&token, &other_record_id) {
+                            entry.removed = true;
+                        } else {
+                            entry.failed = true;
+                            entry.error_code =
+                                Some("plugin_propagate_uninstall_failed".to_string());
+                        }
+                    }
+                },
+            },
+        }
+        results.push(entry);
     }
-    let material_root = checkin_material_root(&state)?;
-    let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
-        let token = plugin_tab_account_token(&material_root, &storage_root)?;
-        let installed = fetch_installed_plugins(&token)
-            .map_err(|_| "plugin_tab_cloud_unavailable".to_string())?;
-        let entries = manifest_entries_from_cloud(&installed);
-        PluginManifest::new(&storage_root)
-            .save(&entries)
-            .map_err(|_| "plugin_manifest_write_failed".to_string())
-    })
-    .await
-    .map_err(|_| "plugin_absorb_join_failed".to_string())?
+    results
+}
+
+/// 移除传播到其他账号（生产实现）：凭据包取 token → 云端列表 → 云端卸载。
+fn propagate_uninstall_to_accounts(
+    records: &[traesync_infrastructure::account_registry::AccountRecord],
+    current_profile_id: Option<&str>,
+    marketplace_plugin_id: &str,
+    material_root: &Path,
+) -> Vec<PluginUninstallAccountDto> {
+    let store = CheckinCredentialStore::new(material_root);
+    propagate_uninstall_with(
+        records,
+        current_profile_id,
+        marketplace_plugin_id,
+        |record| {
+            store
+                .load(&CheckinProfileBinding::new(
+                    record.profile_id.clone(),
+                    record.account_id.clone(),
+                    record.device_id.clone(),
+                    record.device_public_key.clone(),
+                ))
+                .ok()
+                .map(|bundle| bundle.access_token)
+        },
+        |token| fetch_installed_plugins(token).ok(),
+        |token, record_id| uninstall_cloud_plugin(token, record_id).unwrap_or(false),
+    )
 }
 
 // ===== P5-8a 会话归档/恢复/真实删除（ADR-0022 hidden_status 借用）=====
@@ -8194,9 +8358,11 @@ fn map_master_archive_error(error: MasterArchiveError) -> String {
 ///
 /// 归档可逆、不改变记录归属（切号随行）；主库运行中可执行
 /// （busy_timeout 与 TRAE 写入错峰，绝不长锁——探针实证路径）。
+/// `library_id` 为库实例引用（ADR-0025，缺省主库）。
 #[tauri::command]
 async fn archive_master_sessions(
     session_ids: Vec<String>,
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterArchiveResultDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -8207,8 +8373,7 @@ async fn archive_master_sessions(
     }
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let master_dir = resolve_library_dir(library_id.as_deref())?;
         archive_master_sessions_inner(&master_dir, &raw_key, &session_ids)
             .map(|affected| MasterArchiveResultDto {
                 affected: affected as u32,
@@ -8222,10 +8387,12 @@ async fn archive_master_sessions(
 /// P5-8a：恢复归档会话（在线写，hidden_status 还原 NULL）。
 ///
 /// 恢复即归位：侧栏按 work_mode 原生聚合，恢复的会话自动并入当前
-/// 同类型分组（ADR-0022 决策 3，真机实证）。
+/// 同类型分组（ADR-0022 决策 3，真机实证）。`library_id` 为库实例
+/// 引用（ADR-0025，缺省主库）。
 #[tauri::command]
 async fn restore_master_sessions(
     session_ids: Vec<String>,
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterArchiveResultDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -8236,8 +8403,7 @@ async fn restore_master_sessions(
     }
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let master_dir = resolve_library_dir(library_id.as_deref())?;
         restore_master_sessions_inner(&master_dir, &raw_key, &session_ids)
             .map(|affected| MasterArchiveResultDto {
                 affected: affected as u32,
@@ -8264,9 +8430,11 @@ struct MasterDeleteResultDto {
 ///
 /// 纪律与切号/手动备份一致：主库实例运行中拒绝（`master_delete_running`）；
 /// 执行前自动创建 `.switch-bak-*` 备份（ADR-0018 铁律，备份失败不删除）。
+/// `library_id` 为库实例引用（ADR-0025，缺省主库）。
 #[tauri::command]
 async fn delete_master_sessions(
     session_ids: Vec<String>,
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterDeleteResultDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -8279,8 +8447,7 @@ async fn delete_master_sessions(
     // P5-9：删除前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let master_dir = resolve_library_dir(library_id.as_deref())?;
         // 运行中禁止（口径同 create_master_backup）：删除前必须能拿到静止
         // 一致的三件套备份。
         let running = list_trae_processes()
@@ -8329,11 +8496,13 @@ struct MasterMergeResultDto {
 ///
 /// 批量迁移属破坏性操作：主库实例运行中拒绝（`master_merge_running`，
 /// 与删除/切号同纪律）；执行前自动创建 `.switch-bak-*` 备份
-/// （ADR-0018 铁律，备份失败合并不执行）。
+/// （ADR-0018 铁律，备份失败合并不执行）。`library_id` 为库实例引用
+/// （ADR-0025，缺省主库）。
 #[tauri::command]
 async fn merge_master_projects(
     source_project_ids: Vec<String>,
     target_project_id: String,
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterMergeResultDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -8346,8 +8515,7 @@ async fn merge_master_projects(
     // P5-9：合并前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let master_dir = resolve_library_dir(library_id.as_deref())?;
         // 运行中禁止（口径同 delete_master_sessions）：合并前必须能拿到静止
         // 一致的三件套备份。
         let running = list_trae_processes()
@@ -8439,13 +8607,18 @@ struct RelayLedgerEntryDto {
 
 /// P5-3：读取接力台账（全部记录，前端按 session_id / from_session_id
 /// 链回成完整接力轨迹）。台账损坏报错不静默重建（铁律）。
+/// `library_id` 为库实例引用（ADR-0025，缺省主库；V1 台账随主库
+/// 存储于存储根 environments 目录，此处仅校验库 id 合法性）。
 #[tauri::command]
 async fn get_relay_ledger(
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<RelayLedgerEntryDto>, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("trae_real_mode_required".to_string());
     }
+    // ADR-0025：库作用域校验——未知库直接拒绝，不落到默认库。
+    resolve_library_dir(library_id.as_deref())?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     tauri::async_runtime::spawn_blocking(move || {
@@ -9452,12 +9625,12 @@ pub fn run() {
             // P5-5 主库体检 + 一键收编（环境页）。
             get_master_checkup,
             incorporate_master_records,
-            // P5-8b 插件 tab（ADR-0023 环境插件清单）：状态/市场/装/卸/吸收。
+            // P5-8b 插件 tab（ADR-0023 清单 + ADR-0026 实时同步）：
+            // 状态/市场/装（零确认）/卸（全账号传播）。
             get_plugin_tab_state,
             browse_plugin_market,
             install_plugin,
-            uninstall_plugin,
-            absorb_plugin_manifest,
+            uninstall_plugin_everywhere,
             // 自动签到（ADR-0019 决策 5 / 2026-08-23 grill）：设置读写 + 每账号开关。
             get_auto_checkin_settings,
             set_auto_checkin_settings,
@@ -9555,6 +9728,149 @@ mod master_switch_rollback_tests {
         // 写回失败（路径不存在）：返回 false（外层据此转备份链错误码）。
         let missing = Path::new("Z:/trae-sync-test-missing-rollback/storage.json");
         assert!(!rollback_master_login_bytes(missing, "{}"));
+    }
+}
+
+/// G23 插件同步策略（ADR-0026）：切号静默应用（纯新增零确认、含移除
+/// 单次确认）+ 移除全账号传播（逐账号 fail-soft、builtin 跳过）。
+#[cfg(test)]
+mod plugin_sync_policy_tests {
+    use super::*;
+
+    /// 构造云端已装条目（预检与传播测试共用）。
+    fn cloud_item(record_id: &str, market_id: Option<&str>, name: &str) -> CloudPluginItem {
+        let mut item = CloudPluginItem {
+            record_id: record_id.to_string(),
+            marketplace_plugin_id: market_id.map(|id| id.to_string()),
+            name: name.to_string(),
+            display_name: name.to_string(),
+            version: "1.0.0".to_string(),
+            registry: "trae-remote-official".to_string(),
+            builtin: false,
+        };
+        item.builtin = record_id.starts_with("builtin:");
+        item
+    }
+
+    /// 构造注册表档案（传播测试共用；profile_id 决定当前账号判定）。
+    fn account(profile_id: &str, name: &str) -> traesync_infrastructure::AccountRecord {
+        traesync_infrastructure::AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: format!("uid-{profile_id}"),
+            screen_name: name.to_string(),
+            avatar_url: String::new(),
+            device_id: "1234567890123456".to_string(),
+            device_public_key: "pub".to_string(),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 0,
+            last_verified_at_unix_seconds: 0,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: true,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn preview_pure_install_difference_is_silent_apply() {
+        // ADR-0026 决策 3 纯新增分支：源多目标少 → install_names 非空、
+        // remove_names 为空（前端不弹确认，静默应用）。
+        let source = vec![
+            cloud_item("r1", Some("uuid-a"), "插件A"),
+            cloud_item("r2", Some("uuid-b"), "插件B"),
+        ];
+        let target = vec![cloud_item("r9", Some("uuid-a"), "插件A")];
+        let preview = switch_plugin_preview_from_lists(&source, &target);
+        assert!(!preview.aborted);
+        assert_eq!(preview.source_count, 2);
+        assert_eq!(preview.target_count, 1);
+        assert_eq!(preview.install_names, vec!["插件B".to_string()]);
+        // 无移除 → 无需确认。
+        assert!(preview.remove_names.is_empty());
+    }
+
+    #[test]
+    fn preview_with_removal_lists_names_for_confirmation() {
+        // ADR-0026 决策 3 含移除分支：目标有源无 → remove_names 非空
+        // （前端据此弹一次移除确认，列明插件名）。
+        let source = vec![cloud_item("r1", Some("uuid-a"), "插件A")];
+        let target = vec![
+            cloud_item("r9", Some("uuid-a"), "插件A"),
+            cloud_item("r8", Some("uuid-d"), "插件D"),
+        ];
+        let preview = switch_plugin_preview_from_lists(&source, &target);
+        assert_eq!(preview.remove_names, vec!["插件D".to_string()]);
+        assert!(preview.install_names.is_empty());
+    }
+
+    #[test]
+    fn propagate_uninstall_is_fail_soft_per_account() {
+        // 逐账号尽力：甲凭据不可用、乙成功、丙云端卸载失败、丁未装——
+        // 任一失败不中断后续账号，全部账号都有回执。
+        let records = vec![
+            account("profile-a", "账号甲"),
+            account("profile-b", "账号乙"),
+            account("profile-c", "账号丙"),
+            account("profile-d", "账号丁"),
+        ];
+        let results = propagate_uninstall_with(
+            &records,
+            None, // 无当前账号（全部按其他账号处理）
+            "uuid-x",
+            |record| match record.profile_id.as_str() {
+                "profile-a" => None, // 凭据不可用
+                _ => Some(format!("token-{}", record.profile_id)),
+            },
+            |token| {
+                if token == "token-profile-b" || token == "token-profile-c" {
+                    Some(vec![cloud_item("r-b1", Some("uuid-x"), "目标插件")])
+                } else {
+                    Some(vec![]) // 丁没装
+                }
+            },
+            |token, _record_id| token != "token-profile-c", // 丙的卸载失败
+        );
+        assert_eq!(results.len(), 4);
+        // 甲：凭据不可用 → 失败但继续。
+        assert!(results[0].failed);
+        assert!(!results[0].removed);
+        assert_eq!(
+            results[0].error_code.as_deref(),
+            Some("plugin_propagate_credential_unavailable")
+        );
+        assert_eq!(results[0].display_name, "账号甲");
+        // 乙：成功移除。
+        assert!(results[1].removed && !results[1].failed);
+        // 丙：卸载失败（fail-soft 记失败，不影响丁）。
+        assert!(results[2].failed && !results[2].removed);
+        // 丁：未装 → 无需移除，不算失败。
+        assert!(!results[3].removed && !results[3].failed);
+        assert_eq!(results[3].error_code, None);
+    }
+
+    #[test]
+    fn propagate_uninstall_skips_current_account_and_builtin() {
+        // 当前账号已单独处理（云端卸载 + 清单移除），传播跳过；
+        // 其他账号列表中的 builtin 条目即使带上同 UUID 也不可卸载。
+        let records = vec![
+            account("profile-current", "当前账号"),
+            account("profile-other", "账号乙"),
+        ];
+        let mut builtin_with_same_id =
+            cloud_item("builtin:trae-remote-official:x", Some("uuid-x"), "内置");
+        builtin_with_same_id.builtin = true;
+        let results = propagate_uninstall_with(
+            &records,
+            Some("profile-current"),
+            "uuid-x",
+            |_| Some("token".to_string()),
+            |_| Some(vec![builtin_with_same_id.clone()]),
+            |_, _| panic!("builtin 条目不可触发卸载"),
+        );
+        // 只剩账号乙（当前账号被跳过）；builtin 无可卸载目标 → 未装语义。
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].display_name, "账号乙");
+        assert!(!results[0].removed && !results[0].failed);
     }
 }
 

@@ -492,7 +492,9 @@ export function AccountCenter({ active }: AccountCenterProps) {
           entry={selectedEntry}
           onRelogin={() => handleLogin(false)}
           loginBusy={loginBusy}
-          onDataChanged={refreshOverview}
+          onDataChanged={async () => {
+            await refreshOverview();
+          }}
           onSaveMobile={(mobile) => saveMobileBackfill(selectedEntry.profile_id, mobile)}
           onBack={() => setSelectedProfileId("")}
         />

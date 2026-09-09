@@ -45,6 +45,7 @@ function tabState(overrides: Partial<PluginTabStateDto> = {}): PluginTabStateDto
         installed_in_cloud: true,
       },
     ],
+    known_account_count: 2,
     ...overrides,
   };
 }
@@ -82,268 +83,278 @@ const MARKET = [
   },
 ];
 
-/** 吸收后的收敛状态：手动装的插件入清单（in_manifest=true）。 */
-function absorbedState(): PluginTabStateDto {
-  const base = tabState();
-  return {
-    ...base,
-    installed: base.installed.map((item) =>
-      item.record_id === "rec-3" ? { ...item, in_manifest: true } : item,
-    ),
-  };
+/** 默认路由：插件状态 + 市场目录（G23 起已装段分类关联也用市场数据）。 */
+function mockRoutes(handlers: Record<string, (args?: unknown) => unknown> = {}) {
+  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+    if (command in handlers) return handlers[command](args);
+    if (command === "get_plugin_tab_state") return tabState();
+    if (command === "browse_plugin_market") return MARKET;
+    return undefined;
+  });
 }
 
-describe("PluginWorkbench（P5-8b 插件 tab）", () => {
+describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("已装列表渲染：随主库徽章 + 内置条目移除禁用", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return tabState();
-      return undefined;
-    });
+  it("已装列表表格渲染：切号保留标签 + 内置条目移除禁用 + 分类关联", async () => {
+    mockRoutes();
     render(<PluginWorkbench active />);
 
     await screen.findByTestId("plugin-row-rec-1");
+    // G4 术语：清单内条目标「切号保留」。
     expect(screen.getByTestId("plugin-row-rec-1")).toHaveTextContent("插件一");
-    expect(screen.getByTestId("plugin-row-rec-1")).toHaveTextContent("1.0.0");
-    // 内置条目：徽章 + 移除禁用（云端无记录，卸载必须跳过）。
+    expect(screen.getByTestId("plugin-row-rec-1")).toHaveTextContent("切号保留");
+    // 分类列：按市场 UUID 关联市场目录分类名。
+    expect(screen.getByTestId("plugin-row-rec-1")).toHaveTextContent("效率工具");
+    // 内置条目：标签 + 移除禁用（云端无记录，卸载必须跳过）。
     expect(screen.getByTestId("plugin-row-rec-2")).toHaveTextContent("内置");
     expect(screen.getByTestId("plugin-uninstall-rec-2")).toBeDisabled();
     expect(screen.getByTestId("plugin-uninstall-rec-1")).toBeEnabled();
   });
 
-  it("无差异不显示对账条（静默通过）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return tabState();
-      return undefined;
-    });
-    render(<PluginWorkbench active />);
-
-    await screen.findByTestId("plugin-row-rec-1");
-    expect(screen.queryByTestId("plugin-drift")).not.toBeInTheDocument();
-  });
-
-  it("对账差异：显示手动装/卸数量，吸收后差异收敛", async () => {
-    const withDrift = tabState({
-      installed: [
-        ...tabState().installed,
-        {
-          record_id: "rec-3",
-          marketplace_plugin_id: "uuid-p3",
-          name: "plugin-three",
-          display_name: "插件三",
-          version: "2.0.0",
-          registry: "trae-remote-official",
-          builtin: false,
-          in_manifest: false,
-        },
-      ],
-      manifest: [
-        ...tabState().manifest,
-        {
-          marketplace_plugin_id: "uuid-p4",
-          name: "plugin-four",
-          display_name: "插件四",
-          version: "1.0.0",
-          registry: "trae-remote-official",
-          installed_in_cloud: false,
-        },
-      ],
-    });
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return withDrift;
-      if (command === "absorb_plugin_manifest") return undefined;
-      return undefined;
-    });
-    render(<PluginWorkbench active />);
-
-    const drift = await screen.findByTestId("plugin-drift");
-    expect(drift).toHaveTextContent("新装 1 项");
-    expect(drift).toHaveTextContent("移除 1 项");
-
-    fireEvent.click(screen.getByTestId("plugin-drift-absorb"));
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("absorb_plugin_manifest");
-    });
-  });
-
-  it("吸收触发状态重读（absorbed 数据替换旧状态）", async () => {
-    const withDrift = tabState({
-      installed: [
-        ...tabState().installed,
-        {
-          record_id: "rec-3",
-          marketplace_plugin_id: "uuid-p3",
-          name: "plugin-three",
-          display_name: "插件三",
-          version: "2.0.0",
-          registry: "trae-remote-official",
-          builtin: false,
-          in_manifest: false,
-        },
-      ],
-    });
-    let state = withDrift;
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return state;
-      if (command === "absorb_plugin_manifest") {
-        state = absorbedState();
-        return undefined;
-      }
-      return undefined;
-    });
-    render(<PluginWorkbench active />);
-
-    await screen.findByTestId("plugin-drift");
-    fireEvent.click(screen.getByTestId("plugin-drift-absorb"));
-    // 吸收后：差异条消失 + 吸收回执可见。
-    await waitFor(() => {
-      expect(screen.queryByTestId("plugin-drift")).not.toBeInTheDocument();
-    });
-    expect(screen.getByTestId("plugin-notice")).toHaveTextContent("已按当前账号更新主库插件清单");
-  });
-
-  it("市场懒加载：首次进入市场段才拉目录，已装条目显示已安装", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return tabState();
-      if (command === "browse_plugin_market") return MARKET;
-      return undefined;
-    });
-    render(<PluginWorkbench active />);
-
-    await screen.findByTestId("plugin-row-rec-1");
-    // 已装段不预取市场。
-    expect(mockInvoke).not.toHaveBeenCalledWith("browse_plugin_market");
-
-    fireEvent.click(screen.getByTestId("plugin-segment-market"));
-    await screen.findByTestId("plugin-market-row-uuid-p2");
-    expect(mockInvoke).toHaveBeenCalledWith("browse_plugin_market");
-    // 已装条目（按市场 UUID 匹配）显示「已安装」而非安装按钮。
-    expect(screen.getByTestId("plugin-market-installed-uuid-p1")).toBeVisible();
-    expect(screen.queryByTestId("plugin-install-uuid-p1")).not.toBeInTheDocument();
-    expect(screen.getByTestId("plugin-install-uuid-p2")).toBeEnabled();
-  });
-
-  it("市场目录按作用分类分组展示（与 TRAE 插件市场对齐）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return tabState();
-      if (command === "browse_plugin_market") return MARKET;
-      return undefined;
-    });
-    render(<PluginWorkbench active />);
-
-    await screen.findByTestId("plugin-row-rec-1");
-    fireEvent.click(screen.getByTestId("plugin-segment-market"));
-
-    // 分组头：分类名 + 条目数；相邻同分类合并为一组。
-    const efficiency = await screen.findByTestId("plugin-market-group-效率工具");
-    expect(efficiency).toHaveTextContent("2 项");
-    expect(efficiency).toHaveTextContent("插件一");
-    expect(efficiency).toHaveTextContent("插件二");
-    expect(screen.getByTestId("plugin-market-group-其他")).toHaveTextContent("插件三");
-  });
-
-  it("安装市场插件：调 install_plugin 后刷新状态并显示回执", async () => {
-    let installedIds = new Set(["uuid-p1"]);
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "get_plugin_tab_state") {
-        const base = tabState();
-        return {
-          ...base,
+  it("清单外条目标「仅此账号」（G4 术语，替代旧「未入清单」）", async () => {
+    mockRoutes({
+      get_plugin_tab_state: () =>
+        tabState({
           installed: [
-            ...base.installed,
-            ...(installedIds.has("uuid-p2")
-              ? [
-                  {
-                    record_id: "rec-3",
-                    marketplace_plugin_id: "uuid-p2",
-                    name: "plugin-two",
-                    display_name: "插件二",
-                    version: "1.0.0",
-                    registry: "trae-remote-official",
-                    builtin: false,
-                    in_manifest: true,
-                  },
-                ]
-              : []),
+            {
+              record_id: "rec-3",
+              marketplace_plugin_id: "uuid-p3",
+              name: "plugin-three",
+              display_name: "插件三",
+              version: "2.0.0",
+              registry: "trae-remote-official",
+              builtin: false,
+              in_manifest: false,
+            },
           ],
-        };
-      }
-      if (command === "browse_plugin_market") return MARKET;
-      if (command === "install_plugin") {
+        }),
+    });
+    render(<PluginWorkbench active />);
+
+    const row = await screen.findByTestId("plugin-row-rec-3");
+    expect(row).toHaveTextContent("仅此账号");
+  });
+
+  it("对账条已移除：存在差异也不显示 plugin-drift（ADR-0026 静默应用）", async () => {
+    mockRoutes({
+      get_plugin_tab_state: () =>
+        tabState({
+          installed: [
+            ...tabState().installed,
+            {
+              record_id: "rec-3",
+              marketplace_plugin_id: "uuid-p3",
+              name: "plugin-three",
+              display_name: "插件三",
+              version: "2.0.0",
+              registry: "trae-remote-official",
+              builtin: false,
+              in_manifest: false,
+            },
+          ],
+          manifest: [
+            ...tabState().manifest,
+            {
+              marketplace_plugin_id: "uuid-p4",
+              name: "plugin-four",
+              display_name: "插件四",
+              version: "1.0.0",
+              registry: "trae-remote-official",
+              installed_in_cloud: false,
+            },
+          ],
+        }),
+    });
+    render(<PluginWorkbench active />);
+
+    await screen.findByTestId("plugin-row-rec-3");
+    expect(screen.queryByTestId("plugin-drift")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("plugin-drift-absorb")).not.toBeInTheDocument();
+  });
+
+  it("分类筛选 chips：复用市场分类，点击后列表过滤", async () => {
+    mockRoutes();
+    render(<PluginWorkbench active />);
+
+    await screen.findByTestId("plugin-row-rec-1");
+    // 已装段 chips：已装条目关联分类（效率工具）与未关联（其他）。
+    const chips = await screen.findByTestId("plugin-category-chips");
+    expect(chips).toHaveTextContent("效率工具");
+    expect(chips).toHaveTextContent("其他");
+
+    // 点「效率工具」：只剩关联该分类的行（rec-1）。
+    fireEvent.click(screen.getByTestId("plugin-chip-效率工具"));
+    expect(screen.getByTestId("plugin-row-rec-1")).toBeInTheDocument();
+    expect(screen.queryByTestId("plugin-row-rec-2")).not.toBeInTheDocument();
+
+    // 点「全部」：恢复全部行。
+    fireEvent.click(screen.getByTestId("plugin-chip-all"));
+    expect(screen.getByTestId("plugin-row-rec-2")).toBeInTheDocument();
+  });
+
+  it("市场段表格化：搜索框按名称/描述过滤 + 分类 chips", async () => {
+    mockRoutes();
+    render(<PluginWorkbench active />);
+
+    await screen.findByTestId("plugin-row-rec-1");
+    fireEvent.click(screen.getByTestId("plugin-segment-market"));
+
+    await screen.findByTestId("plugin-market-row-uuid-p2");
+    expect(screen.getByTestId("plugin-market-row-uuid-p1")).toBeInTheDocument();
+    expect(screen.getByTestId("plugin-market-row-uuid-p3")).toBeInTheDocument();
+
+    // 搜索「二」：只剩插件二。
+    fireEvent.change(screen.getByTestId("plugin-market-search"), {
+      target: { value: "二" },
+    });
+    expect(screen.getByTestId("plugin-market-row-uuid-p2")).toBeInTheDocument();
+    expect(screen.queryByTestId("plugin-market-row-uuid-p1")).not.toBeInTheDocument();
+
+    // 清空搜索后按分类筛选：效率工具只剩插件一/二（已装显示「已安装」）。
+    fireEvent.change(screen.getByTestId("plugin-market-search"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByTestId("plugin-chip-效率工具"));
+    expect(screen.getByTestId("plugin-market-row-uuid-p1")).toBeInTheDocument();
+    expect(screen.getByTestId("plugin-market-row-uuid-p2")).toBeInTheDocument();
+    expect(screen.queryByTestId("plugin-market-row-uuid-p3")).not.toBeInTheDocument();
+  });
+
+  it("安装零确认：点击安装直接调 install_plugin（无确认弹层）", async () => {
+    let installedIds = new Set(["uuid-p1"]);
+    mockRoutes({
+      get_plugin_tab_state: () => {
+        const base = tabState();
+        return installedIds.has("uuid-p2")
+          ? {
+              ...base,
+              installed: [
+                ...base.installed,
+                {
+                  record_id: "rec-3",
+                  marketplace_plugin_id: "uuid-p2",
+                  name: "plugin-two",
+                  display_name: "插件二",
+                  version: "1.0.0",
+                  registry: "trae-remote-official",
+                  builtin: false,
+                  in_manifest: true,
+                },
+              ],
+            }
+          : base;
+      },
+      install_plugin: (args) => {
         expect(args).toMatchObject({ pluginId: "uuid-p2", name: "plugin-two" });
         installedIds = new Set([...installedIds, "uuid-p2"]);
         return undefined;
-      }
-      return undefined;
+      },
     });
     render(<PluginWorkbench active />);
 
     await screen.findByTestId("plugin-row-rec-1");
     fireEvent.click(screen.getByTestId("plugin-segment-market"));
-    await screen.findByTestId("plugin-install-uuid-p2");
-    fireEvent.click(screen.getByTestId("plugin-install-uuid-p2"));
+    fireEvent.click(await screen.findByTestId("plugin-install-uuid-p2"));
 
-    // 安装回执 + 状态刷新后该条目变为已安装。
+    // 直接安装（零确认），完成后条目变为已安装。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("install_plugin", expect.objectContaining({
+        pluginId: "uuid-p2",
+      }));
+    });
     await waitFor(() => {
       expect(screen.getByTestId("plugin-market-installed-uuid-p2")).toBeVisible();
     });
-    expect(screen.getByTestId("plugin-notice")).toHaveTextContent("已安装 插件二");
   });
 
-  it("卸载走二次确认：确认后调 uninstall_plugin 并刷新", async () => {
+  it("卸载确认文案列明影响面：N 个账号 + 切号不再带走；确认后调 uninstall_plugin_everywhere", async () => {
     let state = tabState();
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "get_plugin_tab_state") return state;
-      if (command === "uninstall_plugin") {
-        expect(args).toMatchObject({ recordId: "rec-1" });
+    mockRoutes({
+      get_plugin_tab_state: () => state,
+      uninstall_plugin_everywhere: () => {
         state = {
           ...state,
           installed: state.installed.filter((item) => item.record_id !== "rec-1"),
           manifest: [],
         };
-        return undefined;
-      }
-      return undefined;
+        return {
+          accounts: [
+            { display_name: "账号甲", removed: true, failed: false, error_code: null },
+            { display_name: "账号乙", removed: true, failed: false, error_code: null },
+          ],
+        };
+      },
     });
     render(<PluginWorkbench active />);
 
     await screen.findByTestId("plugin-uninstall-rec-1");
     fireEvent.click(screen.getByTestId("plugin-uninstall-rec-1"));
-    // 确认弹窗出现（未确认不触发卸载）。
-    expect(screen.getByTestId("plugin-uninstall-confirm")).toBeVisible();
-    expect(mockInvoke).not.toHaveBeenCalledWith("uninstall_plugin", expect.anything());
+    // 确认弹窗：列明「将同时从 N 个账号移除」与切号语义（N=known_account_count）。
+    const dialog = screen.getByTestId("plugin-uninstall-confirm");
+    expect(dialog).toHaveTextContent("将同时从 2 个账号移除");
+    expect(dialog).toHaveTextContent("移除后切换账号不再带走该插件");
+    // 未确认不触发卸载。
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "uninstall_plugin_everywhere",
+      expect.anything(),
+    );
 
     fireEvent.click(screen.getByTestId("plugin-uninstall-confirm-ok"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("uninstall_plugin", { recordId: "rec-1" });
+      expect(mockInvoke).toHaveBeenCalledWith("uninstall_plugin_everywhere", {
+        recordId: "rec-1",
+      });
     });
-    // 卸载后行消失 + 回执可见。
+    // 卸载后行消失 + 回执列明账号数。
     await waitFor(() => {
       expect(screen.queryByTestId("plugin-row-rec-1")).not.toBeInTheDocument();
     });
-    expect(screen.getByTestId("plugin-notice")).toHaveTextContent("已移除 插件一");
+    expect(screen.getByTestId("plugin-notice")).toHaveTextContent("已从 2 个账号移除 插件一");
+  });
+
+  it("卸载回执透出部分失败（fail-soft：列明失败账号）", async () => {
+    mockRoutes({
+      uninstall_plugin_everywhere: () => ({
+        accounts: [
+          { display_name: "账号甲", removed: true, failed: false, error_code: null },
+          { display_name: "账号乙", removed: false, failed: true, error_code: "plugin_propagate_uninstall_failed" },
+        ],
+      }),
+    });
+    render(<PluginWorkbench active />);
+
+    await screen.findByTestId("plugin-uninstall-rec-1");
+    fireEvent.click(screen.getByTestId("plugin-uninstall-rec-1"));
+    fireEvent.click(screen.getByTestId("plugin-uninstall-confirm-ok"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("plugin-notice")).toHaveTextContent(
+        "已从 1 个账号移除 插件一；账号乙 移除失败",
+      );
+    });
   });
 
   it("卸载确认弹窗可取消，不触发命令", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return tabState();
-      return undefined;
-    });
+    mockRoutes();
     render(<PluginWorkbench active />);
 
     await screen.findByTestId("plugin-uninstall-rec-1");
     fireEvent.click(screen.getByTestId("plugin-uninstall-rec-1"));
     fireEvent.click(screen.getByTestId("plugin-uninstall-confirm").querySelector("button")!);
     expect(screen.queryByTestId("plugin-uninstall-confirm")).not.toBeInTheDocument();
-    expect(mockInvoke).not.toHaveBeenCalledWith("uninstall_plugin", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "uninstall_plugin_everywhere",
+      expect.anything(),
+    );
   });
 
   it("读取失败显示稳定错误文案（plugin_tab_no_account）", async () => {
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_plugin_tab_state") throw new Error("plugin_tab_no_account");
+      if (command === "browse_plugin_market") return MARKET;
       return undefined;
     });
     render(<PluginWorkbench active />);
@@ -352,15 +363,32 @@ describe("PluginWorkbench（P5-8b 插件 tab）", () => {
     expect(alert).toHaveTextContent("主库当前没有已登录账号");
   });
 
+  it("市场目录读取失败不阻断已装列表（分类列留空，fail-soft）", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_plugin_tab_state") return tabState();
+      if (command === "browse_plugin_market") throw new Error("plugin_market_unavailable");
+      return undefined;
+    });
+    render(<PluginWorkbench active />);
+
+    const row = await screen.findByTestId("plugin-row-rec-1");
+    expect(row).toHaveTextContent("插件一");
+    // 无市场数据：无分类 chips（单一条目无分类可筛）。
+    expect(screen.queryByTestId("plugin-category-chips")).not.toBeInTheDocument();
+  });
+
   it("active=false 不发起任何读取", () => {
     render(<PluginWorkbench active={false} />);
     expect(mockInvoke).not.toHaveBeenCalled();
   });
 
   it("已装为空显示空态引导", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return { installed: [], manifest: [] };
-      return undefined;
+    mockRoutes({
+      get_plugin_tab_state: () => ({
+        installed: [],
+        manifest: [],
+        known_account_count: 1,
+      }),
     });
     render(<PluginWorkbench active />);
 

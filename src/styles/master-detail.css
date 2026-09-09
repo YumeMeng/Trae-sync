@@ -164,7 +164,8 @@
   gap: 12px;
 }
 
-/* —— 插件 tab（P5-8b）：分段控件 + 对账条 + 列表 + 确认弹窗 —— */
+/* —— 插件 tab（G23 表格化，ADR-0026 实时同步）：分段控件 + 分类 chips
+   + 密集行列表 + 确认弹窗（对账条已随静默应用策略移除） —— */
 .plugin-workbench {
   flex: 1;
   min-height: 0;
@@ -181,13 +182,17 @@
   overflow-y: auto;
 }
 
-/* 工具行：分段控件靠左，刷新按钮靠右 */
+/* 工具行：分段控件靠左，市场段搜索框居右（与刷新按钮同行） */
 .plugin-workbench__bar {
   flex: none;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 10px;
+}
+
+.plugin-workbench__bar > .btn {
+  margin-left: auto;
 }
 
 .plugin-segment {
@@ -223,7 +228,33 @@
   color: var(--accent);
 }
 
-/* 操作回执（安装/移除/吸收成功提示）：轻量非阻断 */
+/* 市场段搜索框：图标 + 输入，宽度弹性上限 */
+.plugin-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--line-control);
+  border-radius: var(--radius-control);
+  background: var(--glass);
+  color: var(--text-3);
+  width: clamp(160px, 30%, 240px);
+}
+
+.plugin-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-1);
+  font-size: 12.5px;
+}
+
+.plugin-search input:focus {
+  outline: none;
+}
+
+/* 操作回执（安装/移除成功提示）：轻量非阻断 */
 .plugin-workbench__notice {
   flex: none;
   padding: 8px 12px;
@@ -234,43 +265,44 @@
   font-size: 12.5px;
 }
 
-/* 对账提示条：TRAE 手动装/卸与清单基线的偏移（有差异才出现） */
-.plugin-drift {
+/* 分类筛选 chips（G23：复用市场 category_name） */
+.plugin-chips {
   flex: none;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 14px;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.plugin-chip {
   border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
+  border-radius: 999px;
+  padding: 3px 12px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.plugin-chip:hover {
   background: var(--fill-soft);
-}
-
-.plugin-drift__copy {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.plugin-drift__copy b {
-  font-size: 13px;
   color: var(--text-1);
 }
 
-.plugin-drift__copy span {
-  font-size: 12px;
-  color: var(--text-3);
+.plugin-chip--active {
+  border-color: transparent;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
-/* 插件列表：行式布局（名称 + 元信息 | 徽章 + 动作） */
+/* 插件列表：密集行表格（G23 行高约 40px） */
 .plugin-list {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .plugin-empty {
@@ -280,49 +312,41 @@
   text-align: center;
 }
 
-/* 插件市场分组：按作用分类展示（组头 + 组内条目，行距与列表一致） */
-.plugin-market-group {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.plugin-market-group__head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 6px 2px 0;
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--text-2);
-}
-
-.plugin-market-group__head span:last-child {
-  font-size: 10.5px;
-  font-weight: 400;
-  color: var(--text-3);
-}
-
+/* 行骨架（已装/市场共用）：图标 | 名称+元信息 | 分类 | 标签+操作 */
 .plugin-row {
+  flex: none;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 10px 12px;
+  gap: 10px;
+  min-height: 40px;
+  padding: 4px 12px;
   border: 1px solid var(--line-hair);
   border-radius: var(--radius-control);
   background: var(--fill-soft);
 }
 
+.plugin-row__icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: var(--glass);
+  color: var(--text-3);
+}
+
 .plugin-row__main {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  min-width: 0;
+  gap: 1px;
 }
 
 .plugin-row__name {
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-1);
   overflow: hidden;
@@ -331,16 +355,19 @@
 }
 
 .plugin-row__meta {
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.plugin-row__desc {
-  font-size: 12px;
-  color: var(--text-2);
+/* 分类列：固定占位避免筛选/换段时行宽跳动 */
+.plugin-row__category {
+  flex: none;
+  width: 76px;
+  font-size: 11.5px;
+  color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -357,19 +384,19 @@
   flex: none;
   padding: 2px 8px;
   border-radius: 999px;
-  background: var(--fill-soft);
+  background: var(--glass);
   font-size: 11px;
   font-weight: 600;
   color: var(--text-3);
 }
 
-/* 「随主库/已安装」徽章：清单绑定态 */
+/* 「切号保留/已安装」徽章：清单绑定态（G4 术语） */
 .plugin-badge--bound {
   background: var(--accent-soft);
   color: var(--accent);
 }
 
-/* 「未入清单」徽章：对账偏移态（与 drift 条呼应） */
+/* 「仅此账号」徽章：清单外条目（TRAE 内手动装/自装） */
 .plugin-badge--drift {
   border: 1px dashed var(--line-hair);
   color: var(--text-2);

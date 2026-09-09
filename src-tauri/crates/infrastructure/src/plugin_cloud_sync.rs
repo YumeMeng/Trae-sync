@@ -1,12 +1,13 @@
 //! 插件云端预同步（切号编排第 4.5 步，2026-08-31；2026-09-01 按 ADR-0023
-//! 改造为「吸收后应用」对账）：以源账号（切换前账号）云端现状为环境清单，
-//! 把清单应用到目标账号——缺的装上、多的卸掉。
+//! 改造为「吸收后应用」对账；2026-09-04 按 ADR-0026 改为静默应用）：
+//! 以源账号（切换前账号）云端现状为环境清单，把清单应用到目标账号
+//! ——缺的装上、多的卸掉。
 //!
 //! 背景：切号重启后 TRAE 按目标账号云端插件列表调和本地安装（云端没有的
 //! 会被卸载）。对账在重启前把差异消除，重启后 TRAE 调和即无事发生。
-//! 移除属破坏性操作：由切号弹层预检（preview_master_switch_plugins，
-//! lib.rs）以 +N/-M 形式一次确认后执行；「多装少卸」的纯增量场景同样
-//! 走确认（差异即用户可见的变化）。
+//! ADR-0026 决策 3：对账静默执行，差异（装/卸）直达目标账号云端；
+//! 仅当计划含移除时，由切号弹层预检（preview_master_switch_plugins，
+//! lib.rs）弹一次确认（破坏性操作红线，ADR-0018）；纯新增差异直接应用。
 //!
 //! 协议事实（.scratch/history-u6/w0-probe/plugin_sync_probe.rs 实测闭环，
 //! 2026-08-31 真机 4/4 成功 + 复核确认；证据同 docs/TECHNICAL_BASELINE.md）：
@@ -52,18 +53,16 @@ pub struct PluginCloudSyncOutcome {
     pub skipped: usize,
     /// 整体未执行（列表拉取失败/凭据不可用/源账号不在注册表）。
     pub aborted: bool,
-    /// 用户在预检中选择「以目标账号现状为准」：未执行对账，清单保持原状。
-    pub declined: bool,
     /// 吸收集（源账号云端市场插件定型视图）；aborted 时为空。
     /// 供 lib.rs 落盘环境清单（ADR-0023「吸收」），不进前端 DTO。
     #[serde(skip)]
     pub absorbed: Vec<CloudPluginItem>,
 }
 
-/// 切号插件对账（ADR-0023「吸收后应用」，fail-soft，不返回 Err）：
+/// 切号插件对账（ADR-0026 决策 3 静默应用，fail-soft，不返回 Err）：
 /// 吸收集 = 源账号云端市场插件（随回执带回，调用方落盘清单）；
-/// 应用 = 缺的装上 + 多的卸掉。移除属破坏性操作，由切号弹层预检
-/// 以 +N/-M 形式一次确认后才会走到这里。
+/// 应用 = 缺的装上 + 多的卸掉。确认语义（仅含移除时单次确认）由
+/// 切号弹层预检承担，这里始终执行完整对账。
 ///
 /// 供切号编排调用：源 = 切换前登录账号，目标 = 切换目标账号。
 /// 任一账号列表拉取失败即中止（token 失效属可预期情况，交上层透出）。
@@ -79,7 +78,6 @@ pub fn sync_account_cloud_plugins(
         failed: 0,
         skipped: 0,
         aborted: false,
-        declined: false,
         absorbed: Vec::new(),
     };
 
@@ -147,6 +145,7 @@ pub fn sync_account_cloud_plugins(
 /// 对账计划（纯函数，预检与执行共用）：吸收后清单 = 源账号市场插件；
 /// install = 源有目标无；remove = 目标市场插件有而源无
 /// （目标自装无市场 ID 与 builtin 条目不在同步宇宙，不动）。
+/// ADR-0026 决策 3：remove 非空时预检弹一次移除确认，纯新增静默应用。
 pub fn reconcile_plan(
     source: &[CloudPluginItem],
     target: &[CloudPluginItem],
@@ -193,6 +192,21 @@ fn cloud_item_install_source(item: &CloudPluginItem) -> serde_json::Value {
         "version": item.version,
         "registry": item.registry,
     })
+}
+
+/// 移除全账号传播的单账号定位（ADR-0026 决策 2，纯函数）：按市场 UUID
+/// 在该账号云端已装列表中定位卸载键（record_id）。builtin 条目即使带上
+/// 市场 ID 也跳过（云端无记录，恒 404）；该账号未装返回 None（无需处理）。
+pub fn find_uninstall_target(
+    items: &[CloudPluginItem],
+    marketplace_plugin_id: &str,
+) -> Option<String> {
+    items
+        .iter()
+        .find(|item| {
+            !item.builtin && item.marketplace_plugin_id.as_deref() == Some(marketplace_plugin_id)
+        })
+        .map(|item| item.record_id.clone())
 }
 
 /// 拉取账号云端已装插件列表（GET /api/remote/v1/plugins）。
@@ -872,5 +886,34 @@ mod tests {
         assert_eq!(raw["name"], "plugin:r1");
         assert_eq!(raw["version"], "1.0.0");
         assert_eq!(raw["registry"], "trae-remote-official");
+    }
+
+    #[test]
+    fn find_uninstall_target_matches_by_market_uuid() {
+        // 已装：按市场 UUID 定位该账号的卸载键（record_id，非 UUID 本身）。
+        let items = vec![
+            installed_item("r1", Some("uuid-a")),
+            installed_item("r2", Some("uuid-b")),
+        ];
+        assert_eq!(
+            find_uninstall_target(&items, "uuid-b").as_deref(),
+            Some("r2")
+        );
+        // 该账号未装：None（无需处理，不算失败）。
+        assert_eq!(find_uninstall_target(&items, "uuid-x"), None);
+        // 自装条目（无市场 UUID）不参与匹配。
+        assert_eq!(
+            find_uninstall_target(&[installed_item("r-self", None)], "uuid-a"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_uninstall_target_skips_builtin_even_with_market_id() {
+        // builtin 条目即使带上市场 ID（防御脏数据）也跳过：云端无记录，
+        // DELETE 恒 404（ADR-0026 决策 4「builtin: 前缀条目不可卸载」）。
+        let mut builtin = installed_item("builtin:trae-remote-official:lark", Some("uuid-a"));
+        builtin.builtin = true;
+        assert_eq!(find_uninstall_target(&[builtin], "uuid-a"), None);
     }
 }

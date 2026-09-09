@@ -45,7 +45,6 @@ function receipt(): MasterAccountSwitchDto {
       failed: 0,
       skipped: 0,
       aborted: false,
-      declined: false,
     },
     relaunch_outcome: "launched",
   };
@@ -64,7 +63,7 @@ function renderDialog(overrides: { onFinished?: () => Promise<void> } = {}) {
   return { onFinished, onClose };
 }
 
-describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）", () => {
+describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockListen.mockResolvedValue(() => undefined);
@@ -75,7 +74,7 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
     });
   });
 
-  it("预检无差异时静默直过切号（applyPlugins=true，force=false）并展示五步与目标账号", async () => {
+  it("预检无差异时静默直过切号（force=false）并展示五步与目标账号", async () => {
     renderDialog();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("preview_master_switch_plugins", { profileId: "profile-b" });
@@ -84,7 +83,6 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
       expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
         profileId: "profile-b",
         force: false,
-        applyPlugins: true,
       });
     });
     expect(screen.getByTestId("master-switch-dialog")).toBeInTheDocument();
@@ -97,6 +95,26 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
     expect(screen.getByText("重启 TRAE")).toBeInTheDocument();
   });
 
+  it("纯新增差异不弹确认（ADR-0026 决策 3：零确认静默应用）", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "preview_master_switch_plugins")
+        return preview({ aborted: false, install_names: ["飞书协作", "视频生成"] });
+      return receipt();
+    });
+    renderDialog();
+    // 无移除 → 不弹确认，直接切换。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
+        profileId: "profile-b",
+        force: false,
+      });
+    });
+    expect(screen.queryByTestId("master-switch-plugin-diff")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText(/已切换到 账号乙/)).toBeInTheDocument();
+    });
+  });
+
   it("预检失败不阻断切号（fail-soft：直接发起切换）", async () => {
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "preview_master_switch_plugins") throw new Error("network");
@@ -107,7 +125,6 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
       expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
         profileId: "profile-b",
         force: false,
-        applyPlugins: true,
       });
     });
   });
@@ -132,7 +149,6 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
       expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
         profileId: "profile-b",
         force: false,
-        applyPlugins: true,
       });
     });
 
@@ -167,13 +183,12 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
     expect(await screen.findByText("TRAE 正在生成回复")).toBeInTheDocument();
     expect(screen.getByTestId("master-switch-wait")).toBeInTheDocument();
 
-    // 强制切换 → force=true 重发（保留预检确认的 applyPlugins）→ 完成态
+    // 强制切换 → force=true 重发 → 完成态
     fireEvent.click(screen.getByTestId("master-switch-force"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
         profileId: "profile-b",
         force: true,
-        applyPlugins: true,
       });
     });
     await waitFor(() => {
@@ -210,7 +225,6 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
       expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
         profileId: "profile-b",
         force: false,
-        applyPlugins: true,
       });
     });
     // 事件先到（rolled_back=true），错误后到。
@@ -238,7 +252,6 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
       expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
         profileId: "profile-b",
         force: false,
-        applyPlugins: true,
       });
     });
     handlers.get("master-switch-progress")?.({
@@ -270,8 +283,8 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
     expect(mockInvoke).not.toHaveBeenCalled();
   });
 
-  describe("插件差异确认（+N/-M）", () => {
-    function diffPreview(): MasterSwitchPluginPreviewDto {
+  describe("插件移除确认（ADR-0026：仅含移除时单次确认）", () => {
+    function removalPreview(): MasterSwitchPluginPreviewDto {
       return preview({
         aborted: false,
         source_count: 3,
@@ -281,26 +294,27 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
       });
     }
 
-    it("预检出差异弹确认：列出 +N/-M 与插件名，确认后带 applyPlugins=true 切换", async () => {
+    it("预检含移除弹确认：列明移除插件名与新装数量，确认后继续切换", async () => {
       mockInvoke.mockImplementation(async (command: string) => {
-        if (command === "preview_master_switch_plugins") return diffPreview();
+        if (command === "preview_master_switch_plugins") return removalPreview();
         return receipt();
       });
       renderDialog();
 
-      // 确认分支：差异说明 + 插件名清单（+ 安装 / − 移除）
+      // 确认分支：移除清单 + 新装数量（纯新增零风险，只带数量）。
       expect(await screen.findByTestId("master-switch-plugin-diff")).toBeInTheDocument();
-      expect(screen.getByText(/安装 2 个、移除 1 个/)).toBeInTheDocument();
-      expect(screen.getByText("+ 飞书协作")).toBeInTheDocument();
+      expect(screen.getByText(/新装 2 个/)).toBeInTheDocument();
+      expect(screen.getByText(/以下 1 个插件将从该账号卸载/)).toBeInTheDocument();
       expect(screen.getByText("− 浏览器控制")).toBeInTheDocument();
+      // 安装明细不进确认清单（零确认策略）。
+      expect(screen.queryByText("+ 飞书协作")).not.toBeInTheDocument();
 
-      // 确认同步 → applyPlugins=true 发起切换 → 完成态
-      fireEvent.click(screen.getByTestId("master-switch-apply-plugins"));
+      // 确认继续 → 发起切换（无插件选择参数，对账后端静默应用）。
+      fireEvent.click(screen.getByTestId("master-switch-confirm-removal"));
       await waitFor(() => {
         expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
           profileId: "profile-b",
           force: false,
-          applyPlugins: true,
         });
       });
       await waitFor(() => {
@@ -308,29 +322,22 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + P5-8b-3 插件差异确认）
       });
     });
 
-    it("选择保留目标账号插件：带 applyPlugins=false 切换，回执透出 declined 文案", async () => {
-      const declinedReceipt = {
-        ...receipt(),
-        plugin_sync: { ...receipt().plugin_sync, declined: true },
-      };
+    it("取消切换：关闭弹层，不发起切换命令", async () => {
       mockInvoke.mockImplementation(async (command: string) => {
-        if (command === "preview_master_switch_plugins") return diffPreview();
-        return declinedReceipt;
+        if (command === "preview_master_switch_plugins") return removalPreview();
+        return new Promise(() => undefined);
       });
-      renderDialog();
+      const { onClose } = renderDialog();
 
       expect(await screen.findByTestId("master-switch-plugin-diff")).toBeInTheDocument();
-      fireEvent.click(screen.getByTestId("master-switch-keep-plugins"));
-      await waitFor(() => {
-        expect(mockInvoke).toHaveBeenCalledWith("switch_master_account", {
-          profileId: "profile-b",
-          force: false,
-          applyPlugins: false,
-        });
-      });
-      await waitFor(() => {
-        expect(screen.getByText(/已按目标账号的插件现状切换/)).toBeInTheDocument();
-      });
+      fireEvent.click(screen.getByTestId("master-switch-cancel"));
+      // 二选一（保留目标账号插件）已取消：只剩「继续切换」与「取消切换」。
+      expect(screen.queryByTestId("master-switch-keep-plugins")).not.toBeInTheDocument();
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "switch_master_account",
+        expect.objectContaining({ profileId: "profile-b" }),
+      );
+      expect(onClose).toHaveBeenCalledTimes(1);
     });
   });
 });

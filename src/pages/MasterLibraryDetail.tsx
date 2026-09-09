@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import type { AppPage } from "../components/NavigationRail";
-import { HistoryWorkbench } from "../components/HistoryWorkbench";
+import { LibrarySessionsPanel } from "../components/LibrarySessionsPanel";
 import { PluginWorkbench } from "../components/PluginWorkbench";
 import { MasterVerificationPanel } from "../components/MasterVerificationPanel";
 import type { EnvironmentStateDto } from "../types/environment";
@@ -12,13 +12,13 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 // ============================================================================
 // 主库详情页 shell（G20 三 tab 平级结构，2026-09-04 重构）：
 // 顶部只留面包屑式标题（主库名 + 返回环境页）+ 刷新；
-// tabs = 对话列表（默认，HistoryWorkbench embedded 两栏）· 插件 · 库信息
+// tabs = 对话列表（默认，LibrarySessionsPanel embedded 两栏）· 插件 · 库信息
 //（原基础信息：路径/大小/账号/统计/最近活跃/最近备份 + 备份对比）。
 // 原数据校验 tab 已取消：备份对比移入库信息 tab，接力台账核对由
 // P8-5 主库自检（G18）承载。
 // ============================================================================
 
-/** 详情页 tab：对话列表复用历史页；插件为 P5-8b；库信息为 G20。 */
+/** 详情页 tab：对话列表复用库对话面板（ADR-0025）；插件为 P5-8b；库信息为 G20。 */
 type MasterDetailTab = "sessions" | "plugins" | "info";
 
 interface MasterLibraryDetailProps {
@@ -36,7 +36,7 @@ export function MasterLibraryDetail({ active, onNavigate }: MasterLibraryDetailP
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<MasterDetailTab>("sessions");
   // 懒挂载：App 各页面常驻 DOM（[hidden] 切换），若详情页一启动就渲染内嵌
-  // HistoryWorkbench，会与历史页实例产生重复的 data-testid（测试定位冲突），
+  // 库对话面板，会与独立历史页实例产生重复的 data-testid（测试定位冲突），
   // 也会白白挂载一份两栏视图。首次激活后再挂载，之后保持（切页不丢状态）。
   const [contentMounted, setContentMounted] = useState(false);
 
@@ -137,7 +137,13 @@ export function MasterLibraryDetail({ active, onNavigate }: MasterLibraryDetailP
 
       <div className="master-detail__tabpanels">
         <div className="master-detail__tabpanel" hidden={tab !== "sessions"}>
-          <HistoryWorkbench active={active && tab === "sessions"} embedded onNavigate={onNavigate} />
+          {/* ADR-0025：详情页注入库实例引用（V1 仅主库；副库详情页直接复用）。 */}
+          <LibrarySessionsPanel
+            active={active && tab === "sessions"}
+            embedded
+            onNavigate={onNavigate}
+            library={{ id: "master" }}
+          />
         </div>
         {/* 插件 tab（P5-8b）：已装清单 + 对账 + 市场浏览 + 装/卸。 */}
         <div className="master-detail__tabpanel" hidden={tab !== "plugins"}>

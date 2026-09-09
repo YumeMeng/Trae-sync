@@ -124,9 +124,9 @@ pub use checkin_login::{
     LoginSession, CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
 };
 pub use plugin_cloud_sync::{
-    fetch_installed_plugins, fetch_market_plugins, install_market_plugin, reconcile_plan,
-    sync_account_cloud_plugins, uninstall_cloud_plugin, CloudPluginItem, MarketPluginItem,
-    PluginCloudSyncOutcome,
+    fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, install_market_plugin,
+    reconcile_plan, sync_account_cloud_plugins, uninstall_cloud_plugin, CloudPluginItem,
+    MarketPluginItem, PluginCloudSyncOutcome,
 };
 pub use plugin_manifest::{PluginManifest, PluginManifestEntry, PluginManifestError};
 pub use content_graph::DeterministicContentGraphHasher;

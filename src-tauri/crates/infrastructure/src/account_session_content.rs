@@ -50,7 +50,7 @@ pub enum SessionMessagesStatus {
 }
 
 /// 单会话消息读取上限：防御异常巨型会话拖垮一次性返回。
-const MAX_MESSAGES_PER_SESSION: usize = 2000;
+pub const MAX_MESSAGES_PER_SESSION: usize = 2000;
 
 /// 读取单个账号单个会话的消息流。
 ///
@@ -90,6 +90,16 @@ pub fn read_master_session_messages(
     session_id: &str,
     raw_key: &str,
 ) -> SessionMessagesStatus {
+    read_master_session_messages_page(master_data_dir, session_id, raw_key, 0)
+}
+
+/// 读取主库单个会话的一页消息；`offset` 用于向上滚动时继续加载更早消息。
+pub fn read_master_session_messages_page(
+    master_data_dir: &Path,
+    session_id: &str,
+    raw_key: &str,
+    offset: usize,
+) -> SessionMessagesStatus {
     let db_path = crate::master_handover::master_database_path(master_data_dir);
     if !db_path.exists() {
         return SessionMessagesStatus::NoInstanceData;
@@ -98,7 +108,7 @@ pub fn read_master_session_messages(
         Ok(conn) => conn,
         Err(_) => return SessionMessagesStatus::ReadFailed,
     };
-    match read_session_messages(&conn, session_id) {
+    match read_session_messages_page(&conn, session_id, offset) {
         Ok(messages) => SessionMessagesStatus::Ready(messages),
         Err(_) => SessionMessagesStatus::ReadFailed,
     }
@@ -108,6 +118,15 @@ pub fn read_master_session_messages(
 fn read_session_messages(
     conn: &Connection,
     session_id: &str,
+) -> Result<Vec<SessionMessageEntry>, ()> {
+    read_session_messages_page(conn, session_id, 0)
+}
+
+/// 按最新消息倒序分页查询，再反转为时间正序供前端拼接。
+fn read_session_messages_page(
+    conn: &Connection,
+    session_id: &str,
+    offset: usize,
 ) -> Result<Vec<SessionMessageEntry>, ()> {
     // 内容表存在性防御：TRAE schema 演进时缺表降级为空内容而非整体失败。
     // 缺表时 JOIN 与列都要以 NULL 占位：SELECT 列数必须恒定，否则行映射
@@ -139,14 +158,15 @@ fn read_session_messages(
     } else {
         ("", "NULL")
     };
-    // DESC + LIMIT 取最近窗口（超长会话保尾部最新内容），收集后反转为升序。
+    // DESC + LIMIT/OFFSET 取一页最新窗口，收集后反转为升序；offset 由后端
+    // 内部生成，不来自 SQL 字符串外部输入，避免为分页引入参数类型变化。
     let sql = format!(
         "SELECT m.message_id, m.message_role, m.message_type, m.created_at, \
          {general_col}, {task_col}, {chat_col} \
          FROM chat_message m {general_join} {task_join} {chat_join} \
          WHERE m.session_id = ?1 AND (m.deleted_at IS NULL OR m.deleted_at = 0) \
          ORDER BY m.created_at DESC, m.rowid DESC \
-         LIMIT {MAX_MESSAGES_PER_SESSION}"
+         LIMIT {MAX_MESSAGES_PER_SESSION} OFFSET {offset}"
     );
     let mut statement = conn.prepare(&sql).map_err(|_| ())?;
     let rows = statement
@@ -383,6 +403,16 @@ mod tests {
                 assert_eq!(messages.last().unwrap().message_id, "m2005");
             }
             other => panic!("期望 Ready，实际 {:?}", other),
+        }
+        // 第二页继续取更早消息，供主库查看器向上滚动时拼接。
+        let conn = open_with_key_readonly(&dir.join("database.db"), &raw_key).unwrap();
+        match read_session_messages_page(&conn, "s1", MAX_MESSAGES_PER_SESSION) {
+            Ok(messages) => {
+                assert_eq!(messages.len(), 5);
+                assert_eq!(messages.first().unwrap().message_id, "m1");
+                assert_eq!(messages.last().unwrap().message_id, "m5");
+            }
+            Err(()) => panic!("第二页消息读取失败"),
         }
         // s2：JOIN 放大的重复行被去重为一条。
         match read_account_session_messages(&temp, "checkin-a", "s2", &raw_key) {

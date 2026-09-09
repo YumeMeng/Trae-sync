@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted，2026-08-31。决策来源 grill-with-docs 会话（2026-08-31，主库详情页设计）。协议事实见 `docs/TECHNICAL_BASELINE.md` 插件云端 API 章节（plugin_sync_probe 真机闭环）。
+Accepted，2026-08-31。决策来源 grill-with-docs 会话（2026-08-31，主库详情页设计）。协议事实见 `docs/TECHNICAL_BASELINE.md` 插件云端 API 章节（plugin_sync_probe 真机闭环）。**2026-09-04 修订：决策 2 的对账确认语义（+N/-M 弹层、新账号二选一）已被 ADR-0026 取代**（改为静默应用 + 含移除时单次确认）；其余决策继续有效。
 
 ## 背景
 

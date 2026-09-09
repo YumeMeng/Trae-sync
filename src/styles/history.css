@@ -1,6 +1,7 @@
-/* 历史页主库视图（P5-3，原型契约 .scratch/proto-20260830-env-model/index.html）
-   项目左栏 + 会话右栏两栏结构；数据源为主库 database.db（project.user_id 过滤）。
-   所有色值走语义令牌（tokens.css），换主题无需改本文件。 */
+/* 库对话面板（G21 两栏式 + G22 统一选择模式，ADR-0025 Library 抽象）
+   左栏 = 项目树（原地展开会话子级）+ 底部固定区；右栏 = 对话查看器
+   （消息流按接力账号着色 + 接力时间线）。所有色值走语义令牌
+   （tokens.css），换主题无需改本文件。 */
 
 /* —— 页面骨架：占满视口剩余高度，两栏各自内部滚动 —— */
 .history-page {
@@ -15,12 +16,7 @@
   flex: none;
 }
 
-.history-page .page-header__actions {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
-/* —— 空态/引导/错误（主库未启动、读取失败等居中卡） —— */
+/* —— 空态/引导/错误（库未启动、读取失败等居中卡） —— */
 .history-empty {
   flex: 1;
   display: flex;
@@ -50,64 +46,8 @@
   font-size: 12px;
 }
 
-/* —— 顶栏工具：会话标题搜索 + 时间范围 chips —— */
-.history-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 32px;
-  padding: 0 12px;
-  border: 1px solid var(--line-control);
-  border-radius: 999px;
-  background: var(--glass);
-  color: var(--text-3);
-}
-
-.history-search input {
-  width: 170px;
-  border: none;
-  background: transparent;
-  font-size: 12.5px;
-  color: var(--text-1);
-}
-
-/* 聚焦合同（同 workbench.css）：不写 outline:none —— 全局 focus ring 保留，
-   forced-colors 下焦点仍可见；wrapper 的 focus-within 提供 accent 外晕。 */
-.history-search:focus-within {
-  border-color: var(--accent-border);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-
-.history-chips {
-  display: flex;
-  gap: 6px;
-}
-
-.history-chip {
-  height: 32px;
-  padding: 0 14px;
-  border: 1px solid var(--line-control);
-  border-radius: 999px;
-  background: transparent;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-2);
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-
-.history-chip:hover {
-  background: var(--fill-soft);
-}
-
-.history-chip--active {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
 /* ============================================================
-   两栏主体（Q4：项目为中心扁平双栏）
+   两栏主体：左栏项目树 | 右栏对话查看器
    ============================================================ */
 .history-body {
   flex: 1;
@@ -116,10 +56,10 @@
   gap: 14px;
 }
 
-/* —— 左栏：项目列表（密集玻璃面板） —— */
-.proj-panel {
+/* —— 左栏：库面板（搜索 / 树 / 行内提示 / 底部固定区） —— */
+.lib-panel {
   flex: none;
-  width: 272px;
+  width: 300px;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -132,230 +72,726 @@
   overflow: hidden;
 }
 
-.proj-panel__head {
+/* 顶部搜索（过滤树内会话标题，输入即过滤） */
+.lib-search {
   flex: none;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
-  padding: 13px 16px 10px;
-  border-bottom: 1px solid var(--line-hair);
-}
-
-.proj-panel__head b {
-  font-size: 12.5px;
-}
-
-.proj-panel__head span {
-  font-size: 11px;
+  margin: 10px 10px 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-control);
+  border-radius: 999px;
+  background: var(--glass);
   color: var(--text-3);
 }
 
-/* —— P5-8c 分组合并：左栏头部工具位（合并入口） —— */
-.proj-panel__tools {
-  margin-left: auto;
+.lib-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  font-size: 12.5px;
+  color: var(--text-1);
+}
+
+.lib-search input::placeholder {
+  color: var(--muted-placeholder);
+  opacity: 1;
+}
+
+/* 聚焦合同（同 workbench.css）：不写 outline:none —— 全局 focus ring 保留 */
+.lib-search:focus-within {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 归档视图顶部返回行 */
+.lib-back {
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 6px;
+  padding: 8px 10px 4px;
 }
 
-/* 窄栏批量栏（272px）：允许换行收纳全选/计数/合并/退出。 */
-.batch-bar--proj {
-  flex-wrap: wrap;
-  padding: 8px 10px;
+/* 行内提示条：操作回执（中性）/ 失败（危险色） */
+.lib-notice {
+  flex: none;
+  margin: 0 10px 6px;
+  padding: 7px 11px;
+  border: 1px solid var(--line-hair);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--text-1);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
-/* 选择态勾选的分组行（复用会话行勾选视觉令牌）。 */
-.proj-item--checked {
+.lib-notice--error {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* —— 项目树 —— */
+.lib-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 8px 10px;
+}
+
+.lib-branch + .lib-branch,
+.lib-arch-mode + .lib-arch-mode {
+  margin-top: 2px;
+}
+
+/* 项目行：折叠箭头 + 勾选框（选择态）+ 文件夹图标 + 项目名 + 会话数角标 */
+.lib-project {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 7px 8px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.13s;
+}
+
+.lib-project:hover {
+  background: var(--fill-soft);
+}
+
+.lib-project__chevron {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+}
+
+.lib-project__icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--fill-soft);
+  color: var(--text-2);
+}
+
+.lib-project__name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lib-project__count {
+  flex: none;
+  min-width: 20px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--fill-soft);
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 650;
+  text-align: center;
+}
+
+.lib-check {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  color: var(--text-3);
+}
+
+.lib-project--checked {
   background: var(--accent-soft);
   box-shadow: inset 0 0 0 1px var(--accent-border);
 }
 
-.proj-item--checked .proj-item__icon {
+.lib-project--checked .lib-check,
+.lib-session--checked .lib-check {
   color: var(--accent);
 }
 
-/* 合并完成回执（一句话，进入下一次分组选择时清除）。 */
-.batch-notice {
+/* 会话子级：缩进一级（标题 + 相对时间） */
+.lib-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 1px 0 4px 23px;
+}
+
+.lib-session {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.13s, border-color 0.13s;
+}
+
+.lib-session:hover {
+  background: var(--fill-soft);
+}
+
+.lib-session__title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lib-session__time {
   flex: none;
-  padding: 8px 16px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.lib-session--checked {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+}
+
+/* 浏览态悬浮快捷归档（单会话直接归档，不进选择模式） */
+.lib-session__quick {
+  display: none;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.lib-session:hover .lib-session__quick {
+  display: inline-flex;
+}
+
+.lib-session__quick:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.lib-session__quick:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.lib-tree__empty {
+  padding: 40px 16px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+/* —— 归档视图：模式 → 项目 → 会话（低饱和灰显，G21） —— */
+.lib-arch-mode__head {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-3);
+  letter-spacing: 0.5px;
+}
+
+.lib-tree--archive .lib-project {
+  cursor: default;
+}
+
+.lib-tree--archive .lib-project:hover {
+  background: transparent;
+}
+
+.lib-tree--archive .lib-project__name {
+  color: var(--text-2);
+  font-weight: 550;
+}
+
+.lib-tree--archive .lib-project__icon {
+  background: transparent;
+  color: var(--text-3);
+}
+
+.lib-tree--archive .lib-session__title {
+  color: var(--text-2);
+}
+
+/* —— 左栏底部固定区：已归档入口 + 选择按钮 —— */
+.lib-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line-hair);
+}
+
+.lib-archive-entry {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.13s;
+}
+
+.lib-archive-entry:hover {
+  background: var(--fill-soft);
+}
+
+.lib-archive-entry__count {
+  margin-left: auto;
+  min-width: 20px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--fill-soft);
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 650;
+  text-align: center;
+}
+
+.lib-select-btn {
+  flex: none;
+}
+
+/* ============================================================
+   右栏：对话查看器（常驻，G21）
+   ============================================================ */
+.viewer-panel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass-dense);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  overflow: hidden;
+}
+
+.viewer {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 选择模式提示条（查看器仍可看，顶部提示只读预览） */
+.viewer-roam {
+  flex: none;
+  padding: 7px 16px;
   border-bottom: 1px solid var(--line-hair);
   background: var(--accent-soft);
   color: var(--text-1);
   font-size: 12px;
 }
 
-.proj-list {
+/* 空态引导 */
+.viewer-empty {
   flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 8px;
-}
-
-.proj-item {
-  width: 100%;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 11px;
-  padding: 10px 11px;
-  border: none;
-  border-radius: 11px;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-  font-family: inherit;
-  transition: background 0.13s;
+  justify-content: center;
+  gap: 10px;
+  color: var(--text-3);
+  font-size: 13px;
+  text-align: center;
 }
 
-.proj-item:hover {
-  background: var(--fill-soft);
-}
-
-.proj-item--active {
-  background: var(--accent-soft);
-  box-shadow: inset 0 0 0 1px var(--accent-border);
-}
-
-.proj-item__icon {
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  flex: none;
-  border-radius: 9px;
-  background: var(--fill-soft);
-  color: var(--text-2);
-}
-
-.proj-item--active .proj-item__icon {
-  background: #fff;
-  color: var(--accent);
-  box-shadow: var(--shadow-panel);
-}
-
-.proj-item__main {
-  flex: 1;
-  min-width: 0;
-}
-
-.proj-item__name {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.proj-item__meta {
-  margin-top: 1px;
-  font-size: 11px;
+.viewer-empty svg {
   color: var(--text-3);
 }
 
-/* —— 右栏：会话列表 —— */
-.sess-panel {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-panel);
-  background: var(--glass-dense);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  box-shadow: var(--glass-shadow);
-  overflow: hidden;
-}
-
-.sess-panel__head {
+/* 头部：会话标题 + 项目/规模 meta + 关闭 */
+.viewer-head {
   flex: none;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
-  padding: 13px 18px 11px;
+  padding: 14px 18px 10px;
   border-bottom: 1px solid var(--line-hair);
 }
 
-.sess-panel__head b {
-  font-size: 13px;
+.viewer-head__main {
+  flex: 1;
+  min-width: 0;
 }
 
-.sess-panel__head span {
+.viewer-head__title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-1);
+  overflow-wrap: anywhere;
+}
+
+.viewer-head__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 4px;
   font-size: 11.5px;
   color: var(--text-3);
 }
 
-.sess-list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 8px;
-}
-
-.sess-row {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 12px 14px;
-  border: 1px solid transparent;
-  border-radius: 12px;
-  background: transparent;
-  cursor: pointer;
-  font-family: inherit;
-  text-align: left;
-  transition: background 0.13s, border-color 0.13s;
-}
-
-.sess-row:hover {
-  background: var(--fill-soft);
-  border-color: var(--line-hair);
-}
-
-.sess-row__main {
-  flex: 1;
-  min-width: 0;
-}
-
-.sess-row__title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.sess-row__meta {
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  margin-top: 5px;
-  font-size: 11px;
-  color: var(--text-3);
-}
-
-.sess-row__meta span {
+.viewer-head__meta span {
   display: inline-flex;
   align-items: center;
   gap: 4px;
 }
 
-.sess-row__meta svg {
+.viewer-head__meta svg {
   width: 11px;
   height: 11px;
 }
 
-.sess-empty {
-  padding: 60px 20px;
-  text-align: center;
+.viewer-close {
+  flex: none;
+}
+
+/* 消息 | 接力 tab */
+.viewer-tabs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--line-hair);
+}
+
+.viewer-tab {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.13s, color 0.13s;
+}
+
+.viewer-tab:hover {
+  background: var(--fill-soft);
+}
+
+.viewer-tab--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.viewer-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 加载/错误/空消息态 */
+.viewer-state {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 30px 16px;
   color: var(--text-3);
   font-size: 12.5px;
+  text-align: center;
 }
 
 /* ============================================================
-   会话预览弹层：接力轨迹时间线 + 消息流
+   消息 tab：聊天流（用户右对齐账号色 / 助手左对齐中性色）
+   ============================================================ */
+.chat-flow {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 18px;
+}
+
+/* 2000 条截断如实提示（无真分页） */
+.chat-notice {
+  flex: none;
+  padding: 7px 12px;
+  border: 1px solid var(--line-hair);
+  border-radius: 10px;
+  background: var(--fill-soft);
+  color: var(--text-2);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+.chat-msg {
+  display: flex;
+  gap: 9px;
+  max-width: 88%;
+}
+
+.chat-msg--assistant {
+  align-self: flex-start;
+}
+
+.chat-msg--user {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+}
+
+/* 用户消息侧栏：账号色头像 + 账号名小字 */
+.chat-msg__side {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.chat-msg__name {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+/* 助手消息：通用机器人图标（中性色，不着色） */
+.chat-msg__bot {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line-hair);
+  border-radius: 50%;
+  background: var(--fill-soft);
+  color: var(--text-2);
+}
+
+.chat-msg__bubble {
+  padding: 9px 13px;
+  border: 1px solid var(--line-hair);
+  border-radius: 12px;
+  background: var(--glass-hover);
+  overflow-wrap: anywhere;
+}
+
+.chat-msg--assistant .chat-msg__bubble {
+  border-radius: 4px 12px 12px 12px;
+}
+
+.chat-msg--user .chat-msg__bubble {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  border-radius: 12px 4px 12px 12px;
+}
+
+.chat-msg__text {
+  font-size: 12.5px;
+  color: var(--text-1);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-msg__text--trace {
+  color: var(--text-2);
+}
+
+.chat-msg__thoughts {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* 账号色块头像：圆形 + 账号色底 + 白色首字母（G21 账号着色） */
+.account-avatar {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+/* 账号色板（G21）：按腿顺序首次出现循环 蓝 → 绿 → 琥珀 */
+.account-avatar--c0 {
+  background: var(--accent, #4f8cff);
+}
+
+.account-avatar--c1 {
+  background: #34a853;
+}
+
+.account-avatar--c2 {
+  background: #f9ab00;
+}
+
+/* ============================================================
+   接力 tab：持有时间线（每腿账号 + 时间段 + 新增消息数）
+   ============================================================ */
+.viewer-relay {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 18px;
+}
+
+.viewer-relay__hint {
+  margin: 0 0 12px;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.leg-timeline {
+  display: flex;
+  flex-direction: column;
+}
+
+.leg-step {
+  display: flex;
+  gap: 12px;
+}
+
+.leg-step__rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.leg-step__dot {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 50%;
+}
+
+.leg-step__dot .account-avatar {
+  width: 26px;
+  height: 26px;
+  font-size: 11px;
+  border: 2px solid #fff;
+  box-shadow: var(--shadow-panel);
+}
+
+.leg-step__line {
+  width: 2px;
+  flex: 1;
+  margin: 3px 0;
+  background: var(--line-control);
+}
+
+.leg-step:last-child .leg-step__line {
+  display: none;
+}
+
+.leg-step__body {
+  padding-bottom: 14px;
+}
+
+.leg-step__name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+/* 当前腿（交接至今，进行中）徽章 */
+.leg-step__badge {
+  padding: 1px 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.leg-step__meta {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* ============================================================
+   G22 Gmail 式浮动操作栏（fixed，选择模式浮出）
+   ============================================================ */
+.lib-actionbar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 55;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: calc(100vw - 32px);
+  padding: 9px 12px 9px 18px;
+  border: 1px solid var(--accent-border);
+  border-radius: 16px;
+  background: var(--glass-dense);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-float);
+}
+
+.lib-actionbar__count {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.lib-actionbar__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ============================================================
+   确认弹层骨架（删除/合并共用：遮罩 + 玻璃卡 + 底部动作条）
    ============================================================ */
 .preview-veil {
   position: fixed;
@@ -419,414 +855,6 @@
   padding: 16px 20px;
 }
 
-.preview__section {
-  margin: 4px 0 9px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-3);
-  letter-spacing: 0.5px;
-}
-
-.preview__section--gap {
-  margin-top: 18px;
-}
-
-/* 消息气泡：用户消息靛蓝底，AI 消息白玻璃底 */
-.msg {
-  margin-bottom: 8px;
-  padding: 10px 13px;
-  border: 1px solid var(--line-hair);
-  border-radius: 11px;
-  background: var(--glass-hover);
-}
-
-.msg--user {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-}
-
-.msg__role {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 3px;
-  font-size: 10.5px;
-  font-weight: 700;
-  color: var(--text-3);
-}
-
-.msg__text {
-  font-size: 12.5px;
-  color: var(--text-1);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.msg__text--trace {
-  color: var(--text-2);
-}
-
-.msg__thoughts {
-  margin: 6px 0 0;
-  padding-left: 18px;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-
-/* 接力轨迹时间线（预览弹层内，时间正序逐腿） */
-.leg-timeline {
-  display: flex;
-  flex-direction: column;
-}
-
-.leg-step {
-  display: flex;
-  gap: 12px;
-}
-
-.leg-step__rail {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
-
-.leg-step__dot {
-  display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  flex: none;
-  border-radius: 50%;
-}
-
-.leg-step__dot .relay-avatar {
-  width: 26px;
-  height: 26px;
-  font-size: 11px;
-  border: 2px solid #fff;
-  box-shadow: var(--shadow-panel);
-}
-
-.leg-step__line {
-  width: 2px;
-  flex: 1;
-  margin: 3px 0;
-  background: var(--line-control);
-}
-
-.leg-step:last-child .leg-step__line {
-  display: none;
-}
-
-.leg-step__body {
-  padding-bottom: 14px;
-}
-
-.leg-step__name {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12.5px;
-  font-weight: 700;
-}
-
-.leg-step__badge {
-  padding: 1px 8px;
-  border: 1px solid var(--accent-border);
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-size: 10.5px;
-  font-weight: 600;
-}
-
-.leg-step__meta {
-  margin-top: 2px;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-
-/* ============================================================
-   接力轨迹徽章：头像链 + 悬停浮层
-   浮层 fixed 定位 + JS 锚定（视口钳制），避免被滚动容器裁剪。
-   ============================================================ */
-.relay-avatar {
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
-  flex: none;
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.85);
-  color: #fff;
-  font-size: 10.5px;
-  font-weight: 700;
-}
-
-/* 六档稳定色调：按 user_id 哈希取档，同一账号跨页面颜色一致 */
-.relay-avatar--t0 { background: #4f46e5; }  /* 靛蓝（品牌主色档） */
-.relay-avatar--t1 { background: #2e8f6e; }  /* 绿 */
-.relay-avatar--t2 { background: #c2653e; }  /* 橙棕 */
-.relay-avatar--t3 { background: #0e7490; }  /* 青 */
-.relay-avatar--t4 { background: #6d5bd0; }  /* 紫 */
-.relay-avatar--t5 { background: #b4556e; }  /* 玫红 */
-
-.relay-chain {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  flex: none;
-}
-
-.relay-chain .relay-avatar {
-  margin-left: -7px;
-}
-
-.relay-chain .relay-avatar:first-child {
-  margin-left: 0;
-}
-
-/* 项目行的参与头像链：小一档 */
-.relay-chain--compact .relay-avatar {
-  width: 20px;
-  height: 20px;
-  font-size: 9.5px;
-  border-width: 1.5px;
-}
-
-.relay-chain__more {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  margin-left: -7px;
-  border: 1.5px solid rgba(255, 255, 255, 0.85);
-  border-radius: 50%;
-  background: var(--fill-strong);
-  color: var(--text-2);
-  font-size: 9px;
-  font-weight: 700;
-}
-
-/* 悬停浮层：默认隐藏，hover 显现（定位由 JS 写入 left/top） */
-.relay-pop {
-  position: fixed;
-  z-index: 70;
-  min-width: 230px;
-  padding: 12px 14px;
-  border: 1px solid var(--line-hair);
-  border-radius: 12px;
-  background: var(--glass-dense);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  box-shadow: var(--shadow-float);
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(4px);
-  transition: opacity 0.15s, transform 0.15s;
-}
-
-/* 测量态：JS 取尺寸期间保持不可见（visibility 而非 display，保住布局） */
-.relay-pop--measuring {
-  visibility: hidden;
-  opacity: 1;
-  transform: none;
-}
-
-.relay-chain:hover .relay-pop {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-.relay-pop__title {
-  display: block;
-  margin-bottom: 8px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-3);
-  letter-spacing: 0.4px;
-}
-
-.relay-pop__row {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 5px 0;
-}
-
-.relay-pop__row + .relay-pop__row {
-  border-top: 1px dashed var(--line-hair);
-}
-
-.relay-pop__name {
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.relay-pop__meta {
-  margin-left: auto;
-  text-align: right;
-  font-size: 11px;
-  color: var(--text-3);
-}
-
-/* —— 窄视口降级：左栏收窄，搜索框收缩 —— */
-@media (max-width: 1100px) {
-  .history-page {
-    /* 低于该宽度改为页面级滚动，避免两栏被过度压缩 */
-    height: auto;
-    min-height: calc(100vh - 112px);
-  }
-
-  .history-body {
-    flex-direction: column;
-  }
-
-  .proj-panel {
-    width: auto;
-    max-height: 320px;
-  }
-}
-
-/* 动效偏好：悬停浮层过渡关闭 */
-@media (prefers-reduced-motion: reduce) {
-  .relay-pop {
-    transition: none;
-  }
-
-  .history-chip {
-    transition: none;
-  }
-}
-
-/* ============================================================
-   主列表项目分组（全部项目视图：组头 = 项目名 + 会话数）
-   ============================================================ */
-.sess-group + .sess-group {
-  margin-top: 6px;
-}
-
-.sess-group__head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 8px 10px 4px;
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--text-2);
-}
-
-.sess-group__head span:last-child {
-  font-size: 10.5px;
-  font-weight: 400;
-  color: var(--text-3);
-}
-
-/* ============================================================
-   P5-8a 会话归档：选择模式批量栏 + 归档视图 + 删除确认弹窗
-   ============================================================ */
-
-/* —— 右栏头部工具按钮（选择 / 已归档入口） —— */
-.sess-panel__head {
-  gap: 8px;
-}
-
-.sess-panel__tools {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-}
-
-/* —— 选择态会话行：勾选框 + 选中高亮 —— */
-.sess-row--select {
-  gap: 10px;
-}
-
-.sess-row__check {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: 22px;
-  color: var(--text-3);
-}
-
-.sess-row--checked .sess-row__check {
-  color: var(--accent);
-}
-
-.sess-row--checked {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-}
-
-/* —— Gmail 式批量操作栏（选择态替换右栏头部） —— */
-.batch-bar {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 14px;
-  border-bottom: 1px solid var(--line-hair);
-  background: var(--accent-soft);
-}
-
-.batch-bar__count {
-  font-size: 11.5px;
-  color: var(--text-2);
-  white-space: nowrap;
-}
-
-.batch-bar__actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-}
-
-/* 批量操作失败提示条（安全文案，不影响已渲染列表） */
-.batch-error {
-  flex: none;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--line-hair);
-  background: var(--fill-soft);
-  color: var(--text-2);
-  font-size: 12px;
-}
-
-/* —— 归档视图：模式 → 项目分组 → 会话 层级 —— */
-.archive-list {
-  padding: 4px 8px 12px;
-}
-
-.archive-mode + .archive-mode {
-  margin-top: 6px;
-}
-
-.archive-mode__head {
-  padding: 10px 10px 6px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-3);
-  letter-spacing: 0.5px;
-}
-
-.archive-group__head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 8px 10px 4px;
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--text-2);
-}
-
-.archive-group__head span:last-child {
-  font-size: 10.5px;
-  font-weight: 400;
-  color: var(--text-3);
-}
-
 /* —— 删除二次确认弹窗（复用 preview 骨架 + 底部动作条） —— */
 .confirm-dialog {
   width: min(460px, 92vw);
@@ -859,7 +887,7 @@
   color: var(--text-3);
 }
 
-/* —— P5-8c 合并弹层：保留分组单选行 —— */
+/* —— 合并弹层：保留项目单选行 —— */
 .confirm-dialog__list--choice li {
   padding: 0;
 }
@@ -899,4 +927,32 @@
   gap: 8px;
   padding: 12px 18px;
   border-top: 1px solid var(--line-hair);
+}
+
+/* —— 窄视口降级：左栏收窄为可滚动区块 —— */
+@media (max-width: 1100px) {
+  .history-page {
+    /* 低于该宽度改为页面级滚动，避免两栏被过度压缩 */
+    height: auto;
+    min-height: calc(100vh - 112px);
+  }
+
+  .history-body {
+    flex-direction: column;
+  }
+
+  .lib-panel {
+    width: auto;
+    max-height: 380px;
+  }
+}
+
+/* 动效偏好：行内过渡关闭 */
+@media (prefers-reduced-motion: reduce) {
+  .lib-project,
+  .lib-session,
+  .lib-archive-entry,
+  .viewer-tab {
+    transition: none;
+  }
 }

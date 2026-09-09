@@ -2,7 +2,7 @@
  * U-2/U-3 视觉验收截图脚本（一次性工具，非测试）。
  *
  * 用 mock invoke 边界（同 e2e/mock-bridge 约束：不启动 Tauri、不访问真实数据）
- * 驱动构建产物，对账号页（列表/卡片）、签到页、总览页、历史页截图，
+ * 驱动构建产物，对账号页（列表/卡片）、签到页、总览页、主库详情页截图，
  * 供与 DESIGN_TOKENS 样张（方案 02 亮白通用玻璃）对照验收。
  *
  * 运行前置：pnpm build && pnpm preview --port 4173
@@ -21,7 +21,7 @@ mkdirSync(OUT, { recursive: true });
 function buildOverview() { return []; }
 void buildOverview;
 
-async function mockInvoke(command) {
+async function mockInvoke(command, args) {
   const NOW_LOCAL = Math.floor(Date.now() / 1000);
   const DAY_LOCAL = 86400;
   const overview = [
@@ -69,6 +69,33 @@ async function mockInvoke(command) {
     case "get_auto_checkin_settings":
       return { enabled: true, daily_time_hhmm: "10:00", ledger: { date: "2026-08-26", running: false, total: 5, completed: 4, failed: 0, skipped: 1 } };
     case "get_managed_account_state": return { saved_accounts: [], switch_state: "idle" };
+    // 主库详情页链路（环境页 + 库对话面板，G21 两栏截图数据）。
+    case "get_environment_state": return {
+      env_id: "master",
+      current_profile_id: "p1",
+      current_account_name: "梦梦",
+      data_dir: "C:\\TraeSync\\data\\environments\\master",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 1750000000,
+    };
+    case "get_master_history": {
+      if (args?.previous) {
+        return { status: "unchanged", current_user_id: null, projects: [], sessions: [], fingerprint: null };
+      }
+      return {
+        status: "ready",
+        current_user_id: "u-b",
+        projects: [{ project_id: "p1", name: "项目阿尔法", absolute_path: null }],
+        sessions: [{
+          session_id: "s1", project_id: "p1", title: "会话一", message_count: 8,
+          updated_at_unix_seconds: NOW_LOCAL - 60, deleted: false,
+          hidden_status: null, work_mode: "code",
+        }],
+        fingerprint: { db: { mtime_secs: NOW_LOCAL, mtime_nanos: 0, size: 1000 }, wal: null, shm: null },
+      };
+    }
+    case "get_relay_ledger": return [];
     default: return null;
   }
 }
@@ -122,10 +149,13 @@ await page.click('[data-testid="navigation-checkin"]');
 await page.waitForTimeout(600);
 await page.screenshot({ path: `${OUT}/05-checkin.png` });
 
-// —— 历史页（U-4 B1 玻璃基底验收）：初始授权态即可，目标是玻璃/主题可见非内容渲染 ——
-await page.click('[data-testid="navigation-history"]');
+// —— 主库详情页（库对话面板宿主，G21 两栏玻璃基底）——
+// 进入路径 = 环境页 → 主库卡「详情」（独立历史页 P8-6 将删除，不再作宿主）。
+await page.click('[data-testid="navigation-environment"]');
+await page.waitForTimeout(400);
+await page.click('[data-testid="env-master-detail"]');
 await page.waitForTimeout(800);
-await page.screenshot({ path: `${OUT}/06-history.png`, fullPage: false });
+await page.screenshot({ path: `${OUT}/06-master-detail.png`, fullPage: false });
 
 await browser.close();
 console.log(`screenshots -> ${OUT}`);

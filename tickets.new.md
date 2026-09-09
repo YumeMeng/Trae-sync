@@ -304,10 +304,10 @@
 
 ### P5-8 主库详情页（环境资产管理入口）✅（2026-08-31 grill 闭环，ADR-0022/0023；子项 a-1/a-2/b/b-3/界面纪律/8c 全部实施完成，「数据校验」tab 由 P5-7 填充）
 - **结构**：主库卡片点击进入 → 顶部基础信息（主库路径与大小、当前绑定账号、项目/会话/消息统计、最近活跃、最近备份时间）+ tabs（对话列表 · 插件 · 后续扩展位；tab 位稀缺，归档不占 tab）。
-- **详情页 shell（P5-8a-2 ✅ 2026-08-31 实施闭环）**：`MasterLibraryDetail` 页（环境卡「详情」入口 → App 路由 `master-library`，返回环境页为唯一退路）；基础信息区（当前账号/主库大小/最近活跃/最近备份/主库路径 + 项目/会话/消息计数，统计或备份链读取失败静默降级为 —）；tabs = 对话列表（复用 `HistoryWorkbench` embedded 模式，无页级标题保留工具行）+ 插件占位（P5-8b 填充）。实施：`master_stats.rs` 增 `message_count`（当前账号可见会话消息总数）+ `master_trio_size_bytes`（主库三件套合计字节）+ DTO 透出；tab 内容懒挂载（首次激活才渲染，避免与历史页实例重复 testid/白挂载）。验收全绿：cargo 640+ / tsc / vitest 136 / e2e 31（history-workbench 20 + ui-acceptance 11）。
+- **详情页 shell（P5-8a-2 ✅ 2026-08-31 实施闭环）**：`MasterLibraryDetail` 页（环境卡「详情」入口 → App 路由 `master-library`，返回环境页为唯一退路）；基础信息区（当前账号/主库大小/最近活跃/最近备份/主库路径 + 项目/会话/消息计数，统计或备份链读取失败静默降级为 —）；tabs = 对话列表（复用 `LibrarySessionsPanel` embedded 模式，无页级标题保留工具行）+ 插件占位（P5-8b 填充）。实施：`master_stats.rs` 增 `message_count`（当前账号可见会话消息总数）+ `master_trio_size_bytes`（主库三件套合计字节）+ DTO 透出；tab 内容懒挂载（首次激活才渲染，避免与历史页实例重复 testid/白挂载）。验收全绿：cargo 640+ / tsc / vitest 136 / e2e 31（history-workbench 20 + ui-acceptance 11）。
 - **对话列表 tab（P5-8a-1 ✅ 2026-08-31 实施闭环）**：历史页两栏形态承载（归档入口在右栏头部，不占 tab）；会话级归档（ADR-0022：出库 = hidden_status 借用 voice_discussion，恢复 = 还原 NULL）；归档视图按「模式 → 分组 → 会话」层级收纳；Gmail 式多选（浏览态无框，选择态浮出批量栏：归档/恢复/删除，Esc/完成退出）；真实删除 = 消息+会话+空壳项目行，列明规模单次确认。实施：`master_archive.rs`（归档/恢复/删除 + 自动备份，6 单测）+ `master_history.rs` 扩展 hidden_status/work_mode + 3 Tauri 命令 + 历史页选择模式/归档视图/删除确认弹窗；vitest 126/126 + e2e 32/32 全绿。真机验收（TRAE 侧栏即时生效）随 P5-A 日常使用顺带收口。
-- **插件 tab（P5-8b ✅ 2026-08-31 实施闭环）**：环境插件清单模型（ADR-0023：环境持基线，切号对账 = 吸收后应用，+N/-M 单次确认，工具内装/卸即时改云端并更新清单）；已装清单管理必做，「浏览市场 + 安装」与「移除随行」两大能力前提已于 2026-08-31 探测闭环（市场目录 `GET /extensions/api/-/plugin/list` 响应 `data.plugins`；云端卸载 `DELETE /api/remote/v1/plugins/<记录ID>` 实测 code 0 + 重装往返无损，`builtin:` 前缀条目为客户端内置不可卸载需跳过——协议事实见 `docs/TECHNICAL_BASELINE.md`），无需降级。实施：后端 `plugin_manifest.rs`（storage_root 单 JSON 原子写，损坏拒绝覆盖，6 单测）+ `plugin_cloud_sync.rs` 扩云端已装/市场目录/装卸 API + 5 Tauri 命令（`get_plugin_tab_state` 首次启用自动从当前账号云端导入清单 / `browse_plugin_market` / `install_plugin` / `uninstall_plugin` / `absorb_plugin_manifest`）；前端 `PluginWorkbench`（已装/市场分段、市场懒加载、对账差异条 +N/-M 吸收按钮、卸载二次确认弹窗、装/卸回执；占位已移除）；插件通道错误码全部入 `safeUiError` 映射。验收全绿：cargo 647+ / tsc / vitest 147（PluginWorkbench 11 新增）/ e2e 34（P5-8b 插件 tab 全流程用例：清单徽章 → 吸收收敛 → 市场安装 → 卸载确认）。
-- **切号对账改造（P5-8b-3 ✅ 2026-09-01 实施闭环）**：切号预同步按 ADR-0023 升级为「吸收后应用」——`plugin_cloud_sync.rs` 对账改为双向（缺的装上 + 多的卸掉，`reconcile_plan` 纯函数预检与执行共用，回执新增 removed/declined/absorbed）；`lib.rs` 新增 `preview_master_switch_plugins` 预检命令（源 = 环境档案当前账号，fail-soft 永不报错），`switch_master_account` 增 `apply_plugins` 参数（false = 用户选择保留目标账号插件现状，declined 回执；true = 对账后吸收集落盘环境清单）。前端 `MasterSwitchDialog` 弹层先预检：无差异/预检失败静默直过；有差异弹 +N/-M 确认（插件名单列，移除项红色单列——破坏性操作红线），确认后带选择切换；busy 强制切换保留插件选择。验收：cargo test workspace 全绿 / tsc / vitest 151（MasterSwitchDialog 8）/ e2e 34。真机切号观察随 P5-A 批次 0 顺带收口。
+- **插件 tab（P5-8b 初版记录，已由 P8-4 G23 / ADR-0026 取代）**：环境插件清单模型（ADR-0023：环境持基线，切号对账 = 吸收后应用，+N/-M 单次确认，工具内装/卸即时改云端并更新清单）；已装清单管理必做，「浏览市场 + 安装」与「移除随行」两大能力前提已于 2026-08-31 探测闭环（市场目录 `GET /extensions/api/-/plugin/list` 响应 `data.plugins`；云端卸载 `DELETE /api/remote/v1/plugins/<记录ID>` 实测 code 0 + 重装往返无损，`builtin:` 前缀条目为客户端内置不可卸载需跳过——协议事实见 `docs/TECHNICAL_BASELINE.md`），无需降级。实施：后端 `plugin_manifest.rs`（storage_root 单 JSON 原子写，损坏拒绝覆盖，6 单测）+ `plugin_cloud_sync.rs` 扩云端已装/市场目录/装卸 API + 5 Tauri 命令（`get_plugin_tab_state` 首次启用自动从当前账号云端导入清单 / `browse_plugin_market` / `install_plugin` / `uninstall_plugin` / `absorb_plugin_manifest`）；前端 `PluginWorkbench`（已装/市场分段、市场懒加载、对账差异条 +N/-M 吸收按钮、卸载二次确认弹窗、装/卸回执；占位已移除）；插件通道错误码全部入 `safeUiError` 映射。验收全绿：cargo 647+ / tsc / vitest 147（PluginWorkbench 11 新增）/ e2e 34（P5-8b 插件 tab 全流程用例：清单徽章 → 吸收收敛 → 市场安装 → 卸载确认）。
+- **切号对账改造（P5-8b-3 历史记录，已由 P8-4 G23 / ADR-0026 取代）**：切号预同步按 ADR-0023 升级为「吸收后应用」——`plugin_cloud_sync.rs` 对账改为双向（缺的装上 + 多的卸掉，`reconcile_plan` 纯函数预检与执行共用，回执新增 removed/declined/absorbed）；`lib.rs` 新增 `preview_master_switch_plugins` 预检命令（源 = 环境档案当前账号，fail-soft 永不报错），`switch_master_account` 增 `apply_plugins` 参数（false = 用户选择保留目标账号插件现状，declined 回执；true = 对账后吸收集落盘环境清单）。前端 `MasterSwitchDialog` 弹层先预检：无差异/预检失败静默直过；有差异弹 +N/-M 确认（插件名单列，移除项红色单列——破坏性操作红线），确认后带选择切换；busy 强制切换保留插件选择。验收：cargo test workspace 全绿 / tsc / vitest 151（MasterSwitchDialog 8）/ e2e 34。当前策略见 P8-4 G23。
 - **界面表达纪律落地（2026-09-01 ✅）**：按用户反馈全面清理 UI 技术性表达——插件行去掉 slug/registry 元信息（只留「版本 x」，技术标识收进行悬浮提示）；账号详情折叠区字段中文化（账号档案标识/服务端账号标识）；总览证据带「账号指纹：xxx」→「当前账号 · xxx」；自造词全量替换（重铸→重置、随行→保留、交接会话→转移会话、凭据互换→登录状态切换、证据已过期→账号信息已过期等，覆盖切号弹层/账号页/签到页/错误码映射）；规则已写入 AGENTS.md「界面表达纪律」，后续所有 UI 文案遵循。验收：vitest 147 / e2e 34 全绿。
 - **分组合并（P5-8c ✅ 2026-09-01 实施闭环）**：任意选组合并底层操作落地——后端 `master_archive.rs` 新增 `merge_master_projects`（源分组全部会话改挂目标分组（含归档/软删行，归位语义一致）+ 空壳源分组行 NOT EXISTS 守卫清理，事务原子；执行前自动 `.switch-bak-*` 备份，备份失败不执行；3 新单测）；`lib.rs` 命令 `merge_master_projects`（主库运行中拒绝 `master_merge_running`，与删除/切号同纪律）。前端历史页左栏 Gmail 式分组选择态（浏览态无框，「合并」入口进选择态 → 勾选分组 → 紧凑批量栏（全选/计数/合并/退出，Esc 退出）→ 确认弹层单选保留目标分组（列明将移动会话数（含已归档）与备份提示，ADR-0018 单次确认）→ 回执以数量表述（「已把 N 个会话并入「X」，清理 M 个空分组。」）；合并后若当前筛选分组被并走自动回退全部项目视图。`safeUiError` 新增 `master_merge_running`/`master_merge_invalid` 文案。同名合并快捷入口未做（弹层内改选目标已覆盖主路径，留待实际使用反馈再定）。验收：cargo master_archive 9/9（含 3 合并用例）/ tsc / vitest 154（HistoryWorkbench 新增 3 用例：完整合并流程、少于 2 个禁用 + Esc 层级、错误安全文案）。真机合并观察随 P5-A 日常使用顺带收口。
 - **验收**：归档/恢复在 TRAE 侧栏即时生效；切号弹层差异确认（+N/-M）与插件 tab 状态联动；全部破坏性操作单次确认；UI 术语无内部词。
@@ -505,27 +505,29 @@
 
 ### P8-4 主库详情批（最大改造）
 
-**G19 SQL 层 0 会话项目过滤（最先做，独立可交付）**
+**G19 SQL 层 0 会话项目过滤（最先做，独立可交付）（✅ 2026-09-07 实施闭环）**
 - **问题（已核实）**：SQL 捞全部未删除项目含 0 会话空壳（`master_history.rs:191-193`），TRAE 自动创建的哈希名虚拟项目全变"未命名项目"堆积。
 - **方案**：SQL 改为只返回至少 1 个可见会话的项目（EXISTS 子查询）；哈希名且路径尾段不可读的项目不进列表；无路径但有会话的项目归并"未关联文件夹"分组（复用现有按名合并机制）。不删任何数据（铁律）。
 - **验收**：SQL 单测（0 会话项目被过滤、有会话项目保留、未关联归并）；真机列表"未命名项目"消失。
 
-**G20 三 tab 平级结构**
+**G20 三 tab 平级结构（✅ 2026-09-07 实施闭环）**
 - **方案**：主库详情改三 tab——对话列表 / 插件 / 库信息（原基础信息），默认落"对话列表"；顶部只留面包屑式标题（主库名+返回环境页）。数据校验 tab 由 G24 取消，其功能移入库信息 tab（备份对比）与 P8-5 自检（台账核对）。
 - **验收**：三 tab 切换正常；顶部无大段基础信息；e2e 截图。
 
-**G8+G21+G22 对话列表重构（两栏式，先出原型确认）**
+**G8+G21+G22 对话列表重构（两栏式，先出原型确认）（✅ 2026-09-09 实施闭环；独立历史入口删除留 P8-6）**
 - **前置**：补「Library 抽象」ADR——主库和副库的基地是"库"，库内模块（对话/插件/归档）不与具体库实例耦合；HistoryWorkbench 重命名 LibrarySessionsPanel，宿主页注入库参数（数据目录、raw key、当前 user_id）。
 - **G21 两栏式**：左栏=项目树（点击原地展开会话子级：标题+相对时间；"未关联文件夹"末位；搜索框置顶；底部"选择"按钮）；右栏=对话查看器（顶部会话标题+[消息|接力]tab 默认消息；消息流上下排列，用户右对齐、助手左对齐；默认滚动到底部最新，向上滚动加载更早历史；2000 条截断保留）。用户消息按接力账号着色（色板 A=蓝/B=绿/C=琥珀 循环分配，色块头像+首字母），LLM 回复中性色。会话底部接力徽章收悬浮。
 - **G22 统一选择模式**：左栏底部[选择]按钮进入（项目行/会话行显示勾选框，右栏变只读预览）；底部浮出 Gmail 式操作栏 [已选 N 会话·M 项目]+[归档][合并到…][恢复]（归档视图）/[删除]（会话级、单次确认列明数量与消息量）。合并流：弹层选目标项目→确认页→事务改挂+空源组清理。归档流：直接执行不确认（可逆），toast 反馈；左栏"已归档"入口行（有归档内容才显示，进入归档视图——同一棵树灰显，层级 模式→项目→会话）。浏览态项目行悬浮"归档"快捷图标。
 - **流程**：先用 rapid-prototype-craft 出高保真原型（含账号着色与选择模式两关键交互）→ 用户确认 → 实施。
 - **验收**：原型确认记录；组件测试（树展开、选择模式、操作栏上下文按钮）；SQL 归档/合并既有测试全绿；e2e。
+- **实施记录（2026-09-09）**：`LibrarySessionsPanel` 承载两栏式项目树与会话查看器（消息/接力 tab、接力账号着色、默认滚动到底部、向上分页读取更早消息并保留单页 2000 条上限）；统一选择模式覆盖项目/会话，归档/恢复/删除/分组合并沿用单次破坏性确认与可逆归档语义；ADR-0025 的库引用与 `libraryId` 参数化已接入主库详情页。验收：cargo test workspace 全绿（基础设施 700+55）/ tsc / vitest 210 / e2e 33/33。
 
-**G23 插件表格化 + 实时同步（含后端）**
+**G23 插件表格化 + 实时同步（含后端）（✅ 2026-09-07 实施闭环）**
 - **前置**：补「插件同步策略」ADR——新增全实时零确认（安全操作）；移除保留单次确认（"将同时从 N 个账号移除"，确认后应用到所有已知账号）；切号时差异确认弹层取消改静默应用（差异含移除时才弹一次确认）；对账条（plugin-drift）自然消失。
 - **布局**：已装插件改密集行列表（图标+名称+来源标签+分类+操作按钮，行高约 40px）；顶部分类筛选 chips（复用市场 category_name）；市场段同表格化+搜索框；已装/市场共用组件骨架，segment 切换换数据源。
 - **术语**：按 G4 执行（切号保留/仅此账号；卸载确认"移除后切换账号不再带走该插件"）。
 - **验收**：后端单测（同步策略：新增零确认、移除单确认、切号静默应用）；组件测试（表格渲染、筛选）；e2e 插件 tab 截图。
+- **实施记录（2026-09-07 至 2026-09-09）**：策略按 ADR-0026 落地——`switch_master_account` 删 `apply_plugins` 参数（对账静默执行，`PluginCloudSyncOutcome` 删 declined）；`uninstall_plugin`/`absorb_plugin_manifest` 命令删除，新增 `uninstall_plugin_everywhere`（当前账号卸载 + 清单移除 + 其他账号逐个 fail-soft 传播，`propagate_uninstall_with` 依赖注入可测，builtin 跳过）；`get_plugin_tab_state` 增 `known_account_count`（卸载确认文案 N）；预检抽纯函数 `switch_plugin_preview_from_lists`（remove_names 非空才确认）。前端 `PluginWorkbench` 表格化（共用 `PluginRow` 行骨架 + 分类 chips + 市场搜索，市场目录随 tab 激活拉取供分类关联），`MasterSwitchDialog` 仅含移除时弹单次确认（取消「保留目标账号插件」二选一）。验收：cargo 700+55（策略单测 6 新增）/ vitest 210 / tsc 全绿；e2e 33/33，mock bridge 命令已同步。
 
 ### P8-5 环境+总览批
 

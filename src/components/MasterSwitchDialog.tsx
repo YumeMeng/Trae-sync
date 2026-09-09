@@ -65,11 +65,8 @@ const STAGES: ReadonlyArray<{ stage: MasterSwitchStage; label: string }> = [
   { stage: "restarting", label: "重启 TRAE" },
 ];
 
-/** 插件对账回执 → 回执行文案；无差异时静默（无事发生即最佳）。 */
+/** 插件同步回执 → 回执行文案；无差异时静默（无事发生即最佳）。 */
 function pluginSyncNote(sync: PluginCloudSyncDto): string {
-  if (sync.declined) {
-    return " · 已按目标账号的插件现状切换";
-  }
   if (sync.aborted) {
     return " · 插件未能同步，可在 TRAE 插件市场重新安装";
   }
@@ -115,15 +112,16 @@ type DialogPhase =
 
 /**
  * 主库切号进度弹层（P5-2，消费 P5-1 的 master-switch-progress 事件）：
- * 插件差异预检（+N/-M 确认，ADR-0023）→ 五步进度 → 完成回执；
- * `master_switch_busy` 走「等待完成 / 强制切换」分支（Q1.2）。
+ * 插件差异预检（ADR-0026：仅差异含移除时单次确认，纯新增静默直过）
+ * → 五步进度 → 完成回执；`master_switch_busy` 走「等待完成 / 强制切换」
+ * 分支（Q1.2）。
  */
 export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitchDialogProps) {
   const [phase, setPhase] = useState<DialogPhase>({ kind: "previewing" });
   // P7-3 交接细粒度进度（仅 handing_over 阶段显示；进入其他阶段自动隐藏）。
   const [handoverProgress, setHandoverProgress] = useState<MasterSwitchHandoverProgress | null>(null);
-  // busy 分支记忆目标与插件对账选择（强制切换时无需上层重新传参）。
-  const busyTargetRef = useRef<{ target: MasterSwitchTarget; applyPlugins: boolean } | null>(null);
+  // busy 分支记忆目标（强制切换时无需上层重新传参）。
+  const busyTargetRef = useRef<MasterSwitchTarget | null>(null);
   // 已发起预检的 profile：防止 onFinished 身份变化引起 startSwitch 重建后重复 invoke。
   const startedForRef = useRef<string | null>(null);
   // P7-2 回滚标记：后端在 invoke 拒绝前发 rolled-back 事件（事件先到、
@@ -134,7 +132,7 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
     if (!target) startedForRef.current = null;
   }, [target]);
 
-  const startSwitch = useCallback(async (next: MasterSwitchTarget, force: boolean, applyPlugins: boolean) => {
+  const startSwitch = useCallback(async (next: MasterSwitchTarget, force: boolean) => {
     setPhase({ kind: "running", stage: "closing" });
     rolledBackRef.current = false;
     setHandoverProgress(null);
@@ -142,14 +140,13 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
       const receipt = await invoke<MasterAccountSwitchDto>("switch_master_account", {
         profileId: next.profile_id,
         force,
-        applyPlugins,
       });
       setPhase({ kind: "done", receipt });
       await onFinished();
     } catch (reason: unknown) {
       const code = rawErrorCode(reason);
       if (code === "master_switch_busy") {
-        busyTargetRef.current = { target: next, applyPlugins };
+        busyTargetRef.current = next;
         setPhase({ kind: "busy" });
       } else {
         const base = (code && code in ERROR_COPY ? ERROR_COPY[code as MasterSwitchErrorCode] : null)
@@ -162,22 +159,22 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
     }
   }, [onFinished]);
 
-  // 插件差异预检（fail-soft）：无差异或预检失败 → 静默直过切号（apply=true，
-  // 执行侧对凭据不可用同样会自行中止）；有差异 → +N/-M 确认后再切换。
+  // 插件差异预检（fail-soft）：纯新增或无差异 → 静默直过切号（对账在后端
+  // 静默应用，ADR-0026 决策 3）；仅当差异含移除时弹一次移除确认。
   const runPreview = useCallback(async (next: MasterSwitchTarget) => {
     setPhase({ kind: "previewing" });
     try {
       const preview = await invoke<MasterSwitchPluginPreviewDto>("preview_master_switch_plugins", {
         profileId: next.profile_id,
       });
-      if (!preview.aborted && (preview.install_names.length > 0 || preview.remove_names.length > 0)) {
+      if (!preview.aborted && preview.remove_names.length > 0) {
         setPhase({ kind: "confirm", preview });
         return;
       }
     } catch {
       // 预检失败不阻断切号（与执行侧 fail-soft 语义一致）。
     }
-    void startSwitch(next, false, true);
+    void startSwitch(next, false);
   }, [startSwitch]);
 
   // 目标账号变化即开始一次切换（上层通过传入新 target 触发）。
@@ -238,7 +235,7 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
       ? Math.max(0, STAGES.findIndex((item) => item.stage === phase.stage))
       : 0;
   const progressPercent = allDone ? 100 : Math.round((stageIndex + 1) / STAGES.length * 100);
-  const displayName = (phase.kind === "busy" ? busyTargetRef.current?.target.display_name : null) ?? target.display_name;
+  const displayName = (phase.kind === "busy" ? busyTargetRef.current?.display_name : null) ?? target.display_name;
 
   const handleClose = () => {
     busyTargetRef.current = null;
@@ -277,7 +274,7 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
                 onClick={() => {
                   const next = busyTargetRef.current;
                   busyTargetRef.current = null;
-                  if (next) void startSwitch(next.target, true, next.applyPlugins);
+                  if (next) void startSwitch(next, true);
                 }}
                 data-testid="master-switch-force"
               >
@@ -300,17 +297,15 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
             <div className="switch-dialog__notice">
               <TriangleAlert size={18} aria-hidden="true" />
               <div>
-                <strong>切换前同步插件</strong>
+                <strong>切换将移除部分插件</strong>
                 <p>
-                  当前账号与{displayName}的插件存在差异：安装 {phase.preview.install_names.length} 个、移除 {phase.preview.remove_names.length} 个。
-                  移除的插件将从目标账号卸载。
+                  切换后{displayName}的插件将与当前账号一致
+                  {phase.preview.install_names.length > 0 && `（新装 ${phase.preview.install_names.length} 个）`}
+                  ，以下 {phase.preview.remove_names.length} 个插件将从该账号卸载。
                 </p>
               </div>
             </div>
             <ul className="switch-dialog__diff" data-testid="master-switch-plugin-diff">
-              {phase.preview.install_names.map((name) => (
-                <li key={`install-${name}`} className="switch-dialog__diff-item switch-dialog__diff-item--install">+ {name}</li>
-              ))}
               {phase.preview.remove_names.map((name) => (
                 <li key={`remove-${name}`} className="switch-dialog__diff-item switch-dialog__diff-item--remove">− {name}</li>
               ))}
@@ -319,18 +314,18 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
               <button
                 className="btn"
                 type="button"
-                onClick={() => void startSwitch(target, false, false)}
-                data-testid="master-switch-keep-plugins"
+                onClick={handleClose}
+                data-testid="master-switch-cancel"
               >
-                保留目标账号插件
+                取消切换
               </button>
               <button
                 className="btn btn--primary"
                 type="button"
-                onClick={() => void startSwitch(target, false, true)}
-                data-testid="master-switch-apply-plugins"
+                onClick={() => void startSwitch(target, false)}
+                data-testid="master-switch-confirm-removal"
               >
-                同步插件并切换
+                继续切换
               </button>
             </div>
           </>

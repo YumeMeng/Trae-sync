@@ -250,6 +250,10 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "分组选择已失效（分组可能已被移动或删除），请刷新列表后重试。",
   ],
   [
+    /library_not_found/i,
+    "未找到该对话库。",
+  ],
+  [
     /master_incorporate_busy/i,
     "主库正在生成回复，归入需等它完成；稍后重试即可。",
   ],
