@@ -25,6 +25,8 @@ export type MasterHistoryMode =
 export interface MockScenario {
   // RealReadPreview：生产只读 workspace，使用默认位置与命令。
   production?: boolean;
+  // 真实签到能力 mock：让账号页显示凭据维护入口，但仍只调用合成命令。
+  realHttp?: boolean;
   // P5-3：主库历史读取状态（默认 ready，两栏数据可见）。
   masterHistory?: MasterHistoryMode;
   // 会话消息窗口：bulk = 首页 2000 条，滚到顶部可继续取一页更早消息。
@@ -46,6 +48,8 @@ export async function installMockBridge(
     (window as any).__setScenario = (s: unknown) => {
       (window as any).__activeScenario = s;
     };
+    // 记录命令名，供 E2E 验证刷新凭据没有误触发 OAuth 登录。
+    (window as any).__mockCommandCalls = [];
 
     // 预定义合成数据
     const PRODUCTION_LOCATION = "C:\\TRAE\\ModularData";
@@ -481,6 +485,7 @@ export async function installMockBridge(
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
       const scn = (window as any).__activeScenario || {};
+      (window as any).__mockCommandCalls.push(cmd);
       // ADR-0025 库实例参数化：所有库命令按 libraryId 路由（V1 唯一 master）。
       const assertMasterLibrary = () => {
         if (args?.libraryId !== "master") {
@@ -494,16 +499,32 @@ export async function installMockBridge(
       if (cmd === "get_managed_account_state") return MANAGED_ACCOUNT_STATE;
       if (cmd === "get_key_status") return KEY_STATUS;
       if (cmd === "get_checkin_capability") {
+        const realHttpEnabled = scn.realHttp === true;
         return {
-          enabled: !scn.production,
-          transport: scn.production ? "disabled" : "fixture",
-          real_http_enabled: false,
-          message: scn.production
+          enabled: !scn.production || realHttpEnabled,
+          transport: realHttpEnabled ? "real_http" : scn.production ? "disabled" : "fixture",
+          real_http_enabled: realHttpEnabled,
+          message: realHttpEnabled
+            ? "真实签到能力已启用；凭据刷新使用当前设备换发，不会打开新的 OAuth 登录。"
+            : scn.production
             ? "真实签到未启用；当前版本只开放主库历史与账号切换。"
             : "当前为 fixture transport，仅用于验收签到流程；不会访问远程服务。",
         };
       }
       if (cmd === "get_checkin_overview") return CHECKIN_OVERVIEW;
+      if (cmd === "refresh_checkin_credentials") {
+        if (scn.realHttp !== true) throw new Error("checkin_http_disabled");
+        const ids = Array.isArray(args?.profileIds) ? args.profileIds : [];
+        return ids.map((profileId: string) => {
+          const entry = CHECKIN_OVERVIEW.find((item) => item.profile_id === profileId);
+          return {
+            profile_id: profileId,
+            screen_name: entry?.screen_name ?? "",
+            refreshed: Boolean(entry),
+            error_code: entry ? null : "credential_missing",
+          };
+        });
+      }
       if (cmd === "get_trae_instance_states") {
         return (args?.profileIds ?? []).map((profileId: string) => ({
           profile_id: profileId,

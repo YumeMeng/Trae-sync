@@ -60,11 +60,13 @@ use traesync_infrastructure::{
     reconcile_current_catalog_sidecar, reconcile_plan, resolve_current_catalog_generation_id,
     resolve_current_catalog_path, salted_user_id_fingerprint, storage_space_status,
     sync_account_cloud_plugins, uninstall_cloud_plugin, user_id_binding_fingerprint,
-    user_id_display_fingerprint, AccountEvidenceReader, AccountRegistry, AutoCheckinBatchState,
+    user_id_display_fingerprint, AccountEvidenceReader, AccountRecord, AccountRegistry,
+    AutoCheckinBatchState,
     AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, CatalogPathError,
     CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding, CloudPluginItem,
     CredentialApplyOutcome, CredentialBinding, CredentialState, CredentialStatus, CredentialVault,
-    CredentialVaultError, DeviceRemintService, FilesystemSnapshotStore, FixtureCheckinTransport,
+    CredentialMaintenanceStateStore, CredentialVaultError, DeviceRemintService,
+    FilesystemSnapshotStore, FixtureCheckinTransport,
     FixturePathError, FixturePathGuard, FixtureWorkspaceStateProvider, JsonHandoffIntentStore,
     JsonManagedAccountProfileStore, MarketPluginItem, OperationLease, OperationLockStatus,
     PersistedScanAuthorization, PlatformFileIdentityProvider, PluginCloudSyncOutcome,
@@ -3632,6 +3634,7 @@ fn maintain_all_credentials(material_root: &Path, execution_lock: &Arc<Mutex<()>
         .load()
         .unwrap_or_default();
     let store = CheckinCredentialStore::new(material_root);
+    let maintenance_state = CredentialMaintenanceStateStore::new(material_root);
     let renewal = RealCheckinRenewalService::new(&store);
     let now = Utc::now().timestamp().max(0) as u64;
     let mut renewed = Vec::new();
@@ -3645,13 +3648,51 @@ fn maintain_all_credentials(material_root: &Path, execution_lock: &Arc<Mutex<()>
             record.device_id,
             record.device_public_key,
         );
+        // 退避状态落盘后，App 重启不会把失败账号重新当成可立即尝试，
+        // 从而避免启动/定时器反复消耗服务端请求。
+        let allowed = match maintenance_state.is_attempt_allowed(&profile_id, now) {
+            Ok(allowed) => allowed,
+            Err(_) => {
+                // 状态文件损坏或不可读时按 fail-closed 处理：不发网络请求，
+                // 同时留下可在账号列表中观察到的非敏感原因码。
+                failures.push((
+                    profile_id,
+                    "credential_maintenance_state_unavailable".to_string(),
+                ));
+                continue;
+            }
+        };
+        if !allowed {
+            continue;
+        }
         match renewal.renew_if_needed(&binding, now) {
-            Ok(Some(_)) => renewed.push(profile_id),
+            Ok(Some(_)) => {
+                if maintenance_state
+                    .record_success(&binding.profile_id, now)
+                    .is_ok()
+                {
+                    renewed.push(profile_id);
+                } else {
+                    failures.push((
+                        profile_id,
+                        "credential_maintenance_state_unavailable".to_string(),
+                    ));
+                }
+            }
             Ok(None) => {}
-            Err(error) => failures.push((
-                profile_id,
-                credential_maintenance_error_code(&error).to_string(),
-            )),
+            Err(error) => {
+                let error_code = credential_maintenance_error_code(&error).to_string();
+                failures.push((profile_id.clone(), error_code.clone()));
+                if maintenance_state
+                    .record_failure(&profile_id, now, &error_code)
+                    .is_err()
+                {
+                    failures.push((
+                        profile_id,
+                        "credential_maintenance_state_unavailable".to_string(),
+                    ));
+                }
+            }
         }
     }
     // 后台维护失败立即留下账号级展示标记；成功只清除维护失败标记，
@@ -4853,10 +4894,6 @@ fn refresh_checkin_credentials_inner(
     material_root: &std::path::Path,
     selected: &[String],
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
-    let registry = AccountRegistry::new(material_root);
-    let records = registry
-        .load()
-        .map_err(|_| "checkin_registry_invalid".to_string())?;
     let store = CheckinCredentialStore::new(material_root);
     // 有未收口写回时整批停止，避免把现场继续推进到更难恢复的状态。
     if store
@@ -4866,17 +4903,40 @@ fn refresh_checkin_credentials_inner(
         return Err("manual_recovery_required".to_string());
     }
 
-    let renewal = RealCheckinRenewalService::new(&store);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    let renewal = RealCheckinRenewalService::new(&store);
+    refresh_checkin_credentials_inner_with(material_root, selected, now, &|binding, timestamp| {
+        renewal.renew_now(binding, timestamp).map(|_| ())
+    })
+}
+
+/// 手动刷新命令的结果收集边界。
+///
+/// 生产路径传入真实续期服务；测试可以注入确定性闭包，验证选中账号去重、
+/// 单账号失败后继续处理、逐账号回执和失败证据写回，而无需触碰 OAuth 网络。
+fn refresh_checkin_credentials_inner_with(
+    material_root: &std::path::Path,
+    selected: &[String],
+    now: u64,
+    renew: &dyn Fn(&CheckinProfileBinding, u64) -> Result<(), CheckinCredentialError>,
+) -> Result<Vec<CredentialRefreshEntryDto>, String> {
+    let registry = AccountRegistry::new(material_root);
+    let records = registry
+        .load()
+        .map_err(|_| "checkin_registry_invalid".to_string())?;
     let mut refreshed = Vec::new();
     let mut failures = Vec::new();
     let mut entries = Vec::with_capacity(selected.len());
+    let maintenance_state = CredentialMaintenanceStateStore::new(material_root);
 
     for profile_id in selected {
-        let Some(record) = records.iter().find(|record| &record.profile_id == profile_id) else {
+        let Some(record) = records
+            .iter()
+            .find(|record| &record.profile_id == profile_id)
+        else {
             failures.push((profile_id.clone(), "credential_missing".to_string()));
             entries.push(CredentialRefreshEntryDto {
                 profile_id: profile_id.clone(),
@@ -4892,9 +4952,12 @@ fn refresh_checkin_credentials_inner(
             record.device_id.clone(),
             record.device_public_key.clone(),
         );
-        match renewal.renew_now(&binding, now) {
+        match renew(&binding, now) {
             Ok(_) => {
                 refreshed.push(profile_id.clone());
+                // 手动成功也清除自动维护的旧退避；手动入口不读取/拦截退避，
+                // 只把确认成功的结果反馈给下一次自动维护。
+                let _ = maintenance_state.record_success(profile_id, now);
                 entries.push(CredentialRefreshEntryDto {
                     profile_id: profile_id.clone(),
                     screen_name: record.screen_name.clone(),
@@ -4919,6 +4982,104 @@ fn refresh_checkin_credentials_inner(
     checkin_overview::update_refresh_failures(material_root, &failures);
     checkin_overview::clear_refresh_failures(material_root, &refreshed);
     Ok(entries)
+}
+
+#[cfg(test)]
+mod credential_refresh_contract_tests {
+    use super::*;
+
+    fn record(profile_id: &str, account_id: &str, screen_name: &str) -> AccountRecord {
+        AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: account_id.to_string(),
+            screen_name: screen_name.to_string(),
+            avatar_url: String::new(),
+            device_id: "1234567890123456".to_string(),
+            device_public_key: "public-key".to_string(),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 0,
+            last_verified_at_unix_seconds: 0,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: true,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn manual_refresh_returns_per_account_results_and_continues_after_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = AccountRegistry::new(root.path());
+        registry
+            .upsert(&record("profile-fail", "account-fail", "失败账号"))
+            .unwrap();
+        registry
+            .upsert(&record("profile-ok", "account-ok", "成功账号"))
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let selected = vec![
+            "profile-fail".to_string(),
+            "profile-ok".to_string(),
+            "profile-missing".to_string(),
+        ];
+
+        let results = refresh_checkin_credentials_inner_with(
+            root.path(),
+            &selected,
+            1_800_000_000,
+            &|binding, _| {
+                calls.lock().unwrap().push(binding.profile_id.clone());
+                if binding.profile_id == "profile-fail" {
+                    Err(CheckinCredentialError::CredentialRefreshFailed)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+
+        // 一个账号失败不能中断后续账号；缺失账号也必须有明确回执。
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["profile-fail".to_string(), "profile-ok".to_string()]
+        );
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].refreshed);
+        assert_eq!(
+            results[0].error_code.as_deref(),
+            Some("credential_refresh_failed")
+        );
+        assert!(results[1].refreshed);
+        assert_eq!(results[1].screen_name, "成功账号");
+        assert!(!results[2].refreshed);
+        assert_eq!(results[2].error_code.as_deref(), Some("credential_missing"));
+    }
+
+    #[test]
+    fn automatic_maintenance_persists_failure_backoff_before_next_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        AccountRegistry::new(root.path())
+            .upsert(&record(
+                "profile-missing",
+                "account-missing",
+                "缺少凭据账号",
+            ))
+            .unwrap();
+        let execution_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+
+        // 缺失凭据不会触碰网络，但必须形成可跨重启读取的退避记录。
+        assert!(maintain_all_credentials(root.path(), &execution_lock));
+        let state_path = root.path().join("credential-maintenance.json");
+        let first: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(first["accounts"]["profile-missing"]["attempts_today"], 1);
+
+        // 同一退避窗口内第二次维护不应重新尝试该账号，计数保持不变。
+        assert!(maintain_all_credentials(root.path(), &execution_lock));
+        let second: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(second["accounts"]["profile-missing"]["attempts_today"], 1);
+    }
 }
 
 /// 删除账号：注册表档案 + DPAPI 凭据包 + 积分缓存条目三件套清理。

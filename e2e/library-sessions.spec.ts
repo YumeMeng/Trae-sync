@@ -465,4 +465,38 @@ test.describe("账号档案", () => {
     await expect(accountCenter.getByRole("button", { name: "保存当前登录" })).toHaveCount(0);
     await expect(accountCenter.getByRole("button", { name: "切换账号" })).toHaveCount(0);
   });
+
+  test("真实能力模式下批量刷新凭据不重新打开 OAuth", async ({ page }) => {
+    await installMockBridge(page, { realHttp: true });
+    await page.goto("/");
+    await page.getByTestId("navigation-accounts").click();
+
+    const accountCenter = page.getByRole("region", { name: "账号", exact: true });
+    await accountCenter.getByTestId("account-refresh-credentials").click();
+    await expect(accountCenter.getByTestId("operation-result-card")).toContainText(
+      "凭据刷新完成：2 个账号正常。",
+    );
+
+    const calls = await page.evaluate(() => (window as any).__mockCommandCalls as string[]);
+    expect(calls).toContain("refresh_checkin_credentials");
+    expect(calls).not.toContain("begin_checkin_login");
+    expect(calls).not.toContain("complete_checkin_login");
+  });
+
+  test("账号详情的单账号刷新凭据沿用同一命令契约", async ({ page }) => {
+    await installMockBridge(page, { realHttp: true });
+    await page.goto("/");
+    await page.getByTestId("navigation-accounts").click();
+
+    const accountCenter = page.getByRole("region", { name: "账号", exact: true });
+    await accountCenter.getByTestId("account-card-profile-current").click();
+    const detailPage = page.getByRole("region", { name: "账号详情", exact: true });
+    await detailPage.getByTestId("account-detail-refresh-credentials").click();
+    await expect(detailPage.getByRole("status")).toContainText("登录凭据已更新，无需重新登录。");
+
+    const calls = await page.evaluate(() => (window as any).__mockCommandCalls as string[]);
+    expect(calls.filter((call) => call === "refresh_checkin_credentials")).toHaveLength(1);
+    expect(calls).not.toContain("begin_checkin_login");
+    expect(calls).not.toContain("complete_checkin_login");
+  });
 });

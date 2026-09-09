@@ -815,6 +815,103 @@ pub fn exchange_token_by_refresh(
     parse_exchange_envelope(response)
 }
 
+/// 凭据换发所需的最小 HTTP 边界。
+///
+/// 生产实现仍然使用下方的 reqwest 适配器；边界允许测试在不触碰真实 OAuth
+/// 服务的情况下验证“同设备取码 -> 换发 -> 身份校验 -> 安全写回”的完整闭环。
+pub trait CredentialRenewalHttpAdapter: Send + Sync {
+    /// 使用当前 access token 为同一设备申请一次性 AuthCode。
+    fn get_pc_auth_code(
+        &self,
+        access_token: &str,
+        code_challenge: &str,
+        device_id: &str,
+        oauth_client: OAuthClient,
+    ) -> Result<String, CheckinHttpError>;
+
+    /// 使用 AuthCode 和 PKCE 换发新凭据。
+    fn exchange_token_by_auth_code(
+        &self,
+        auth_code: &str,
+        code_verifier: &str,
+        device_info: &DeviceInfoBlock,
+        oauth_client: OAuthClient,
+    ) -> Result<TokenGrant, CheckinHttpError>;
+
+    /// 使用旧 refresh token 进行一次设备证明换发。
+    fn exchange_token_by_refresh(
+        &self,
+        current_token: &str,
+        refresh_token: &str,
+        device_private_key_pem: &str,
+        device_info: &DeviceInfoBlock,
+        oauth_client: OAuthClient,
+        timestamp_unix_seconds: u64,
+        nonce: &str,
+    ) -> Result<TokenGrant, CheckinHttpError>;
+}
+
+/// 生产 HTTP 适配器；只在真正执行续期时创建，不在普通账号列表刷新时发起网络请求。
+struct ReqwestCredentialRenewalHttpAdapter {
+    client: reqwest::blocking::Client,
+}
+
+impl CredentialRenewalHttpAdapter for ReqwestCredentialRenewalHttpAdapter {
+    fn get_pc_auth_code(
+        &self,
+        access_token: &str,
+        code_challenge: &str,
+        device_id: &str,
+        oauth_client: OAuthClient,
+    ) -> Result<String, CheckinHttpError> {
+        get_pc_auth_code(
+            &self.client,
+            access_token,
+            code_challenge,
+            device_id,
+            oauth_client,
+        )
+    }
+
+    fn exchange_token_by_auth_code(
+        &self,
+        auth_code: &str,
+        code_verifier: &str,
+        device_info: &DeviceInfoBlock,
+        oauth_client: OAuthClient,
+    ) -> Result<TokenGrant, CheckinHttpError> {
+        exchange_token_by_auth_code(
+            &self.client,
+            auth_code,
+            code_verifier,
+            device_info,
+            oauth_client,
+        )
+    }
+
+    fn exchange_token_by_refresh(
+        &self,
+        current_token: &str,
+        refresh_token: &str,
+        device_private_key_pem: &str,
+        device_info: &DeviceInfoBlock,
+        oauth_client: OAuthClient,
+        timestamp_unix_seconds: u64,
+        nonce: &str,
+    ) -> Result<TokenGrant, CheckinHttpError> {
+        exchange_token_by_refresh(
+            &self.client,
+            current_token,
+            refresh_token,
+            device_private_key_pem,
+            device_info,
+            oauth_client,
+            timestamp_unix_seconds,
+            nonce,
+        )
+    }
+}
+
 /// `GetUserInfo` 返回的脱敏账号资料；不含原始手机号或认证材料。
 #[derive(Debug, Clone, Default)]
 pub struct UserInfoSummary {
@@ -924,15 +1021,26 @@ pub fn get_user_info_full(
 /// 原子替换/重新验证固定顺序。
 pub struct RealCheckinRenewalService<'a> {
     store: &'a CheckinCredentialStore,
-    client: reqwest::blocking::Client,
+    http: Box<dyn CredentialRenewalHttpAdapter>,
 }
 
 impl<'a> RealCheckinRenewalService<'a> {
     pub fn new(store: &'a CheckinCredentialStore) -> Self {
         Self {
             store,
-            client: http_client(),
+            http: Box::new(ReqwestCredentialRenewalHttpAdapter {
+                client: http_client(),
+            }),
         }
+    }
+
+    /// 使用指定的 HTTP 适配器创建续期服务；生产代码使用 [`Self::new`]，
+    /// 测试可注入确定性适配器而不触碰真实 OAuth 服务。
+    pub fn with_http_adapter(
+        store: &'a CheckinCredentialStore,
+        http: Box<dyn CredentialRenewalHttpAdapter>,
+    ) -> Self {
+        Self { store, http }
     }
 
     /// 剩余寿命高于阈值时跳过（`Ok(None)`）；需要时执行一次真实续期。
@@ -1015,8 +1123,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         let oauth_client = OAuthClient::Solo;
         let pkce = generate_pkce_pair()
             .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
-        let auth_code = get_pc_auth_code(
-            &self.client,
+        let auth_code = self.http.get_pc_auth_code(
             &bundle.access_token,
             &pkce.code_challenge,
             &bundle.device_id,
@@ -1028,8 +1135,7 @@ impl<'a> RealCheckinRenewalService<'a> {
             &bundle.machine_id,
             &bundle.device_public_key,
         );
-        let grant = exchange_token_by_auth_code(
-            &self.client,
+        let grant = self.http.exchange_token_by_auth_code(
             &auth_code,
             &pkce.code_verifier,
             &device_info,
@@ -1082,8 +1188,7 @@ impl<'a> RealCheckinRenewalService<'a> {
             &bundle.device_public_key,
         );
         let nonce = random_nonce()?;
-        let grant = exchange_token_by_refresh(
-            &self.client,
+        let grant = self.http.exchange_token_by_refresh(
             &bundle.access_token,
             &bundle.refresh_token,
             &bundle.device_private_key,
@@ -1388,14 +1493,7 @@ mod tests {
             "1234567890123456",
             &public_pem,
         );
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(1))
-            .build()
-            .unwrap();
-        let service = RealCheckinRenewalService {
-            store: &store,
-            client,
-        };
+        let service = RealCheckinRenewalService::new(&store);
 
         assert_eq!(
             service.renew_now(&binding, now).unwrap_err(),
@@ -1433,5 +1531,217 @@ mod tests {
             service.renew_if_needed(&binding, 0).err(),
             Some(CheckinCredentialError::RecoveryRequired)
         );
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone)]
+    struct TestRenewalHttpAdapter {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        expected_device_id: String,
+        expected_machine_id: String,
+        expected_public_key: String,
+        auth_code_result: Result<String, CheckinHttpError>,
+        auth_grant_result: Result<TokenGrant, CheckinHttpError>,
+        refresh_grant_result: Result<TokenGrant, CheckinHttpError>,
+    }
+
+    #[cfg(windows)]
+    impl TestRenewalHttpAdapter {
+        fn assert_device_info(&self, device_info: &DeviceInfoBlock) {
+            // 测试夹具必须确认生产路径复用当前设备四件套，而不是只确认调用次数。
+            assert_eq!(device_info.device_id, self.expected_device_id);
+            assert_eq!(device_info.machine_id, self.expected_machine_id);
+            assert_eq!(device_info.device_public_key, self.expected_public_key);
+            assert_eq!(device_info.platform_code, "SOLO_PC");
+            assert_eq!(device_info.client_version, TRAE_SOLO_IDE_VERSION);
+        }
+    }
+
+    #[cfg(windows)]
+    impl CredentialRenewalHttpAdapter for TestRenewalHttpAdapter {
+        fn get_pc_auth_code(
+            &self,
+            _access_token: &str,
+            _code_challenge: &str,
+            device_id: &str,
+            oauth_client: OAuthClient,
+        ) -> Result<String, CheckinHttpError> {
+            assert_eq!(device_id, self.expected_device_id);
+            assert_eq!(oauth_client, OAuthClient::Solo);
+            self.calls.lock().unwrap().push("auth_code");
+            self.auth_code_result.clone()
+        }
+
+        fn exchange_token_by_auth_code(
+            &self,
+            _auth_code: &str,
+            _code_verifier: &str,
+            device_info: &DeviceInfoBlock,
+            oauth_client: OAuthClient,
+        ) -> Result<TokenGrant, CheckinHttpError> {
+            self.assert_device_info(device_info);
+            assert_eq!(oauth_client, OAuthClient::Solo);
+            self.calls.lock().unwrap().push("auth_exchange");
+            self.auth_grant_result.clone()
+        }
+
+        fn exchange_token_by_refresh(
+            &self,
+            _current_token: &str,
+            _refresh_token: &str,
+            _device_private_key_pem: &str,
+            device_info: &DeviceInfoBlock,
+            oauth_client: OAuthClient,
+            _timestamp_unix_seconds: u64,
+            _nonce: &str,
+        ) -> Result<TokenGrant, CheckinHttpError> {
+            self.assert_device_info(device_info);
+            assert_eq!(oauth_client, OAuthClient::Solo);
+            self.calls.lock().unwrap().push("refresh");
+            self.refresh_grant_result.clone()
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_jwt(account_id: &str, expires_at: u64) -> String {
+        let payload = serde_json::json!({
+            "data": {"id": account_id},
+            "exp": expires_at,
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        format!("header.{encoded}.signature")
+    }
+
+    #[cfg(windows)]
+    fn test_bundle(
+        store: &CheckinCredentialStore,
+        now: u64,
+        access_expires_at: u64,
+    ) -> CheckinProfileBinding {
+        let (private_key, public_key) = crate::checkin_credential::generate_device_keypair().unwrap();
+        let bundle = CheckinCredentialBundle {
+            profile_id: "profile-test".to_string(),
+            account_id: "account-test".to_string(),
+            device_id: "1234567890123456".to_string(),
+            machine_id: "machine-test".to_string(),
+            device_public_key: public_key.clone(),
+            device_private_key: private_key,
+            access_token: test_jwt("account-test", now + 14 * 24 * 60 * 60),
+            refresh_token: "refresh-old".to_string(),
+            client_id: TRAE_SOLO_CLIENT_ID.to_string(),
+            access_token_expires_at_unix_seconds: access_expires_at,
+            refresh_token_expires_at_unix_seconds: now + 180 * 24 * 60 * 60,
+            mobile_full: None,
+        };
+        store.save(&bundle).unwrap();
+        CheckinProfileBinding::new(
+            "profile-test",
+            "account-test",
+            "1234567890123456",
+            public_key,
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_renewal_uses_injected_same_device_adapter_and_writes_new_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let now = 1_800_000_000u64;
+        let binding = test_bundle(&store, now, now + 10 * 24 * 60 * 60);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = TestRenewalHttpAdapter {
+            calls: std::sync::Arc::clone(&calls),
+            expected_device_id: binding.device_id.clone(),
+            expected_machine_id: "machine-test".to_string(),
+            expected_public_key: binding.device_public_key.clone(),
+            auth_code_result: Ok("auth-code-test".to_string()),
+            auth_grant_result: Ok(TokenGrant {
+                access_token: test_jwt("account-test", now + 14 * 24 * 60 * 60),
+                refresh_token: "refresh-new".to_string(),
+                access_token_expires_at_unix_seconds: now + 14 * 24 * 60 * 60,
+                refresh_token_expires_at_unix_seconds: now + 180 * 24 * 60 * 60,
+            }),
+            refresh_grant_result: Err(CheckinHttpError::Business(20324)),
+        };
+        let service = RealCheckinRenewalService::with_http_adapter(&store, Box::new(adapter));
+
+        let receipt = service.renew_now(&binding, now).unwrap();
+        assert_eq!(receipt.profile_id, "profile-test");
+        assert_eq!(*calls.lock().unwrap(), vec!["auth_code", "auth_exchange"]);
+
+        let updated = store.load(&binding).unwrap();
+        // 同设备续期只替换令牌和有效期，设备四件套保持不变。
+        assert!(updated.access_token.starts_with("header."));
+        assert!(updated.refresh_token == "refresh-new");
+        assert_eq!(updated.device_id, binding.device_id);
+        assert_eq!(updated.device_public_key, binding.device_public_key);
+        assert_eq!(updated.client_id, TRAE_SOLO_CLIENT_ID);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_renewal_rejects_injected_identity_mismatch_without_writeback() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let now = 1_800_000_000u64;
+        let binding = test_bundle(&store, now, now + 10 * 24 * 60 * 60);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = TestRenewalHttpAdapter {
+            calls: std::sync::Arc::clone(&calls),
+            expected_device_id: binding.device_id.clone(),
+            expected_machine_id: "machine-test".to_string(),
+            expected_public_key: binding.device_public_key.clone(),
+            auth_code_result: Ok("auth-code-test".to_string()),
+            auth_grant_result: Ok(TokenGrant {
+                access_token: test_jwt("different-account", now + 14 * 24 * 60 * 60),
+                refresh_token: "refresh-should-not-write".to_string(),
+                access_token_expires_at_unix_seconds: now + 14 * 24 * 60 * 60,
+                refresh_token_expires_at_unix_seconds: now + 180 * 24 * 60 * 60,
+            }),
+            refresh_grant_result: Err(CheckinHttpError::Business(20324)),
+        };
+        let service = RealCheckinRenewalService::with_http_adapter(&store, Box::new(adapter));
+
+        assert_eq!(
+            service.renew_now(&binding, now).unwrap_err(),
+            CheckinCredentialError::AuthMismatch
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["auth_code", "auth_exchange"]);
+        let unchanged = store.load(&binding).unwrap();
+        // 身份不一致必须零回写，避免错误账号令牌污染当前 Profile。
+        assert!(unchanged.access_token.starts_with("header."));
+        assert!(unchanged.refresh_token == "refresh-old");
+        assert!(!root.path().join("renewals").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_renewal_uses_injected_refresh_adapter_only_after_access_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let now = 1_800_000_000u64;
+        let binding = test_bundle(&store, now, now - 1);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = TestRenewalHttpAdapter {
+            calls: std::sync::Arc::clone(&calls),
+            expected_device_id: binding.device_id.clone(),
+            expected_machine_id: "machine-test".to_string(),
+            expected_public_key: binding.device_public_key.clone(),
+            auth_code_result: Err(CheckinHttpError::Business(20101)),
+            auth_grant_result: Err(CheckinHttpError::Protocol),
+            refresh_grant_result: Ok(TokenGrant {
+                access_token: test_jwt("account-test", now + 14 * 24 * 60 * 60),
+                refresh_token: "refresh-new".to_string(),
+                access_token_expires_at_unix_seconds: now + 14 * 24 * 60 * 60,
+                refresh_token_expires_at_unix_seconds: now + 180 * 24 * 60 * 60,
+            }),
+        };
+        let service = RealCheckinRenewalService::with_http_adapter(&store, Box::new(adapter));
+
+        service.renew_now(&binding, now).unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["refresh"]);
+        assert!(store.load(&binding).unwrap().refresh_token == "refresh-new");
     }
 }

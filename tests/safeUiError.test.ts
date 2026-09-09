@@ -76,6 +76,12 @@ describe("读取授权失效错误映射", () => {
     );
   });
 
+  it("凭据维护状态不可用时显示可执行提示而不暴露错误码", () => {
+    expect(safeUiErrorMessage("credential_maintenance_state_unavailable", "fallback")).toBe(
+      "凭据维护状态暂时不可读取，本次未发起自动刷新；请检查本地存储后重试。",
+    );
+  });
+
   it.each([
     ["login_real_mode_required", "当前运行模式不支持账号登录。"],
     ["login_begin_failed", "登录会话创建失败，请重新发起登录。"],

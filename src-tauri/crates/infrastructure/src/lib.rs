@@ -30,6 +30,7 @@ pub mod checkin_credential;
 pub mod checkin_http;
 pub mod checkin_login;
 pub mod content_graph;
+pub mod credential_maintenance;
 pub mod credential_vault;
 pub mod data_location;
 pub mod environment_registry;
@@ -115,9 +116,9 @@ pub use checkin_credential::{
 pub use checkin_http::{
     checkin_claim_request, checkin_status_request, exchange_token_by_auth_code,
     exchange_token_by_refresh, get_pc_auth_code, get_user_info, get_user_info_full,
-    trae_http_client, CheckinHttpError, DeviceInfoBlock, OAuthClient, RealCheckinRenewalService,
-    RealCheckinTransport, TokenGrant, UserInfoFull, UserInfoSummary, TRAE_IDE_VERSION,
-    TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
+    trae_http_client, CheckinHttpError, CredentialRenewalHttpAdapter, DeviceInfoBlock,
+    OAuthClient, RealCheckinRenewalService, RealCheckinTransport, TokenGrant, UserInfoFull,
+    UserInfoSummary, TRAE_IDE_VERSION, TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
 };
 pub use checkin_login::{
     begin_login, complete_login, LoginCallbackServer, LoginError, LoginHandoff, LoginReceipt,
@@ -130,6 +131,10 @@ pub use plugin_cloud_sync::{
 };
 pub use plugin_manifest::{PluginManifest, PluginManifestEntry, PluginManifestError};
 pub use content_graph::DeterministicContentGraphHasher;
+pub use credential_maintenance::{
+    CredentialMaintenanceStateStore, CredentialMaintenanceStoreError,
+    CREDENTIAL_BACKOFF_STEPS_SECONDS, MAX_DAILY_MAINTENANCE_ATTEMPTS,
+};
 pub use credential_vault::{
     CredentialApplyOutcome, CredentialBinding, CredentialRecoveryRecord, CredentialState,
     CredentialStatus, CredentialVault, CredentialVaultError,

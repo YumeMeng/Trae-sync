@@ -62,6 +62,10 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "当前已有签到或凭据维护在进行，请稍后重试。",
   ],
   [
+    /credential_maintenance_state_unavailable/i,
+    "凭据维护状态暂时不可读取，本次未发起自动刷新；请检查本地存储后重试。",
+  ],
+  [
     /binding_mismatch|auth_mismatch/i,
     "账号绑定信息与本机登录凭据不一致，请重新登录该账号。",
   ],
