@@ -89,8 +89,9 @@ pub fn read_master_session_messages(
     master_data_dir: &Path,
     session_id: &str,
     raw_key: &str,
+    current_user_id: &str,
 ) -> SessionMessagesStatus {
-    read_master_session_messages_page(master_data_dir, session_id, raw_key, 0)
+    read_master_session_messages_page(master_data_dir, session_id, raw_key, 0, current_user_id)
 }
 
 /// 读取主库单个会话的一页消息；`offset` 用于向上滚动时继续加载更早消息。
@@ -99,6 +100,7 @@ pub fn read_master_session_messages_page(
     session_id: &str,
     raw_key: &str,
     offset: usize,
+    current_user_id: &str,
 ) -> SessionMessagesStatus {
     let db_path = crate::master_handover::master_database_path(master_data_dir);
     if !db_path.exists() {
@@ -108,7 +110,7 @@ pub fn read_master_session_messages_page(
         Ok(conn) => conn,
         Err(_) => return SessionMessagesStatus::ReadFailed,
     };
-    match read_session_messages_page(&conn, session_id, offset) {
+    match read_session_messages_page(&conn, session_id, offset, Some(current_user_id)) {
         Ok(messages) => SessionMessagesStatus::Ready(messages),
         Err(_) => SessionMessagesStatus::ReadFailed,
     }
@@ -119,7 +121,7 @@ fn read_session_messages(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<SessionMessageEntry>, ()> {
-    read_session_messages_page(conn, session_id, 0)
+    read_session_messages_page(conn, session_id, 0, None)
 }
 
 /// 按最新消息倒序分页查询，再反转为时间正序供前端拼接。
@@ -127,6 +129,7 @@ fn read_session_messages_page(
     conn: &Connection,
     session_id: &str,
     offset: usize,
+    current_user_id: Option<&str>,
 ) -> Result<Vec<SessionMessageEntry>, ()> {
     // 内容表存在性防御：TRAE schema 演进时缺表降级为空内容而非整体失败。
     // 缺表时 JOIN 与列都要以 NULL 占位：SELECT 列数必须恒定，否则行映射
@@ -136,7 +139,9 @@ fn read_session_messages_page(
     let has_chat = table_exists(conn, "chat_message_chat")?;
     let (general_join, general_col) = if has_general {
         (
-            "LEFT JOIN chat_message_general g ON g.message_id = m.message_id",
+            "LEFT JOIN (SELECT message_id, MAX(content) AS content \
+             FROM chat_message_general GROUP BY message_id) g \
+             ON g.message_id = page.message_id",
             "g.content",
         )
     } else {
@@ -144,7 +149,9 @@ fn read_session_messages_page(
     };
     let (task_join, task_col) = if has_task {
         (
-            "LEFT JOIN chat_message_task t ON t.message_id = m.message_id",
+            "LEFT JOIN (SELECT message_id, MAX(content) AS content \
+             FROM chat_message_task GROUP BY message_id) t \
+             ON t.message_id = page.message_id",
             "t.content",
         )
     } else {
@@ -152,25 +159,48 @@ fn read_session_messages_page(
     };
     let (chat_join, chat_col) = if has_chat {
         (
-            "LEFT JOIN chat_message_chat ch ON ch.message_id = m.message_id",
+            "LEFT JOIN (SELECT message_id, MAX(content) AS content \
+             FROM chat_message_chat GROUP BY message_id) ch \
+             ON ch.message_id = page.message_id",
             "ch.content",
         )
     } else {
         ("", "NULL")
     };
-    // DESC + LIMIT/OFFSET 取一页最新窗口，收集后反转为升序；offset 由后端
-    // 内部生成，不来自 SQL 字符串外部输入，避免为分页引入参数类型变化。
+    // 先对消息元数据分页，再连接内容表：内容表 message_id 非唯一时，不能
+    // 让 JOIN 放大行数并改变 LIMIT/OFFSET 的消息边界。offset 由后端内部生成，
+    // 不来自 SQL 字符串外部输入，避免为分页引入参数类型变化。
+    let (owner_join, owner_filter) = if current_user_id.is_some() {
+        (
+            "JOIN chat_session s ON s.session_id = m.session_id \
+             JOIN project p ON p.project_id = s.project_id",
+            " AND p.user_id = ?2",
+        )
+    } else {
+        ("", "")
+    };
     let sql = format!(
-        "SELECT m.message_id, m.message_role, m.message_type, m.created_at, \
-         {general_col}, {task_col}, {chat_col} \
-         FROM chat_message m {general_join} {task_join} {chat_join} \
-         WHERE m.session_id = ?1 AND (m.deleted_at IS NULL OR m.deleted_at = 0) \
-         ORDER BY m.created_at DESC, m.rowid DESC \
-         LIMIT {MAX_MESSAGES_PER_SESSION} OFFSET {offset}"
+        "WITH message_page AS ( \
+           SELECT m.rowid AS message_rowid, m.message_id, m.message_role, \
+                  m.message_type, m.created_at \
+           FROM chat_message m {owner_join} \
+           WHERE m.session_id = ?1 AND (m.deleted_at IS NULL OR m.deleted_at = 0) \
+                 {owner_filter} \
+           ORDER BY m.created_at DESC, m.rowid DESC \
+           LIMIT {MAX_MESSAGES_PER_SESSION} OFFSET {offset} \
+         ) \
+         SELECT page.message_id, page.message_role, page.message_type, page.created_at, \
+                {general_col}, {task_col}, {chat_col} \
+         FROM message_page page {general_join} {task_join} {chat_join} \
+         ORDER BY page.created_at DESC, page.message_rowid DESC"
     );
     let mut statement = conn.prepare(&sql).map_err(|_| ())?;
+    let mut params = vec![session_id];
+    if let Some(current_user_id) = current_user_id {
+        params.push(current_user_id);
+    }
     let rows = statement
-        .query_map([session_id], |row| {
+        .query_map(rusqlite::params_from_iter(params), |row| {
             let message_id: String = row.get(0)?;
             let role: String = row.get(1)?;
             let message_type: String = row.get(2)?;
@@ -197,8 +227,8 @@ fn read_session_messages_page(
         rows.collect::<Result<Vec<_>, _>>().map_err(|_| ())?;
     // 反转为时间升序（对话时间线阅览方向）。
     messages.reverse();
-    // 内容表 message_id 无唯一约束（实测 schema 如此）：同一 ID 在单表多行会经
-    // JOIN 放大行数，按 message_id 去重保留首见（时间序最早）行。
+    // 内容表与历史数据可能出现重复 message_id，保留这一层防御以兼容旧库；
+    // 正常情况下 SQL 聚合已经保证重复内容不会影响分页边界。
     let mut seen = std::collections::HashSet::new();
     messages.retain(|entry| seen.insert(entry.message_id.clone()));
     Ok(messages)
@@ -348,6 +378,53 @@ mod tests {
     }
 
     #[test]
+    fn master_messages_are_filtered_by_project_owner() {
+        let temp = std::env::temp_dir().join(format!(
+            "trae-sync-p53-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db_path = crate::master_handover::master_database_path(&temp);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let raw_key = "ad".repeat(32);
+        create_encrypted_db_with_messages(&db_path, &raw_key, "s1");
+        {
+            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
+            let conn = Connection::open_with_flags(&db_path, flags).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT);
+                 INSERT INTO project VALUES ('p1', '111');
+                 INSERT INTO project VALUES ('p2', '222');
+                 INSERT INTO chat_session VALUES ('s2', 'p2', '他人会话', 1770000000000, NULL);
+                 INSERT INTO chat_message (session_id, message_id, message_type, message_role, created_at, deleted_at)
+                    VALUES ('s2', 'm4', 'general', 'user', 1770000300, NULL);
+                 INSERT INTO chat_message_general (message_id, content, deleted_at)
+                    VALUES ('m4', '[{\"type\":\"text\",\"text_content\":\"他人内容\"}]', NULL);",
+            )
+            .unwrap();
+        }
+
+        match read_master_session_messages_page(&temp, "s1", &raw_key, 0, "111") {
+            SessionMessagesStatus::Ready(messages) => assert_eq!(messages.len(), 2),
+            other => panic!("当前账号应能读取自己的会话，实际 {:?}", other),
+        }
+        match read_master_session_messages_page(&temp, "s1", &raw_key, 0, "222") {
+            SessionMessagesStatus::Ready(messages) => assert!(messages.is_empty()),
+            other => panic!("跨账号读取应返回空页，实际 {:?}", other),
+        }
+        match read_master_session_messages_page(&temp, "s2", &raw_key, 0, "111") {
+            SessionMessagesStatus::Ready(messages) => assert!(messages.is_empty()),
+            other => panic!("跨账号会话不应泄露消息，实际 {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn oversized_session_keeps_latest_window_and_dedupes_joined_rows() {
         let temp = std::env::temp_dir().join(format!(
             "trae-sync-p32-latest-{}-{}",
@@ -393,6 +470,12 @@ mod tests {
                 [],
             )
             .unwrap();
+            // m7 的重复内容用于验证内容表 JOIN 不会挤占元数据分页窗口。
+            conn.execute(
+                "INSERT INTO chat_message_general (message_id, content, deleted_at) VALUES ('m7', '[{\"type\":\"text\",\"text_content\":\"重复内容\"}]', NULL), ('m7', '[{\"type\":\"text\",\"text_content\":\"重复内容-2\"}]', NULL)",
+                [],
+            )
+            .unwrap();
         }
 
         // s1：上限 2000，保留最新窗口 m6..=m2005（最早 5 条被截断），升序返回。
@@ -406,7 +489,7 @@ mod tests {
         }
         // 第二页继续取更早消息，供主库查看器向上滚动时拼接。
         let conn = open_with_key_readonly(&dir.join("database.db"), &raw_key).unwrap();
-        match read_session_messages_page(&conn, "s1", MAX_MESSAGES_PER_SESSION) {
+        match read_session_messages_page(&conn, "s1", MAX_MESSAGES_PER_SESSION, None) {
             Ok(messages) => {
                 assert_eq!(messages.len(), 5);
                 assert_eq!(messages.first().unwrap().message_id, "m1");

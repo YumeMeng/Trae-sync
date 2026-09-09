@@ -235,6 +235,7 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("get_master_history", {
         previous: null,
+        previousCurrentUserId: null,
         libraryId: "master",
       });
     });
@@ -429,6 +430,7 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
       expect(screen.getByTestId("library-project-p1")).toBeInTheDocument();
       expect(mockInvoke).toHaveBeenCalledWith("get_master_history", {
         previous: null,
+        previousCurrentUserId: null,
         libraryId: "master",
       });
 
@@ -438,6 +440,7 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
       });
       expect(mockInvoke).toHaveBeenCalledWith("get_master_history", {
         previous: dto.fingerprint,
+        previousCurrentUserId: dto.current_user_id,
         libraryId: "master",
       });
       expect(mockInvoke.mock.calls.filter(([command]) => command === "get_relay_ledger")).toHaveLength(1);

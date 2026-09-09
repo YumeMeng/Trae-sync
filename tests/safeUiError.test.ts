@@ -70,6 +70,12 @@ describe("读取授权失效错误映射", () => {
     );
   });
 
+  it("主库当前账号未确认时不暴露内部错误码", () => {
+    expect(safeUiErrorMessage("master_current_account_unavailable", "fallback")).toBe(
+      "主库当前登录账号未确认，请先在环境页确认账号后重试。",
+    );
+  });
+
   it.each([
     ["login_real_mode_required", "当前运行模式不支持账号登录。"],
     ["login_begin_failed", "登录会话创建失败，请重新发起登录。"],

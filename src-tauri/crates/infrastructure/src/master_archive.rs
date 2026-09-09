@@ -111,6 +111,37 @@ fn placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
 }
 
+/// 只保留当前主库登录账号名下的会话；调用方给出的 ID 可能来自过期界面，
+/// 所有写操作都必须在数据库层重新确认项目归属。
+fn authorized_session_ids(
+    conn: &Connection,
+    session_ids: &[String],
+    current_user_id: &str,
+) -> Result<Vec<String>, MasterArchiveError> {
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owner_param = session_ids.len() + 1;
+    let sql = format!(
+        "SELECT DISTINCT s.session_id \
+         FROM chat_session s \
+         JOIN project p ON p.project_id = s.project_id \
+         WHERE s.session_id IN ({}) AND p.user_id = ?{owner_param}",
+        placeholders(session_ids.len())
+    );
+    let mut params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+    params.push(current_user_id);
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|_| MasterArchiveError::WriteFailed)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params), |row| row.get(0))
+        .map_err(|_| MasterArchiveError::WriteFailed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| MasterArchiveError::WriteFailed)?;
+    Ok(rows)
+}
+
 /// 归档会话（在线写）：hidden_status → 'voice_discussion'。
 ///
 /// 只动集合内 `hidden_status IS NULL` 的行（原生已隐藏的会话不重复触碰）；
@@ -119,6 +150,7 @@ pub fn archive_master_sessions(
     master_data_dir: &Path,
     raw_key: &str,
     session_ids: &[String],
+    current_user_id: &str,
 ) -> Result<usize, MasterArchiveError> {
     if session_ids.is_empty() {
         return Ok(0);
@@ -134,10 +166,15 @@ pub fn archive_master_sessions(
     }
     let sql = format!(
         "UPDATE chat_session SET hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
-         WHERE hidden_status IS NULL AND session_id IN ({})",
-        placeholders(session_ids.len())
+         WHERE hidden_status IS NULL AND session_id IN ({}) \
+         AND EXISTS (SELECT 1 FROM project p \
+                    WHERE p.project_id = chat_session.project_id \
+                      AND p.user_id = ?{})",
+        placeholders(session_ids.len()),
+        session_ids.len() + 1
     );
-    let params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+    let mut params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+    params.push(current_user_id);
     let changed = conn
         .execute(&sql, rusqlite::params_from_iter(params))
         .map_err(|_| MasterArchiveError::WriteFailed)?;
@@ -152,6 +189,7 @@ pub fn restore_master_sessions(
     master_data_dir: &Path,
     raw_key: &str,
     session_ids: &[String],
+    current_user_id: &str,
 ) -> Result<usize, MasterArchiveError> {
     if session_ids.is_empty() {
         return Ok(0);
@@ -167,10 +205,15 @@ pub fn restore_master_sessions(
     }
     let sql = format!(
         "UPDATE chat_session SET hidden_status = NULL \
-         WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' AND session_id IN ({})",
-        placeholders(session_ids.len())
+         WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' AND session_id IN ({}) \
+         AND EXISTS (SELECT 1 FROM project p \
+                    WHERE p.project_id = chat_session.project_id \
+                      AND p.user_id = ?{})",
+        placeholders(session_ids.len()),
+        session_ids.len() + 1
     );
-    let params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+    let mut params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+    params.push(current_user_id);
     let changed = conn
         .execute(&sql, rusqlite::params_from_iter(params))
         .map_err(|_| MasterArchiveError::WriteFailed)?;
@@ -186,6 +229,7 @@ pub fn delete_master_sessions(
     master_data_dir: &Path,
     raw_key: &str,
     session_ids: &[String],
+    current_user_id: &str,
 ) -> Result<MasterDeleteOutcome, MasterArchiveError> {
     if session_ids.is_empty() {
         return Ok(MasterDeleteOutcome {
@@ -199,13 +243,28 @@ pub fn delete_master_sessions(
     if !db_path.is_file() {
         return Err(MasterArchiveError::DbUnavailable);
     }
+    // 先确认 ID 属于当前账号；过期界面传入他人 ID 时直接空操作，
+    // 连备份链也不新增，避免把无效请求误当成破坏性操作。
+    let conn = open_with_key_readwrite(&db_path, raw_key)?;
+    verify_key_readable(&conn)?;
+    let authorized_ids = authorized_session_ids(&conn, session_ids, current_user_id)?;
+    if authorized_ids.is_empty() {
+        return Ok(MasterDeleteOutcome {
+            deleted_sessions: 0,
+            deleted_messages: 0,
+            removed_projects: 0,
+            backup_path: String::new(),
+        });
+    }
+    drop(conn);
+
     // ADR-0018 铁律：破坏性批量操作前必须先备份（失败则删除不执行）。
     let backup = backup_master_trio(&db_path).map_err(|_| MasterArchiveError::BackupFailed)?;
 
     let conn = open_with_key_readwrite(&db_path, raw_key)?;
     verify_key_readable(&conn)?;
-    let params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
-    let in_clause = placeholders(session_ids.len());
+    let params: Vec<&str> = authorized_ids.iter().map(String::as_str).collect();
+    let in_clause = placeholders(authorized_ids.len());
 
     // 受影响会话的所属项目（空壳判定范围；事务外读取无妨——同一连接串行）。
     let affected_projects: Vec<String> = {
@@ -318,6 +377,7 @@ pub fn merge_master_projects(
     raw_key: &str,
     source_project_ids: &[String],
     target_project_id: &str,
+    current_user_id: &str,
 ) -> Result<MasterMergeOutcome, MasterArchiveError> {
     // 参数防御：目标不能在来源集合中（改挂目标必须是被保留的分组）。
     if source_project_ids.is_empty() || source_project_ids.iter().any(|id| id == target_project_id)
@@ -328,26 +388,47 @@ pub fn merge_master_projects(
     if !db_path.is_file() {
         return Err(MasterArchiveError::DbUnavailable);
     }
-    // ADR-0018 铁律：批量迁移前必须先备份（失败则合并不执行）。
-    let backup = backup_master_trio(&db_path).map_err(|_| MasterArchiveError::BackupFailed)?;
-
     let conn = open_with_key_readwrite(&db_path, raw_key)?;
     verify_key_readable(&conn)?;
-    // 目标分组存在性校验：防 UI 数据过期把会话挂到不存在的分组行上。
-    let target_exists = conn
+    // 目标与来源分组都必须属于当前账号；过期界面传入他人分组时拒绝，
+    // 防止把会话改挂到错误账号或清理他人空壳分组。
+    let target_owned = conn
         .query_row(
-            "SELECT COUNT(*) FROM project WHERE project_id = ?1",
-            [target_project_id],
+            "SELECT COUNT(*) FROM project WHERE project_id = ?1 AND user_id = ?2",
+            [target_project_id, current_user_id],
             |row| row.get::<_, i64>(0),
         )
         .map(|count| count > 0)
         .map_err(|_| MasterArchiveError::WriteFailed)?;
-    if !target_exists {
+    if !target_owned {
         return Err(MasterArchiveError::MergeInvalid);
     }
 
     let source_params: Vec<&str> = source_project_ids.iter().map(String::as_str).collect();
     let source_clause = placeholders(source_project_ids.len());
+    let source_owner_param = source_project_ids.len() + 1;
+    let mut source_owner_params = source_params.clone();
+    source_owner_params.push(current_user_id);
+    let owned_source_count: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM project WHERE project_id IN ({source_clause}) \
+                 AND user_id = ?{source_owner_param}"
+            ),
+            rusqlite::params_from_iter(source_owner_params),
+            |row| row.get(0),
+        )
+        .map_err(|_| MasterArchiveError::WriteFailed)?;
+    if owned_source_count != source_project_ids.len() as i64 {
+        return Err(MasterArchiveError::MergeInvalid);
+    }
+    drop(conn);
+
+    // ADR-0018 铁律：批量迁移前必须先备份（失败则合并不执行）。
+    let backup = backup_master_trio(&db_path).map_err(|_| MasterArchiveError::BackupFailed)?;
+
+    let conn = open_with_key_readwrite(&db_path, raw_key)?;
+    verify_key_readable(&conn)?;
 
     let tx = conn
         .unchecked_transaction()
@@ -455,7 +536,8 @@ mod tests {
         create_archive_fixture(&master_database_path(&dir), &key);
 
         // 归档：s1（NULL → voice_discussion）；s3 原生已隐藏不动。
-        let affected = archive_master_sessions(&dir, &key, &["s1".into(), "s3".into()]).unwrap();
+        let affected =
+            archive_master_sessions(&dir, &key, &["s1".into(), "s3".into()], "111").unwrap();
         assert_eq!(affected, 1);
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
         let conn = Connection::open_with_flags(master_database_path(&dir), flags).unwrap();
@@ -466,9 +548,46 @@ mod tests {
         );
 
         // 恢复：s1 还原 NULL。
-        let affected = restore_master_sessions(&dir, &key, &["s1".into()]).unwrap();
+        let affected = restore_master_sessions(&dir, &key, &["s1".into()], "111").unwrap();
         assert_eq!(affected, 1);
         assert_eq!(hidden_status_of(&conn, "s1"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_restore_and_delete_ignore_other_account_sessions() {
+        let dir = temp_dir("owner");
+        let key = "ab".repeat(32);
+        create_archive_fixture(&master_database_path(&dir), &key);
+
+        // 当前账号 111 不能通过过期/伪造的 ID 操作账号 222 的会话。
+        assert_eq!(
+            archive_master_sessions(&dir, &key, &["s4".into()], "111").unwrap(),
+            0
+        );
+        assert_eq!(
+            restore_master_sessions(&dir, &key, &["s4".into()], "111").unwrap(),
+            0
+        );
+        let outcome = delete_master_sessions(&dir, &key, &["s4".into()], "111").unwrap();
+        assert_eq!(outcome.deleted_sessions, 0);
+        assert!(outcome.backup_path.is_empty(), "无授权目标不应创建备份");
+
+        let conn = Connection::open_with_flags(
+            master_database_path(&dir),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
+        let session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id = 's4'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_count, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -476,7 +595,7 @@ mod tests {
     fn archive_missing_db_reports_unavailable() {
         let dir = temp_dir("missing");
         assert_eq!(
-            archive_master_sessions(&dir, &"bb".repeat(32), &["s1".into()]),
+            archive_master_sessions(&dir, &"bb".repeat(32), &["s1".into()], "111"),
             Err(MasterArchiveError::DbUnavailable)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -487,7 +606,7 @@ mod tests {
         let dir = temp_dir("wrongkey");
         create_archive_fixture(&master_database_path(&dir), &"cc".repeat(32));
         assert_eq!(
-            archive_master_sessions(&dir, &"dd".repeat(32), &["s1".into()]),
+            archive_master_sessions(&dir, &"dd".repeat(32), &["s1".into()], "111"),
             Err(MasterArchiveError::DbOpenFailed)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -508,7 +627,7 @@ mod tests {
         .unwrap();
         drop(conn);
         assert_eq!(
-            archive_master_sessions(&dir, &key, &["s1".into()]),
+            archive_master_sessions(&dir, &key, &["s1".into()], "111"),
             Err(MasterArchiveError::ArchiveUnsupported)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -522,7 +641,7 @@ mod tests {
 
         // 删除 s1（p1 还挂 s2，p1 保留）与 s3（p2 变空壳被清理）。
         let outcome =
-            delete_master_sessions(&dir, &key, &["s1".into(), "s3".into()]).unwrap();
+            delete_master_sessions(&dir, &key, &["s1".into(), "s3".into()], "111").unwrap();
         assert_eq!(outcome.deleted_sessions, 2);
         // 消息元数据 3 行（m1/m2/m3）+ 内容行 3 行（m1 general、m2 task、m3 general）。
         assert_eq!(outcome.deleted_messages, 6);
@@ -551,7 +670,7 @@ mod tests {
     fn delete_missing_db_reports_unavailable_without_backup() {
         let dir = temp_dir("deletemissing");
         assert_eq!(
-            delete_master_sessions(&dir, &"aa".repeat(32), &["s1".into()]),
+            delete_master_sessions(&dir, &"aa".repeat(32), &["s1".into()], "111"),
             Err(MasterArchiveError::DbUnavailable)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -564,7 +683,7 @@ mod tests {
         create_archive_fixture(&master_database_path(&dir), &key);
 
         // p2（含归档会话 s3）并入 p1：全部会话改挂，p2 空壳清理。
-        let outcome = merge_master_projects(&dir, &key, &["p2".into()], "p1").unwrap();
+        let outcome = merge_master_projects(&dir, &key, &["p2".into()], "p1", "111").unwrap();
         assert_eq!(outcome.moved_sessions, 1);
         assert_eq!(outcome.removed_projects, 1);
         assert!(outcome.backup_path.contains(".switch-bak-"));
@@ -599,12 +718,25 @@ mod tests {
 
         // 目标在来源集合中：直接拒绝（不改库）。
         assert_eq!(
-            merge_master_projects(&dir, &key, &["p1".into()], "p1"),
+            merge_master_projects(&dir, &key, &["p1".into()], "p1", "111"),
             Err(MasterArchiveError::MergeInvalid)
         );
         // 目标分组不存在（UI 数据过期场景）：拒绝。
         assert_eq!(
-            merge_master_projects(&dir, &key, &["p1".into()], "p-missing"),
+            merge_master_projects(&dir, &key, &["p1".into()], "p-missing", "111"),
+            Err(MasterArchiveError::MergeInvalid)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_rejects_other_account_projects() {
+        let dir = temp_dir("mergeowner");
+        let key = "55".repeat(32);
+        create_archive_fixture(&master_database_path(&dir), &key);
+
+        assert_eq!(
+            merge_master_projects(&dir, &key, &["p3".into()], "p1", "111"),
             Err(MasterArchiveError::MergeInvalid)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -615,7 +747,7 @@ mod tests {
         let dir = temp_dir("mergewrongkey");
         create_archive_fixture(&master_database_path(&dir), &"33".repeat(32));
         assert_eq!(
-            merge_master_projects(&dir, &"44".repeat(32), &["p2".into()], "p1"),
+            merge_master_projects(&dir, &"44".repeat(32), &["p2".into()], "p1", "111"),
             Err(MasterArchiveError::DbOpenFailed)
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -44,8 +44,8 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 // 数据链路按库实例参数化（ADR-0025）：宿主页注入 library（非敏感 id +
 // 显示名），数据目录 / raw key / 当前 user_id 的解析全部留在 Rust 侧。
 //
-// 准实时新鲜度：每 5 秒带 previous 指纹轮询 get_master_history，指纹未变
-// 返回 unchanged（维持现有树，不重读）；台账仅在库记录变化时随行刷新。
+// 准实时新鲜度：每 5 秒带 previous 指纹与账号身份轮询 get_master_history，
+// 指纹和账号都未变才返回 unchanged；台账仅在库记录变化时随行刷新。
 
 /** ADR-0025 库描述：宿主页注入的库实例引用（非敏感 id + 显示名）。 */
 export interface LibraryRef {
@@ -126,28 +126,43 @@ export function LibrarySessionsPanel({
   const [mergeConfirm, setMergeConfirm] = useState<readonly MasterProjectEntryDto[] | null>(null);
   // 轮询指纹基线（上一轮读取成功的三件套指纹；unchanged 预检依据）。
   const fingerprintRef = useRef<MasterHistoryDto["fingerprint"] | null>(null);
+  // 指纹相同但主库切号时文件可能未变，身份也必须参与 unchanged 判定。
+  const currentUserIdRef = useRef<string | null>(null);
   const pollCancelled = useRef(false);
 
   const load = useCallback(
     async (force: boolean) => {
       const next = await invoke<MasterHistoryDto>("get_master_history", {
         previous: force ? null : fingerprintRef.current,
+        previousCurrentUserId: force ? null : currentUserIdRef.current,
         libraryId: library.id,
       });
       if (next.status === "unchanged") return;
       setHistory(next);
       setLoadError(null);
+      fingerprintRef.current = next.fingerprint;
+      currentUserIdRef.current = next.status === "ready" ? next.current_user_id : null;
       if (next.status === "ready") {
-        fingerprintRef.current = next.fingerprint;
         // 台账只在库记录实际变化时随行刷新（切号后轨迹立即更新）。
         const entries = await invoke<RelayLedgerEntryDto[]>("get_relay_ledger", {
           libraryId: library.id,
         });
         setLedger(entries);
+      } else {
+        setLedger([]);
       }
     },
     [library.id],
   );
+
+  // 切换库实例时不能复用上一库的指纹或账号身份。
+  useEffect(() => {
+    fingerprintRef.current = null;
+    currentUserIdRef.current = null;
+    setHistory(null);
+    setLedger([]);
+    setViewer(null);
+  }, [library.id]);
 
   useEffect(() => {
     if (!active) return;

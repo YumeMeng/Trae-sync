@@ -5365,6 +5365,45 @@ fn reconcile_master_current_profile(
     }
 }
 
+/// 解析需要数据归属或账号凭据的主库当前账号。
+///
+/// 环境注册表是缓存，不能作为授权主体；这里要求主库登录态 blob
+/// 实测得到已登记账号。登出、blob 不可读或账号未登记时均返回 None，
+/// 防止沿用旧缓存读取或修改另一账号的数据。
+fn resolve_actual_master_account(
+    material_root: &Path,
+    storage_root: &Path,
+    master_instance_dir: &Path,
+) -> Result<Option<traesync_infrastructure::account_registry::AccountRecord>, String> {
+    let registry = EnvironmentRegistry::new(storage_root);
+    let cached = registry
+        .ensure_master()
+        .map_err(|_| "environment_registry_invalid".to_string())?;
+    let accounts = AccountRegistry::new(material_root)
+        .load()
+        .map_err(|_| "checkin_registry_invalid".to_string())?;
+    let Some(profile_id) = observed_master_profile_id(&accounts, master_instance_dir) else {
+        return Ok(None);
+    };
+    if cached.current_profile_id.as_deref() != Some(profile_id.as_str()) {
+        // 实测已确认账号时顺手收敛缓存，供环境页等展示路径使用。
+        let _ = registry.set_current_profile(MASTER_ENV_ID, &profile_id);
+    }
+    Ok(accounts
+        .into_iter()
+        .find(|record| record.profile_id == profile_id))
+}
+
+/// 需要执行主库归属操作时的强制账号解析；未确认实测账号即拒绝操作。
+fn require_actual_master_account(
+    material_root: &Path,
+    storage_root: &Path,
+    master_instance_dir: &Path,
+) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
+    resolve_actual_master_account(material_root, storage_root, master_instance_dir)?
+        .ok_or_else(|| "master_current_account_unavailable".to_string())
+}
+
 fn get_environment_state_inner(
     material_root: &Path,
     storage_root: &Path,
@@ -6783,7 +6822,7 @@ struct MasterSwitchPluginPreviewDto {
     aborted: bool,
 }
 
-/// 切号插件差异预检（P5-8b-3）：源 = 环境档案当前账号（与插件 tab 同源），
+/// 切号插件差异预检（P5-8b-3）：源 = 主库登录态实测当前账号（与插件 tab 同源），
 /// 目标 = 切换目标账号；对账计划与执行侧共用 `reconcile_plan`，保证
 /// 「确认的移除清单 = 实际应用的移除」。预检永不返回 Err（fail-soft）。
 #[tauri::command]
@@ -6857,22 +6896,19 @@ fn preview_master_switch_plugins_inner(
         remove_names: Vec::new(),
         aborted: true,
     };
-    // 源账号 = 环境档案当前账号；执行侧以凭据互换观察到的 from_user_id
-    // 为权威，两者在正常切号流程一致（档案随每次切换写回）。
-    let Ok(Some(env)) = EnvironmentRegistry::new(storage_root).load() else {
+    // 源账号必须来自主库登录态实测；环境档案只作为展示缓存。
+    let Ok(master_dir) = master_data_dir() else {
         return aborted;
     };
-    let Some(source_profile_id) = env.current_profile_id else {
+    let Ok(Some(source)) = resolve_actual_master_account(material_root, storage_root, &master_dir)
+    else {
         return aborted;
     };
     let records = match AccountRegistry::new(material_root).load() {
         Ok(records) => records,
         Err(_) => return aborted,
     };
-    let (Some(source), Some(target)) = (
-        records.iter().find(|r| r.profile_id == source_profile_id),
-        records.iter().find(|r| r.profile_id == profile_id),
-    ) else {
+    let Some(target) = records.iter().find(|r| r.profile_id == profile_id) else {
         return aborted;
     };
     // 同一账号无从谈差异（switch_same_account 由执行侧兜底，这里直过）。
@@ -6890,7 +6926,7 @@ fn preview_master_switch_plugins_inner(
             ))
             .map(|bundle| bundle.access_token)
     };
-    let (Ok(source_token), Ok(target_token)) = (load_token(source), load_token(target)) else {
+    let (Ok(source_token), Ok(target_token)) = (load_token(&source), load_token(target)) else {
         return aborted;
     };
     let (Ok(source_items), Ok(target_items)) = (
@@ -7250,13 +7286,14 @@ fn resolve_library_dir(library_id: Option<&str>) -> Result<PathBuf, String> {
 
 /// P5-3：读取主库历史（当前账号可见的项目 + 会话）。
 ///
-/// 当前账号 = 环境注册表 current_profile_id → 账号注册表 account_id；
+/// 当前账号 = 主库登录态 blob 实测 user_id → 账号注册表 account_id；
 /// `project.user_id` 过滤（E1b 可见性口径）。`previous` 为前端保存的
-/// 上一轮指纹，未变化时返回 unchanged（避免轮询全量重读）。
+/// 上一轮指纹，另带当前账号身份，避免切号后文件指纹未变时错误返回 unchanged。
 /// `library_id` 为库实例引用（ADR-0025，缺省主库）。
 #[tauri::command]
 async fn get_master_history(
     previous: Option<InstanceFingerprint>,
+    previous_current_user_id: Option<String>,
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterHistoryDto, String> {
@@ -7270,14 +7307,17 @@ async fn get_master_history(
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // 当前账号：主库环境档案 → 账号注册表 account_id（即 TRAE user_id）。
-        let record = EnvironmentRegistry::new(&storage_root)
-            .ensure_master()
-            .map_err(|_| "environment_registry_invalid".to_string())?;
         // ADR-0025：库目录统一走 resolve_library_dir（指纹与读取同源）。
         let master_dir = resolve_library_dir(library_id.as_deref())?;
+        let current_account =
+            resolve_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let current_user_id = current_account
+            .as_ref()
+            .map(|account| account.account_id.as_str());
         let fingerprint = stat_master_fingerprint(&master_dir);
-        if previous == Some(fingerprint.clone()) {
+        if previous == Some(fingerprint.clone())
+            && previous_current_user_id.as_deref() == current_user_id
+        {
             return Ok(MasterHistoryDto {
                 status: "unchanged",
                 current_user_id: None,
@@ -7286,20 +7326,8 @@ async fn get_master_history(
                 fingerprint,
             });
         }
-        let Some(profile_id) = record.current_profile_id else {
+        let Some(account) = current_account else {
             // 主库尚未登记登录账号：历史页引导到环境页先启动并登录。
-            return Ok(MasterHistoryDto {
-                status: "no_current_account",
-                current_user_id: None,
-                projects: Vec::new(),
-                sessions: Vec::new(),
-                fingerprint,
-            });
-        };
-        let records = AccountRegistry::new(&material_root)
-            .load()
-            .map_err(|_| "checkin_registry_invalid".to_string())?;
-        let Some(account) = records.iter().find(|r| r.profile_id == profile_id) else {
             return Ok(MasterHistoryDto {
                 status: "no_current_account",
                 current_user_id: None,
@@ -7356,20 +7384,30 @@ async fn get_master_session_messages(
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     let offset = offset.unwrap_or(0) as usize;
     tauri::async_runtime::spawn_blocking(move || {
         use traesync_infrastructure::account_session_content::SessionMessagesStatus;
         let master_dir = resolve_library_dir(library_id.as_deref())?;
-        let (status, messages, has_more) =
-            match read_master_session_messages_page(&master_dir, &session_id, &raw_key, offset) {
-                SessionMessagesStatus::Ready(entries) => {
-                    let has_more = entries.len() == MAX_MESSAGES_PER_SESSION;
-                    ("ready", map_session_message_entries(entries), has_more)
-                }
-                SessionMessagesStatus::NoInstanceData => ("no_master_data", Vec::new(), false),
-                SessionMessagesStatus::ReadFailed => ("read_failed", Vec::new(), false),
-            };
+        let current_account =
+            resolve_actual_master_account(&material_root, &storage_root, &master_dir)?
+                .ok_or_else(|| "master_current_account_unavailable".to_string())?;
+        let (status, messages, has_more) = match read_master_session_messages_page(
+            &master_dir,
+            &session_id,
+            &raw_key,
+            offset,
+            &current_account.account_id,
+        ) {
+            SessionMessagesStatus::Ready(entries) => {
+                let has_more = entries.len() == MAX_MESSAGES_PER_SESSION;
+                ("ready", map_session_message_entries(entries), has_more)
+            }
+            SessionMessagesStatus::NoInstanceData => ("no_master_data", Vec::new(), false),
+            SessionMessagesStatus::ReadFailed => ("read_failed", Vec::new(), false),
+        };
         Ok(MasterSessionMessagesDto {
             session_id,
             status,
@@ -7407,7 +7445,7 @@ struct MasterLibraryStatsDto {
 /// P5-4：主库聚合统计（总览页统计卡 + 环境卡会话胶囊数据源）。
 ///
 /// 轻量只读：4 条聚合 SQL，主库运行中可随时读取。当前账号解析与
-/// get_master_history 同口径（环境档案 → 账号注册表 account_id）。
+/// get_master_history 同口径（主库登录态实测 → 账号注册表 account_id）。
 #[tauri::command]
 async fn get_master_library_stats(
     state: tauri::State<'_, AppState>,
@@ -7425,30 +7463,14 @@ async fn get_master_library_stats(
         use traesync_infrastructure::master_stats::{
             master_trio_size_bytes, read_master_stats, MasterStatsStatus,
         };
-        let record = EnvironmentRegistry::new(&storage_root)
-            .ensure_master()
-            .map_err(|_| "environment_registry_invalid".to_string())?;
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
         // 体积与库内容统计独立：库打开失败时体积仍可展示（详情页降级不空白）。
         let size_bytes = master_trio_size_bytes(&master_dir);
-        let Some(profile_id) = record.current_profile_id else {
+        let current_account =
+            resolve_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let Some(account) = current_account else {
             // 未登记账号：统计归零 + 状态引导（总览隐藏区块，环境页提示登录）。
-            return Ok(MasterLibraryStatsDto {
-                status: "no_current_account",
-                current_user_id: None,
-                project_count: 0,
-                session_count: 0,
-                message_count: 0,
-                participating_account_count: 0,
-                last_active_unix_seconds: None,
-                size_bytes,
-            });
-        };
-        let records = AccountRegistry::new(&material_root)
-            .load()
-            .map_err(|_| "checkin_registry_invalid".to_string())?;
-        let Some(account) = records.iter().find(|r| r.profile_id == profile_id) else {
             return Ok(MasterLibraryStatsDto {
                 status: "no_current_account",
                 current_user_id: None,
@@ -7557,19 +7579,21 @@ async fn get_master_checkup(state: tauri::State<'_, AppState>) -> Result<MasterC
             .map_err(|_| "checkin_registry_invalid".to_string())?;
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-        // 当前账号：环境档案登记的 profile（收编目标与「当前账号」标记）。
-        let registry = EnvironmentRegistry::new(&storage_root);
-        let current_profile = registry
-            .ensure_master()
-            .map_err(|_| "environment_registry_invalid".to_string())?
-            .current_profile_id;
-        let current = current_profile
-            .as_deref()
-            .and_then(|profile_id| records.iter().find(|r| r.profile_id == profile_id));
+        // 当前账号必须来自主库登录态实测，不能沿用环境档案缓存。
+        let current = resolve_actual_master_account(&material_root, &storage_root, &master_dir)?;
 
         match read_master_checkup(&master_dir, &raw_key) {
             MasterCheckupStatus::Ready(report) => {
-                let current_user_id = current.map(|r| r.account_id.as_str());
+                let Some(current) = current.as_ref() else {
+                    return Ok(MasterCheckupDto {
+                        status: "no_current_account",
+                        current_account_name: None,
+                        accounts: Vec::new(),
+                        orphan_project_count: 0,
+                        orphan_session_count: 0,
+                    });
+                };
+                let current_user_id = Some(current.account_id.as_str());
                 let accounts = report
                     .accounts
                     .iter()
@@ -7591,10 +7615,11 @@ async fn get_master_checkup(state: tauri::State<'_, AppState>) -> Result<MasterC
                     .collect();
                 Ok(MasterCheckupDto {
                     status: "ready",
-                    current_account_name: current.map(|r| {
-                        r.display_name
+                    current_account_name: Some({
+                        current
+                            .display_name
                             .clone()
-                            .unwrap_or_else(|| r.screen_name.clone())
+                            .unwrap_or_else(|| current.screen_name.clone())
                     }),
                     accounts,
                     orphan_project_count: report.orphan_project_count,
@@ -7684,26 +7709,17 @@ fn incorporate_master_records_inner(
 ) -> Result<MasterIncorporateResultDto, String> {
     use traesync_infrastructure::master_checkup::{read_master_checkup, MasterCheckupStatus};
 
-    // 前置：当前账号（收编目标）必须已登记。
-    let records = AccountRegistry::new(material_root)
-        .load()
-        .map_err(|_| "checkin_registry_invalid".to_string())?;
-    let current_profile = EnvironmentRegistry::new(storage_root)
-        .ensure_master()
-        .map_err(|_| "environment_registry_invalid".to_string())?
-        .current_profile_id
+    // 前置：当前账号（收编目标）必须由主库登录态实测且已登记。
+    let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+    let record = resolve_actual_master_account(material_root, storage_root, &master_dir)?
         .ok_or_else(|| "incorporate_no_current_account".to_string())?;
-    let record = records
-        .iter()
-        .find(|r| r.profile_id == current_profile)
-        .ok_or_else(|| "incorporate_no_current_account".to_string())?;
+    let current_profile = record.profile_id.clone();
     let target_user_id = record.account_id.clone();
     let window_title = record
         .display_name
         .clone()
         .unwrap_or_else(|| record.screen_name.clone());
 
-    let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
     let db_path = master_database_path(&master_dir);
 
     // 预检（只读）：确认确有滞留记录才关实例——避免空跑打扰正在使用的主库。
@@ -8258,21 +8274,11 @@ struct PluginTabStateDto {
     known_account_count: usize,
 }
 
-/// 插件 tab 当前账号凭据解析：环境档案 current_profile_id → 账号注册表
+/// 插件 tab 当前账号凭据解析：主库登录态实测 user_id → 账号注册表
 /// → 凭据包 access_token。任一环节缺失返回稳定错误码（前端据此降级文案）。
 fn plugin_tab_account_token(material_root: &Path, storage_root: &Path) -> Result<String, String> {
-    let record = EnvironmentRegistry::new(storage_root)
-        .load()
-        .map_err(|_| "environment_registry_invalid".to_string())?
-        .ok_or_else(|| "plugin_tab_no_account".to_string())?;
-    let profile_id = record
-        .current_profile_id
-        .ok_or_else(|| "plugin_tab_no_account".to_string())?;
-    let account = AccountRegistry::new(material_root)
-        .load()
-        .map_err(|_| "checkin_registry_invalid".to_string())?
-        .into_iter()
-        .find(|record| record.profile_id == profile_id)
+    let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+    let account = resolve_actual_master_account(material_root, storage_root, &master_dir)?
         .ok_or_else(|| "plugin_tab_no_account".to_string())?;
     CheckinCredentialStore::new(material_root)
         .load(&CheckinProfileBinding::new(
@@ -8542,6 +8548,11 @@ async fn uninstall_plugin_everywhere(
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     tauri::async_runtime::spawn_blocking(move || {
+        let master_dir =
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let current_account =
+            resolve_actual_master_account(&material_root, &storage_root, &master_dir)?
+                .ok_or_else(|| "plugin_tab_no_account".to_string())?;
         let token = plugin_tab_account_token(&material_root, &storage_root)?;
         // 先查条目：校验非 builtin，并取市场 UUID 供清单移除与传播匹配。
         let items = fetch_installed_plugins(&token)
@@ -8561,9 +8572,7 @@ async fn uninstall_plugin_everywhere(
         }
         // 当前账号回执展示名：注册表账号名（备注名优先）；读不到时
         // 用通用兜底（回执是账号维度结果，不塞插件名）。
-        let current_name = current_account_record(&material_root, &storage_root)
-            .map(|record| account_display_name(&record))
-            .unwrap_or_else(|| "当前账号".to_string());
+        let current_name = account_display_name(&current_account);
         let mut accounts = vec![PluginUninstallAccountDto {
             display_name: current_name,
             removed: true,
@@ -8586,14 +8595,9 @@ async fn uninstall_plugin_everywhere(
             let records = AccountRegistry::new(&material_root)
                 .load()
                 .map_err(|_| "checkin_registry_invalid".to_string())?;
-            let current_profile_id = EnvironmentRegistry::new(&storage_root)
-                .load()
-                .ok()
-                .flatten()
-                .and_then(|env| env.current_profile_id);
             let others = propagate_uninstall_to_accounts(
                 &records,
-                current_profile_id.as_deref(),
+                Some(current_account.profile_id.as_str()),
                 market_id,
                 &material_root,
             );
@@ -8603,23 +8607,6 @@ async fn uninstall_plugin_everywhere(
     })
     .await
     .map_err(|_| "plugin_uninstall_join_failed".to_string())?
-}
-
-/// 环境档案当前账号 → 注册表档案（找不到返回 None，回执降级用通用名）。
-fn current_account_record(
-    material_root: &Path,
-    storage_root: &Path,
-) -> Option<traesync_infrastructure::account_registry::AccountRecord> {
-    let profile_id = EnvironmentRegistry::new(storage_root)
-        .load()
-        .ok()
-        .flatten()
-        .and_then(|env| env.current_profile_id)?;
-    AccountRegistry::new(material_root)
-        .load()
-        .ok()?
-        .into_iter()
-        .find(|record| record.profile_id == profile_id)
 }
 
 /// 账号展示名：备注名优先，回退服务端昵称（界面纪律：内部 ID 不进主视野）。
@@ -8754,14 +8741,23 @@ async fn archive_master_sessions(
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let master_dir = resolve_library_dir(library_id.as_deref())?;
-        archive_master_sessions_inner(&master_dir, &raw_key, &session_ids)
-            .map(|affected| MasterArchiveResultDto {
-                affected: affected as u32,
-            })
-            .map_err(map_master_archive_error)
+        let current_account =
+            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        archive_master_sessions_inner(
+            &master_dir,
+            &raw_key,
+            &session_ids,
+            &current_account.account_id,
+        )
+        .map(|affected| MasterArchiveResultDto {
+            affected: affected as u32,
+        })
+        .map_err(map_master_archive_error)
     })
     .await
     .map_err(|_| "master_archive_join_failed".to_string())?
@@ -8784,14 +8780,23 @@ async fn restore_master_sessions(
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let master_dir = resolve_library_dir(library_id.as_deref())?;
-        restore_master_sessions_inner(&master_dir, &raw_key, &session_ids)
-            .map(|affected| MasterArchiveResultDto {
-                affected: affected as u32,
-            })
-            .map_err(map_master_archive_error)
+        let current_account =
+            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        restore_master_sessions_inner(
+            &master_dir,
+            &raw_key,
+            &session_ids,
+            &current_account.account_id,
+        )
+        .map(|affected| MasterArchiveResultDto {
+            affected: affected as u32,
+        })
+        .map_err(map_master_archive_error)
     })
     .await
     .map_err(|_| "master_archive_join_failed".to_string())?
@@ -8827,10 +8832,14 @@ async fn delete_master_sessions(
         return Err("source_key_unavailable".to_string());
     }
     let raw_key = state.source_raw_key.clone();
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
     // P5-9：删除前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let master_dir = resolve_library_dir(library_id.as_deref())?;
+        let current_account =
+            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
         // 运行中禁止（口径同 create_master_backup）：删除前必须能拿到静止
         // 一致的三件套备份。
         let running = list_trae_processes()
@@ -8845,14 +8854,19 @@ async fn delete_master_sessions(
         if running {
             return Err("master_delete_running".to_string());
         }
-        let result = delete_master_sessions_inner(&master_dir, &raw_key, &session_ids)
-            .map(|outcome: MasterDeleteOutcome| MasterDeleteResultDto {
-                deleted_sessions: outcome.deleted_sessions as u32,
-                deleted_messages: outcome.deleted_messages as u32,
-                removed_projects: outcome.removed_projects as u32,
-                backup_path: outcome.backup_path,
-            })
-            .map_err(map_master_archive_error);
+        let result = delete_master_sessions_inner(
+            &master_dir,
+            &raw_key,
+            &session_ids,
+            &current_account.account_id,
+        )
+        .map(|outcome: MasterDeleteOutcome| MasterDeleteResultDto {
+            deleted_sessions: outcome.deleted_sessions as u32,
+            deleted_messages: outcome.deleted_messages as u32,
+            removed_projects: outcome.removed_projects as u32,
+            backup_path: outcome.backup_path,
+        })
+        .map_err(map_master_archive_error);
         // P5-9：删除链已生成新备份，按保留策略清理旧备份（静默容错）。
         if result.is_ok() {
             let db_path = master_database_path(&master_dir);
@@ -8895,10 +8909,14 @@ async fn merge_master_projects(
         return Err("source_key_unavailable".to_string());
     }
     let raw_key = state.source_raw_key.clone();
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
     // P5-9：合并前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let master_dir = resolve_library_dir(library_id.as_deref())?;
+        let current_account =
+            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
         // 运行中禁止（口径同 delete_master_sessions）：合并前必须能拿到静止
         // 一致的三件套备份。
         let running = list_trae_processes()
@@ -8918,6 +8936,7 @@ async fn merge_master_projects(
             &raw_key,
             &source_project_ids,
             &target_project_id,
+            &current_account.account_id,
         )
         .map(|outcome: MasterMergeOutcome| MasterMergeResultDto {
             moved_sessions: outcome.moved_sessions as u32,
@@ -10727,6 +10746,10 @@ mod master_current_account_reconcile_tests {
             AccountRegistry::new(self.root.path().join("material"))
         }
 
+        fn material_root(&self) -> PathBuf {
+            self.root.path().join("material")
+        }
+
         fn master_dir(&self) -> PathBuf {
             self.root.path().join("master-instance")
         }
@@ -10748,6 +10771,15 @@ mod master_current_account_reconcile_tests {
             .set_current_profile(MASTER_ENV_ID, "checkin-a")
             .unwrap();
         seed_login(&fixture.master_dir(), "222");
+
+        let actual = resolve_actual_master_account(
+            &fixture.material_root(),
+            &fixture.storage_root(),
+            &fixture.master_dir(),
+        )
+        .unwrap()
+        .expect("已登录且已登记的主库账号应可解析");
+        assert_eq!(actual.profile_id, "checkin-b");
 
         // 实测优先：返回 B 的 profile，而非缓存 A。
         let resolved = reconcile_master_current_profile(
@@ -10782,6 +10814,26 @@ mod master_current_account_reconcile_tests {
         // 注册表不动（最后已知账号保留，不写垃圾值）。
         let persisted = fixture.registry().load().unwrap().unwrap();
         assert_eq!(persisted.current_profile_id.as_deref(), Some("checkin-a"));
+    }
+
+    #[test]
+    fn data_paths_require_observed_master_account_instead_of_cache() {
+        let fixture = ReconcileFixture::new();
+        let record = account("checkin-a", "111", "账号A");
+        fixture.account_registry().upsert(&record).unwrap();
+        fixture
+            .registry()
+            .set_current_profile(MASTER_ENV_ID, "checkin-a")
+            .unwrap();
+
+        // 登出后不能继续用缓存账号读取或修改主库归属。
+        assert!(resolve_actual_master_account(
+            &fixture.material_root(),
+            &fixture.storage_root(),
+            &fixture.master_dir(),
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

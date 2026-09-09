@@ -286,6 +286,10 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "归入操作未能完成，请稍后重试。",
   ],
   [
+    /master_current_account_unavailable/i,
+    "主库当前登录账号未确认，请先在环境页确认账号后重试。",
+  ],
+  [
     /plugin_tab_no_account/i,
     "主库当前没有已登录账号，无法读取插件状态；请先在环境页确认账号。",
   ],
