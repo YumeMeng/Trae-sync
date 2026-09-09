@@ -209,8 +209,8 @@ export function OverviewPage({
         </p>
       )}
 
-      {/* 每屏一个主操作：有数据 → 查看记录（主库模型下历史页即主库视图，
-          fixture 预览回落查看历史记录）；无数据但目录就绪 → 去环境页查看主库；
+      {/* 每屏一个主操作：有数据 → 查看主库记录（进入主库详情页）；
+          无数据但目录就绪 → 去环境页查看主库；
           目录缺失 → 不出主操作（G1：异常态不加引导按钮）。 */}
       <div className="overview-page__actions">
         {state.data_location.selected &&
@@ -218,7 +218,7 @@ export function OverviewPage({
             <button
               type="button"
               className="btn btn--primary btn--large"
-              onClick={() => onNavigate("history")}
+              onClick={() => onNavigate("master-library")}
               data-testid="overview-scan-cta"
             >
               {masterStats?.status === "ready" ? (
@@ -226,7 +226,7 @@ export function OverviewPage({
               ) : (
                 <BookOpen size={17} strokeWidth={2} aria-hidden="true" />
               )}
-              {masterStats?.status === "ready" ? "查看主库记录" : "查看历史记录"}
+              查看主库记录
             </button>
           ) : (
             <button

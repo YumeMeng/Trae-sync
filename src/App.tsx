@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { WorkspaceStateDto } from "./types/workspace";
 import { TitleBar } from "./components/TitleBar";
-import { LibrarySessionsPanel } from "./components/LibrarySessionsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { AccountCenter } from "./components/AccountCenter";
 import { CheckinPage } from "./components/CheckinPage";
@@ -18,8 +17,8 @@ import { safeUiErrorMessage } from "./utils/safeUiError";
 const STAGGER_LISTS = ["account-list", "account-card-grid", "checkin-flow"];
 const playedStaggerLists = new Set<string>();
 
-// 应用根组件：五页信息架构（总览/历史/账号/签到/设置），
-// 历史读取入口收敛在历史页，账号档案收敛在账号页，签到收敛在签到页。
+// 应用根组件：五个导航工作区（总览/账号/签到/环境/设置）；
+// 主库对话列表嵌入主库详情页，账号档案与签到分别收敛在对应工作区。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -152,12 +151,6 @@ export default function App() {
             <OverviewPage
               state={state}
               active={activePage === "overview"}
-              onNavigate={setActivePage}
-            />
-          </div>
-          <div className="app-page" hidden={activePage !== "history"}>
-            <LibrarySessionsPanel
-              active={activePage === "history"}
               onNavigate={setActivePage}
             />
           </div>

@@ -13,7 +13,7 @@ export interface MasterLibraryStatsDto {
   readonly current_user_id: string | null;
   readonly project_count: number;
   readonly session_count: number;
-  /** 当前账号会话的消息总数（P5-8a-2 详情页头部，与历史页同口径）。 */
+  /** 当前账号会话的消息总数（P5-8a-2 主库详情页头部，与对话列表同口径）。 */
   readonly message_count: number;
   /** 主库内出现过的全部账号数（含非当前账号历史归属）。 */
   readonly participating_account_count: number;

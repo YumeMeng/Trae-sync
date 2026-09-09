@@ -3,7 +3,7 @@ import { installMockBridge } from "./mock-bridge";
 
 // 布局诊断（主库详情页库对话面板，G21 两栏式）：主要工作区矩形不能真实重叠，
 // 紧凑桌面左栏项目树滚动到底部时末项完整可见。
-// 独立历史页实例常驻 DOM 但停留在加载态（不渲染 .lib-panel），选择器天然唯一。
+// 库对话面板只在主库详情页挂载，选择器天然唯一。
 
 const viewports = [
   { name: "1024x600", width: 1024, height: 600 },

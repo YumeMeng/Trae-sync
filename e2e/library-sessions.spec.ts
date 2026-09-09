@@ -13,10 +13,8 @@
 // - 无水平溢出、返回环境页再进入详情浏览状态保持
 //
 // 宿主 = 主库详情页（环境页 → 主库卡「详情」，默认对话列表 tab 内嵌面板）。
-// 独立历史页（navigation-history）P8-6 将删除，不再作为测试宿主。
-// App 各页常驻 DOM（[hidden] 切换），独立历史页实例停留在加载态且不渲染
-// 库面板内容——但为防跨实例 testid 冲突，所有库面板断言都 scope 在
-// 「主库详情」region 内。
+// App 各页常驻 DOM（[hidden] 切换）；为防跨区域 testid 冲突，所有库面板断言
+// 都 scope 在「主库详情」region 内。
 // Windows 桌面视口由 playwright.config.ts 覆盖；移动端不属于当前产品目标。
 // 所有测试使用 mock 命令边界，绝不启动 Tauri 或访问真实 TRAE 数据。
 

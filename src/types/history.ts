@@ -1,4 +1,4 @@
-// P5-3 历史页主库视图 DTO：项目/会话两栏 + 接力台账 + 主库消息预览。
+// P5-3 主库对话视图 DTO：项目/会话两栏 + 接力台账 + 主库消息预览。
 // 与 Rust 后端 get_master_history / get_master_session_messages /
 // get_relay_ledger 命令返回结构保持一致（snake_case wire 格式）。
 // 旧 T03/T04 扫描/浏览类型已随 U-6 骨架退役（环境模型取代账号中心方案）。

@@ -36,8 +36,8 @@ export function MasterLibraryDetail({ active, onNavigate }: MasterLibraryDetailP
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<MasterDetailTab>("sessions");
   // 懒挂载：App 各页面常驻 DOM（[hidden] 切换），若详情页一启动就渲染内嵌
-  // 库对话面板，会与独立历史页实例产生重复的 data-testid（测试定位冲突），
-  // 也会白白挂载一份两栏视图。首次激活后再挂载，之后保持（切页不丢状态）。
+  // 库对话面板只在详情页首次激活后挂载，避免未访问详情时白白创建两栏视图；
+  // 之后保持挂载，切换工作区不会丢失浏览状态。
   const [contentMounted, setContentMounted] = useState(false);
 
   const load = useCallback(async () => {

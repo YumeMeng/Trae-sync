@@ -69,11 +69,12 @@ describe("应用工作区入口", () => {
     });
   });
 
-  it("历史页走主库直读，不存在授权扫描入口", async () => {
+  it("G8：独立历史入口已删除，主库对话面板仅由主库详情承载", async () => {
     render(<App />);
 
     expect(await screen.findByTestId("current-account-context")).toBeInTheDocument();
-    // P5-3 起历史页直接读主库，授权勾选/扫描入口全部退役。
+    expect(screen.queryByRole("button", { name: "历史" })).not.toBeInTheDocument();
+    // 主库详情未激活前不挂载库内对话面板，也不保留旧授权扫描入口。
     expect(screen.queryByTestId("authorize-check")).not.toBeInTheDocument();
     expect(screen.queryByText("Work CN 只读入口")).not.toBeInTheDocument();
     expect(screen.queryByText("同步目标")).not.toBeInTheDocument();
@@ -193,6 +194,10 @@ describe("应用工作区入口", () => {
     expect(screen.queryByTestId("overview-empty-hint")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-master-cta")).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-scan-cta")).toHaveTextContent("查看主库记录");
+
+    // G8：总览主操作进入主库详情页，不再依赖已删除的独立历史工作区。
+    fireEvent.click(screen.getByTestId("overview-scan-cta"));
+    expect(await screen.findByRole("region", { name: "主库详情" })).toBeVisible();
   });
 
   it("总览页目录就绪但无对话时显示中性空态并引导去环境页", async () => {
@@ -244,12 +249,12 @@ describe("应用工作区入口", () => {
     expect(screen.queryByTestId("overview-master-cta")).not.toBeInTheDocument();
   });
 
-  it("导航使用总览、历史、账号、签到、环境、设置六个工作区", async () => {
+  it("导航使用总览、账号、签到、环境、设置五个工作区", async () => {
     render(<App />);
     await screen.findByTestId("current-account-context");
 
     expect(screen.getByRole("button", { name: "总览" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "历史" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "历史" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "账号" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "签到" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "环境" })).toBeInTheDocument();

@@ -1,4 +1,4 @@
-import { BookOpen, CalendarCheck, Layers, Settings2, UserRound } from "lucide-react";
+import { CalendarCheck, Layers, Settings2, UserRound } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Home } from "lucide-react";
 
@@ -6,7 +6,6 @@ import { Home } from "lucide-react";
 // 页内「返回」回环境页），故 navigationItems 不含它。
 export type AppPage =
   | "overview"
-  | "history"
   | "accounts"
   | "checkin"
   | "environment"
@@ -25,7 +24,6 @@ const navigationItems: Array<{
   icon: LucideIcon;
 }> = [
   { page: "overview", label: "总览", icon: Home },
-  { page: "history", label: "历史", icon: BookOpen },
   { page: "accounts", label: "账号", icon: UserRound },
   { page: "checkin", label: "签到", icon: CalendarCheck },
   { page: "environment", label: "环境", icon: Layers },

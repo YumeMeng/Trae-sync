@@ -150,7 +150,7 @@
 
 .workbench__auth {
   border-bottom: 1px solid var(--line-hair);
-  /* 密集玻璃（U-4 B1）：历史页整页 --glass-dense 统一质感 */
+  /* 密集玻璃（U-4 B1）：库工作区整页 --glass-dense 统一质感 */
   background: var(--glass-dense);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -1358,7 +1358,7 @@
 }
 
 /* ============================================================
-   U-6 W4 历史页账号切换器（账号为中心骨架）
+   U-6 W4 账号切换器（账号为中心骨架，已由环境模型取代）
    横跨工作区全宽（grid 1/-1）：三态筛选 + 账号分段控件 + 归档操作条。
    分段控件复用 .seg-control*（accounts.css 全局类），此处只补布局与专属子元素。
    ============================================================ */

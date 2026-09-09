@@ -233,7 +233,7 @@ check("行内单签禁用（已签）", (await page.locator('[data-testid="check
 check("单列表演进式列表", (await page.locator(".checkin-flow__row").count()) === 3);
 
 // —— 主库详情页契约（G21 两栏：左栏项目树 + 右栏查看器玻璃面板） ——
-// 进入路径 = 环境页 → 主库卡「详情」（独立历史页 P8-6 将删除，不再作宿主）。
+// 进入路径 = 环境页 → 主库卡「详情」（主库详情页是对话面板宿主）。
 await page.click('[data-testid="navigation-environment"]');
 await page.waitForTimeout(400);
 await page.click('[data-testid="env-master-detail"]');

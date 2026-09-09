@@ -275,7 +275,7 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
   ],
   [
     /master_incorporate_conflict/i,
-    "存在同名项目的记录冲突，已停止归入以保护数据；请先在历史页合并同名分组后再试。",
+    "存在同名项目的记录冲突，已停止归入以保护数据；请先在主库详情的对话列表中合并同名分组后再试。",
   ],
   [
     /master_incorporate_integrity_failed/i,
