@@ -3592,6 +3592,10 @@ fn checkin_material_root(state: &AppState) -> Result<PathBuf, String> {
 /// 自动签到调度器循环间隔（秒）：兼顾触发及时性与存储读取频率。
 const AUTO_CHECKIN_TICK_SECONDS: u64 = 30;
 
+/// 凭据维护检查间隔（秒）：在 access token 过期前留出足够的重试窗口，
+/// 同时避免在每个 30 秒签到 tick 上重复访问 OAuth 接口。
+const CREDENTIAL_MAINTENANCE_INTERVAL_SECONDS: u64 = 60 * 60;
+
 /// OAuth 临时档案清理线程间隔（秒）：小于保留时长，
 /// 超龄目录在一个间隔内必被回收。
 const OAUTH_PROFILE_CLEANUP_TICK_SECONDS: u64 = 300;
@@ -3612,6 +3616,51 @@ fn spawn_oauth_profile_cleanup_scheduler() {
     });
 }
 
+/// 独立维护所有已登记账号的凭据。
+///
+/// 维护不依赖自动签到开关或当天签到时间；只要管理工具在运行，就会按
+/// `RealCheckinRenewalService` 的阈值检查凭据。整个维护批次复用签到编排的
+/// 互斥锁，避免维护、签到、手动重置设备并发写入同一凭据包。
+fn maintain_all_credentials(material_root: &Path, execution_lock: &Arc<Mutex<()>>) -> bool {
+    // 维护批次整体持锁，避免同一进程内签到/设备操作在账号之间插入写回。
+    let Ok(_guard) = execution_lock.try_lock() else {
+        // 锁忙时不消费本次维护时间点，下一 tick 继续尝试，避免与签到
+        // 恰好重叠后整整延迟一个维护周期。
+        return false;
+    };
+    let records = AccountRegistry::new(material_root)
+        .load()
+        .unwrap_or_default();
+    let store = CheckinCredentialStore::new(material_root);
+    let renewal = RealCheckinRenewalService::new(&store);
+    let now = Utc::now().timestamp().max(0) as u64;
+    let mut renewed = Vec::new();
+    let mut failures = Vec::new();
+
+    for record in records {
+        let profile_id = record.profile_id.clone();
+        let binding = CheckinProfileBinding::new(
+            record.profile_id,
+            record.account_id,
+            record.device_id,
+            record.device_public_key,
+        );
+        match renewal.renew_if_needed(&binding, now) {
+            Ok(Some(_)) => renewed.push(profile_id),
+            Ok(None) => {}
+            Err(error) => failures.push((
+                profile_id,
+                credential_maintenance_error_code(&error).to_string(),
+            )),
+        }
+    }
+    // 后台维护失败立即留下账号级展示标记；成功只清除维护失败标记，
+    // 不触碰积分、额度和签到尝试证据。
+    checkin_overview::update_refresh_failures(material_root, &failures);
+    checkin_overview::clear_refresh_failures(material_root, &renewed);
+    true
+}
+
 /// 自动签到调度器（grill 2026-08-23 决策 1B：每日时间点 + 打开补偿混合）。
 ///
 /// 后台线程每 tick 检查触发条件（设置开启 + 今日未发起 + 已到/已过今日时间点）；
@@ -3630,8 +3679,17 @@ fn spawn_auto_checkin_scheduler(
             return;
         }
         let material_root = PathBuf::from(&storage_root).join("checkin");
+        let mut last_credential_maintenance: Option<std::time::Instant> = None;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(AUTO_CHECKIN_TICK_SECONDS));
+            let maintenance_due = last_credential_maintenance
+                .map(|last| {
+                    last.elapsed() >= std::time::Duration::from_secs(CREDENTIAL_MAINTENANCE_INTERVAL_SECONDS)
+                })
+                .unwrap_or(true);
+            if maintenance_due && maintain_all_credentials(&material_root, &execution_lock) {
+                last_credential_maintenance = Some(std::time::Instant::now());
+            }
             run_auto_checkin_tick(&app, &material_root, &execution_lock);
         }
     });
@@ -3901,7 +3959,7 @@ struct AutoCheckinLedgerWireDto {
 
 /// 真实批量签到：注册表取档案 -> 阈值续期（refresh 模式）-> status/claim/status 直连。
 ///
-/// 失败收口规则（fail-closed，ADR-0014）：
+/// 失败收口规则（fail-closed，ADR-0019 第 8 条、ADR-0027）：
 /// - 未登录（注册表无档案）或续期失败的账号合成失败结果，不发起签到；
 /// - 存在中断写回现场（RecoveryRequired）时所有账号拒绝，先恢复再签到；
 /// - 单账号失败不影响其余账号执行。
@@ -4166,6 +4224,19 @@ fn synthetic_real_checkin_failure(
         detail_code: Some(detail_code.to_string()),
         started_at: now,
         finished_at: now,
+    }
+}
+
+/// 凭据维护错误 -> 账号总览可持久化的非敏感原因码。
+fn credential_maintenance_error_code(error: &CheckinCredentialError) -> &'static str {
+    match error {
+        CheckinCredentialError::BindingMismatch => "binding_mismatch",
+        CheckinCredentialError::CredentialRefreshFailed => "credential_refresh_failed",
+        CheckinCredentialError::AuthMismatch => "auth_mismatch",
+        CheckinCredentialError::RecoveryRequired => "manual_recovery_required",
+        CheckinCredentialError::Missing => "credential_missing",
+        CheckinCredentialError::Unavailable => "credential_unavailable",
+        CheckinCredentialError::Invalid => "credential_invalid",
     }
 }
 
@@ -4574,6 +4645,17 @@ struct CreditsRefreshEntryDto {
     error_code: Option<String>,
 }
 
+/// 手动刷新登录凭据逐账号回执；不携带 access/refresh 等敏感内容。
+#[derive(Clone, Serialize)]
+struct CredentialRefreshEntryDto {
+    profile_id: String,
+    screen_name: String,
+    /// 是否已完成同设备凭据换发并安全写回。
+    refreshed: bool,
+    /// 失败原因码；成功为 None。
+    error_code: Option<String>,
+}
+
 /// 只读刷新积分：逐账号调 status + ide_user_ent_usage（不 claim、不消耗签到资格），
 /// 成功快照分别写回积分/额度缓存。串行执行、账号间无间隔（仅查询，实时完成；
 /// 签到 claim 才需要 3-8 秒随机间隔防风控）。单账号失败不影响其余账号；
@@ -4727,6 +4809,115 @@ fn refresh_checkin_credits_inner(
     checkin_overview::update_credits_from_snapshots(material_root, &snapshots);
     checkin_overview::update_usage_cache(material_root, &usages);
     checkin_overview::update_refresh_failures(material_root, &failures);
+    Ok(entries)
+}
+
+/// 手动刷新登录凭据：只走凭据换发链路，不签到、不查询额度、不打开用户 OAuth。
+///
+/// access 仍有效时由 `renew_now` 使用同设备 AuthCode 换发；access 已过期时
+/// 仅允许当前凭据代次的一次 refresh 救援。账号逐个处理，单个失败不会阻塞其余账号。
+#[tauri::command]
+async fn refresh_checkin_credentials(
+    profile_ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<CredentialRefreshEntryDto>, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("checkin_http_disabled".to_string());
+    }
+    let mut selected = Vec::new();
+    for profile_id in profile_ids {
+        if profile_id.is_empty() || profile_id.len() > 256 {
+            return Err("checkin_profile_invalid".to_string());
+        }
+        if !selected.contains(&profile_id) {
+            selected.push(profile_id);
+        }
+    }
+    if selected.is_empty() {
+        return Err("checkin_profile_empty".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let execution_lock = Arc::clone(&state.checkin_execution_lock);
+    tauri::async_runtime::spawn_blocking(move || {
+        // 凭据换发与签到/设备操作共享互斥，避免并发写入同一凭据包。
+        let _guard = execution_lock
+            .try_lock()
+            .map_err(|_| "credential_refresh_busy".to_string())?;
+        refresh_checkin_credentials_inner(&material_root, &selected)
+    })
+    .await
+    .map_err(|_| "credential_refresh_join_failed".to_string())?
+}
+
+fn refresh_checkin_credentials_inner(
+    material_root: &std::path::Path,
+    selected: &[String],
+) -> Result<Vec<CredentialRefreshEntryDto>, String> {
+    let registry = AccountRegistry::new(material_root);
+    let records = registry
+        .load()
+        .map_err(|_| "checkin_registry_invalid".to_string())?;
+    let store = CheckinCredentialStore::new(material_root);
+    // 有未收口写回时整批停止，避免把现场继续推进到更难恢复的状态。
+    if store
+        .has_pending_renewal()
+        .map_err(|_| "manual_recovery_required".to_string())?
+    {
+        return Err("manual_recovery_required".to_string());
+    }
+
+    let renewal = RealCheckinRenewalService::new(&store);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut refreshed = Vec::new();
+    let mut failures = Vec::new();
+    let mut entries = Vec::with_capacity(selected.len());
+
+    for profile_id in selected {
+        let Some(record) = records.iter().find(|record| &record.profile_id == profile_id) else {
+            failures.push((profile_id.clone(), "credential_missing".to_string()));
+            entries.push(CredentialRefreshEntryDto {
+                profile_id: profile_id.clone(),
+                screen_name: String::new(),
+                refreshed: false,
+                error_code: Some("credential_missing".to_string()),
+            });
+            continue;
+        };
+        let binding = CheckinProfileBinding::new(
+            record.profile_id.clone(),
+            record.account_id.clone(),
+            record.device_id.clone(),
+            record.device_public_key.clone(),
+        );
+        match renewal.renew_now(&binding, now) {
+            Ok(_) => {
+                refreshed.push(profile_id.clone());
+                entries.push(CredentialRefreshEntryDto {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    refreshed: true,
+                    error_code: None,
+                });
+            }
+            Err(error) => {
+                let error_code = credential_maintenance_error_code(&error).to_string();
+                failures.push((profile_id.clone(), error_code.clone()));
+                entries.push(CredentialRefreshEntryDto {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    refreshed: false,
+                    error_code: Some(error_code),
+                });
+            }
+        }
+    }
+
+    // 失败证据保留；成功只清除该账号的凭据维护失败标记，不碰额度与签到记录。
+    checkin_overview::update_refresh_failures(material_root, &failures);
+    checkin_overview::clear_refresh_failures(material_root, &refreshed);
     Ok(entries)
 }
 
@@ -9988,6 +10179,7 @@ pub fn run() {
             list_checkin_accounts,
             get_checkin_overview,
             refresh_checkin_credits,
+            refresh_checkin_credentials,
             remove_checkin_account,
             // ADR-0019 v4：手动重置签到设备（生成新随机设备并设为 home）。
             reset_checkin_device,

@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import type {
   CheckinBatchSummaryDto,
+  CredentialRefreshEntryDto,
   CheckinOverviewEntryDto,
   CreditsRefreshEntryDto,
 } from "../types/account_switch";
@@ -35,11 +36,12 @@ interface AccountDetailProps {
   onBack: () => void;
 }
 
-type DetailAction = "credits" | "checkin" | "remove" | "relogin" | "auto-checkin" | "reset-device" | "alias" | "mobile" | null;
+type DetailAction = "credentials" | "credits" | "checkin" | "remove" | "relogin" | "auto-checkin" | "reset-device" | "alias" | "mobile" | null;
 
 /**
  * 单账号详情独立视图：基础信息 -> 登录健康度 -> 操作区 -> 折叠技术细节。
- * 操作四件套：刷新额度（只读查询，不消耗签到资格）/ 立即签到（单账号批次）/ 重新登录（OAuth 覆盖更新）/ 删除账号（二次确认）。
+ * 操作区包含：刷新登录凭据（同设备换发，不打开用户 OAuth）/ 刷新额度（只读查询）/
+ * 立即签到（单账号批次）/ 重新登录（OAuth 覆盖更新）/ 删除账号（二次确认）。
  */
 export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSaveMobile, onBack }: AccountDetailProps) {
   const [busy, setBusy] = useState<DetailAction>(null);
@@ -103,6 +105,19 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
       ? formatCreditsValue(result.usage_remaining_credits)
       : "未知";
     setMessage(`额度已更新：模型积分 ${usage}（今日${result?.checked_in ? "已签" : "未签"}）。`);
+  }), [entry.profile_id, onDataChanged, runAction]);
+
+  // 手动刷新登录凭据：只执行同设备换发，成功后写回本机加密凭据与 TRAE 登录 blob。
+  const handleRefreshCredentials = useCallback(() => void runAction("credentials", async () => {
+    const results = await invoke<CredentialRefreshEntryDto[]>("refresh_checkin_credentials", {
+      profileIds: [entry.profile_id],
+    });
+    const result = results[0];
+    if (!result?.refreshed) {
+      throw new Error(result?.error_code ?? "credential_refresh_failed");
+    }
+    await onDataChanged();
+    setMessage("登录凭据已更新，无需重新登录。");
   }), [entry.profile_id, onDataChanged, runAction]);
 
   // 立即签到：单账号批次，当日已签（缓存确认）时按钮禁用并显示已签状态。
@@ -305,10 +320,10 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
         </dl>
         {entry.credential_legacy ? (
           <p className="account-detail__hint account-detail__hint--warn" data-testid="account-detail-legacy-hint">
-            该账号仍在使用已停用的旧版登录通道，自动续期不可用；重新登录一次即可更新凭据并恢复。
+            该账号仍在使用旧版登录通道；可先尝试“刷新登录凭据”，若当前凭据已无法换发，再重新登录。
           </p>
         ) : (
-          <p className="account-detail__hint">刷新令牌过期前可自动续期；过期后需要重新登录。</p>
+          <p className="account-detail__hint">应用会按需维护登录凭据，也可手动刷新；不会重复打开用户 OAuth 登录。</p>
         )}
       </section>
 
@@ -340,6 +355,9 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
       <section className="account-detail__section" aria-labelledby="account-detail-actions">
         <h2 id="account-detail-actions">操作</h2>
         <div className="account-detail__actions">
+          <button className="btn btn--primary" type="button" onClick={handleRefreshCredentials} disabled={busy !== null || loginBusy} data-testid="account-detail-refresh-credentials">
+            <RefreshCw size={15} aria-hidden="true" />{busy === "credentials" ? "刷新中…" : "刷新登录凭据"}
+          </button>
           <button className="btn" type="button" onClick={handleRefreshCredits} disabled={busy !== null || loginBusy}>
             <RefreshCw size={15} aria-hidden="true" />{busy === "credits" ? "查询中…" : "刷新额度"}
           </button>

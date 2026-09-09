@@ -307,6 +307,16 @@ export interface CreditsRefreshEntryDto {
   readonly error_code: string | null;
 }
 
+/** refresh_checkin_credentials 手动凭据刷新逐账号回执。 */
+export interface CredentialRefreshEntryDto {
+  readonly profile_id: string;
+  readonly screen_name: string;
+  /** 是否已完成同设备换发并安全写回。 */
+  readonly refreshed: boolean;
+  /** 失败原因码；成功为 null。 */
+  readonly error_code: string | null;
+}
+
 /** 开始 OAuth 登录的返回：登录页地址（后端已同时打开系统浏览器）。 */
 export interface CheckinLoginBeginDto {
   readonly login_url: string;

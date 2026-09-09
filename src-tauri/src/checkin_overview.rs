@@ -278,6 +278,26 @@ pub fn update_refresh_failures(material_root: &Path, failures: &[(String, String
     write_credits_cache(material_root, &cache);
 }
 
+/// 清除已成功完成凭据维护账号的展示失败标记；不触碰积分、额度和签到证据。
+pub fn clear_refresh_failures(material_root: &Path, profile_ids: &[String]) {
+    if profile_ids.is_empty() {
+        return;
+    }
+    let mut cache = CreditsCacheFile {
+        entries: read_credits_cache(material_root),
+        ..CreditsCacheFile::default()
+    };
+    let mut changed = false;
+    for profile_id in profile_ids {
+        if let Some(entry) = cache.entries.get_mut(profile_id) {
+            changed |= entry.refresh_error_code.take().is_some();
+        }
+    }
+    if changed {
+        write_credits_cache(material_root, &cache);
+    }
+}
+
 /// 用 `ide_user_ent_usage` 快照更新额度缓存（refresh_checkin_credits 用）。
 /// 仅写入成功取得快照的账号；保留其余字段不动。
 pub fn update_usage_cache(material_root: &Path, usages: &[(String, EntitlementUsageSnapshot)]) {
@@ -602,6 +622,17 @@ mod tests {
         let cache = read_credits_cache(&root);
         assert_eq!(cache.get("p1").unwrap().refresh_error_code, None);
         assert!(cache.get("p2").unwrap().refresh_error_code.is_some());
+
+        // 后台维护成功也能独立清除标记，不需要额外触发一次 status 网络请求。
+        update_refresh_failures(&root, &[("p1".to_string(), "network_error".to_string())]);
+        clear_refresh_failures(&root, &["p1".to_string()]);
+        assert_eq!(
+            read_credits_cache(&root)
+                .get("p1")
+                .unwrap()
+                .refresh_error_code,
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

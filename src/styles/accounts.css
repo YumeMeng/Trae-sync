@@ -814,7 +814,13 @@
   text-overflow: ellipsis;
 }
 
-/* meta 行：手机号（G13 精简后仅保留手机号，弱化文字） */
+/* meta 行：手机号与登录凭据剩余时间，弱化文字 */
+.account-meta-group {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .account-item__meta {
   display: flex;
   align-items: center;
@@ -919,7 +925,7 @@
   color: var(--warn);
 }
 
-/* 卡片手机号行：中性小字。 */
+/* 卡片手机号/凭据有效期行：中性小字。 */
 .account-card__meta {
   margin: 0;
   color: var(--text-2);
@@ -1295,4 +1301,3 @@
 .account-detail__tech .account-detail__facts {
   padding: 14px 16px;
 }
-

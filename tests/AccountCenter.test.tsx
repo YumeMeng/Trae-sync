@@ -163,7 +163,7 @@ describe("AccountCenter", () => {
     expect(screen.queryByTestId("account-add-primary")).not.toBeInTheDocument();
   });
 
-  it("真实模式条目展示要素：名称、模型额度、签到槽位徽章、令牌 meta（U-2 新徽章语言）", async () => {
+  it("真实模式条目展示要素：名称、模型额度、签到槽位徽章、凭据剩余时间", async () => {
     mockRealMode([overviewEntry("profile-login-1", "登录账号甲", {
       usage_remaining_credits: 1240,
       usage_cached_at: "2026-08-22T01:00:00.000Z",
@@ -171,14 +171,13 @@ describe("AccountCenter", () => {
 
     render(<AccountCenter active={true} />);
     const card = await screen.findByTestId("account-card-profile-login-1");
-    // 可断言文本：名称、模型积分额度、签到槽（已签）、G13 meta 精简后的手机号。
+    // 可断言文本：名称、模型积分额度、签到槽（已签）、手机号与凭据剩余时间。
     expect(card).toHaveTextContent("登录账号甲");
     expect(card).toHaveTextContent("模型积分");
     expect(card).toHaveTextContent("1240");
     expect(screen.getByText("已签")).toBeInTheDocument();
     expect(screen.getByText("138****0000", { selector: ".account-item__meta" })).toBeInTheDocument();
-    // G13：令牌天数不再出现在列表 meta（收进详情页）。
-    expect(card).not.toHaveTextContent(/令牌 \d+ 天/);
+    expect(screen.getByText(/登录凭据剩余 10 天/, { selector: ".account-item__token-expiry" })).toBeInTheDocument();
   });
 
   it("积分未查询时条目显示占位文案，未签显示空心槽位徽章", async () => {
@@ -196,17 +195,28 @@ describe("AccountCenter", () => {
     expect(screen.getByTestId("account-card-profile-login-1")).not.toHaveTextContent(/积分 \d/);
   });
 
-  it("token 健康度不再占列表 meta：令牌天数与过期警示收进登录槽徽章与详情页", async () => {
+  it("账号列表区分凭据已过期与有效期未知", async () => {
     const now = Date.now() / 1000;
     mockRealMode([
       overviewEntry("profile-a", "过期账号", { access_token_expires_at_unix_seconds: Math.floor(now - 100) }),
+      overviewEntry("profile-unknown", "未知账号", { access_token_expires_at_unix_seconds: null }),
     ]);
 
     render(<AccountCenter active={true} />);
     const card = await screen.findByTestId("account-card-profile-a");
-    // G13 移除 meta 令牌文字；G10 后过期警示由登录槽徽章承载（此处凭据未初始化 → 未登录灰）。
-    expect(card).not.toHaveTextContent(/令牌 \d+ 天/);
+    expect(card).toHaveTextContent("登录凭据已过期");
     expect(card).not.toHaveTextContent("登录已过期");
+    expect(screen.getByTestId("account-card-profile-unknown")).toHaveTextContent("登录凭据有效期未知");
+  });
+
+  it("卡片视图同样展示登录凭据剩余时间", async () => {
+    window.localStorage.setItem("accounts.view", "card");
+    mockRealMode([overviewEntry("profile-card", "卡片账号")]);
+
+    render(<AccountCenter active={true} />);
+    const card = await screen.findByTestId("account-card-profile-card");
+    expect(screen.getByText(/登录凭据剩余 10 天/, { selector: ".account-card__token-expiry" })).toBeInTheDocument();
+    expect(card).toHaveTextContent("138****0000");
   });
 
   it("点击卡片进入详情视图，展示基础信息与折叠技术细节，返回回到列表", async () => {
@@ -264,6 +274,82 @@ describe("AccountCenter", () => {
       expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credits", { profileIds: ["profile-login-1"] });
     });
     expect(await screen.findByText(/额度已更新：模型积分 236\.5（今日已签）/)).toBeInTheDocument();
+  });
+
+  it("详情页刷新登录凭据只调用凭据命令，不触发额度查询或签到", async () => {
+    const entry = overviewEntry("profile-credential-one", "凭据账号甲");
+    let refreshed = false;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [entry];
+      if (command === "get_trae_instance_states") {
+        return [{ profile_id: entry.profile_id, login_state: "logged_in", archive_available: false }];
+      }
+      if (command === "refresh_checkin_credentials") {
+        refreshed = true;
+        return [{
+          profile_id: entry.profile_id,
+          screen_name: entry.screen_name,
+          refreshed: true,
+          error_code: null,
+        }];
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+    fireEvent.click(await screen.findByTestId("account-card-profile-credential-one"));
+    fireEvent.click(screen.getByTestId("account-detail-refresh-credentials"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credentials", {
+        profileIds: [entry.profile_id],
+      });
+    });
+    expect(refreshed).toBe(true);
+    expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credits", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
+    expect(await screen.findByText("登录凭据已更新，无需重新登录。")).toBeInTheDocument();
+  });
+
+  it("账号列表刷新全部凭据按账号展示成功与失败，不触发额度查询", async () => {
+    const entryA = overviewEntry("profile-credential-all-a", "凭据成功账号");
+    const entryB = overviewEntry("profile-credential-all-b", "凭据失败账号");
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [entryA, entryB];
+      if (command === "get_trae_instance_states") {
+        return [entryA, entryB].map((entry) => ({
+          profile_id: entry.profile_id,
+          login_state: "logged_in",
+          archive_available: false,
+        }));
+      }
+      if (command === "refresh_checkin_credentials") {
+        return [
+          { profile_id: entryA.profile_id, screen_name: entryA.screen_name, refreshed: true, error_code: null },
+          { profile_id: entryB.profile_id, screen_name: entryB.screen_name, refreshed: false, error_code: "credential_refresh_failed" },
+        ];
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+    await screen.findByText("凭据成功账号");
+    fireEvent.click(screen.getByTestId("account-refresh-credentials"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credentials", {
+        profileIds: [entryA.profile_id, entryB.profile_id],
+      });
+    });
+    expect(await screen.findByText("凭据刷新完成：1 个账号正常，1 个需要处理。")).toBeInTheDocument();
+    expect(screen.getByText("凭据失败账号", { selector: ".result-card__issue-name" })).toBeInTheDocument();
+    expect(screen.getByText("登录凭据已过期或不可用，无法自动续期；请重新登录该账号以更新凭据。")).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credits", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
   });
 
   it("详情页立即签到执行单账号批次，成功后显示奖励已发放", async () => {
@@ -1235,6 +1321,27 @@ describe("AccountCenter", () => {
     fireEvent.click(screen.getByTestId("account-filter-attention"));
     // 琥珀账号仍显示在需处理视图。
     expect(await screen.findByTestId("account-card-profile-stale-1")).toBeInTheDocument();
+  });
+
+  it("G14 需处理过滤：凭据已过期或凭据缺失时，即使健康度未返回也计入", async () => {
+    const expired = overviewEntry("profile-expired-1", "令牌过期账号", {
+      access_token_expires_at_unix_seconds: 0,
+    });
+    const missing = overviewEntry("profile-missing-1", "凭据缺失账号", {
+      refresh_error_code: "credential_missing",
+    });
+    mockRealMode([expired, missing]);
+
+    render(<AccountCenter active={true} />);
+    await screen.findByText("令牌过期账号");
+
+    // 过期时间与持久化凭据错误都是可执行的处理项，不能被未初始化的健康度结果遮住。
+    expect(screen.getByTestId("account-filter-attention")).toHaveTextContent("2");
+    expect(screen.getByTestId("account-card-profile-expired-1")).toHaveTextContent("已过期");
+
+    fireEvent.click(screen.getByTestId("account-filter-attention"));
+    await waitFor(() => expect(screen.getByTestId("account-card-profile-expired-1")).toBeInTheDocument());
+    expect(screen.getByTestId("account-card-profile-missing-1")).toBeInTheDocument();
   });
 
   it("G14 需处理过滤：全部正常时无角标，切过去显示空态提示", async () => {

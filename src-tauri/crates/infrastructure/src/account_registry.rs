@@ -1,7 +1,7 @@
 //! MVP 非敏感账号注册表：OAuth 登录成功后的账号档案（JSON 文件）。
 //!
 //! 只保存可进入前端展示的字段；Token、refresh token、设备私钥等敏感材料
-//! 只存在于 `CheckinCredentialStore` 的 DPAPI 加密凭据包中（见 ADR-0014）。
+//! 只存在于 `CheckinCredentialStore` 的 DPAPI 加密凭据包中（见 ADR-0019）。
 
 use std::collections::BTreeMap;
 use std::fs;

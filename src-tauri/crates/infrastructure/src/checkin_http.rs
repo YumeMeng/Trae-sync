@@ -9,8 +9,8 @@
 //!   （UA + 固定标识 + 账号派生 ID + 每请求刷新 ID），status 端点带头/裸头
 //!   对比实测 PASS（报告 telemetry-headers-probe-20260902-234021.json：
 //!   带头组与裸头基线均 200/code=0 且业务字段一致）。
-//! - `ExchangeToken`：AuthCode 模式免签名（登录）；refresh 模式需 DeviceProof
-//!   ECDSA-SHA256 签名（续期）。响应含毫秒过期时间与设备绑定状态。
+//! - `ExchangeToken`：AuthCode 模式免签名（登录/同设备滚动换发）；refresh 模式需
+//!   DeviceProof ECDSA-SHA256 签名（旧续期兜底）。响应含毫秒过期时间与设备绑定状态。
 //! - `GetUserInfo`：只读身份/资料查询。
 //!
 //! 网络错误映射为 `CheckinTransportError`，错误文本不含 Token 或响应正文。
@@ -34,7 +34,7 @@ use crate::checkin_credential::{
     device_proof_signing_input, needs_refresh, sign_device_proof, CheckinCredentialBundle,
     CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding, RenewalReceipt,
 };
-use crate::checkin_login::decode_account_from_jwt;
+use crate::checkin_login::{decode_account_from_jwt, generate_pkce_pair};
 
 const API_BASE: &str = "https://api.trae.cn";
 const CHECKIN_STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
@@ -916,10 +916,10 @@ pub fn get_user_info_full(
     })
 }
 
-/// 真实凭据续期编排：阈值检查 -> refresh 模式 `ExchangeToken`（设备签名）->
+/// 真实凭据续期编排：阈值检查 -> 同设备 AuthCode 滚动换发 ->
 /// 新令牌身份校验（JWT `data.id` 必须匹配绑定账号）-> 安全写回。
 ///
-/// 与 `FixtureRenewalService` 遵循同一生命周期契约（ADR-0014）：
+/// 与 `FixtureRenewalService` 遵循同一生命周期契约（ADR-0019、ADR-0027）：
 /// 中断现场未收口前禁止续期；身份不一致零回写；写回走备份/临时文件/
 /// 原子替换/重新验证固定顺序。
 pub struct RealCheckinRenewalService<'a> {
@@ -949,7 +949,120 @@ impl<'a> RealCheckinRenewalService<'a> {
         if !needs_refresh(&bundle, now_unix_seconds) {
             return Ok(None);
         }
-        self.renew(binding, bundle, now_unix_seconds).map(Some)
+        self.renew_loaded(binding, bundle, now_unix_seconds)
+            .map(Some)
+    }
+
+    /// 立即刷新当前账号凭据，不检查剩余寿命阈值。
+    ///
+    /// App 的手动刷新入口使用此方法：access 仍有效时走已验证的同设备
+    /// AuthCode 换发；access 已过期时仅允许当前凭据代次的一次 refresh 救援。
+    /// 全程不打开用户 OAuth 登录页，也不创建新设备。
+    pub fn renew_now(
+        &self,
+        binding: &CheckinProfileBinding,
+        now_unix_seconds: u64,
+    ) -> Result<RenewalReceipt, CheckinCredentialError> {
+        if self.store.has_pending_renewal()? {
+            return Err(CheckinCredentialError::RecoveryRequired);
+        }
+        let bundle = self.store.load(binding)?;
+        self.renew_loaded(binding, bundle, now_unix_seconds)
+    }
+
+    /// 按当前凭据代次选择不创建新设备的换发路径。
+    fn renew_loaded(
+        &self,
+        binding: &CheckinProfileBinding,
+        bundle: CheckinCredentialBundle,
+        now_unix_seconds: u64,
+    ) -> Result<RenewalReceipt, CheckinCredentialError> {
+        // ADR-0019 v6：旧 Work 通道已退役，必须在任何换发/救援前快速失败，
+        // 避免无效网络请求和消耗该凭据代次唯一一次 rescue 机会。
+        if bundle.client_id != TRAE_SOLO_CLIENT_ID {
+            return Err(CheckinCredentialError::CredentialRefreshFailed);
+        }
+        // 真实实测：同一设备用仍有效的 access token 申请 AuthCode，再交换新
+        // token 可连续滚动；refresh 模式在当前账号代次上稳定返回 20403。
+        // 只有 access 已经过期、无法再申请 AuthCode 时才保留一次旧 refresh 兜底。
+        if bundle.access_token_expires_at_unix_seconds > now_unix_seconds {
+            return self.renew_via_same_device_auth_code(binding, bundle);
+        }
+
+        // access 已过期时沿用一次性代次闸门，避免手动点击或多实例并发
+        // 反复重放已被服务端拒绝的旧 refresh token。
+        let claimed = self.store.claim_refresh_rescue_attempt(
+            binding,
+            &bundle,
+            now_unix_seconds,
+        )?;
+        if !claimed {
+            return Err(CheckinCredentialError::CredentialRefreshFailed);
+        }
+        self.renew(binding, bundle, now_unix_seconds)
+    }
+
+    /// 用当前设备和仍有效的 access token 滚动换发凭据。
+    ///
+    /// 这条路径不使用旧 refresh token，也不创建新设备：GetPCAuthCode 的
+    /// DeviceID 与当前凭据一致，AuthCode Exchange 后仍沿用原设备四件套。
+    /// 2026-09-09 已在两个真实账号上各连续验证两次。
+    fn renew_via_same_device_auth_code(
+        &self,
+        binding: &CheckinProfileBinding,
+        bundle: CheckinCredentialBundle,
+    ) -> Result<RenewalReceipt, CheckinCredentialError> {
+        let oauth_client = OAuthClient::Solo;
+        let pkce = generate_pkce_pair()
+            .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
+        let auth_code = get_pc_auth_code(
+            &self.client,
+            &bundle.access_token,
+            &pkce.code_challenge,
+            &bundle.device_id,
+            oauth_client,
+        )
+        .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
+        let device_info = oauth_client.device_info(
+            &bundle.device_id,
+            &bundle.machine_id,
+            &bundle.device_public_key,
+        );
+        let grant = exchange_token_by_auth_code(
+            &self.client,
+            &auth_code,
+            &pkce.code_verifier,
+            &device_info,
+            oauth_client,
+        )
+        .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
+        let (account_id, _) = decode_account_from_jwt(&grant.access_token)
+            .map_err(|_| CheckinCredentialError::AuthMismatch)?;
+        if account_id != binding.account_id {
+            return Err(CheckinCredentialError::AuthMismatch);
+        }
+        let mut updated = bundle;
+        updated.access_token = grant.access_token;
+        updated.refresh_token = grant.refresh_token;
+        updated.client_id = TRAE_SOLO_CLIENT_ID.to_string();
+        updated.access_token_expires_at_unix_seconds = grant.access_token_expires_at_unix_seconds;
+        updated.refresh_token_expires_at_unix_seconds =
+            grant.refresh_token_expires_at_unix_seconds;
+        let operation_id = self.store.write_back(binding, &updated)?;
+        // 新 token 写回后同步当前实例登录 blob；失败不影响已验证的凭据包。
+        crate::blob_keepalive::keepalive_after_renewal(
+            self.store.root(),
+            &binding.profile_id,
+            &updated.access_token,
+            &updated.refresh_token,
+            updated.access_token_expires_at_unix_seconds,
+            updated.refresh_token_expires_at_unix_seconds,
+        );
+        Ok(RenewalReceipt {
+            profile_id: binding.profile_id.clone(),
+            operation_id,
+            refresh_token_rotated: true,
+        })
     }
 
     fn renew(
@@ -989,6 +1102,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         let mut updated = bundle;
         updated.access_token = grant.access_token;
         updated.refresh_token = grant.refresh_token;
+        updated.client_id = TRAE_SOLO_CLIENT_ID.to_string();
         updated.access_token_expires_at_unix_seconds = grant.access_token_expires_at_unix_seconds;
         updated.refresh_token_expires_at_unix_seconds = grant.refresh_token_expires_at_unix_seconds;
         let operation_id = self.store.write_back(binding, &updated)?;
@@ -1242,6 +1356,53 @@ mod tests {
         let service = RealCheckinRenewalService::new(&store);
         // 剩余寿命充足：跳过续期，不发起网络请求。
         assert!(service.renew_if_needed(&binding, now).unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_renewal_rejects_legacy_work_without_rescue_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let (private_pem, public_pem) =
+            crate::checkin_credential::generate_device_keypair().unwrap();
+        let now = 1_800_000_000u64;
+        let bundle = CheckinCredentialBundle {
+            profile_id: "profile-legacy".to_string(),
+            account_id: "account-legacy".to_string(),
+            device_id: "1234567890123456".to_string(),
+            machine_id: "machine-legacy".to_string(),
+            device_public_key: public_pem.clone(),
+            device_private_key: private_pem,
+            access_token: "expired-token".to_string(),
+            refresh_token: "legacy-refresh".to_string(),
+            // 旧 Work 通道不能再进入任何续期路径，避免浪费一次 rescue 机会。
+            client_id: "ono9krqynydwx5".to_string(),
+            access_token_expires_at_unix_seconds: now - 1,
+            refresh_token_expires_at_unix_seconds: now + 180 * 24 * 60 * 60,
+            mobile_full: None,
+        };
+        store.save(&bundle).unwrap();
+        let binding = CheckinProfileBinding::new(
+            "profile-legacy",
+            "account-legacy",
+            "1234567890123456",
+            &public_pem,
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(1))
+            .build()
+            .unwrap();
+        let service = RealCheckinRenewalService {
+            store: &store,
+            client,
+        };
+
+        assert_eq!(
+            service.renew_now(&binding, now).unwrap_err(),
+            CheckinCredentialError::CredentialRefreshFailed
+        );
+        // 旧 Work 凭据应在策略判断处收口，不创建过期 access 的 rescue 标记。
+        assert!(!root.path().join("refresh-rescue").exists());
     }
 
     #[test]

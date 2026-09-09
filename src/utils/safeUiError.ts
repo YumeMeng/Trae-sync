@@ -58,6 +58,18 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "登录凭据已过期或不可用，无法自动续期；请重新登录该账号以更新凭据。",
   ],
   [
+    /credential_refresh_busy/i,
+    "当前已有签到或凭据维护在进行，请稍后重试。",
+  ],
+  [
+    /binding_mismatch|auth_mismatch/i,
+    "账号绑定信息与本机登录凭据不一致，请重新登录该账号。",
+  ],
+  [
+    /credential_missing|credential_unavailable|credential_invalid/i,
+    "本机登录凭据不可用，请重新登录该账号。",
+  ],
+  [
     /business_9074/i,
     "设备身份未获服务端信任（9074）；若刚登录或刚重置设备请稍等几分钟再试，否则请在账号详情重置签到设备。",
   ],

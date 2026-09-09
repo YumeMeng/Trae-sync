@@ -7,7 +7,7 @@
 | ADR | 主题 | 约束什么 |
 |-----|------|---------|
 | [0018](0018-data-redline-release.md) | 数据红线解除 | 可直接读写真实数据；数据安全 = 手动备份入口 + 破坏性操作单次确认；铁律不自动删证据 |
-| [0019](0019-checkin-virtual-device-and-account-source.md) | 签到虚拟设备与账号来源 | 每账号持久虚拟设备（随机 ID + EC 密钥对 + 随机 MachineID）；仅 OAuth 登录；打开时自动签；业务码不得压平；凭据原子写回（第 7 条）；续期 `20403` 例外见 ADR-0027 |
+| [0019](0019-checkin-virtual-device-and-account-source.md) | 签到虚拟设备与账号来源 | 每账号持久虚拟设备（随机 ID + EC 密钥对 + 随机 MachineID）；仅 OAuth 登录；打开时自动签；业务码不得压平；凭据原子写回（第 7 条）；同设备续期见 ADR-0027 |
 | [0020](0020-master-library-and-instance-model.md) | 主库与实例模型 | 主库 = 目录级切换分两阶段；纯本地；并行多开（2026-08-23 修订），主库模式强制单实例。阶段 A/B 与收入/返还语义已被 ADR-0021 部分取代；决策 4 并行多开承载已由 ADR-0024 改为「环境」 |
 | [0021](0021-master-single-ownership.md) | 主库记录单一归属 | 主库 = 环境内全部对话集合，单一归属当前登录账号；切号即归一；收编 = 环境页体检 + 一键归入；插件为验收观察点 |
 | [0022](0022-session-archive-channel.md) | 会话级归档通道 | 出库 = 借用 hidden_status 原生枚举（voice_discussion）；恢复 = 还原 NULL；归档抽屉为对话列表子视图；批量走 Gmail 式选择态；合并为遗留清理工具 |
@@ -15,7 +15,7 @@
 | [0024](0024-account-environment-decoupling.md) | 账号-环境解耦 | 实例目录转型登录凭据存档（三件套即全部消费面，E1 实证）；启动实例功能退役；环境 = 独立目录 + 当前账号（多对多，主库环境默认不可删）；工具链缓存为可清理派生数据 |
 | [0025](0025-library-abstraction.md) | Library 抽象 | 主库/副库基地是「库」：前端注入 libraryId 引用（不注入密钥），后端命令按 id 解析库实例；HistoryWorkbench 改名 LibrarySessionsPanel |
 | [0026](0026-plugin-sync-policy.md) | 插件同步策略 | 新增零确认、移除单确认且全账号传播、切号静默应用（含移除才单确认）；取代 ADR-0023 决策 2 确认语义；对账条移除 |
-| [0027](0027-first-login-credential-acceptance.md) | 首次登录凭据验收与一次 OAuth 约束 | 首次 OAuth 必须通过真实续期验收；`20403` 最多同会话设备重铸一次；禁止静默第二次 OAuth；失败保留证据 |
+| [0027](0027-first-login-credential-acceptance.md) | 首次登录凭据验收与一次 OAuth 约束 | access 未过期时同设备 AuthCode 滚动换发；不自动重铸签到设备；禁止静默第二次 OAuth；失败保留证据 |
 
 配套决策记录：`docs/DECISIONS-20260822-GRILL.md`（项目方向历史锚点，九问九答全量；部分决策已被本表 ADR 取代，见其头部标注）。
 

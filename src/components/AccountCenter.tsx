@@ -6,6 +6,7 @@ import type {
   CheckinLoginBeginDto,
   CheckinLoginReceiptDto,
   CheckinOverviewEntryDto,
+  CredentialRefreshEntryDto,
   CreditsRefreshEntryDto,
   ManagedAccountsViewDto,
   TraeInstanceLoginState,
@@ -75,6 +76,8 @@ export function AccountCenter({ active }: AccountCenterProps) {
   const [loginBrowserMode, setLoginBrowserMode] = useState<LoginBrowserMode>("isolated");
   // 批量刷新积分进行中（按钮禁用 + 进度提示）。
   const [creditsBusy, setCreditsBusy] = useState(false);
+  // 批量刷新登录凭据进行中（只换发 token，不签到、不查询额度）。
+  const [credentialRefreshBusy, setCredentialRefreshBusy] = useState(false);
   // 一键健康检测进行中（本地检测 + 网络探测，按钮禁用 + 进度提示）。
   const [healthBusy, setHealthBusy] = useState(false);
   // G15 纯本地刷新进行中（毫秒级本地读取，仅驱动按钮图标旋转）。
@@ -233,9 +236,12 @@ export function AccountCenter({ active }: AccountCenterProps) {
   }, [overview, accountSort]);
 
   // G14 需处理判定：口径与 G10 槽位一致——登录槽红/琥珀 或 签到槽红。
-  // 未签/未刷新（灰）不算异常；登录槽灰（未登录）也不算。
+  // 已知凭据失效/缺失和 access 过期属于明确可处理项，即使健康度读取没有返回也不能隐藏。
+  // 未签/未刷新（灰）不算异常；登录槽灰（未登录）仍按“尚未登录”处理。
   const needsAttention = useCallback((entry: CheckinOverviewEntryDto) => {
-    const credentialDead = entry.credential_legacy || entry.refresh_error_code === "credential_refresh_failed";
+    const nowUnixSeconds = Math.floor(Date.now() / 1000);
+    if (credentialNeedsAttention(entry, nowUnixSeconds)) return true;
+    const credentialDead = credentialRequiresRelogin(entry);
     const loginSlot = deriveLoginSlotState({
       login_state: effectiveCredentialState(entry, loginStates[entry.profile_id]),
       relogin_only: credentialDead,
@@ -374,6 +380,54 @@ export function AccountCenter({ active }: AccountCenterProps) {
       }
     })();
   }, [creditsBusy, overview, refreshOverview]);
+
+  // 批量刷新登录凭据：逐账号执行同设备换发，不打开用户 OAuth、不签到、不过问额度。
+  const handleRefreshAllCredentials = useCallback(() => {
+    if (credentialRefreshBusy || overview.length === 0) return;
+    setCredentialRefreshBusy(true);
+    setError(null);
+    setMessage(null);
+    setResultCard(null);
+    void (async () => {
+      try {
+        const profileIds = overview.map((entry) => entry.profile_id);
+        const results = await invoke<CredentialRefreshEntryDto[]>("refresh_checkin_credentials", { profileIds });
+        await refreshOverview();
+        const nameOf = new Map(overview.map((entry) => [entry.profile_id, effectiveDisplayName(entry)]));
+        const issues = results
+          .filter((item) => !item.refreshed)
+          .map((item) => ({
+            key: item.profile_id,
+            name: (nameOf.get(item.profile_id) ?? item.screen_name) || "该账号",
+            reason: safeUiErrorMessage(item.error_code, "登录凭据刷新未完成，请稍后重试。"),
+          }));
+        setResultCard({
+          title: "凭据刷新",
+          okCount: results.filter((item) => item.refreshed).length,
+          issues,
+        });
+        // 换发结果已完成身份校验；本地徽章无需再次发起逐账号网络探测。
+        setLoginStates((previous) => {
+          const next = { ...previous };
+          for (const item of results) {
+            if (item.refreshed) {
+              const current = next[item.profile_id];
+              next[item.profile_id] = {
+                profile_id: item.profile_id,
+                login_state: "logged_in",
+                archive_available: current?.archive_available ?? false,
+              };
+            }
+          }
+          return next;
+        });
+      } catch (reason: unknown) {
+        setError(safeUiErrorMessage(reason, "凭据刷新未完成，请稍后重试。"));
+      } finally {
+        setCredentialRefreshBusy(false);
+      }
+    })();
+  }, [credentialRefreshBusy, overview, refreshOverview]);
 
   // 一键健康检测：登录存档深度检测（storage.json 键 + 最近启动日志证据，
   // 秒级）→ 签到会话网络探测（复用 refresh_checkin_credits 只读查询，顺带
@@ -520,17 +574,20 @@ export function AccountCenter({ active }: AccountCenterProps) {
                 className="btn"
                 type="button"
                 onClick={handleLocalRefresh}
-                disabled={localRefreshBusy}
+                disabled={localRefreshBusy || credentialRefreshBusy}
                 data-testid="account-refresh-local"
                 title="重读本机缓存的账号信息（不联网）；需要探测真实状态请用健康检测"
               >
                 <RefreshCw size={15} className={localRefreshBusy ? "icon-spin" : undefined} aria-hidden="true" />刷新
               </button>
-              <button className="btn" type="button" onClick={handleHealthCheck} disabled={healthBusy || creditsBusy || loginBusy} data-testid="account-health-check">
+              <button className="btn" type="button" onClick={handleHealthCheck} disabled={healthBusy || creditsBusy || credentialRefreshBusy || loginBusy} data-testid="account-health-check">
                 <HeartPulse size={15} aria-hidden="true" />{healthBusy ? "检测中…" : "健康检测"}
               </button>
-              <button className="btn" type="button" onClick={handleRefreshAllCredits} disabled={creditsBusy || loginBusy || healthBusy} data-testid="account-refresh-credits">
+              <button className="btn" type="button" onClick={handleRefreshAllCredits} disabled={creditsBusy || loginBusy || healthBusy || credentialRefreshBusy} data-testid="account-refresh-credits">
                 <RefreshCw size={15} aria-hidden="true" />{creditsBusy ? "查询中…" : "刷新额度"}
+              </button>
+              <button className="btn btn--primary" type="button" onClick={handleRefreshAllCredentials} disabled={credentialRefreshBusy || loginBusy || healthBusy || creditsBusy} data-testid="account-refresh-credentials">
+                <RefreshCw size={15} aria-hidden="true" />{credentialRefreshBusy ? "刷新中…" : "刷新凭据"}
               </button>
             </>
           )}
@@ -542,14 +599,14 @@ export function AccountCenter({ active }: AccountCenterProps) {
                 aria-label="登录浏览器方式"
                 className="page-header__select"
                 value={loginBrowserMode}
-                disabled={loginBusy}
+                disabled={loginBusy || credentialRefreshBusy || healthBusy || creditsBusy}
                 onChange={(event) => setLoginBrowserMode(event.target.value as LoginBrowserMode)}
                 data-testid="login-browser-mode"
               >
                 <option value="isolated">隔离浏览器</option>
                 <option value="system">本机浏览器</option>
               </select>
-              <button className="btn btn--primary" type="button" onClick={() => void handleLogin(loginBrowserMode === "system")} disabled={loginBusy} data-testid="account-add-primary">
+              <button className="btn btn--primary" type="button" onClick={() => void handleLogin(loginBrowserMode === "system")} disabled={loginBusy || credentialRefreshBusy || healthBusy || creditsBusy} data-testid="account-add-primary">
                 <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
               </button>
             </div>
@@ -586,6 +643,7 @@ export function AccountCenter({ active }: AccountCenterProps) {
         </div>
       )}
       {creditsBusy && <p className="account-center__meta" role="status">正在查询最新额度…</p>}
+      {credentialRefreshBusy && <p className="account-center__meta" role="status">正在刷新登录凭据，不会打开新的 OAuth 登录…</p>}
       {healthBusy && <p className="account-center__meta" role="status">正在检测账号健康度（登录存档 + 签到会话探测）…</p>}
 
       {/* 我的账号：页面主体。真实模式双视图（U-2：列表宽行默认 / 卡片网格切换，
@@ -728,7 +786,7 @@ export function AccountCenter({ active }: AccountCenterProps) {
 /**
  * 账号条目（U-2 双视图）：variant=list 横向宽行 / variant=card 卡片网格。
  * 两槽位徽章系统（StatusBadges）：槽位1 签到三态 + 槽位2 登录存档健康度；
- * 令牌健康/设备尾号/手机号降级为 meta 文字（正常态安静，异常才亮色）。
+ * 登录凭据剩余时间与手机号降级为 meta 文字（正常态安静，异常才亮色）。
  * 点击条目进入详情视图；切换按钮不冒泡。
  * 注：签到活动 credits 为静态池值（实证恒 200），不展示以免误导。
  */
@@ -758,12 +816,12 @@ function AccountCard({
 }) {
   const displayName = effectiveDisplayName(entry);
   // 徽章失效后的恢复路径提示：旧通道凭据/续期被拒不会自动恢复（重新登录是唯一出路）。
-  const credentialDead = entry.credential_legacy || entry.refresh_error_code === "credential_refresh_failed";
+  const credentialDead = credentialRequiresRelogin(entry);
   // G10 统一状态机：两槽位徽章都先经 derive* 纯函数求枚举态，再交徽章渲染。
   const checkinState = deriveCheckinSlotState(entry);
   const loginSlot = deriveLoginSlotState({ login_state: loginState, relogin_only: credentialDead });
-  // G13 meta 精简：卡片/列表只保留手机号；令牌天数与设备尾号在详情页
-  // （登录健康度 / 基础信息）展示，不再占主视野。
+  // 列表/卡片保留手机号与访问令牌剩余时间；精确到期时刻仍在详情页展示。
+  const tokenRemaining = tokenRemainingLabel(entry.access_token_expires_at_unix_seconds);
 
   const creditsBlock = (
     <div className="account-item__credits" title="TRAE 真实可用模型额度（积分包剩余总和，与 IDE 内显示一致）">
@@ -858,8 +916,11 @@ function AccountCard({
                   <CheckinSlotBadge state={checkinState} />
                   <LoginArchiveSlotBadge state={loginSlot} archiveAvailable={archiveAvailable} />
                 </div>
-                {/* G13：meta 只保留手机号（令牌/设备收进详情页）；G11 补录后显示全号。 */}
-                {displayMobile(entry) && <p className="account-item__meta">{displayMobile(entry)}</p>}
+                {/* G13：主列表展示手机号与凭据剩余时间；G11 补录后显示全号。 */}
+                <div className="account-meta-group">
+                  {displayMobile(entry) && <p className="account-item__meta">{displayMobile(entry)}</p>}
+                  <p className="account-item__meta account-item__token-expiry">{tokenRemaining}</p>
+                </div>
               </div>
             </div>
             <div className="account-item__side">
@@ -905,7 +966,10 @@ function AccountCard({
               <LoginArchiveSlotBadge state={loginSlot} archiveAvailable={archiveAvailable} />
             </div>
             {cardCredits}
-            {displayMobile(entry) && <p className="account-card__meta">{displayMobile(entry)}</p>}
+            <div className="account-meta-group">
+              {displayMobile(entry) && <p className="account-card__meta">{displayMobile(entry)}</p>}
+              <p className="account-card__meta account-card__token-expiry">{tokenRemaining}</p>
+            </div>
             {cardSwitchButton}
           </>
         )}
@@ -920,6 +984,33 @@ function toLoginStateMap(states: readonly TraeInstanceStateDto[]): Record<string
   return Object.fromEntries(states.map((entry) => [entry.profile_id, entry]));
 }
 
+/** 已确认只能通过重新登录恢复的凭据错误；网络类刷新失败不在此列。 */
+const CREDENTIAL_RELOGIN_ERROR_CODES = new Set([
+  "credential_refresh_failed",
+  "binding_mismatch",
+  "auth_mismatch",
+  "credential_missing",
+  "credential_unavailable",
+  "credential_invalid",
+  "manual_recovery_required",
+]);
+
+function credentialRequiresRelogin(entry: CheckinOverviewEntryDto): boolean {
+  return entry.credential_legacy || CREDENTIAL_RELOGIN_ERROR_CODES.has(entry.refresh_error_code ?? "");
+}
+
+function accessTokenExpired(entry: CheckinOverviewEntryDto, nowUnixSeconds: number): boolean {
+  return (
+    entry.access_token_expires_at_unix_seconds != null
+    && entry.access_token_expires_at_unix_seconds <= nowUnixSeconds
+  );
+}
+
+/** 凭据明确需要用户处理：失效标记或 access 已过期；未知状态留给登录槽状态机。 */
+function credentialNeedsAttention(entry: CheckinOverviewEntryDto, nowUnixSeconds: number): boolean {
+  return credentialRequiresRelogin(entry) || accessTokenExpired(entry, nowUnixSeconds);
+}
+
 /**
  * 徽章生效登录态 = 实调结果 × 两层本地修正（2026-09-02 徽章修复决策）：
  * 1. 本地判定（零网络，页面加载即生效）：旧通道凭据（client_id 非 SOLO）
@@ -932,8 +1023,8 @@ function effectiveCredentialState(
   entry: CheckinOverviewEntryDto | undefined,
   state?: TraeInstanceStateDto,
 ): TraeInstanceLoginState | undefined {
-  if (entry?.credential_legacy) return "stale";
-  if (entry?.refresh_error_code === "credential_refresh_failed") return "stale";
+  if (entry && credentialRequiresRelogin(entry)) return "stale";
+  if (entry && accessTokenExpired(entry, Math.floor(Date.now() / 1000))) return "stale";
   return state?.login_state;
 }
 
@@ -966,7 +1057,9 @@ function buildHealthResult(
   const probeOf = new Map(results.map((result) => [result.profile_id, result]));
   // 统计口径同 effectiveCredentialState：本次探测到续期被拒也计入“登录失效”。
   const renewalDead = new Set(
-    results.filter((item) => item.error_code === "credential_refresh_failed").map((item) => item.profile_id),
+    results
+      .filter((item) => CREDENTIAL_RELOGIN_ERROR_CODES.has(item.error_code ?? ""))
+      .map((item) => item.profile_id),
   );
   const issues: OperationResultIssue[] = [];
   for (const entry of overview) {
@@ -976,10 +1069,7 @@ function buildHealthResult(
       renewalDead.has(entry.profile_id) && state ? { ...state, login_state: "stale" as const } : state,
     );
     // relogin_only 口径与卡片徽章一致：旧通道 / 续期被拒（本次探测或既有标记）。
-    const reloginOnly =
-      entry.credential_legacy ||
-      entry.refresh_error_code === "credential_refresh_failed" ||
-      renewalDead.has(entry.profile_id);
+    const reloginOnly = credentialRequiresRelogin(entry) || renewalDead.has(entry.profile_id);
     const loginReason = states
       ? LOGIN_SLOT_REASONS[deriveLoginSlotState({ login_state: effective, relogin_only: reloginOnly })]
       : null;
@@ -1012,6 +1102,16 @@ function formatDateTime(value: string | null): string {
   if (Number.isNaN(date.getTime())) return "时间不可用";
   return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
 }
+
+/** 账号列表展示访问令牌剩余时间；只读总览时间戳，不触发网络请求。 */
+function tokenRemainingLabel(expiresAt: number | null): string {
+  if (expiresAt == null) return "登录凭据有效期未知";
+  const remainingMs = expiresAt * 1000 - Date.now();
+  if (remainingMs <= 0) return "登录凭据已过期";
+  // 与详情页保持同一口径：不足一天仍显示为 1 天，避免把可用凭据显示为 0 天。
+  return `登录凭据剩余 ${Math.ceil(remainingMs / 86400000)} 天`;
+}
+
 function formatShortDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "时间不可用";

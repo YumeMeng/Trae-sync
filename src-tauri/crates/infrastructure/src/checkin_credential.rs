@@ -1,6 +1,6 @@
 //! T16 签到 Profile 凭据包与无进程续期（fixture 范围）。
 //!
-//! 实现 ADR-0014 中可在本地验证的凭据生命周期：
+//! 实现 ADR-0019 与 ADR-0027 中可在本地验证的凭据生命周期：
 //! - DPAPI 加密凭据包（账号 ID、设备 ID、设备密钥对、Token 等绑定材料）；
 //! - 账号 ID、设备 ID、设备公钥绑定校验失败时零回写；
 //! - `ExchangeToken` 的 `DeviceProof` 设备签名：EC P-256 密钥对 +
@@ -8,6 +8,7 @@
 //!   签名输入按 HTTP 方法、请求路径、ClientID、refresh token、
 //!   时间戳、nonce 的固定顺序拼接；
 //! - refresh token 轮换、`GetUserInfo` 身份校验与旧凭据保留；
+//! - access 过期后的 refresh 救援按凭据代次只申领一次，保留非敏感尝试证据；
 //! - Profile 写回：旧凭据备份、临时文件、解密校验、原子替换、
 //!   重新读取验证和中断恢复 journal。
 //!
@@ -37,6 +38,8 @@ use crate::key_wrapper::{protect_secret, unprotect_secret};
 const BUNDLE_FORMAT_VERSION: u32 = 1;
 const BUNDLE_MAGIC: &[u8; 8] = b"TRVCKN01";
 const JOURNAL_OPERATION: &str = "checkin_credential_renewal";
+const REFRESH_RESCUE_DIRECTORY: &str = "refresh-rescue";
+const REFRESH_RESCUE_FORMAT_VERSION: u32 = 1;
 const EXCHANGE_METHOD: &str = "POST";
 const EXCHANGE_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
 /// 访问令牌剩余寿命低于该秒数（7 天）时需要续期。
@@ -401,6 +404,15 @@ struct RenewalManifest {
     created_at_unix_seconds: u64,
 }
 
+/// refresh 救援尝试的非敏感证据；凭据代次指纹只用于防止同一代次重复触网。
+#[derive(Debug, Serialize)]
+struct RefreshRescueAttempt {
+    format_version: u32,
+    profile_id_sha256: String,
+    credential_generation_sha256: String,
+    attempted_at_unix_seconds: u64,
+}
+
 impl RenewalManifest {
     /// 推进到下一状态；状态转移合法性由调用方保证。
     fn next(&self, state: &str) -> Self {
@@ -466,6 +478,63 @@ impl CheckinCredentialStore {
     /// 是否存在未收口的中断写回。
     pub fn has_pending_renewal(&self) -> Result<bool, CheckinCredentialError> {
         Ok(!self.pending_renewals()?.is_empty())
+    }
+
+    /// 为已过期 access token 原子申领一次 refresh 救援。
+    ///
+    /// 标记按完整凭据代次（token、设备材料、客户端形态和有效期）隔离，
+    /// 且使用 `create_new` 防止多个进程并发重复触发服务端 refresh。标记
+    /// 一旦创建不自动删除；同一代次后续只读检查会直接跳过网络请求。成功的
+    /// AuthCode 换发会产生新代次，因此不会继承旧代次的救援标记。
+    pub(crate) fn claim_refresh_rescue_attempt(
+        &self,
+        binding: &CheckinProfileBinding,
+        bundle: &CheckinCredentialBundle,
+        attempted_at_unix_seconds: u64,
+    ) -> Result<bool, CheckinCredentialError> {
+        if !bundle_matches_binding(bundle, binding) {
+            return Err(CheckinCredentialError::BindingMismatch);
+        }
+        validate_bundle(bundle)?;
+
+        let rescue_root = self.root.join(REFRESH_RESCUE_DIRECTORY);
+        prepare_directory(&rescue_root)?;
+        let profile_id_sha256 = sha256_hex(binding.profile_id.as_bytes());
+        let credential_generation_sha256 = credential_generation_sha256(bundle);
+        let marker_path = rescue_root.join(format!(
+            "{profile_id_sha256}-{credential_generation_sha256}.json"
+        ));
+        let marker = RefreshRescueAttempt {
+            format_version: REFRESH_RESCUE_FORMAT_VERSION,
+            profile_id_sha256,
+            credential_generation_sha256,
+            attempted_at_unix_seconds,
+        };
+        let payload = serde_json::to_vec_pretty(&marker)
+            .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+        {
+            Ok(mut file) => {
+                file.write_all(&payload)
+                    .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
+                file.sync_all()
+                    .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&marker_path)
+                    .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
+                if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+                    return Err(CheckinCredentialError::RecoveryRequired);
+                }
+                Ok(false)
+            }
+            Err(_) => Err(CheckinCredentialError::RecoveryRequired),
+        }
     }
 
     /// 从指定凭据文件读取并解码凭据包（退役恢复用；只读，不写任何文件）。
@@ -1288,6 +1357,28 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// 计算凭据代次指纹；只把哈希写入救援证据，不落盘任何认证材料正文。
+fn credential_generation_sha256(bundle: &CheckinCredentialBundle) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        bundle.profile_id.as_bytes(),
+        bundle.account_id.as_bytes(),
+        bundle.device_id.as_bytes(),
+        bundle.machine_id.as_bytes(),
+        bundle.device_public_key.as_bytes(),
+        bundle.device_private_key.as_bytes(),
+        bundle.access_token.as_bytes(),
+        bundle.refresh_token.as_bytes(),
+        bundle.client_id.as_bytes(),
+    ] {
+        hasher.update(field);
+        hasher.update([0]);
+    }
+    hasher.update(bundle.access_token_expires_at_unix_seconds.to_le_bytes());
+    hasher.update(bundle.refresh_token_expires_at_unix_seconds.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1575,6 +1666,45 @@ mod tests {
             );
         }
         assert_no_writeback(&store, &saved);
+    }
+
+    #[test]
+    fn refresh_rescue_claim_is_once_per_credential_generation() {
+        let root = tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path().join("profiles"));
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let binding = fixture_binding(&public_pem);
+        let bundle = fixture_bundle(&public_pem, &private_pem);
+
+        // 同一凭据代次只能申领一次；第二次不再允许触网。
+        assert!(store
+            .claim_refresh_rescue_attempt(&binding, &bundle, 1_800_000_000)
+            .unwrap());
+        assert!(!store
+            .claim_refresh_rescue_attempt(&binding, &bundle, 1_800_000_001)
+            .unwrap());
+
+        // AuthCode 换发产生新代次后，新的代次拥有独立的一次救援额度。
+        let next_generation = CheckinCredentialBundle {
+            access_token: FIXTURE_ACCESS_TOKEN_B.to_string(),
+            refresh_token: FIXTURE_REFRESH_TOKEN_B.to_string(),
+            ..bundle.clone()
+        };
+        assert!(store
+            .claim_refresh_rescue_attempt(&binding, &next_generation, 1_800_000_002)
+            .unwrap());
+
+        let markers: Vec<_> = fs::read_dir(store.root().join(REFRESH_RESCUE_DIRECTORY))
+            .unwrap()
+            .collect();
+        assert_eq!(markers.len(), 2);
+        for marker in markers {
+            let content = fs::read_to_string(marker.unwrap().path()).unwrap();
+            // 救援证据只能包含哈希和时间，不能泄露 token 或私钥。
+            assert!(!content.contains(FIXTURE_ACCESS_TOKEN_A));
+            assert!(!content.contains(FIXTURE_REFRESH_TOKEN_A));
+            assert!(!content.contains(&private_pem));
+        }
     }
 
     #[cfg(windows)]
