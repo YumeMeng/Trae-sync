@@ -241,6 +241,36 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await expect(bar).toHaveCount(0);
   });
 
+  test("勾选项目批量归档：项目行选择会作用于项目下全部会话", async ({ page }) => {
+    await setup(page);
+    const panel = detail(page);
+
+    await panel.getByTestId("library-select-mode").click();
+    await panel.getByTestId("library-project-p1").click();
+    await expect(panel.getByTestId("batch-archive")).toBeEnabled();
+    await panel.getByTestId("batch-archive").click();
+
+    await expect(panel.getByTestId("action-notice")).toContainText("已归档 2 个会话。");
+    await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
+    await expect(panel.getByTestId("library-archive-entry")).toContainText("3");
+  });
+
+  test("勾选项目删除：确认范围包含项目下全部会话", async ({ page }) => {
+    await setup(page);
+    const panel = detail(page);
+
+    await panel.getByTestId("library-select-mode").click();
+    await panel.getByTestId("library-project-p1").click();
+    await panel.getByTestId("batch-delete").click();
+
+    const dialog = panel.getByTestId("delete-confirm");
+    await expect(dialog).toContainText("删除 2 个会话");
+    await expect(dialog).toContainText("共 17 条消息");
+    await panel.getByTestId("delete-confirm-ok").click();
+    await expect(panel.getByTestId("action-notice")).toContainText("已删除 2 个会话。");
+    await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
+  });
+
   test("浏览态悬浮快捷归档：单会话直接归档不进选择模式", async ({ page }) => {
     await setup(page);
     const panel = detail(page);

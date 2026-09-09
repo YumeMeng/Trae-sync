@@ -575,6 +575,48 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.queryByTestId("library-session-s1")).not.toBeInTheDocument();
   });
 
+  it("勾选项目后可归档项目下的全部会话", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active />);
+    await screen.findByTestId("library-project-p1");
+
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-project-p1"));
+
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 0 个会话 · 1 个项目");
+    expect(screen.getByTestId("batch-archive")).not.toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("batch-archive"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("archive_master_sessions", {
+        sessionIds: ["s1", "s2"],
+        libraryId: "master",
+      });
+    });
+  });
+
+  it("勾选项目后删除确认包含项目下全部会话", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active />);
+    await screen.findByTestId("library-project-p1");
+
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-project-p1"));
+    fireEvent.click(screen.getByTestId("batch-delete"));
+
+    const dialog = await screen.findByTestId("delete-confirm");
+    expect(dialog).toHaveTextContent("删除 2 个会话");
+    expect(dialog).toHaveTextContent("共 13 条消息");
+    fireEvent.click(screen.getByTestId("delete-confirm-ok"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("delete_master_sessions", {
+        sessionIds: ["s1", "s2"],
+        libraryId: "master",
+      });
+    });
+  });
+
   it("Esc 退出选择模式并恢复会话选中行为", async () => {
     setupMutableHistory();
     render(<LibrarySessionsPanel active />);
@@ -677,6 +719,91 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-archive-back"));
     await expandProject("p2");
     expect(screen.getByTestId("library-session-s3")).toBeInTheDocument();
+  });
+
+  it("归档视图将多个真实未关联项目合并为一个文件夹组", async () => {
+    const base = historyDto();
+    setupHistory({
+      ...base,
+      projects: [
+        ...base.projects,
+        { project_id: "p10", name: "", absolute_path: null },
+      ],
+      sessions: [
+        ...base.sessions.map((session) =>
+          session.session_id === "s9" ? { ...session, hidden_status: "voice_discussion" } : session,
+        ),
+        {
+          session_id: "s10",
+          project_id: "p10",
+          title: "另一条未关联会话",
+          message_count: 4,
+          updated_at_unix_seconds: NOW - 900,
+          deleted: false,
+          hidden_status: "voice_discussion",
+          work_mode: "code",
+        },
+      ],
+    });
+    render(<LibrarySessionsPanel active />);
+    fireEvent.click(await screen.findByTestId("library-archive-entry"));
+
+    expect(screen.getAllByTestId("library-archive-project-__unlinked__")).toHaveLength(1);
+    expect(screen.queryByTestId("library-archive-project-p9")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("library-archive-project-p10")).not.toBeInTheDocument();
+    expect(screen.getByTestId("library-archive-project-__unlinked__")).toHaveTextContent("2");
+    expect(screen.getByTestId("library-session-s9")).toBeInTheDocument();
+    expect(screen.getByTestId("library-session-s10")).toBeInTheDocument();
+  });
+
+  it("归档视图勾选项目后可恢复项目下全部归档会话", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active />);
+    fireEvent.click(await screen.findByTestId("library-archive-entry"));
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-archive-project-p2"));
+
+    expect(screen.getByTestId("batch-restore")).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId("batch-restore"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("restore_master_sessions", {
+        sessionIds: ["s3"],
+        libraryId: "master",
+      });
+    });
+  });
+
+  it("选择未关联文件夹组后归档其下全部会话", async () => {
+    const base = historyDto();
+    setupHistory({
+      ...base,
+      projects: [...base.projects, { project_id: "p10", name: "", absolute_path: null }],
+      sessions: [
+        ...base.sessions,
+        {
+          session_id: "s10",
+          project_id: "p10",
+          title: "另一条未关联会话",
+          message_count: 4,
+          updated_at_unix_seconds: NOW - 900,
+          deleted: false,
+          hidden_status: null,
+          work_mode: "code",
+        },
+      ],
+    });
+    render(<LibrarySessionsPanel active />);
+    await screen.findByTestId("library-project-__unlinked__");
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-project-__unlinked__"));
+    fireEvent.click(screen.getByTestId("batch-archive"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("archive_master_sessions", {
+        sessionIds: ["s9", "s10"],
+        libraryId: "master",
+      });
+    });
   });
 
   it("合并流：勾选两个项目 → 弹层选保留目标 → 调用后端 → 回执与树刷新", async () => {

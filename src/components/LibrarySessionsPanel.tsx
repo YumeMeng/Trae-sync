@@ -323,6 +323,11 @@ export function LibrarySessionsPanel({
     [liveSessions, keyword],
   );
 
+  const namedProjectIds = useMemo(
+    () => new Set(projects.filter((project) => project.name.trim()).map((project) => project.project_id)),
+    [projects],
+  );
+
   /**
    * 项目树分组：具名项目（仅含有匹配会话的）+「未关联文件夹」末位合并组
    * （G19：空名项目归并一组，会话平铺不做项目二级展示）。
@@ -362,13 +367,26 @@ export function LibrarySessionsPanel({
     for (const session of archivedSessions) {
       const mode = session.work_mode?.trim() || "未标注";
       const group = tree.get(mode) ?? new Map<string, MasterSessionEntryDto[]>();
-      const list = group.get(session.project_id) ?? [];
+      // 空名项目只是数据库层的多个技术记录，归档视图按用户可理解的
+      // 「未关联文件夹」合并，避免一个会话占一个同名文件夹。
+      const projectGroupId = namedProjectIds.has(session.project_id)
+        ? session.project_id
+        : UNLINKED_GROUP_ID;
+      const list = group.get(projectGroupId) ?? [];
       list.push(session);
-      group.set(session.project_id, list);
+      group.set(projectGroupId, list);
       tree.set(mode, group);
     }
+    // 未关联组始终放在各模式末位，和正常视图的排布保持一致。
+    for (const groups of tree.values()) {
+      const unlinked = groups.get(UNLINKED_GROUP_ID);
+      if (unlinked) {
+        groups.delete(UNLINKED_GROUP_ID);
+        groups.set(UNLINKED_GROUP_ID, unlinked);
+      }
+    }
     return tree;
-  }, [archivedSessions]);
+  }, [archivedSessions, namedProjectIds]);
 
   /** 项目显示名：空名项目统一占位「未关联文件夹」。 */
   const projectName = useCallback(
@@ -376,6 +394,12 @@ export function LibrarySessionsPanel({
       const found = projects.find((project) => project.project_id === projectId);
       return found?.name?.trim() || "未关联文件夹";
     },
+    [projects],
+  );
+
+  /** 「未关联文件夹」是多个真实项目的展示合并组，操作时展开为真实项目 ID。 */
+  const unlinkedProjectIds = useMemo(
+    () => projects.filter((project) => !project.name.trim()).map((project) => project.project_id),
     [projects],
   );
 
@@ -507,6 +531,23 @@ export function LibrarySessionsPanel({
     setSelectedProjectIds(new Set());
   }, []);
 
+  /** 项目行统一切换选择；展示合并组一次勾选其下全部真实项目。 */
+  const toggleProjectSelection = useCallback(
+    (projectIds: readonly string[]) => {
+      if (projectIds.length === 0) return;
+      setSelectedProjectIds((current) => {
+        const next = new Set(current);
+        const allSelected = projectIds.every((projectId) => next.has(projectId));
+        for (const projectId of projectIds) {
+          if (allSelected) next.delete(projectId);
+          else next.add(projectId);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
   /** 勾选切换（项目行/会话行共用）。 */
   const toggleInSet = useCallback(
     (id: string, current: ReadonlySet<string>, setter: (next: ReadonlySet<string>) => void) => {
@@ -526,6 +567,43 @@ export function LibrarySessionsPanel({
       return next;
     });
   }, []);
+
+  /** 当前视图中项目/会话选择最终作用到的会话集合。 */
+  const selectedVisibleSessionIds = useMemo(() => {
+    const visibleSessions = archiveView ? archivedSessions : liveSessions;
+    return new Set(
+      visibleSessions
+        .filter(
+          (session) =>
+            selectedSessionIds.has(session.session_id) || selectedProjectIds.has(session.project_id),
+        )
+        .map((session) => session.session_id),
+    );
+  }, [archiveView, archivedSessions, liveSessions, selectedProjectIds, selectedSessionIds]);
+
+  /** 正常视图删除项目时连同其已归档会话一起纳入；归档视图只删当前归档内容。 */
+  const selectedDeleteSessions = useMemo(() => {
+    if (!history || history.status !== "ready") return [];
+    const candidates = archiveView
+      ? archivedSessions
+      : history.sessions.filter((session) => !session.deleted);
+    return candidates.filter(
+      (session) =>
+        selectedSessionIds.has(session.session_id) || selectedProjectIds.has(session.project_id),
+    );
+  }, [archiveView, archivedSessions, history, selectedProjectIds, selectedSessionIds]);
+
+  /** 只有真实具名项目可作为合并目标；未关联展示组仅支持归档/恢复/删除。 */
+  const selectedMergeProjects = useMemo(
+    () => {
+      // 选中未关联展示组时不静默忽略它，避免「合并」只作用于部分所选项目。
+      if ([...selectedProjectIds].some((projectId) => !namedProjectIds.has(projectId))) return [];
+      return projects.filter(
+        (project) => selectedProjectIds.has(project.project_id) && project.name.trim(),
+      );
+    },
+    [namedProjectIds, projects, selectedProjectIds],
+  );
 
   /** 归档（在线写，可逆 → 直接执行不确认；批量与悬浮快捷共用）。 */
   const archiveSessions = useCallback(
@@ -547,22 +625,21 @@ export function LibrarySessionsPanel({
 
   /** 归档视图：恢复所选（hidden_status 还原 NULL，会话归位原分组）。 */
   const restoreSelected = useCallback(() => {
-    const ids = [...selectedSessionIds];
+    const ids = [...selectedVisibleSessionIds];
     if (ids.length === 0) return;
     void runBatch(
       () => invoke("restore_master_sessions", { sessionIds: ids, libraryId: library.id }),
       () => exitSelectMode(),
       `已恢复 ${ids.length} 个会话。`,
     );
-  }, [runBatch, selectedSessionIds, library.id, exitSelectMode]);
+  }, [runBatch, selectedVisibleSessionIds, library.id, exitSelectMode]);
 
   /** 删除所选（先弹确认，确认后走后端先备份再删除）。 */
   const openDeleteConfirm = useCallback(() => {
-    const pool = archiveView ? archivedSessions : liveSessions;
-    const targets = pool.filter((session) => selectedSessionIds.has(session.session_id));
+    const targets = selectedDeleteSessions;
     if (targets.length === 0) return;
     setDeleteConfirm(targets);
-  }, [archiveView, archivedSessions, liveSessions, selectedSessionIds]);
+  }, [selectedDeleteSessions]);
 
   /** 确认删除：真实删除（后端自动创建备份；失败不动原数据）。 */
   const confirmDelete = useCallback(() => {
@@ -581,11 +658,11 @@ export function LibrarySessionsPanel({
 
   /** 打开合并确认弹层（至少选 2 个项目才有合并意义）。 */
   const openMergeConfirm = useCallback(() => {
-    if (selectedProjectIds.size < 2) return;
-    const targets = projects.filter((project) => selectedProjectIds.has(project.project_id));
+    if (selectedMergeProjects.length < 2) return;
+    const targets = selectedMergeProjects;
     if (targets.length < 2) return;
     setMergeConfirm(targets);
-  }, [projects, selectedProjectIds]);
+  }, [selectedMergeProjects]);
 
   /** 确认合并：其余项目的全部会话并入保留项目（后端先备份再事务改挂）。 */
   const confirmMerge = useCallback(
@@ -655,21 +732,18 @@ export function LibrarySessionsPanel({
   }, [history]);
 
   /** 正常视图项目分支（选择模式下项目行可勾选，作为合并源）。 */
-  const renderBranch = (
-    group: {
-      id: string;
-      name: string;
-      path: string | null;
-      sessions: readonly MasterSessionEntryDto[];
-    },
-    mergeSelectable: boolean,
-  ) => {
+  const renderBranch = (group: {
+    id: string;
+    name: string;
+    path: string | null;
+    sessions: readonly MasterSessionEntryDto[];
+  }) => {
     // 搜索时自动展开（结果立即可见）；平时按本地展开状态。
     const expanded = keyword !== "" || expandedIds.has(group.id);
-    const projectChecked = mergeSelectable && selectedProjectIds.has(group.id);
+    const projectChecked = selectedProjectIds.has(group.id);
     const activate = () => {
-      if (selectMode && mergeSelectable) {
-        toggleInSet(group.id, selectedProjectIds, setSelectedProjectIds);
+      if (selectMode) {
+        toggleProjectSelection([group.id]);
       } else {
         toggleExpand(group.id);
       }
@@ -680,7 +754,7 @@ export function LibrarySessionsPanel({
           className={`lib-project${projectChecked ? " lib-project--checked" : ""}`}
           role="button"
           tabIndex={0}
-          aria-pressed={selectMode && mergeSelectable ? projectChecked : undefined}
+          aria-pressed={selectMode ? projectChecked : undefined}
           // 项目文件夹路径收进悬浮提示，不占主视野（界面表达纪律）。
           title={group.path?.trim() || undefined}
           onClick={activate}
@@ -698,7 +772,7 @@ export function LibrarySessionsPanel({
               <ChevronRight size={14} strokeWidth={1.8} />
             )}
           </span>
-          {selectMode && mergeSelectable && (
+          {selectMode && (
             <span className="lib-check" aria-hidden="true">
               {projectChecked ? <CheckSquare size={15} /> : <Square size={15} />}
             </span>
@@ -731,9 +805,15 @@ export function LibrarySessionsPanel({
     );
   };
 
-  /** 「未关联文件夹」合并组（树末位；伪分组不可作为合并源）。 */
+  /** 「未关联文件夹」合并组（树末位；选择时展开为其真实项目集合）。 */
   const renderUnlinkedBranch = (sessions: readonly MasterSessionEntryDto[]) => {
     const expanded = keyword !== "" || expandedIds.has(UNLINKED_GROUP_ID);
+    const projectChecked =
+      unlinkedProjectIds.length > 0 && unlinkedProjectIds.every((projectId) => selectedProjectIds.has(projectId));
+    const activate = () => {
+      if (selectMode) toggleProjectSelection(unlinkedProjectIds);
+      else toggleExpand(UNLINKED_GROUP_ID);
+    };
     return (
       <div className="lib-branch" key={UNLINKED_GROUP_ID}>
         <div
@@ -741,11 +821,12 @@ export function LibrarySessionsPanel({
           role="button"
           tabIndex={0}
           aria-expanded={expanded}
-          onClick={() => toggleExpand(UNLINKED_GROUP_ID)}
+          aria-pressed={selectMode ? projectChecked : undefined}
+          onClick={activate}
           onKeyDown={(event) => {
             if (event.key !== "Enter" && event.key !== " ") return;
             event.preventDefault();
-            toggleExpand(UNLINKED_GROUP_ID);
+            activate();
           }}
           data-testid={`library-project-${UNLINKED_GROUP_ID}`}
         >
@@ -756,6 +837,11 @@ export function LibrarySessionsPanel({
               <ChevronRight size={14} strokeWidth={1.8} />
             )}
           </span>
+          {selectMode && (
+            <span className="lib-check" aria-hidden="true">
+              {projectChecked ? <CheckSquare size={15} /> : <Square size={15} />}
+            </span>
+          )}
           <span className="lib-project__icon" aria-hidden="true">
             <FolderClosed size={15} strokeWidth={1.8} />
           </span>
@@ -902,45 +988,69 @@ export function LibrarySessionsPanel({
             data-testid="library-tree"
           >
             {archiveView
-              ? // 归档视图：模式 → 项目 → 会话（低饱和灰显，会话行可勾选）。
+              ? // 归档视图：模式 → 项目/未关联文件夹 → 会话（低饱和灰显）。
                 [...archiveTree.entries()].map(([mode, groups]) => (
                   <div className="lib-arch-mode" key={mode}>
                     <div className="lib-arch-mode__head">{modeLabel(mode)}</div>
-                    {[...groups.entries()].map(([projectId, sessions]) => (
-                      <div className="lib-branch" key={projectId}>
-                        <div
-                          className="lib-project"
-                          data-testid={`library-archive-project-${projectId}`}
-                        >
-                          <span className="lib-project__icon" aria-hidden="true">
-                            <FolderClosed size={15} strokeWidth={1.8} />
-                          </span>
-                          <span className="lib-project__name">{projectName(projectId)}</span>
-                          <span className="lib-project__count">{sessions.length}</span>
+                    {[...groups.entries()].map(([projectId, sessions]) => {
+                      const selectableProjectIds =
+                        projectId === UNLINKED_GROUP_ID ? unlinkedProjectIds : [projectId];
+                      const projectChecked =
+                        selectableProjectIds.length > 0 &&
+                        selectableProjectIds.every((id) => selectedProjectIds.has(id));
+                      const activate = () => {
+                        if (selectMode) toggleProjectSelection(selectableProjectIds);
+                      };
+                      return (
+                        <div className="lib-branch" key={projectId}>
+                          <div
+                            className={`lib-project${projectChecked ? " lib-project--checked" : ""}`}
+                            role={selectMode ? "button" : undefined}
+                            tabIndex={selectMode ? 0 : undefined}
+                            aria-pressed={selectMode ? projectChecked : undefined}
+                            onClick={selectMode ? activate : undefined}
+                            onKeyDown={(event) => {
+                              if (!selectMode || (event.key !== "Enter" && event.key !== " ")) return;
+                              event.preventDefault();
+                              activate();
+                            }}
+                            data-testid={`library-archive-project-${projectId}`}
+                          >
+                            <span className="lib-project__icon" aria-hidden="true">
+                              <FolderClosed size={15} strokeWidth={1.8} />
+                            </span>
+                            {selectMode && (
+                              <span className="lib-check" aria-hidden="true">
+                                {projectChecked ? <CheckSquare size={15} /> : <Square size={15} />}
+                              </span>
+                            )}
+                            <span className="lib-project__name">{projectName(projectId)}</span>
+                            <span className="lib-project__count">{sessions.length}</span>
+                          </div>
+                          <div className="lib-sessions">
+                            {sessions.map((session) => (
+                              <TreeSessionRow
+                                key={session.session_id}
+                                session={session}
+                                selectMode={selectMode}
+                                checked={selectedSessionIds.has(session.session_id)}
+                                showQuickArchive={false}
+                                onToggle={(sessionId) =>
+                                  toggleInSet(sessionId, selectedSessionIds, setSelectedSessionIds)
+                                }
+                                onOpen={(target) => void openSession(target)}
+                                onQuickArchive={() => undefined}
+                              />
+                            ))}
+                          </div>
                         </div>
-                        <div className="lib-sessions">
-                          {sessions.map((session) => (
-                            <TreeSessionRow
-                              key={session.session_id}
-                              session={session}
-                              selectMode={selectMode}
-                              checked={selectedSessionIds.has(session.session_id)}
-                              showQuickArchive={false}
-                              onToggle={(sessionId) =>
-                                toggleInSet(sessionId, selectedSessionIds, setSelectedSessionIds)
-                              }
-                              onOpen={(target) => void openSession(target)}
-                              onQuickArchive={() => undefined}
-                            />
-                          ))}
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ))
               : // 正常视图：项目树（原地展开会话子级）。
                 [
-                  ...treeGroups.named.map((group) => renderBranch(group, true)),
+                  ...treeGroups.named.map((group) => renderBranch(group)),
                   ...(treeGroups.unlinked.length > 0
                     ? [renderUnlinkedBranch(treeGroups.unlinked)]
                     : []),
@@ -1056,7 +1166,7 @@ export function LibrarySessionsPanel({
                   className="btn btn--primary"
                   type="button"
                   onClick={restoreSelected}
-                  disabled={batchBusy || selectedSessionIds.size === 0}
+                  disabled={batchBusy || selectedVisibleSessionIds.size === 0}
                   data-testid="batch-restore"
                 >
                   <Undo2 size={15} aria-hidden="true" />恢复
@@ -1065,7 +1175,7 @@ export function LibrarySessionsPanel({
                   className="btn btn--danger"
                   type="button"
                   onClick={openDeleteConfirm}
-                  disabled={batchBusy || selectedSessionIds.size === 0}
+                  disabled={batchBusy || selectedDeleteSessions.length === 0}
                   data-testid="batch-delete"
                 >
                   <Trash2 size={15} aria-hidden="true" />删除
@@ -1076,8 +1186,8 @@ export function LibrarySessionsPanel({
                 <button
                   className="btn btn--primary"
                   type="button"
-                  onClick={() => archiveSessions([...selectedSessionIds])}
-                  disabled={batchBusy || selectedSessionIds.size === 0}
+                  onClick={() => archiveSessions([...selectedVisibleSessionIds])}
+                  disabled={batchBusy || selectedVisibleSessionIds.size === 0}
                   data-testid="batch-archive"
                 >
                   <Archive size={15} aria-hidden="true" />归档
@@ -1086,8 +1196,10 @@ export function LibrarySessionsPanel({
                   className="btn"
                   type="button"
                   onClick={openMergeConfirm}
-                  disabled={batchBusy || selectedProjectIds.size < 2}
-                  title={selectedProjectIds.size < 2 ? "至少选择 2 个项目才能合并" : undefined}
+                  disabled={batchBusy || selectedMergeProjects.length < 2}
+                  title={
+                    selectedMergeProjects.length < 2 ? "至少选择 2 个有名称的项目才能合并" : undefined
+                  }
                   data-testid="batch-merge"
                 >
                   <Merge size={15} aria-hidden="true" />合并到…
@@ -1096,7 +1208,7 @@ export function LibrarySessionsPanel({
                   className="btn btn--danger"
                   type="button"
                   onClick={openDeleteConfirm}
-                  disabled={batchBusy || selectedSessionIds.size === 0}
+                  disabled={batchBusy || selectedDeleteSessions.length === 0}
                   data-testid="batch-delete"
                 >
                   <Trash2 size={15} aria-hidden="true" />删除
