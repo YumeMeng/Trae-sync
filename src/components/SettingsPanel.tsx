@@ -204,18 +204,30 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
         <p className="account-center__meta">正在读取自动签到设置…</p>
       )}
 
-      {/* 密钥维护：自账号页「高级」区迁入；与账号档案无关，属于安全维护工具 */}
-      <div className="settings-panel__section-heading">
-        <div>
-          <span className="workbench__eyebrow">安全维护</span>
-          <h3>密钥</h3>
-        </div>
-        <span className={`status-badge status-badge--${keyStatus?.probe_state === "verified" || keyStatus?.probe_state === "verified_pending" ? "safe" : "neutral"}`}>
-          {keyProbeLabel(keyStatus?.probe_state)}
-        </span>
-      </div>
       {error && <p className="workbench__error" role="alert">{error}</p>}
       {message && <p className="settings-panel__key-message" role="status">{message}</p>}
+
+      {/* G3：密钥主视野只留结论，探测与候选维护动作默认收起。 */}
+      <details className="settings-panel__fold" data-testid="settings-key-details">
+        <summary>
+          <span>
+            <span className="workbench__eyebrow">安全维护</span>
+            <strong>密钥</strong>
+          </span>
+          <span className={`status-badge status-badge--${keyConclusion(keyStatus) === "密钥正常" ? "safe" : "neutral"}`}>
+            {keyConclusion(keyStatus)}
+          </span>
+        </summary>
+        <div className="settings-panel__fold-content">
+          <div className="settings-panel__section-heading">
+            <div>
+              <span className="workbench__eyebrow">当前状态</span>
+              <h3>密钥维护</h3>
+            </div>
+            <span className={`status-badge status-badge--${keyStatus?.probe_state === "verified" || keyStatus?.probe_state === "verified_pending" ? "safe" : "neutral"}`}>
+              {keyProbeLabel(keyStatus?.probe_state)}
+            </span>
+          </div>
       <div className="account-center__key-grid">
         <span>来源密钥：{keyStatus?.source_key_configured ? keyStatus.source_key_version : "不可用"}</span>
         <span>历史库密钥：{keyStatus?.catalog_key_configured ? `代次 ${keyStatus.catalog_key_generation ?? "当前"}` : "不可用"}</span>
@@ -240,6 +252,8 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       {keyStatus?.source_key_activation_pending && (
         <p className="account-center__meta" data-testid="source-key-pending-notice">候选密钥已登记，下一次启动激活；当前运行继续使用已激活版本。</p>
       )}
+        </div>
+      </details>
 
       {/* P5-4 主库数据备份（ADR-0018）：备份链展示 + 手动创建 + 人工恢复指引。
           P5-9 备份保留：超出保留数的旧备份自动清理（可关闭）；恢复仍是人工操作，界面只给定位与步骤。 */}
@@ -323,13 +337,16 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
               <DatabaseBackup size={15} aria-hidden="true" />
               {backupBusy ? "备份中…" : "立即备份"}
             </button>
-            <p className="settings-backup__hint" data-testid="master-backup-restore-hint">
-              备份保存在 <code>{backupChain.backup_dir}</code> 目录（.switch-bak- 前缀）。
-              {retention?.enabled
-                ? `超出保留份数的旧备份会自动清理（当前保留 ${retention.keep} 份）。`
-                : "未开启自动清理时，备份不会被自动删除。"}
-              人工恢复：先关闭 TRAE，再把所选备份内的文件复制回该目录覆盖原位，然后重新启动。
-            </p>
+            <details className="settings-panel__fold settings-backup__location" data-testid="master-backup-location-details">
+              <summary>查看备份位置与恢复步骤</summary>
+              <p className="settings-backup__hint" data-testid="master-backup-restore-hint">
+                备份保存在 <code>{backupChain.backup_dir}</code> 目录（.switch-bak- 前缀）。
+                {retention?.enabled
+                  ? `超出保留份数的旧备份会自动清理（当前保留 ${retention.keep} 份）。`
+                  : "未开启自动清理时，备份不会被自动删除。"}
+                人工恢复：先关闭 TRAE，再把所选备份内的文件复制回该目录覆盖原位，然后重新启动。
+              </p>
+            </details>
           </div>
         </>
       )}
@@ -344,6 +361,13 @@ function keyProbeLabel(state: KeyStatusDto["probe_state"] | undefined | null): s
     case "rejected": return "探测拒绝";
     default: return "未探测";
   }
+}
+
+function keyConclusion(status: KeyStatusDto | null): "密钥正常" | "密钥异常需维护" {
+  const verified = status?.probe_state === "verified" || status?.probe_state === "verified_pending";
+  return status?.source_key_configured && status.catalog_key_configured && verified
+    ? "密钥正常"
+    : "密钥异常需维护";
 }
 
 /** 今日台账状态文案：未发起 / 错峰执行中 / 已完成（含跳过与失败计数）。 */

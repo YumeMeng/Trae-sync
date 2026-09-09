@@ -25,9 +25,9 @@ export interface DataLocationStateDto {
 export interface CurrentAccountStateDto {
   /** 是否已检测到当前账号 */
   readonly detected: boolean;
-  /** 用户 ID 不可逆指纹（未检测时为 null） */
+  /** 用户 ID 不可逆指纹（无法读取时为 null；总览页不再展示该字段） */
   readonly user_fingerprint: string | null;
-  /** 不可写原因（未检测时为 "not_detected"） */
+  /** 不可写原因（无法读取时为 "not_detected"） */
   readonly unavailable_reason: string | null;
 }
 

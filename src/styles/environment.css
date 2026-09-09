@@ -117,34 +117,6 @@
   font-size: 11.5px;
 }
 
-/* P5-4 主库统计格（原型 env-stats 契约）：三格等分，玻璃内衬面板 */
-.env-stats {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-  margin-top: 16px;
-}
-
-.env-stat {
-  padding: 12px 14px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--fill-soft);
-}
-
-.env-stat__value {
-  color: var(--text-1);
-  font-size: 19px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
-
-.env-stat__label {
-  margin-top: 2px;
-  color: var(--text-3);
-  font-size: 11px;
-}
-
 .env-card__hint {
   margin: 14px 0 0;
   color: var(--text-2);
@@ -229,6 +201,97 @@
 
 .env-checkup__action {
   margin-top: 12px;
+}
+
+/* ===== P8-5 G18 主库自检报告：分级提示，深度说明默认折叠 ===== */
+.env-self-check {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--fill-soft);
+}
+
+.env-self-check--healthy {
+  border-color: var(--success-border, var(--line-hair));
+}
+
+.env-self-check--self_healable {
+  border-color: var(--warning-border, var(--accent-border));
+}
+
+.env-self-check--needs_manual {
+  border-color: var(--danger-border, var(--line-control));
+}
+
+.env-self-check__head strong {
+  color: var(--text-1);
+  font-size: 12.5px;
+}
+
+.env-self-check__note {
+  margin: 5px 0 0;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.env-self-check__list {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.env-self-check__item {
+  display: grid;
+  grid-template-columns: 72px 56px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--glass);
+  font-size: 11.5px;
+}
+
+.env-self-check__item-name {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.env-self-check__item-status {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.env-self-check__item-summary {
+  min-width: 0;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.env-self-check__details {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.env-self-check__details summary {
+  cursor: pointer;
+  color: var(--text-2);
+}
+
+.env-self-check__details p {
+  margin: 7px 0 0;
+  line-height: 1.45;
+}
+
+.env-self-check__repair {
+  justify-self: start;
 }
 
 /* 卡片底部动作组（P5-8a-2：详情 + 启动/聚焦两枚按钮并排） */

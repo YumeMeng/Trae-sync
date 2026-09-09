@@ -24,10 +24,6 @@ export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<AppPage>("overview");
-  const [accountRefreshState, setAccountRefreshState] = useState<"idle" | "loading" | "error">(
-    "idle",
-  );
-  const [accountRefreshError, setAccountRefreshError] = useState<string | null>(null);
   const [workspaceRefreshPending, setWorkspaceRefreshPending] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const navigationMountedRef = useRef(false);
@@ -52,24 +48,6 @@ export default function App() {
       }
     }
   }, []);
-
-  const refreshCurrentAccount = useCallback(async () => {
-    setAccountRefreshState("loading");
-    setAccountRefreshError(null);
-    try {
-      // 账号检测命令只刷新非敏感证据，不执行外部账号切换。
-      await invoke("refresh_managed_current_account");
-      await refreshWorkspaceState();
-      setAccountRefreshState("idle");
-    } catch (e) {
-      setAccountRefreshState("error");
-      setAccountRefreshError(
-        safeUiErrorMessage(e, "当前账号暂时无法重新检测，请启动并关闭 TRAE 后重试。"),
-      );
-      // 账号刷新失败也要重新读取权威工作区，避免授权已撤销时保留旧账号标题。
-      await refreshWorkspaceState();
-    }
-  }, [refreshWorkspaceState]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -175,9 +153,6 @@ export default function App() {
               state={state}
               active={activePage === "overview"}
               onNavigate={setActivePage}
-              accountRefreshState={accountRefreshState}
-              accountRefreshError={accountRefreshError}
-              onRedetectAccount={refreshCurrentAccount}
             />
           </div>
           <div className="app-page" hidden={activePage !== "history"}>

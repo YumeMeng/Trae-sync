@@ -355,6 +355,18 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "环境档案不可读取，请重启应用后重试；若持续出现请保留数据目录后反馈。",
   ],
   [
+    /master_self_check_instance_running|master_self_check_process_unavailable/i,
+    "主库仍在运行，请先关闭 TRAE 后再执行这项修复。",
+  ],
+  [
+    /master_observed_account_unavailable/i,
+    "暂时无法确认主库实际登录账号，请在 TRAE 内重新登录后再自检。",
+  ],
+  [
+    /master_self_check_join_failed/i,
+    "主库自检未能完成，请稍后重试。",
+  ],
+  [
     /environment_dir_unavailable/i,
     "环境目录创建失败，请检查磁盘后重试。",
   ],

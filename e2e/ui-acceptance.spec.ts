@@ -338,7 +338,7 @@ test.describe("签到页验收", () => {
 });
 
 test.describe("P5-4 总览联动与设置页备份分区验收", () => {
-  test("环境页统计格展示主库聚合，设置页备份链可见且手动备份使计数 +1", async ({ page }) => {
+  test("环境页收窄为主库入口，详情页展示聚合统计，设置页备份链可见且手动备份使计数 +1", async ({ page }) => {
     // production 场景：数据位置就绪（主库统计 ready 的前提，G1 空态三分支）。
     await installMockBridge(page, { production: true });
     await page.goto("/");
@@ -347,14 +347,18 @@ test.describe("P5-4 总览联动与设置页备份分区验收", () => {
     await expect(page.getByTestId("overview-stats-master")).toBeVisible();
     await expect(page.getByTestId("overview-scan-cta")).toHaveText(/查看主库记录/);
 
-    // 环境页：统计格三卡（会话/项目/参与账号，mock 16/4/3）。
+    // 环境页：主库卡不再重复展示统计数字，统计职责收敛到详情页（G5）。
     await page.getByTestId("navigation-environment").click();
-    const stats = page.getByTestId("env-master-stats");
+    await expect(page.getByTestId("env-master-stats")).toHaveCount(0);
+    await page.getByTestId("env-master-detail").click();
+    await expect(page.getByRole("region", { name: "主库详情" })).toBeVisible();
+    await page.getByTestId("master-tab-info").click();
+    const stats = page.getByTestId("master-detail-counts");
     await expect(stats).toBeVisible();
     await expect(stats).toContainText("会话");
     await expect(stats).toContainText("项目");
-    await expect(stats).toContainText("参与账号");
     await expect(stats).toContainText("16");
+    await page.getByTestId("master-detail-back").click();
 
     // 设置页：备份分区（mock 初始 2 份）→ 立即备份 → 徽章 3 份 + 恢复指引可见。
     // 提示文案与 SettingsPanel.test 同口径（P5-9 文案修订后的现行表述）。

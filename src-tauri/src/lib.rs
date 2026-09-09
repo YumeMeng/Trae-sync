@@ -5083,6 +5083,141 @@ fn launch_instance_common(
     })
 }
 
+// ============================================================================
+// P8-5 G18：主库自检四级判定。判定先保持纯函数，真实文件读取只负责组装输入，
+// 这样“健康 / 可自愈 / 需人工”不会被某一条读取路径悄悄改变。
+// ============================================================================
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterSelfCheckLevel {
+    Healthy,
+    SelfHealable,
+    NeedsManual,
+}
+
+impl MasterSelfCheckLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::SelfHealable => "self_healable",
+            Self::NeedsManual => "needs_manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterSelfCheckStatus {
+    Passed,
+    Attention,
+    Failed,
+    Blocked,
+}
+
+impl MasterSelfCheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Attention => "attention",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MasterSelfCheckInput {
+    storage_exists: bool,
+    storage_readable: bool,
+    blob_present: bool,
+    blob_decryptable: bool,
+    account_registered: bool,
+    cache_consistent: bool,
+    instance_stopped: bool,
+    donor_available: bool,
+    ledger_valid: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MasterSelfCheckAssessment {
+    level: MasterSelfCheckLevel,
+    read_status: MasterSelfCheckStatus,
+    consistency_status: MasterSelfCheckStatus,
+    switchability_status: MasterSelfCheckStatus,
+    deep_status: MasterSelfCheckStatus,
+}
+
+fn assess_master_self_check(input: MasterSelfCheckInput) -> MasterSelfCheckAssessment {
+    let read_status = if !input.storage_exists {
+        // 尚未登录不是故障，仍需让用户知道主库目前没有登录数据。
+        MasterSelfCheckStatus::Attention
+    } else if !input.storage_readable
+        || !input.blob_decryptable
+        || !input.account_registered
+    {
+        MasterSelfCheckStatus::Failed
+    } else if !input.blob_present {
+        MasterSelfCheckStatus::Attention
+    } else {
+        MasterSelfCheckStatus::Passed
+    };
+    let consistency_status = if input.cache_consistent {
+        MasterSelfCheckStatus::Passed
+    } else if input.blob_decryptable && input.account_registered {
+        MasterSelfCheckStatus::Attention
+    } else {
+        MasterSelfCheckStatus::Blocked
+    };
+    let switchability_status = if !input.instance_stopped {
+        MasterSelfCheckStatus::Blocked
+    } else if input.donor_available {
+        MasterSelfCheckStatus::Passed
+    } else {
+        MasterSelfCheckStatus::Attention
+    };
+    let deep_status = if input.ledger_valid {
+        MasterSelfCheckStatus::Passed
+    } else {
+        MasterSelfCheckStatus::Failed
+    };
+
+    let statuses = [
+        read_status,
+        consistency_status,
+        switchability_status,
+        deep_status,
+    ];
+    let level = if statuses.contains(&MasterSelfCheckStatus::Failed) {
+        MasterSelfCheckLevel::NeedsManual
+    } else if statuses.iter().any(|status| *status != MasterSelfCheckStatus::Passed) {
+        MasterSelfCheckLevel::SelfHealable
+    } else {
+        MasterSelfCheckLevel::Healthy
+    };
+
+    MasterSelfCheckAssessment {
+        level,
+        read_status,
+        consistency_status,
+        switchability_status,
+        deep_status,
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct MasterSelfCheckItemDto {
+    key: &'static str,
+    status: &'static str,
+    summary: String,
+}
+
+#[derive(Clone, Serialize)]
+struct MasterSelfCheckDto {
+    level: &'static str,
+    checks: Vec<MasterSelfCheckItemDto>,
+    current_account_name: Option<String>,
+    observed_account_name: Option<String>,
+    can_repair: bool,
+}
+
 /// 主库环境状态 DTO（P5-0；环境页主库实例卡数据源，前端 P5-2 接线）。
 #[derive(Clone, Serialize)]
 struct EnvironmentStateDto {
@@ -5280,6 +5415,254 @@ fn get_environment_state_inner(
         login_state: trae_instance_module::instance_login_state(&instance_dir),
         created_at_unix_seconds: record.created_at_unix_seconds,
     })
+}
+
+/// 读取主库自检报告（G18）。文件读取失败只形成报告，不在自检阶段改写用户数据。
+fn get_master_self_check_inner(
+    material_root: &Path,
+    storage_root: &Path,
+) -> Result<MasterSelfCheckDto, String> {
+    let registry = EnvironmentRegistry::new(storage_root);
+    let record = registry
+        .ensure_master()
+        .map_err(|_| "environment_registry_invalid".to_string())?;
+    let accounts = AccountRegistry::new(material_root)
+        .load()
+        .map_err(|_| "checkin_registry_invalid".to_string())?;
+    let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+    let storage_path = master_dir
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let storage_exists = storage_path.is_file();
+    let (storage_readable, blob_present) = if !storage_exists {
+        (true, false)
+    } else {
+        match std::fs::read_to_string(&storage_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        {
+            Some(value) => (
+                true,
+                value.get("iCubeAuthInfo://usertag").is_some(),
+            ),
+            None => (false, false),
+        }
+    };
+    let observed_user_id = if blob_present {
+        archive_login_user_id(&master_dir)
+    } else {
+        None
+    };
+    let observed_profile_id = observed_user_id.as_deref().and_then(|user_id| {
+        accounts
+            .iter()
+            .find(|account| account.account_id == user_id)
+            .map(|account| account.profile_id.clone())
+    });
+    let cache_consistent = match (
+        record.current_profile_id.as_deref(),
+        observed_profile_id.as_deref(),
+    ) {
+        (None, None) => true,
+        (Some(cached), Some(observed)) => cached == observed,
+        _ => false,
+    };
+    let running = list_trae_processes()
+        .map(|processes| {
+            processes.iter().any(|process| {
+                process.command_line.as_deref().is_some_and(|line| {
+                    trae_instance_module::command_line_matches_master(line, &master_dir)
+                })
+            })
+        })
+        .unwrap_or(true);
+    let donor_profile_id = observed_profile_id
+        .as_deref()
+        .or(record.current_profile_id.as_deref());
+    let donor_available = donor_profile_id
+        .map(|profile_id| {
+            instance_data_dir(storage_root, profile_id)
+                .map(|path| path.is_dir())
+                .unwrap_or(false)
+        })
+        .unwrap_or(true);
+    let ledger_valid = RelayLedger::new(storage_root.join("environments")).load().is_ok();
+    let assessment = assess_master_self_check(MasterSelfCheckInput {
+        storage_exists,
+        storage_readable,
+        blob_present,
+        blob_decryptable: !blob_present || observed_user_id.is_some(),
+        account_registered: !blob_present || observed_profile_id.is_some(),
+        cache_consistent,
+        instance_stopped: !running,
+        donor_available,
+        ledger_valid,
+    });
+    let current_account_name = record.current_profile_id.as_deref().and_then(|profile_id| {
+        accounts
+            .iter()
+            .find(|account| account.profile_id == profile_id)
+            .map(|account| {
+                account
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| account.screen_name.clone())
+            })
+    });
+    let observed_account_name = observed_profile_id.as_deref().and_then(|profile_id| {
+        accounts
+            .iter()
+            .find(|account| account.profile_id == profile_id)
+            .map(|account| {
+                account
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| account.screen_name.clone())
+            })
+    });
+    let read_summary = if !storage_exists {
+        "主库尚未产生登录数据"
+    } else if !storage_readable {
+        "登录数据文件无法读取"
+    } else if !blob_present {
+        "主库当前未登录账号"
+    } else if observed_user_id.is_none() {
+        "登录数据已损坏，需重新登录"
+    } else if observed_profile_id.is_none() {
+        "当前登录账号尚未登记"
+    } else {
+        "登录数据可读取，账号可反查"
+    };
+    let consistency_summary = if cache_consistent {
+        "工具记录与实际登录一致"
+    } else if observed_profile_id.is_some() {
+        "实际登录账号与工具记录不一致"
+    } else {
+        "暂时无法确认主库当前账号"
+    };
+    let switchability_summary = if running {
+        "请先关闭主库 TRAE 窗口"
+    } else if donor_available {
+        "主库已关闭，可进行切换"
+    } else {
+        "当前账号没有可用的登录存档"
+    };
+    let deep_summary = if ledger_valid {
+        "接力记录可读取，展开后可进行深度核对"
+    } else {
+        "接力记录不可读取，需要人工保留数据后处理"
+    };
+    Ok(MasterSelfCheckDto {
+        level: assessment.level.as_str(),
+        checks: vec![
+            MasterSelfCheckItemDto {
+                key: "read",
+                status: assessment.read_status.as_str(),
+                summary: read_summary.to_string(),
+            },
+            MasterSelfCheckItemDto {
+                key: "consistency",
+                status: assessment.consistency_status.as_str(),
+                summary: consistency_summary.to_string(),
+            },
+            MasterSelfCheckItemDto {
+                key: "switchability",
+                status: assessment.switchability_status.as_str(),
+                summary: switchability_summary.to_string(),
+            },
+            MasterSelfCheckItemDto {
+                key: "deep",
+                status: assessment.deep_status.as_str(),
+                summary: deep_summary.to_string(),
+            },
+        ],
+        current_account_name,
+        observed_account_name,
+        can_repair: observed_profile_id.is_some() && !cache_consistent,
+    })
+}
+
+/// 读取主库自检报告；fixture 模式不触碰真实目录。
+#[tauri::command]
+async fn get_master_self_check(
+    state: tauri::State<'_, AppState>,
+) -> Result<MasterSelfCheckDto, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    tauri::async_runtime::spawn_blocking(move || {
+        get_master_self_check_inner(&material_root, &storage_root)
+    })
+    .await
+    .map_err(|_| "master_self_check_join_failed".to_string())?
+}
+
+/// 把自检观测到的账号写回环境缓存；只修正工具记录，不修改 TRAE 登录数据。
+#[tauri::command]
+async fn repair_master_current_account(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = EnvironmentRegistry::new(&storage_root);
+        let _ = registry
+            .ensure_master()
+            .map_err(|_| "environment_registry_invalid".to_string())?;
+        let accounts = AccountRegistry::new(&material_root)
+            .load()
+            .map_err(|_| "checkin_registry_invalid".to_string())?;
+        let master_dir =
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let observed = observed_master_profile_id(&accounts, &master_dir)
+            .ok_or_else(|| "master_observed_account_unavailable".to_string())?;
+        registry
+            .set_current_profile(MASTER_ENV_ID, &observed)
+            .map_err(|_| "environment_registry_invalid".to_string())
+    })
+    .await
+    .map_err(|_| "master_self_check_join_failed".to_string())?
+}
+
+/// 强制把主库的工具缓存指向指定账号。该兜底不修复 TRAE 登录数据，且必须在
+/// 主库停止后由前端完成一次明确确认，避免把运行中的主库状态继续写乱。
+#[tauri::command]
+async fn force_reset_master_current_account(
+    profile_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = trae_instance_account_id(&material_root, &profile_id)?;
+        let master_dir =
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let running = list_trae_processes()
+            .map_err(|_| "master_self_check_process_unavailable".to_string())?
+            .iter()
+            .any(|process| {
+                process.command_line.as_deref().is_some_and(|line| {
+                    trae_instance_module::command_line_matches_master(line, &master_dir)
+                })
+            });
+        if running {
+            return Err("master_self_check_instance_running".to_string());
+        }
+        EnvironmentRegistry::new(&storage_root)
+            .set_current_profile(MASTER_ENV_ID, &profile_id)
+            .map_err(|_| "environment_registry_invalid".to_string())
+    })
+    .await
+    .map_err(|_| "master_self_check_join_failed".to_string())?
 }
 
 /// 登记主库当前登录账号（P5-0 持久化原语：首次在主库内登录后登记；
@@ -9594,6 +9977,9 @@ pub fn run() {
             // P5-0：主库环境注册表与实例原语（环境模型：启动/状态/当前账号登记）。
             launch_master_library,
             get_environment_state,
+            get_master_self_check,
+            repair_master_current_account,
+            force_reset_master_current_account,
             set_environment_current_account,
             // P6-4：环境管理 V2（多环境档案 + 生命周期 + 环境登录）。
             list_environments,
@@ -10439,6 +10825,94 @@ mod master_current_account_reconcile_tests {
             Some("checkin-a"),
         );
         assert_eq!(resolved.as_deref(), Some("checkin-a"));
+    }
+}
+
+// ============================================================================
+// P8-5 G18：主库自检四级判定。
+// ============================================================================
+#[cfg(test)]
+mod master_self_check_tests {
+    use super::*;
+
+    fn input() -> MasterSelfCheckInput {
+        MasterSelfCheckInput {
+            storage_exists: true,
+            storage_readable: true,
+            blob_present: true,
+            blob_decryptable: true,
+            account_registered: true,
+            cache_consistent: true,
+            instance_stopped: true,
+            donor_available: true,
+            ledger_valid: true,
+        }
+    }
+
+    #[test]
+    fn healthy_when_four_checks_pass() {
+        let assessment = assess_master_self_check(input());
+
+        assert_eq!(assessment.level, MasterSelfCheckLevel::Healthy);
+        assert_eq!(assessment.read_status, MasterSelfCheckStatus::Passed);
+        assert_eq!(assessment.consistency_status, MasterSelfCheckStatus::Passed);
+        assert_eq!(assessment.switchability_status, MasterSelfCheckStatus::Passed);
+        assert_eq!(assessment.deep_status, MasterSelfCheckStatus::Passed);
+    }
+
+    #[test]
+    fn stale_registry_is_self_healable() {
+        let assessment = assess_master_self_check(MasterSelfCheckInput {
+            cache_consistent: false,
+            ..input()
+        });
+
+        assert_eq!(assessment.level, MasterSelfCheckLevel::SelfHealable);
+        assert_eq!(assessment.consistency_status, MasterSelfCheckStatus::Attention);
+    }
+
+    #[test]
+    fn corrupt_blob_requires_manual_login() {
+        let assessment = assess_master_self_check(MasterSelfCheckInput {
+            blob_decryptable: false,
+            ..input()
+        });
+
+        assert_eq!(assessment.level, MasterSelfCheckLevel::NeedsManual);
+        assert_eq!(assessment.read_status, MasterSelfCheckStatus::Failed);
+    }
+
+    #[test]
+    fn unreadable_storage_requires_manual_attention() {
+        let assessment = assess_master_self_check(MasterSelfCheckInput {
+            storage_readable: false,
+            ..input()
+        });
+
+        assert_eq!(assessment.level, MasterSelfCheckLevel::NeedsManual);
+        assert_eq!(assessment.read_status, MasterSelfCheckStatus::Failed);
+    }
+
+    #[test]
+    fn running_instance_blocks_switchability() {
+        let assessment = assess_master_self_check(MasterSelfCheckInput {
+            instance_stopped: false,
+            ..input()
+        });
+
+        assert_eq!(assessment.level, MasterSelfCheckLevel::SelfHealable);
+        assert_eq!(assessment.switchability_status, MasterSelfCheckStatus::Blocked);
+    }
+
+    #[test]
+    fn invalid_ledger_requires_manual_attention() {
+        let assessment = assess_master_self_check(MasterSelfCheckInput {
+            ledger_valid: false,
+            ..input()
+        });
+
+        assert_eq!(assessment.level, MasterSelfCheckLevel::NeedsManual);
+        assert_eq!(assessment.deep_status, MasterSelfCheckStatus::Failed);
     }
 }
 

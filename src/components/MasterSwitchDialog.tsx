@@ -108,7 +108,7 @@ type DialogPhase =
   | { kind: "running"; stage: MasterSwitchStage }
   | { kind: "busy" }
   | { kind: "done"; receipt: MasterAccountSwitchDto }
-  | { kind: "failed"; message: string };
+  | { kind: "failed"; message: string; code?: string };
 
 /**
  * 主库切号进度弹层（P5-2，消费 P5-1 的 master-switch-progress 事件）：
@@ -120,6 +120,8 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
   const [phase, setPhase] = useState<DialogPhase>({ kind: "previewing" });
   // P7-3 交接细粒度进度（仅 handing_over 阶段显示；进入其他阶段自动隐藏）。
   const [handoverProgress, setHandoverProgress] = useState<MasterSwitchHandoverProgress | null>(null);
+  // G18：强制重置是死锁兜底，必须在弹层内完成一次明确确认。
+  const [forceResetConfirm, setForceResetConfirm] = useState(false);
   // busy 分支记忆目标（强制切换时无需上层重新传参）。
   const busyTargetRef = useRef<MasterSwitchTarget | null>(null);
   // 已发起预检的 profile：防止 onFinished 身份变化引起 startSwitch 重建后重复 invoke。
@@ -154,7 +156,7 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
         const copy = rolledBackRef.current
           ? `${base}主库已自动还原到切换前的登录状态，可安全重试。`
           : base;
-        setPhase({ kind: "failed", message: copy });
+        setPhase({ kind: "failed", message: copy, code });
       }
     }
   }, [onFinished]);
@@ -236,10 +238,26 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
       : 0;
   const progressPercent = allDone ? 100 : Math.round((stageIndex + 1) / STAGES.length * 100);
   const displayName = (phase.kind === "busy" ? busyTargetRef.current?.display_name : null) ?? target.display_name;
+  const forceResetAvailable = phase.kind === "failed"
+    && ["master_login_missing", "switch_auth_failed", "switch_verify_failed"].includes(phase.code ?? "");
 
   const handleClose = () => {
     busyTargetRef.current = null;
+    setForceResetConfirm(false);
     onClose();
+  };
+
+  const handleForceReset = async () => {
+    try {
+      await invoke("force_reset_master_current_account", { profileId: target.profile_id });
+      onClose();
+    } catch (reason: unknown) {
+      setForceResetConfirm(false);
+      setPhase({
+        kind: "failed",
+        message: safeUiErrorMessage(reason, "强制重置未完成，请先关闭主库后重试。"),
+      });
+    }
   };
 
   return (
@@ -288,6 +306,37 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
               <TriangleAlert size={18} aria-hidden="true" />
               <p>{phase.message}</p>
             </div>
+            {forceResetAvailable && !forceResetConfirm && (
+              <button
+                className="btn btn--danger"
+                type="button"
+                onClick={() => setForceResetConfirm(true)}
+                data-testid="master-switch-force-reset"
+              >
+                强制重置为此账号
+              </button>
+            )}
+            {forceResetAvailable && forceResetConfirm && (
+              <div className="switch-dialog__notice switch-dialog__notice--danger" data-testid="master-switch-force-reset-confirm">
+                <div>
+                  <strong>确认强制重置？</strong>
+                  <p>这只会纠正工具记录，不会修复 TRAE 登录数据；完成后仍需在 TRAE 内重新登录。</p>
+                  <div className="switch-dialog__actions">
+                    <button className="btn" type="button" onClick={() => setForceResetConfirm(false)}>
+                      取消
+                    </button>
+                    <button
+                      className="btn btn--danger"
+                      type="button"
+                      onClick={() => void handleForceReset()}
+                      data-testid="master-switch-force-reset-confirm-action"
+                    >
+                      确认重置
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
             <div className="switch-dialog__actions">
               <button className="btn" type="button" onClick={handleClose}>关闭</button>
             </div>

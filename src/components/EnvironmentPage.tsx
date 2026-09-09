@@ -22,7 +22,7 @@ import type {
   MasterCheckupDto,
   MasterIncorporateProgressEvent,
   MasterIncorporateResultDto,
-  MasterLibraryStatsDto,
+  MasterSelfCheckDto,
 } from "../types/masterLibrary";
 import type { AccountProfileDto, ManagedAccountsViewDto } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
@@ -38,14 +38,15 @@ interface EnvironmentPageProps {
 /**
  * 环境页 V2（P5-2 + P6-4，ADR-0024）：
  * 主库环境卡（默认环境，置顶不可删）+ 辅助环境列表（创建/登录账号/
- * 启动/重命名/删除）。主库卡沿用 P5-2 编排（统计/体检/收编/启动）。
+ * 启动/重命名/删除）。主库卡只承载生命周期、体检与自检入口。
  */
 export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageProps) {
   const [state, setState] = useState<EnvironmentStateDto | null>(null);
-  // 主库聚合统计：读取失败（fixture 模式等）时为 null，统计格整体不渲染。
-  const [masterStats, setMasterStats] = useState<MasterLibraryStatsDto | null>(null);
   // P5-5 主库体检：同读同刷；失败静默降级为 null（体检区块不渲染）。
   const [checkup, setCheckup] = useState<MasterCheckupDto | null>(null);
+  // P8-5 G18：手动触发的四项主库自检报告。
+  const [selfCheck, setSelfCheck] = useState<MasterSelfCheckDto | null>(null);
+  const [selfChecking, setSelfChecking] = useState(false);
   // P6-4 环境列表（含主库置顶项；null = 首次未读）。
   const [envList, setEnvList] = useState<EnvironmentListItemDto[] | null>(null);
   // 收编弹层：null = 关闭；确认 → 运行（四阶段进度）→ 完成回执 / 失败提示。
@@ -77,20 +78,44 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
   const load = useCallback(async () => {
     const next = await invoke<EnvironmentStateDto>("get_environment_state");
     setState(next);
-    // 统计与体检同状态同读同刷（聚合 SQL 轻量）：手动刷新/启动后/切号/收编后回页都校准。
-    // 读取失败静默降级为 null（不渲染对应区块），不阻塞环境状态展示。
-    const [stats, checkupReport, list] = await Promise.all([
-      invoke<MasterLibraryStatsDto>("get_master_library_stats").catch(() => null),
+    // 体检与环境列表同读同刷；主库统计由详情页负责，避免环境卡重复读取。
+    const [checkupReport, list] = await Promise.all([
       invoke<MasterCheckupDto>("get_master_checkup").catch(() => null),
       // 手动刷新带体积（主库三件套 + 副环境整目录口径）。
       invoke<EnvironmentListItemDto[]>("list_environments", { includeSize: true }).catch(
         () => null,
       ),
     ]);
-    setMasterStats(stats);
     setCheckup(checkupReport);
     if (list) setEnvList((previous) => mergeListSizes(previous, list));
   }, [mergeListSizes]);
+
+  /** G18：只读自检，报告失败也不改变主库数据。 */
+  const handleSelfCheck = useCallback(async () => {
+    setSelfChecking(true);
+    setError(null);
+    try {
+      const report = await invoke<MasterSelfCheckDto>("get_master_self_check");
+      setSelfCheck(report);
+    } catch (reason: unknown) {
+      setError(safeUiErrorMessage(reason, "主库自检未完成，请稍后重试。"));
+    } finally {
+      setSelfChecking(false);
+    }
+  }, []);
+
+  /** G18：只在用户明确点击后纠正工具缓存，随后重新读取报告。 */
+  const handleRepair = useCallback(async () => {
+    setError(null);
+    try {
+      await invoke("repair_master_current_account");
+      await load();
+      await handleSelfCheck();
+      setMessage("已按实际登录账号纠正主库记录。");
+    } catch (reason: unknown) {
+      setError(safeUiErrorMessage(reason, "主库记录未能纠正，请稍后重试。"));
+    }
+  }, [handleSelfCheck, load]);
 
   useEffect(() => {
     if (!active) return;
@@ -259,25 +284,6 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
             )}
           </div>
 
-          {/* P5-4 主库统计格（原型 env-stats 契约）：会话/项目/参与账号。
-              仅 stats ready 时渲染；库体量/接力次数等留待 P5-8 详情页。 */}
-          {masterStats?.status === "ready" && (
-            <div className="env-stats" data-testid="env-master-stats">
-              <div className="env-stat" title="主库内全部对话会话数">
-                <div className="env-stat__value">{masterStats.session_count}</div>
-                <div className="env-stat__label">会话</div>
-              </div>
-              <div className="env-stat" title="主库内全部项目数">
-                <div className="env-stat__value">{masterStats.project_count}</div>
-                <div className="env-stat__label">项目</div>
-              </div>
-              <div className="env-stat" title="主库内出现过的账号数（含历史归属）">
-                <div className="env-stat__value">{masterStats.participating_account_count}</div>
-                <div className="env-stat__label">参与账号</div>
-              </div>
-            </div>
-          )}
-
           <p className="env-card__hint">
             {state?.current_profile_id
               ? "全部对话记录都在主库内共享；在「账号」页切换账号，全部记录都会保留。"
@@ -322,6 +328,14 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
             </div>
           )}
 
+          {selfCheck && (
+            <MasterSelfCheckReport
+              report={selfCheck}
+              onRepair={() => void handleRepair()}
+              repairing={selfChecking}
+            />
+          )}
+
           <div className="env-card__foot">
             {/* 数据目录完整路径收进悬浮提示，不占主视野（界面表达纪律）。 */}
             <span
@@ -340,6 +354,16 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
                 title="查看主库详情（对话记录、统计与备份）"
               >
                 <Database size={15} aria-hidden="true" />详情
+              </button>
+              <button
+                className="btn"
+                type="button"
+                onClick={() => void handleSelfCheck()}
+                disabled={selfChecking}
+                data-testid="env-master-self-check"
+                title="检查主库登录数据、账号记录和切换条件"
+              >
+                <CheckCircle2 size={15} aria-hidden="true" />{selfChecking ? "自检中…" : "自检"}
               </button>
               <button
                 className="btn btn--primary"
@@ -480,6 +504,101 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
       )}
     </section>
   );
+}
+
+/** G18 自检报告：主视野只显示四项结论，深度说明保持默认折叠。 */
+function MasterSelfCheckReport({
+  report,
+  onRepair,
+  repairing,
+}: {
+  report: MasterSelfCheckDto;
+  onRepair: () => void;
+  repairing: boolean;
+}) {
+  const readCheck = report.checks.find((check) => check.key === "read");
+  const namesDiffer =
+    report.current_account_name !== report.observed_account_name &&
+    report.observed_account_name !== null;
+  return (
+    <div className={`env-self-check env-self-check--${report.level}`} data-testid="env-self-check">
+      <div className="env-self-check__head">
+        <div>
+          <strong>主库自检：{selfCheckLevelLabel(report.level)}</strong>
+          {namesDiffer && (
+            <p className="env-self-check__note">
+              实际登录：{report.observed_account_name}；工具记录：{report.current_account_name ?? "暂无"}
+            </p>
+          )}
+          {readCheck?.status === "failed" && readCheck.summary.includes("损坏") && (
+            <p className="env-self-check__note">登录数据已损坏，需重新登录。</p>
+          )}
+        </div>
+      </div>
+      <ul className="env-self-check__list">
+        {report.checks.map((check) => (
+          <li key={check.key} className={`env-self-check__item env-self-check__item--${check.status}`}>
+            <span className="env-self-check__item-name">{selfCheckKeyLabel(check.key)}</span>
+            <span className="env-self-check__item-status">{selfCheckStatusLabel(check.status)}</span>
+            <span className="env-self-check__item-summary">{check.summary}</span>
+          </li>
+        ))}
+      </ul>
+      <details className="env-self-check__details" data-testid="env-self-check-deep">
+        <summary>查看深度检查说明</summary>
+        <p>{report.checks.find((check) => check.key === "deep")?.summary ?? "暂无深度检查结果。"}</p>
+        <p>需要核对具体记录时，请在主库详情的库信息中展开备份对比。</p>
+      </details>
+      {report.can_repair && (
+        <button
+          className="btn btn--primary env-self-check__repair"
+          type="button"
+          onClick={onRepair}
+          disabled={repairing}
+          data-testid="env-self-check-repair"
+        >
+          {repairing ? "纠正中…" : "纠正为实际登录账号"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function selfCheckLevelLabel(level: MasterSelfCheckDto["level"]): string {
+  switch (level) {
+    case "healthy":
+      return "健康";
+    case "self_healable":
+      return "可自愈";
+    case "needs_manual":
+      return "需人工处理";
+  }
+}
+
+function selfCheckKeyLabel(key: MasterSelfCheckDto["checks"][number]["key"]): string {
+  switch (key) {
+    case "read":
+      return "读校验";
+    case "consistency":
+      return "一致性";
+    case "switchability":
+      return "可切换";
+    case "deep":
+      return "深度检查";
+  }
+}
+
+function selfCheckStatusLabel(status: MasterSelfCheckDto["checks"][number]["status"]): string {
+  switch (status) {
+    case "passed":
+      return "正常";
+    case "attention":
+      return "需关注";
+    case "failed":
+      return "需人工";
+    case "blocked":
+      return "暂不可用";
+  }
 }
 
 /** P6-4 辅助环境卡：名称 + 当前账号 + 运行态 + 体积 + 四项操作。 */

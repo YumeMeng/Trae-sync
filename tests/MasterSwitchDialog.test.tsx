@@ -205,6 +205,27 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
     expect(await screen.findByText(/目标账号的登录凭据不可用/)).toBeInTheDocument();
   });
 
+  it("G18：主库登录数据异常时提供单次确认的强制重置通道", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "preview_master_switch_plugins") return preview();
+      if (command === "force_reset_master_current_account") return true;
+      throw "master_login_missing";
+    });
+    const { onClose } = renderDialog();
+
+    expect(await screen.findByTestId("master-switch-force-reset")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("master-switch-force-reset"));
+    expect(screen.getByTestId("master-switch-force-reset-confirm")).toHaveTextContent("不会修复 TRAE 登录数据");
+    fireEvent.click(screen.getByTestId("master-switch-force-reset-confirm-action"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("force_reset_master_current_account", {
+        profileId: "profile-b",
+      });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("P7-2：失败前收到回滚事件 → 失败文案附「已自动还原，可安全重试」", async () => {
     // 模拟后端时序：rolled-back 事件先到，invoke 拒绝后到。
     let rejectSwitch: (reason: unknown) => void = () => undefined;

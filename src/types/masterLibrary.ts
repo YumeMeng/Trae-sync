@@ -5,7 +5,7 @@
  * MasterBackupChainDto（serde 命名）一致。
  */
 
-/** 主库聚合统计（总览页统计卡 + 环境卡会话胶囊数据源）。 */
+/** 主库聚合统计（总览页统计卡 + 主库详情页会话胶囊数据源）。 */
 export interface MasterLibraryStatsDto {
   /** ready=读取成功；no_master_data=主库从未启动过；no_current_account=尚未登记账号；read_failed=读取失败。 */
   readonly status: "ready" | "no_master_data" | "no_current_account" | "read_failed";
@@ -21,6 +21,27 @@ export interface MasterLibraryStatsDto {
   readonly last_active_unix_seconds: number | null;
   /** 主库三件套合计字节（详情页头部；主库从未启动为 0）。 */
   readonly size_bytes: number;
+}
+
+/** P8-5 G18 主库自检分级。 */
+export type MasterSelfCheckLevel = "healthy" | "self_healable" | "needs_manual";
+
+/** P8-5 G18 单项检查结果。 */
+export type MasterSelfCheckStatus = "passed" | "attention" | "failed" | "blocked";
+
+export interface MasterSelfCheckItemDto {
+  readonly key: "read" | "consistency" | "switchability" | "deep";
+  readonly status: MasterSelfCheckStatus;
+  readonly summary: string;
+}
+
+/** 主库自检报告（读校验 / 一致性 / 可切换 / 深度检查）。 */
+export interface MasterSelfCheckDto {
+  readonly level: MasterSelfCheckLevel;
+  readonly checks: readonly MasterSelfCheckItemDto[];
+  readonly current_account_name: string | null;
+  readonly observed_account_name: string | null;
+  readonly can_repair: boolean;
 }
 
 /** 一份主库数据备份（切换账号与手动备份都会生成）。 */

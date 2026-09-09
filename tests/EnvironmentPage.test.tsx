@@ -114,7 +114,7 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  it("P5-4：主库统计可读时渲染统计格（会话/项目/参与账号）", async () => {
+  it("G5：环境页主库卡不再渲染统计数字，统计职责留在详情页", async () => {
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_environment_state") return envState();
       if (command === "get_master_library_stats") {
@@ -130,11 +130,44 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       return undefined;
     });
     render(<EnvironmentPage active />);
-    const stats = await screen.findByTestId("env-master-stats");
-    expect(stats).toHaveTextContent("7");
-    expect(stats).toHaveTextContent("会话");
-    expect(stats).toHaveTextContent("项目");
-    expect(stats).toHaveTextContent("参与账号");
+    await screen.findByTestId("env-master-card");
+    expect(screen.queryByTestId("env-master-stats")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("get_master_library_stats");
+  });
+
+  it("G18：自检展示四级结果，可把缓存纠正为实测账号", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "get_master_self_check") {
+        return {
+          level: "self_healable",
+          checks: [
+            { key: "read", status: "passed", summary: "登录数据可读取" },
+            { key: "consistency", status: "attention", summary: "检测到实际登录账号与工具记录不一致" },
+            { key: "switchability", status: "passed", summary: "主库已关闭，可进行切换" },
+            { key: "deep", status: "passed", summary: "接力记录可读取" },
+          ],
+          current_account_name: "账号甲",
+          observed_account_name: "账号乙",
+          can_repair: true,
+        };
+      }
+      if (command === "repair_master_current_account") return true;
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+
+    fireEvent.click(await screen.findByTestId("env-master-self-check"));
+    const report = await screen.findByTestId("env-self-check");
+    expect(report).toHaveTextContent("可自愈");
+    expect(report).toHaveTextContent("读校验");
+    expect(report).toHaveTextContent("一致性");
+    expect(report).toHaveTextContent("可切换");
+    expect(report).toHaveTextContent("深度检查");
+    fireEvent.click(screen.getByTestId("env-self-check-repair"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("repair_master_current_account");
+    });
   });
 
   it("P5-4：主库统计读取失败时统计格整体不渲染（可插拔降级）", async () => {

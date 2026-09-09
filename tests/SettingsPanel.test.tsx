@@ -51,11 +51,49 @@ describe("设置面板", () => {
 
     render(<SettingsPanel active={true} />);
 
-    expect(await screen.findByText("探测通过")).toBeInTheDocument();
+    expect(await screen.findByText("密钥正常")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("settings-key-details").querySelector("summary")!);
+    expect(screen.getByText("探测通过")).toBeInTheDocument();
     expect(screen.getByText(/来源密钥：v2026.08/)).toBeInTheDocument();
     expect(screen.getByText(/历史库密钥：代次 3/)).toBeInTheDocument();
     // 密钥正文永不回显：候选输入框是密码框，界面不出现密钥内容。
     expect(screen.getByTestId("source-key-candidate-input")).toHaveAttribute("type", "password");
+  });
+
+  it("G3：密钥默认只显示健康结论，备份路径收进 details", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_key_status") return keyStatus;
+      if (command === "get_master_backup_chain") {
+        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<SettingsPanel active={true} />);
+
+    expect(await screen.findByTestId("settings-key-details")).toHaveTextContent("密钥正常");
+    expect(screen.getByTestId("master-backup-location-details")).toBeInTheDocument();
+    expect(screen.getByTestId("master-backup-create")).toBeInTheDocument();
+  });
+
+  it("G3：密钥异常和操作错误在折叠状态下仍可见", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_key_status") return { ...keyStatus, catalog_key_configured: false };
+      if (command === "probe_source_key") throw new Error("probe_failed");
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<SettingsPanel active={true} />);
+    expect(await screen.findByText("密钥异常需维护")).toBeInTheDocument();
+
+    const details = screen.getByTestId("settings-key-details");
+    fireEvent.click(details.querySelector("summary")!);
+    fireEvent.click(screen.getByRole("button", { name: "重新探测密钥" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("密钥探测未完成");
+
+    // 折叠维护区后，错误仍留在主视野，避免把失败反馈藏进 details。
+    fireEvent.click(details.querySelector("summary")!);
+    expect(screen.getByRole("alert")).toBeVisible();
   });
 
   it("可发起只读密钥探测并显示结论", async () => {

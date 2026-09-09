@@ -1,23 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { BookOpen, CalendarCheck, Database, RefreshCw, UserRound } from "lucide-react";
+import { BookOpen, CalendarCheck, Database, UserRound } from "lucide-react";
 import type { AppPage } from "../components/NavigationRail";
+import type { EnvironmentStateDto } from "../types/environment";
 import type { WorkspaceStateDto } from "../types/workspace";
 import type {
   CheckinCapabilityDto,
   CheckinOverviewEntryDto,
 } from "../types/account_switch";
 import type { MasterLibraryStatsDto } from "../types/masterLibrary";
-import { renderSafeTargetAccount } from "../utils/accountLabel";
 
 interface OverviewPageProps {
   state: WorkspaceStateDto;
   active: boolean;
   onNavigate: (page: AppPage) => void;
-  /** 证据带（原标题栏下沉）：当前账号重新检测的状态与回调 */
-  accountRefreshState?: "idle" | "loading" | "error";
-  accountRefreshError?: string | null;
-  onRedetectAccount?: () => Promise<void> | void;
 }
 
 /**
@@ -30,15 +26,14 @@ export function OverviewPage({
   state,
   active,
   onNavigate,
-  accountRefreshState = "idle",
-  accountRefreshError = null,
-  onRedetectAccount,
 }: OverviewPageProps) {
   const [checkinOverview, setCheckinOverview] = useState<readonly CheckinOverviewEntryDto[] | null>(null);
   const [checkinRealMode, setCheckinRealMode] = useState(false);
   // P5-4 主库聚合统计：ready 时主库统计卡替换旧工作台统计（fixture 模式
   // 命令报错 → null → 维持旧统计，可插拔语义与签到区块一致）。
   const [masterStats, setMasterStats] = useState<MasterLibraryStatsDto | null>(null);
+  // G7 主库真实当前账号：与环境页共用 get_environment_state 读路径。
+  const [masterState, setMasterState] = useState<EnvironmentStateDto | null>(null);
 
   // 签到摘要数据：真实签到能力可用时读取（账号总览）。
   // 只读一次（active 翻转时刷新）；细粒度实时性由签到页/账号页承担。
@@ -56,22 +51,21 @@ export function OverviewPage({
     }
   }, []);
 
-  // 主库统计：轻量聚合（4 条 SQL）；主库未登录账号时返回引导状态。
-  const loadMasterStats = useCallback(async () => {
-    try {
-      const stats = await invoke<MasterLibraryStatsDto>("get_master_library_stats");
-      setMasterStats(stats);
-    } catch {
-      // fixture 模式 / 读取失败：维持 null（显示旧工作台统计）。
-      setMasterStats(null);
-    }
+  // 主库证据：当前账号来自环境真实状态，最近活跃时间来自聚合统计。
+  const loadMasterEvidence = useCallback(async () => {
+    const [environment, stats] = await Promise.all([
+      invoke<EnvironmentStateDto>("get_environment_state").catch(() => null),
+      invoke<MasterLibraryStatsDto>("get_master_library_stats").catch(() => null),
+    ]);
+    setMasterState(environment);
+    setMasterStats(stats);
   }, []);
 
   useEffect(() => {
     if (!active) return;
     void loadCheckinSummary();
-    void loadMasterStats();
-  }, [active, loadCheckinSummary, loadMasterStats]);
+    void loadMasterEvidence();
+  }, [active, loadCheckinSummary, loadMasterEvidence]);
 
   const hasHistory =
     state.history.account_count + state.history.project_count + state.history.session_count > 0;
@@ -110,29 +104,16 @@ export function OverviewPage({
         </p>
       </header>
 
-      {/* 证据带（原标题栏下沉，2026-08-27）：当前账号 + 重新检测。
-          只读证据可复核：指纹缺失显示“未检测”，带原因时括注短说明。 */}
+      {/* G7 证据带：当前登录账号与主库最近活跃时间，读不到主库时显示未登录。 */}
       <div className="overview-evidence" data-testid="current-account-context">
         <UserRound size={15} strokeWidth={1.9} aria-hidden="true" />
-        <span className="overview-evidence__label">当前账号</span>
+        <span className="overview-evidence__label">当前登录：</span>
         <strong data-testid="current-account-name">
-          {renderAccountName(state.current_account, state.platform)}
+          {masterState?.current_account_name ?? "未登录"}
         </strong>
-        {onRedetectAccount && (
-          <button
-            type="button"
-            className="btn btn--quiet overview-evidence__redetect"
-            onClick={() => void onRedetectAccount()}
-            disabled={accountRefreshState === "loading"}
-            data-testid="redetect-account-button"
-          >
-            <RefreshCw size={13} strokeWidth={2} aria-hidden="true" />
-            {accountRefreshState === "loading" ? "检测中…" : "重新检测"}
-          </button>
-        )}
-        {accountRefreshError && (
-          <span className="overview-evidence__error" role="status">
-            {accountRefreshError}
+        {masterStats?.last_active_unix_seconds !== null && masterStats?.last_active_unix_seconds !== undefined && (
+          <span className="overview-evidence__meta">
+            （最近活跃 {formatLastActive(masterStats.last_active_unix_seconds)}）
           </span>
         )}
       </div>
@@ -272,43 +253,6 @@ export function OverviewPage({
       </div>
     </section>
   );
-}
-
-/// 证据带账号名：生产模式展示不可逆指纹，fixture 预览展示原始值；
-/// 指纹缺失回落“未检测”，带原因时括注短说明（逻辑自 TitleBar 迁入）。
-function renderAccountName(
-  account: WorkspaceStateDto["current_account"],
-  platform: WorkspaceStateDto["platform"],
-): string {
-  const productionMode = platform.adapter_implemented;
-  const rawIdentifier = productionMode
-    ? renderSafeTargetAccount(account)
-    : account.user_fingerprint ?? "";
-  // 指纹缺失时回落为空，展示层统一显示“未检测”，避免绕口兜底文案。
-  const identifier = rawIdentifier === "安全指纹不可用" ? "" : rawIdentifier;
-  if (account.detected && !account.unavailable_reason) return identifier;
-  return identifier
-    ? `${identifier}（${renderAccountReason(account.unavailable_reason)}）`
-    : "未检测";
-}
-
-/// 把后端稳定原因码转换为证据带短提示（自 TitleBar 迁入）。
-function renderAccountReason(reason: string | null): string {
-  switch (reason) {
-    case "authorization_required":
-    case "authorization_mismatch":
-      return "读取授权已失效";
-    case "expired":
-      return "账号信息已过期";
-    case "single_source":
-      return "信息不足";
-    case "conflict":
-      return "账号来源冲突";
-    case "fingerprint_changed":
-      return "账号信息已变化";
-    default:
-      return "暂不可用";
-  }
 }
 
 /// 按本地时间生成问候语，避免时区错位。

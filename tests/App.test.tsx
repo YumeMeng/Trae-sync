@@ -46,7 +46,17 @@ describe("应用工作区入口", () => {
     vi.clearAllMocks();
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_workspace_state") return workspace;
-      if (command === "refresh_managed_current_account") return undefined;
+      if (command === "get_environment_state") {
+        return {
+          env_id: "master",
+          current_profile_id: "profile-a",
+          current_account_name: "主库账号",
+          data_dir: "C:\\TRAE\\master",
+          running: false,
+          login_state: "logged_in",
+          created_at_unix_seconds: 1,
+        };
+      }
       if (command === "get_checkin_capability") {
         return {
           enabled: false,
@@ -71,71 +81,19 @@ describe("应用工作区入口", () => {
     expect(mockInvoke).not.toHaveBeenCalledWith("read_work_cn_state", expect.anything());
   });
 
-  it("总览证据带持续显示当前账号，并提供重新检测", async () => {
+  it("G7：总览证据带显示主库真实账号，不再走指纹检测链路", async () => {
     render(<App />);
 
-    expect(await screen.findByTestId("current-account-context")).toHaveTextContent(
-      "当前账号 · acct-1234",
-    );
-
-    fireEvent.click(screen.getByTestId("redetect-account-button"));
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("refresh_managed_current_account");
-    });
-    expect(mockInvoke).toHaveBeenCalledWith("get_workspace_state");
-  });
-
-  it("账号刷新失败仍重新读取工作区并清除旧账号显示", async () => {
-    let revoked = false;
-    let workspaceReadCount = 0;
-    const unauthorizedWorkspace: WorkspaceStateDto = {
-      ...workspace,
-      current_account: {
-        ...workspace.current_account,
-        detected: false,
-        user_fingerprint: null,
-        unavailable_reason: "authorization_required",
-      },
-      capabilities: {
-        ...workspace.capabilities,
-        scan_enabled: false,
-      },
-      honest_status: "读取未授权；等待用户授权后发现 TRAE 数据位置；TRAE 写入保持禁用。",
-    };
-
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_workspace_state") {
-        workspaceReadCount += 1;
-        return revoked ? unauthorizedWorkspace : workspace;
-      }
-      if (command === "refresh_managed_current_account") {
-        revoked = true;
-        throw new Error("account_profile_store_busy");
-      }
-      throw new Error(`未模拟的命令: ${command}`);
-    });
-
-    render(<App />);
     await waitFor(() => {
       expect(screen.getByTestId("current-account-context")).toHaveTextContent(
-        "当前账号 · acct-1234",
+        "当前登录：主库账号",
       );
     });
-
-    fireEvent.click(screen.getByTestId("redetect-account-button"));
-
-    // 账号失效会级联撤销历史读取授权，再触发一次权威工作区刷新。
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("refresh_managed_current_account");
-      expect(screen.getByTestId("current-account-context")).toHaveTextContent(
-        "未检测",
-      );
-      expect(screen.getByTestId("current-account-context")).not.toHaveTextContent("acct-1234");
-    });
-    expect(workspaceReadCount).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByTestId("redetect-account-button")).not.toBeInTheDocument();
+    expect(screen.getByTestId("current-account-context")).not.toHaveTextContent("acct-1234");
   });
 
-  it("读取授权未建立时证据带回落未检测，不渲染内部状态术语", async () => {
+  it("G7：主库没有当前账号时显示未登录，不渲染内部状态术语", async () => {
     const unauthorizedWorkspace: WorkspaceStateDto = {
       ...workspace,
       current_account: {
@@ -152,12 +110,23 @@ describe("应用工作区入口", () => {
     };
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_workspace_state") return unauthorizedWorkspace;
+      if (command === "get_environment_state") {
+        return {
+          env_id: "master",
+          current_profile_id: null,
+          current_account_name: null,
+          data_dir: "C:\\TRAE\\master",
+          running: false,
+          login_state: "logged_out",
+          created_at_unix_seconds: 1,
+        };
+      }
       throw new Error(`未模拟的命令: ${command}`);
     });
 
     render(<App />);
 
-    expect(await screen.findByTestId("current-account-name")).toHaveTextContent("未检测");
+    expect(await screen.findByTestId("current-account-name")).toHaveTextContent("未登录");
     // 内部发布术语不进入用户界面（honest_status 已不再直接渲染）。
     expect(screen.queryByText(/RealReadPreview|真实只读 Preview/)).not.toBeInTheDocument();
   });
@@ -194,7 +163,6 @@ describe("应用工作区入口", () => {
   it("总览页有主库数据时显示统计卡，不同屏出现空态引导", async () => {
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_workspace_state") return workspace;
-      if (command === "refresh_managed_current_account") return undefined;
       if (command === "get_checkin_capability") {
         return {
           enabled: false,
@@ -252,7 +220,6 @@ describe("应用工作区入口", () => {
     };
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_workspace_state") return noLocationWorkspace;
-      if (command === "refresh_managed_current_account") return undefined;
       if (command === "get_checkin_capability") {
         return {
           enabled: false,
