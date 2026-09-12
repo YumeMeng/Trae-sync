@@ -16,7 +16,7 @@ export type MasterHistoryStatus =
   | "no_current_account" // 主库尚未登记登录账号
   | "read_failed"; // 打开或读取失败（key 不匹配、文件损坏等）
 
-/** 左栏项目条目（源库 project 表，当前账号归属过滤后）。 */
+/** 左栏项目条目（正常项目 + 含全局归档内容的项目）。 */
 export interface MasterProjectEntryDto {
   readonly project_id: string;
   /** 项目展示名；哈希/空名已回退路径尾段，仍不可读为空串（前端占位「未关联文件夹」）。 */
@@ -79,6 +79,14 @@ export interface MasterMergeResultDto {
   readonly removed_projects: number;
   /** 合并前自动创建的备份路径（人工恢复定位）。 */
   readonly backup_path: string;
+}
+
+/** apply_master_archive_changes 一次性提交归档草稿的回执。 */
+export interface MasterArchiveApplyResultDto {
+  readonly archived_sessions: number;
+  readonly restored_sessions: number;
+  /** launched/focused/failed；failed 表示数据库已提交但实例待恢复。 */
+  readonly relaunch_outcome: string;
 }
 
 /** get_relay_ledger 逐条记录（前端按 session_id / from_session_id 链回轨迹）。 */

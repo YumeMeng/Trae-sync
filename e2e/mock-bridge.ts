@@ -653,7 +653,39 @@ export async function installMockBridge(
         return RELAY_LEDGER;
       }
       // ===== 会话批量操作（归档 / 恢复 / 删除 / 合并，均带 libraryId）=====
-      // 可变副本：归档/恢复直接改 hidden_status，刷新后两栏联动（与真机行为同构）。
+      // 可变副本：归档/恢复只在一次 apply 中改 hidden_status，刷新后两栏联动。
+      if (cmd === "apply_master_archive_changes") {
+        assertMasterLibrary();
+        const archiveIds = new Set(
+          Array.isArray(args?.archiveSessionIds) ? args.archiveSessionIds : [],
+        );
+        const restoreIds = new Set(
+          Array.isArray(args?.restoreSessionIds) ? args.restoreSessionIds : [],
+        );
+        let archived = 0;
+        let restored = 0;
+        for (const session of MASTER_HISTORY_READY.sessions) {
+          if (
+            archiveIds.has(session.session_id) &&
+            !session.deleted &&
+            session.hidden_status === null
+          ) {
+            session.hidden_status = "voice_discussion";
+            archived += 1;
+          } else if (
+            restoreIds.has(session.session_id) &&
+            session.hidden_status === "voice_discussion"
+          ) {
+            session.hidden_status = null;
+            restored += 1;
+          }
+        }
+        return {
+          archived_sessions: archived,
+          restored_sessions: restored,
+          relaunch_outcome: "launched",
+        };
+      }
       if (cmd === "archive_master_sessions") {
         assertMasterLibrary();
         const ids = new Set(Array.isArray(args?.sessionIds) ? args.sessionIds : []);

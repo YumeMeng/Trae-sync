@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted，2026-08-31。决策来源 grill-with-docs 会话（2026-08-31，主库详情页设计）+ 真机实验闭环（`.scratch/history-u6/w0-probe/` hidden_status_probe / batch_hide_default）。
+Accepted，2026-08-31。决策来源 grill-with-docs 会话（2026-08-31，主库详情页设计）+ 真机实验闭环（`.scratch/history-u6/w0-probe/` hidden_status_probe / batch_hide_default）。**2026-09-12 修订**：决策 1 中“归档会话切号随行不受影响”被 ADR-0028 取代；本 ADR 的 `hidden_status` 通道、归档抽屉和恢复归位继续有效，归档/恢复的批量提交边界由 ADR-0028 定义；项目归档、项目恢复和项目合并语义由 ADR-0028 定义。
 
 ## 背景
 
@@ -17,7 +17,7 @@ Accepted，2026-08-31。决策来源 grill-with-docs 会话（2026-08-31，主�
 
 ## 决策
 
-1. **会话归档 = 写 `hidden_status = 'voice_discussion'`**；恢复 = 还原为 NULL。粒度是会话级，不改变记录归属，切号随行无感。
+1. **会话归档 = 写 `hidden_status = 'voice_discussion'`**；恢复 = 还原为 NULL。粒度是会话级，不改变记录归属；是否参与切号由 ADR-0028 的冻结边界决定，归档会话不再随切号交接。
 2. **归档抽屉是对话列表 tab 内的子视图**（非独立平级 tab），按「模式（code/work）→ 分组 → 会话」层级收纳，保留原位信息。
 3. **恢复即归位**：不做分组映射表——侧栏原生聚合保证恢复会话并入当前同类型分组。
 4. **批量操作走 Gmail 式选择态**：浏览态无勾选框，进入选择态后浮出批量栏（归档/恢复/删除）；删除是真实删除（消息+会话+空壳项目行），列明规模单次确认。

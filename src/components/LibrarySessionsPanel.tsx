@@ -23,6 +23,7 @@ import {
 import type { AppPage } from "./NavigationRail";
 import type {
   MasterHistoryDto,
+  MasterArchiveApplyResultDto,
   MasterMergeResultDto,
   MasterProjectEntryDto,
   MasterSessionEntryDto,
@@ -91,6 +92,45 @@ const UNLINKED_GROUP_ID = "__unlinked__";
 /** 消息流分页大小（后端按时间倒序取页后反转为升序）。 */
 const CHAT_WINDOW_LIMIT = 2000;
 
+/** 归档草稿存储键前缀；按库隔离，应用重启后仍可继续调整。 */
+const ARCHIVE_DRAFT_STORAGE_PREFIX = "trae-sync:archive-draft:";
+
+interface ArchiveDraft {
+  readonly archiveSessionIds: readonly string[];
+  readonly restoreSessionIds: readonly string[];
+}
+
+const EMPTY_ARCHIVE_DRAFT: ArchiveDraft = {
+  archiveSessionIds: [],
+  restoreSessionIds: [],
+};
+
+function archiveDraftStorageKey(libraryId: string): string {
+  return `${ARCHIVE_DRAFT_STORAGE_PREFIX}${encodeURIComponent(libraryId)}`;
+}
+
+/** 读取本地草稿；坏数据按空草稿处理，不能阻断历史列表。 */
+function readArchiveDraft(libraryId: string): ArchiveDraft {
+  try {
+    const raw = window.localStorage.getItem(archiveDraftStorageKey(libraryId));
+    if (!raw) return EMPTY_ARCHIVE_DRAFT;
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object") return EMPTY_ARCHIVE_DRAFT;
+    const record = value as { archiveSessionIds?: unknown; restoreSessionIds?: unknown };
+    const strings = (candidate: unknown): string[] =>
+      Array.isArray(candidate)
+        ? [...new Set(candidate.filter((item): item is string => typeof item === "string"))]
+        : [];
+    const archiveSessionIds = strings(record.archiveSessionIds);
+    const restoreSessionIds = strings(record.restoreSessionIds).filter(
+      (id) => !archiveSessionIds.includes(id),
+    );
+    return { archiveSessionIds, restoreSessionIds };
+  } catch {
+    return EMPTY_ARCHIVE_DRAFT;
+  }
+}
+
 export function LibrarySessionsPanel({
   active,
   onNavigate,
@@ -118,6 +158,10 @@ export function LibrarySessionsPanel({
   const [selectedProjectIds, setSelectedProjectIds] = useState<ReadonlySet<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
+  // 归档/恢复先落在本地草稿，用户点击应用时才一次性写入主库。
+  const [archiveDraft, setArchiveDraft] = useState<ArchiveDraft>(() =>
+    readArchiveDraft(library.id),
+  );
   // 操作回执（归档/恢复/删除/合并完成后的一句话提示，行内展示）。
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   // 删除二次确认（ADR-0018：列明规模，单次确认）。
@@ -129,6 +173,24 @@ export function LibrarySessionsPanel({
   // 指纹相同但主库切号时文件可能未变，身份也必须参与 unchanged 判定。
   const currentUserIdRef = useRef<string | null>(null);
   const pollCancelled = useRef(false);
+
+  const archiveDraftHasChanges =
+    archiveDraft.archiveSessionIds.length > 0 || archiveDraft.restoreSessionIds.length > 0;
+
+  // 切换库实例时切换对应草稿；草稿不因组件卸载或应用重启丢失。
+  useEffect(() => {
+    setArchiveDraft(readArchiveDraft(library.id));
+  }, [library.id]);
+
+  useEffect(() => {
+    try {
+      const key = archiveDraftStorageKey(library.id);
+      if (!archiveDraftHasChanges) window.localStorage.removeItem(key);
+      else window.localStorage.setItem(key, JSON.stringify(archiveDraft));
+    } catch {
+      // 本地存储不可用时仍允许本次会话继续操作，提交失败不会隐藏草稿。
+    }
+  }, [archiveDraft, archiveDraftHasChanges, library.id]);
 
   const load = useCallback(
     async (force: boolean) => {
@@ -303,19 +365,31 @@ export function LibrarySessionsPanel({
   const currentUserId = history?.current_user_id ?? null;
   const keyword = searchText.trim();
 
-  /** 正常视图会话：未删除且未隐藏（归档走归档视图，口径同 TRAE 侧栏白名单）。 */
+  /** 正常视图会话：按草稿计算的最终显示状态，尚未提交也即时反映。 */
   const liveSessions = useMemo(() => {
     if (!history || history.status !== "ready") return [];
-    return history.sessions.filter((session) => !session.deleted && session.hidden_status === null);
-  }, [history]);
+    const archiveIds = new Set(archiveDraft.archiveSessionIds);
+    const restoreIds = new Set(archiveDraft.restoreSessionIds);
+    return history.sessions.filter(
+      (session) =>
+        !session.deleted &&
+        (restoreIds.has(session.session_id) ||
+          (session.hidden_status === null && !archiveIds.has(session.session_id))),
+    );
+  }, [history, archiveDraft]);
 
-  /** 归档会话集合（仅 voice_discussion；scheduled_task 等原生隐藏值不入任何视图）。 */
+  /** 归档会话集合：包含待提交归档，不包含待提交恢复。 */
   const archivedSessions = useMemo(() => {
     if (!history || history.status !== "ready") return [];
+    const archiveIds = new Set(archiveDraft.archiveSessionIds);
+    const restoreIds = new Set(archiveDraft.restoreSessionIds);
     return history.sessions.filter(
-      (session) => !session.deleted && session.hidden_status === "voice_discussion",
+      (session) =>
+        !session.deleted &&
+        !restoreIds.has(session.session_id) &&
+        (archiveIds.has(session.session_id) || session.hidden_status === "voice_discussion"),
     );
-  }, [history]);
+  }, [history, archiveDraft]);
 
   /** 搜索过滤后的树内会话（输入即过滤）。 */
   const treeSessions = useMemo(
@@ -473,7 +547,7 @@ export function LibrarySessionsPanel({
 
   /**
    * 会话腿集合（着色与接力 tab 数据源）：无台账记录 → 当前账号单一腿
-   * （主库记录单一归属，ADR-0021：切号随行后全部记录归当前账号）。
+   * （正常会话切号后归当前账号；归档会话不参与切号）。
    */
   const legsOfSession = useCallback(
     (session: MasterSessionEntryDto): readonly RelayLeg[] => {
@@ -605,34 +679,97 @@ export function LibrarySessionsPanel({
     [namedProjectIds, projects, selectedProjectIds],
   );
 
-  /** 归档（在线写，可逆 → 直接执行不确认；批量与悬浮快捷共用）。 */
+  /** 把会话加入待归档集合；再次反向操作可撤销同一条草稿变更。 */
+  const stageArchiveChange = useCallback(
+    (mode: "archive" | "restore", sessionIds: readonly string[]) => {
+      if (sessionIds.length === 0) return;
+      setArchiveDraft((current) => {
+        const archiveIds = new Set(current.archiveSessionIds);
+        const restoreIds = new Set(current.restoreSessionIds);
+        for (const sessionId of sessionIds) {
+          const addTo = mode === "archive" ? archiveIds : restoreIds;
+          const removeFrom = mode === "archive" ? restoreIds : archiveIds;
+          if (removeFrom.has(sessionId)) removeFrom.delete(sessionId);
+          else addTo.add(sessionId);
+        }
+        return {
+          archiveSessionIds: [...archiveIds],
+          restoreSessionIds: [...restoreIds],
+        };
+      });
+      setBatchError(null);
+      setActionNotice(
+        mode === "archive"
+          ? `已加入待归档设置，共 ${sessionIds.length} 个会话。完成选择后点击“应用归档设置”。`
+          : `已加入待恢复设置，共 ${sessionIds.length} 个会话。完成选择后点击“应用归档设置”。`,
+      );
+    },
+    [],
+  );
+
+  /** 归档只改草稿，不立即写数据库或重启 TRAE。 */
   const archiveSessions = useCallback(
     (sessionIds: readonly string[]) => {
       if (sessionIds.length === 0) return;
-      void runBatch(
-        () =>
-          invoke("archive_master_sessions", { sessionIds: [...sessionIds], libraryId: library.id }),
-        () => {
-          // 正在查看的会话被归档 → 查看器同步清空。
-          if (viewer && sessionIds.includes(viewer.session.session_id)) setViewer(null);
-          exitSelectMode();
-        },
-        `已归档 ${sessionIds.length} 个会话。`,
-      );
+      stageArchiveChange("archive", sessionIds);
+      // 草稿状态下同步关闭被移出正常列表的查看器，避免右栏与左栏不一致。
+      if (viewer && sessionIds.includes(viewer.session.session_id)) setViewer(null);
+      exitSelectMode();
     },
-    [runBatch, viewer, library.id, exitSelectMode],
+    [stageArchiveChange, viewer, exitSelectMode],
   );
 
-  /** 归档视图：恢复所选（hidden_status 还原 NULL，会话归位原分组）。 */
+  /** 归档视图：恢复所选只进入草稿，待用户统一应用。 */
   const restoreSelected = useCallback(() => {
     const ids = [...selectedVisibleSessionIds];
     if (ids.length === 0) return;
-    void runBatch(
-      () => invoke("restore_master_sessions", { sessionIds: ids, libraryId: library.id }),
-      () => exitSelectMode(),
-      `已恢复 ${ids.length} 个会话。`,
-    );
-  }, [runBatch, selectedVisibleSessionIds, library.id, exitSelectMode]);
+    stageArchiveChange("restore", ids);
+    exitSelectMode();
+  }, [selectedVisibleSessionIds, stageArchiveChange, exitSelectMode]);
+
+  /** 应用整批归档设置：关闭实例、单事务写入、重启并校验启动结果。 */
+  const applyArchiveDraft = useCallback(async () => {
+    if (!archiveDraftHasChanges || batchBusy) return;
+    setBatchBusy(true);
+    setBatchError(null);
+    try {
+      const result = await invoke<MasterArchiveApplyResultDto>("apply_master_archive_changes", {
+        archiveSessionIds: [...archiveDraft.archiveSessionIds],
+        restoreSessionIds: [...archiveDraft.restoreSessionIds],
+        libraryId: library.id,
+      });
+      const archivedCount = result.archived_sessions;
+      const restoredCount = result.restored_sessions;
+      setArchiveDraft(EMPTY_ARCHIVE_DRAFT);
+      exitSelectMode();
+      let refreshFailed = false;
+      try {
+        await load(true);
+      } catch {
+        // 数据库已提交，刷新失败不能把已经完成的批次误报为“未提交”。
+        refreshFailed = true;
+      }
+      const resultNotice =
+        result.relaunch_outcome === "failed"
+          ? `主库已更新（归档 ${archivedCount} 个、恢复 ${restoredCount} 个），实例尚未启动，请重试启动。`
+          : `已应用归档设置：归档 ${archivedCount} 个、恢复 ${restoredCount} 个会话。`;
+      setActionNotice(
+        refreshFailed ? `${resultNotice} 历史列表刷新失败，请手动刷新。` : resultNotice,
+      );
+    } catch (reason: unknown) {
+      setBatchError(safeUiErrorMessage(reason, "归档设置未提交，草稿仍保留。"));
+    } finally {
+      setBatchBusy(false);
+    }
+  }, [archiveDraft, archiveDraftHasChanges, batchBusy, exitSelectMode, library.id, load]);
+
+  /** 放弃未提交的归档设置，不触碰主库。 */
+  const discardArchiveDraft = useCallback(() => {
+    if (batchBusy) return;
+    setArchiveDraft(EMPTY_ARCHIVE_DRAFT);
+    setBatchError(null);
+    setActionNotice("已放弃未提交的归档设置，主库没有变化。");
+  }, [batchBusy]);
 
   /** 删除所选（先弹确认，确认后走后端先备份再删除）。 */
   const openDeleteConfirm = useCallback(() => {
@@ -1215,6 +1352,39 @@ export function LibrarySessionsPanel({
                 </button>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {archiveDraftHasChanges && history?.status === "ready" && (
+        <div
+          className="lib-actionbar lib-actionbar--draft"
+          role="toolbar"
+          aria-label="待提交的归档设置"
+          data-testid="archive-draft-bar"
+        >
+          <span className="lib-actionbar__count">
+            待提交：归档 {archiveDraft.archiveSessionIds.length} 个 · 恢复 {archiveDraft.restoreSessionIds.length} 个
+          </span>
+          <div className="lib-actionbar__actions">
+            <button
+              className="btn"
+              type="button"
+              onClick={discardArchiveDraft}
+              disabled={batchBusy}
+              data-testid="archive-draft-discard"
+            >
+              放弃设置
+            </button>
+            <button
+              className="btn btn--primary"
+              type="button"
+              onClick={() => void applyArchiveDraft()}
+              disabled={batchBusy}
+              data-testid="archive-draft-apply"
+            >
+              {batchBusy ? "正在应用…" : "应用归档设置"}
+            </button>
           </div>
         </div>
       )}

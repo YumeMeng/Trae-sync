@@ -18,8 +18,8 @@ pub mod account_session_content;
 #[cfg(feature = "sqlcipher")]
 pub mod account_session_index;
 pub mod account_switch;
-pub mod auto_checkin_store;
 pub(crate) mod atomic_publish;
+pub mod auto_checkin_store;
 pub mod backup_retention;
 pub mod blob_keepalive;
 #[cfg(feature = "sqlcipher")]
@@ -52,9 +52,9 @@ pub mod master_stats;
 pub mod master_verification;
 pub(crate) mod migration_manifest;
 pub mod operation_lease;
+pub mod operation_manifest;
 pub mod plugin_cloud_sync;
 pub mod plugin_manifest;
-pub mod operation_manifest;
 pub mod process_observation;
 #[cfg(feature = "sqlcipher")]
 pub mod production_catalog;
@@ -66,11 +66,11 @@ pub mod remint;
 pub mod scan_authorization;
 pub mod snapshot_store;
 pub mod source_key_profile;
-pub mod trae_instance;
 #[cfg(feature = "sqlcipher")]
 pub mod sqlcipher;
 pub mod storage_deletion;
 pub mod storage_root;
+pub mod trae_instance;
 pub mod work_cn_location;
 #[cfg(feature = "sqlcipher")]
 pub mod work_cn_normalizer;
@@ -84,14 +84,19 @@ pub use account_evidence::{
 pub use account_registry::{
     account_records_by_profile_id, AccountRecord, AccountRegistry, AccountRegistryError,
 };
-pub use auto_checkin_store::{
-    build_staggered_plan, is_valid_hhmm, should_trigger_auto_checkin, AutoCheckinBatchState,
-    AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, AutoCheckinStoreError,
-};
 pub use account_switch::{
     load_account_fingerprint_salt, load_or_create_account_fingerprint_salt,
     profile_store_payload_is_non_sensitive, salted_user_id_fingerprint,
     JsonManagedAccountProfileStore,
+};
+pub use auto_checkin_store::{
+    build_staggered_plan, is_valid_hhmm, should_trigger_auto_checkin, AutoCheckinBatchState,
+    AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, AutoCheckinStoreError,
+};
+pub use blob_keepalive::{
+    archive_login_user_id, construct_auth_identity, decrypt_auth_blob, decrypt_named_blob,
+    switch_auth_identity, writeback_auth_blob, AuthIdentitySwitch, AuthSwitchError,
+    ConstructAuthInput, KeepaliveError, KeepaliveOutcome,
 };
 #[cfg(feature = "sqlcipher")]
 pub use catalog::{
@@ -100,11 +105,6 @@ pub use catalog::{
 };
 pub use catalog_path::{
     resolve_current_catalog_generation_id, resolve_current_catalog_path, CatalogPathError,
-};
-pub use blob_keepalive::{
-    archive_login_user_id, construct_auth_identity, decrypt_auth_blob, decrypt_named_blob,
-    switch_auth_identity, writeback_auth_blob, AuthIdentitySwitch, AuthSwitchError,
-    ConstructAuthInput, KeepaliveError, KeepaliveOutcome,
 };
 pub use checkin::FixtureCheckinTransport;
 pub use checkin_credential::{
@@ -116,20 +116,14 @@ pub use checkin_credential::{
 pub use checkin_http::{
     checkin_claim_request, checkin_status_request, exchange_token_by_auth_code,
     exchange_token_by_refresh, get_pc_auth_code, get_user_info, get_user_info_full,
-    trae_http_client, CheckinHttpError, CredentialRenewalHttpAdapter, DeviceInfoBlock,
-    OAuthClient, RealCheckinRenewalService, RealCheckinTransport, TokenGrant, UserInfoFull,
-    UserInfoSummary, TRAE_IDE_VERSION, TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
+    trae_http_client, CheckinHttpError, CredentialRenewalHttpAdapter, DeviceInfoBlock, OAuthClient,
+    RealCheckinRenewalService, RealCheckinTransport, TokenGrant, UserInfoFull, UserInfoSummary,
+    TRAE_IDE_VERSION, TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
 };
 pub use checkin_login::{
     begin_login, complete_login, LoginCallbackServer, LoginError, LoginHandoff, LoginReceipt,
     LoginSession, CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
 };
-pub use plugin_cloud_sync::{
-    fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, install_market_plugin,
-    reconcile_plan, sync_account_cloud_plugins, uninstall_cloud_plugin, CloudPluginItem,
-    MarketPluginItem, PluginCloudSyncOutcome,
-};
-pub use plugin_manifest::{PluginManifest, PluginManifestEntry, PluginManifestError};
 pub use content_graph::DeterministicContentGraphHasher;
 pub use credential_maintenance::{
     CredentialMaintenanceStateStore, CredentialMaintenanceStoreError,
@@ -152,27 +146,15 @@ pub use key_wrapper::DpapiKeyWrapper;
 pub use logging::{
     LogEvent, LogEventCode, LogLevel, LogSink, RedactingLogSink, SafeLogEventBuilder, SafeLogField,
 };
-pub use operation_lease::{
-    inspect_lock_status, OperationLease, OperationLeaseError, OperationLockStatus,
-};
-pub use operation_manifest::{list_operation_summaries, OperationManifestError, OperationSummary};
-pub use process_observation::{FixedProcessController, WorkCnProcessController};
-pub use relay_ledger::{RelayLedger, RelayLedgerEntry, RelayLedgerError};
-pub use remint::{DeviceRemintService, RemintError};
-pub use scan_authorization::{
-    persisted_record_matches, PersistedScanAuthorization, ScanAuthorizationStore,
-    ScanAuthorizationStoreError,
-};
 #[cfg(feature = "sqlcipher")]
 pub use master_archive::{
-    archive_master_sessions, delete_master_sessions, merge_master_projects,
-    restore_master_sessions, MasterArchiveError, MasterDeleteOutcome, MasterMergeOutcome,
-    ARCHIVE_HIDDEN_STATUS,
+    apply_master_archive_changes, archive_master_sessions, delete_master_sessions,
+    merge_master_projects, restore_master_sessions, MasterArchiveApplyOutcome, MasterArchiveError,
+    MasterDeleteOutcome, MasterMergeOutcome, ARCHIVE_HIDDEN_STATUS,
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_checkup::{
-    read_master_checkup, CheckupAccountRow, MasterCheckup, MasterCheckupStatus,
-    RegisteredAccount,
+    read_master_checkup, CheckupAccountRow, MasterCheckup, MasterCheckupStatus, RegisteredAccount,
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_handover::{
@@ -180,6 +162,17 @@ pub use master_handover::{
     list_master_backups, master_database_path, master_db_activity_detected, HandoverProgress,
     HandoverSession, MasterBackupEntry, MasterHandover, MasterHandoverError,
 };
+pub use operation_lease::{
+    inspect_lock_status, OperationLease, OperationLeaseError, OperationLockStatus,
+};
+pub use operation_manifest::{list_operation_summaries, OperationManifestError, OperationSummary};
+pub use plugin_cloud_sync::{
+    fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, install_market_plugin,
+    reconcile_plan, sync_account_cloud_plugins, uninstall_cloud_plugin, CloudPluginItem,
+    MarketPluginItem, PluginCloudSyncOutcome,
+};
+pub use plugin_manifest::{PluginManifest, PluginManifestEntry, PluginManifestError};
+pub use process_observation::{FixedProcessController, WorkCnProcessController};
 #[cfg(feature = "sqlcipher")]
 pub use production_catalog::{
     open_or_initialize_production_catalog, ProductionCatalogError, ProductionCatalogRuntime,
@@ -192,6 +185,12 @@ pub use progress::{
 pub use recovery_package::{
     export_recovery_package, import_recovery_package, upgrade_catalog_sidecar_with_lease,
     CatalogUpgradeResult, RecoveryPackageError, RecoveryPayload,
+};
+pub use relay_ledger::{RelayLedger, RelayLedgerEntry, RelayLedgerError};
+pub use remint::{DeviceRemintService, RemintError};
+pub use scan_authorization::{
+    persisted_record_matches, PersistedScanAuthorization, ScanAuthorizationStore,
+    ScanAuthorizationStoreError,
 };
 pub use snapshot_store::{sha256_file, FilesystemSnapshotStore};
 pub use source_key_profile::{

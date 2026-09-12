@@ -2,9 +2,8 @@
 //!
 //! 环境模型（`.scratch/grill-log-20260830-env-model.md` Q4/Q5）：
 //! - 历史页数据源 = 主库（2026-08-31 修订：官方 TRAE Work CN 默认数据目录
-//!   `%APPDATA%\TRAE SOLO CN`），全部对话记录归主库；按 `project.user_id`
-//!   过滤当前登录账号可见的记录
-//!   （E1b：本地会话可见性 = project.user_id 归属过滤）。
+//!   `%APPDATA%\TRAE SOLO CN`），全部对话记录归主库；正常会话按
+//!   `project.user_id` 过滤当前登录账号，归档会话作为全局主库内容展示。
 //! - 左栏项目列表来自 `project` 表（`name` 列为展示名，列缺失降级空串）；
 //!   右栏会话来自 `chat_session`（标题/时间/软删/消息数，口径与
 //!   `account_session_index` 一致：列防御 + 毫秒/秒双单位归一化）。
@@ -13,7 +12,7 @@
 //!
 //! 准实时新鲜度：`stat_master_fingerprint` 只 stat 三件套 mtime/size
 //! （不复制不读取），前端轮询比对，变化才触发 `read_master_history` 全量
-//! 重读——主库为单库单账号过滤视图，无需高水位增量。
+//! 重读——主库按正常/归档状态读取，无需高水位增量。
 
 use std::path::Path;
 
@@ -96,10 +95,7 @@ fn normalize_timestamp_to_seconds(raw: i64) -> i64 {
 /// 不适合作为项目名展示（界面表达纪律：编号不当主信息）。
 fn is_opaque_hash_id(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.len() >= 16
-        && trimmed
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit())
+    trimmed.len() >= 16 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// 提取路径最后一段（兼容 `\` 与 `/` 分隔，忽略尾部斜杠）。
@@ -124,7 +120,7 @@ fn project_display_name(name: &str, absolute_path: Option<&str>) -> String {
     String::new()
 }
 
-/// 读取主库历史：当前账号可见的项目 + 会话（`project.user_id` 过滤）。
+/// 读取主库历史：当前账号的正常内容 + 全局归档内容。
 ///
 /// 会话条目为索引模块会话摘要追加 `project_id` 维度后的扁平形态
 /// （左栏联动筛选键；结构口径与 `account_session_index` 一致）。
@@ -134,10 +130,7 @@ pub fn read_master_history(
     current_user_id: &str,
 ) -> MasterHistoryStatus {
     match read_master_history_inner(master_data_dir, raw_key, current_user_id) {
-        Some((projects, sessions)) => MasterHistoryStatus::Ready {
-            projects,
-            sessions,
-        },
+        Some((projects, sessions)) => MasterHistoryStatus::Ready { projects, sessions },
         // db 缺失（None）与 db 存在但打开失败（ReadFailed 内部映射）在此区分：
         // stat_unavailable 按文件存在性归位。
         None => stat_unavailable(master_data_dir),
@@ -167,6 +160,10 @@ fn read_master_history_inner(
     }
     let conn = open_with_key_readonly(&db_path, raw_key).ok()?;
 
+    // 归档内容不再受项目归属过滤，但仍通过 project_id 回到所属项目分组。
+    // 老库没有 hidden_status 时保持旧的“按账号过滤”行为。
+    let has_hidden_status = column_exists(&conn, "chat_session", "hidden_status");
+
     // 项目：name / absolute_path / deleted_at 列防御（schema 契约只保证核心列）。
     let has_project_name = column_exists(&conn, "project", "name");
     let has_project_path = column_exists(&conn, "project", "absolute_path");
@@ -195,10 +192,17 @@ fn read_master_history_inner(
     } else {
         "1 = 1"
     };
+    let project_scope_expr = if has_hidden_status {
+        "(p.user_id = ?1 OR EXISTS (SELECT 1 FROM chat_session archived_s \
+            WHERE archived_s.project_id = p.project_id \
+              AND archived_s.hidden_status = 'voice_discussion'))"
+    } else {
+        "p.user_id = ?1"
+    };
     let mut statement = conn
         .prepare(&format!(
             "SELECT p.project_id, {name_expr}, {path_expr} FROM project p \
-             WHERE p.user_id = ?1 AND {project_deleted_expr} = 0 \
+             WHERE {project_scope_expr} AND {project_deleted_expr} = 0 \
              AND EXISTS (SELECT 1 FROM chat_session s \
                  WHERE s.project_id = p.project_id AND {session_visible_expr}) \
              ORDER BY p.project_id ASC"
@@ -226,7 +230,6 @@ fn read_master_history_inner(
     let has_updated_at = column_exists(&conn, "chat_session", "updated_at");
     // has_session_deleted 已在项目查询前判定（G19 EXISTS 子查询共用）。
     let has_message_deleted = column_exists(&conn, "chat_message", "deleted_at");
-    let has_hidden_status = column_exists(&conn, "chat_session", "hidden_status");
     let has_session_work_mode = column_exists(&conn, "chat_session", "work_mode");
     let has_project_work_mode = column_exists(&conn, "project", "work_mode");
     let title_expr = if has_title {
@@ -264,12 +267,17 @@ fn read_master_history_inner(
     } else {
         "(SELECT COUNT(*) FROM chat_message m WHERE m.session_id = s.session_id)"
     };
+    let session_scope_expr = if has_hidden_status {
+        "(p.user_id = ?1 OR s.hidden_status = 'voice_discussion')"
+    } else {
+        "p.user_id = ?1"
+    };
     let mut statement = conn
         .prepare(&format!(
             "SELECT s.session_id, s.project_id, {title_expr}, {message_count_expr}, \
              {updated_expr}, {deleted_expr}, {hidden_expr}, {work_mode_expr} \
              FROM chat_session s JOIN project p ON p.project_id = s.project_id \
-             WHERE p.user_id = ?1 \
+             WHERE {session_scope_expr} \
              ORDER BY {updated_expr} DESC NULLS LAST, s.session_id ASC"
         ))
         .ok()?;
@@ -512,6 +520,43 @@ mod tests {
     }
 
     #[test]
+    fn archived_sessions_are_visible_across_accounts_but_normal_sessions_are_not() {
+        let dir = temp_master_dir("global-archive");
+        let key = "ab".repeat(32);
+        create_master_fixture(&master_database_path(&dir), &key);
+        {
+            let conn = Connection::open_with_flags(
+                master_database_path(&dir),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            let pragma = format!("PRAGMA key = \"x'{}'\";", key);
+            conn.execute_batch(&pragma).unwrap();
+            conn.execute(
+                "INSERT INTO project VALUES ('p7', '222', 'biz-7', '他人归档项目', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s7', 'p7', '他人归档会话', 1773000000000, 0, 'voice_discussion', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let status = read_master_history(&dir, &key, "111");
+        match status {
+            MasterHistoryStatus::Ready { projects, sessions } => {
+                assert!(projects.iter().any(|project| project.project_id == "p7"));
+                assert!(sessions.iter().any(|session| session.session_id == "s7"));
+                assert!(!sessions.iter().any(|session| session.session_id == "s3"));
+            }
+            other => panic!("期望 Ready，实际 {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn project_display_name_derivation_rules() {
         // name 可读：直接用（前后空白裁剪）。
         assert_eq!(project_display_name(" Trae-sync ", None), "Trae-sync");
@@ -564,15 +609,28 @@ mod tests {
     }
 
     #[test]
-    fn current_user_without_projects_returns_empty_ready() {
-        // 账号已登录但主库尚无归属记录（如刚切换到新账号）：空 Ready 而非错误。
+    fn current_user_without_projects_still_sees_global_archived_ready() {
+        // 账号已登录但主库尚无正常归属记录：仍可查看主库全局归档内容。
         let dir = temp_master_dir("emptyuser");
         let key = "ee".repeat(32);
         create_master_fixture(&master_database_path(&dir), &key);
         let status = read_master_history(&dir, &key, "999");
         match status {
             MasterHistoryStatus::Ready { projects, sessions } => {
-                assert!(projects.is_empty() && sessions.is_empty());
+                assert_eq!(
+                    projects
+                        .iter()
+                        .map(|project| project.project_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["p1"]
+                );
+                assert_eq!(
+                    sessions
+                        .iter()
+                        .map(|session| session.session_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["s2"]
+                );
             }
             other => panic!("期望 Ready 空列表，实际 {:?}", other),
         }

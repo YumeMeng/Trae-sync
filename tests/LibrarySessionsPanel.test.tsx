@@ -225,6 +225,7 @@ async function expandProject(projectId: string) {
 describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    window.localStorage.clear();
   });
 
   it("树结构：项目行 + 会话子级按需展开 + 未关联文件夹末位 + 库注入参数", async () => {
@@ -467,7 +468,7 @@ type MutableSession = {
   work_mode: string | null;
 };
 
-/** 可变历史 mock：批量命令直接改写状态，get_master_history 返回新引用触发刷新。 */
+/** 可变历史 mock：归档草稿只在 apply 命令时一次性改写状态。 */
 function setupMutableHistory() {
   const dto = historyDto();
   const sessions = dto.sessions.map((session) => ({ ...session })) as MutableSession[];
@@ -477,23 +478,29 @@ function setupMutableHistory() {
     if (command === "get_master_session_messages") {
       return sessionMessages((args as { sessionId: string }).sessionId);
     }
-    if (command === "archive_master_sessions") {
-      const ids = new Set((args as { sessionIds: string[] }).sessionIds);
+    if (command === "apply_master_archive_changes") {
+      const { archiveSessionIds, restoreSessionIds } = args as {
+        archiveSessionIds: string[];
+        restoreSessionIds: string[];
+      };
+      const archiveIds = new Set(archiveSessionIds);
+      const restoreIds = new Set(restoreSessionIds);
+      let archived = 0;
+      let restored = 0;
       for (const session of sessions) {
-        if (ids.has(session.session_id)) session.hidden_status = "voice_discussion";
-      }
-      return { affected: ids.size };
-    }
-    if (command === "restore_master_sessions") {
-      const ids = new Set((args as { sessionIds: string[] }).sessionIds);
-      let affected = 0;
-      for (const session of sessions) {
-        if (ids.has(session.session_id) && session.hidden_status === "voice_discussion") {
+        if (archiveIds.has(session.session_id) && session.hidden_status === null) {
+          session.hidden_status = "voice_discussion";
+          archived += 1;
+        } else if (restoreIds.has(session.session_id) && session.hidden_status === "voice_discussion") {
           session.hidden_status = null;
-          affected += 1;
+          restored += 1;
         }
       }
-      return { affected };
+      return {
+        archived_sessions: archived,
+        restored_sessions: restored,
+        relaunch_outcome: "launched",
+      };
     }
     if (command === "delete_master_sessions") {
       const ids = new Set((args as { sessionIds: string[] }).sessionIds);
@@ -539,9 +546,10 @@ function setupMutableHistory() {
 describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    window.localStorage.clear();
   });
 
-  it("批量归档：勾选会话浮出操作栏 → 归档调用命令 → 退出选择 + 行内回执", async () => {
+  it("批量归档：勾选会话只生成草稿，点击应用后一次性提交", async () => {
     setupMutableHistory();
     render(<LibrarySessionsPanel active />);
     await expandProject("p1");
@@ -557,11 +565,17 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-session-s2"));
     expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 2 个会话 · 0 个项目");
 
-    // 归档（可逆 → 直接执行不确认）
+    // 归档只生成草稿，不立即调用后端。
     fireEvent.click(screen.getByTestId("batch-archive"));
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+    expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 2 个");
+
+    // 应用时才一次性调用关闭实例/事务/重启链路。
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("archive_master_sessions", {
-        sessionIds: ["s1", "s2"],
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: ["s1", "s2"],
+        restoreSessionIds: [],
         libraryId: "master",
       });
     });
@@ -571,7 +585,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
       expect(screen.getByTestId("library-archive-entry")).toHaveTextContent("3");
     });
     expect(screen.queryByTestId("library-action-bar")).not.toBeInTheDocument();
-    expect(screen.getByTestId("action-notice")).toHaveTextContent("已归档 2 个会话。");
+    expect(screen.getByTestId("action-notice")).toHaveTextContent("已应用归档设置：归档 2 个、恢复 0 个会话。");
     expect(screen.queryByTestId("library-session-s1")).not.toBeInTheDocument();
   });
 
@@ -587,9 +601,11 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.getByTestId("batch-archive")).not.toBeDisabled();
 
     fireEvent.click(screen.getByTestId("batch-archive"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("archive_master_sessions", {
-        sessionIds: ["s1", "s2"],
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: ["s1", "s2"],
+        restoreSessionIds: [],
         libraryId: "master",
       });
     });
@@ -634,24 +650,53 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(await screen.findByTestId("library-viewer")).toBeInTheDocument();
   });
 
-  it("悬浮快捷归档：单会话直接归档，不进选择模式", async () => {
+  it("悬浮快捷归档：单会话只生成草稿，不进选择模式", async () => {
     setupMutableHistory();
     render(<LibrarySessionsPanel active />);
     await expandProject("p1");
 
     fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("archive_master_sessions", {
-        sessionIds: ["s2"],
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: ["s2"],
+        restoreSessionIds: [],
         libraryId: "master",
       });
     });
     // 不进选择模式；回执 + 树内即时消失
     expect(screen.queryByTestId("library-action-bar")).not.toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getByTestId("action-notice")).toHaveTextContent("已归档 1 个会话。");
+      expect(screen.getByTestId("action-notice")).toHaveTextContent("已应用归档设置：归档 1 个、恢复 0 个会话。");
     });
     expect(screen.queryByTestId("library-session-s2")).not.toBeInTheDocument();
+  });
+
+  it("归档草稿在组件重载后仍保留，用户可放弃而不写入数据库", async () => {
+    setupMutableHistory();
+    const firstRender = render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+
+    firstRender.unmount();
+    mockInvoke.mockClear();
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+
+    fireEvent.click(screen.getByTestId("archive-draft-discard"));
+    expect(screen.queryByTestId("archive-draft-bar")).not.toBeInTheDocument();
+    await expandProject("p1");
+    expect(screen.getByTestId("library-session-s2")).toBeInTheDocument();
   });
 
   it("删除确认列明规模：取消不删除、确认后调用真实删除", async () => {
@@ -701,13 +746,16 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(tree).toHaveTextContent("项目二");
     expect(screen.getByTestId("library-session-s3")).toHaveTextContent("旧归档会话");
 
-    // 选择 → 恢复所选（归档视图操作栏：恢复 + 删除）
+    // 选择 → 恢复所选先进入草稿，再统一应用（归档视图操作栏：恢复 + 删除）
     fireEvent.click(screen.getByTestId("library-select-mode"));
     fireEvent.click(screen.getByTestId("library-session-s3"));
     fireEvent.click(screen.getByTestId("batch-restore"));
+    expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("恢复 1 个");
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("restore_master_sessions", {
-        sessionIds: ["s3"],
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: [],
+        restoreSessionIds: ["s3"],
         libraryId: "master",
       });
     });
@@ -765,9 +813,11 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
 
     expect(screen.getByTestId("batch-restore")).not.toBeDisabled();
     fireEvent.click(screen.getByTestId("batch-restore"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("restore_master_sessions", {
-        sessionIds: ["s3"],
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: [],
+        restoreSessionIds: ["s3"],
         libraryId: "master",
       });
     });
@@ -797,10 +847,12 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-select-mode"));
     fireEvent.click(screen.getByTestId("library-project-__unlinked__"));
     fireEvent.click(screen.getByTestId("batch-archive"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
 
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("archive_master_sessions", {
-        sessionIds: ["s9", "s10"],
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: ["s9", "s10"],
+        restoreSessionIds: [],
         libraryId: "master",
       });
     });

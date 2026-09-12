@@ -61,21 +61,20 @@ use traesync_infrastructure::{
     resolve_current_catalog_path, salted_user_id_fingerprint, storage_space_status,
     sync_account_cloud_plugins, uninstall_cloud_plugin, user_id_binding_fingerprint,
     user_id_display_fingerprint, AccountEvidenceReader, AccountRecord, AccountRegistry,
-    AutoCheckinBatchState,
-    AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, CatalogPathError,
-    CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding, CloudPluginItem,
-    CredentialApplyOutcome, CredentialBinding, CredentialState, CredentialStatus, CredentialVault,
-    CredentialMaintenanceStateStore, CredentialVaultError, DeviceRemintService,
-    FilesystemSnapshotStore, FixtureCheckinTransport,
-    FixturePathError, FixturePathGuard, FixtureWorkspaceStateProvider, JsonHandoffIntentStore,
-    JsonManagedAccountProfileStore, MarketPluginItem, OperationLease, OperationLockStatus,
-    PersistedScanAuthorization, PlatformFileIdentityProvider, PluginCloudSyncOutcome,
-    PluginManifest, PluginManifestEntry, ProductionCatalogError, ProductionCatalogRuntime,
-    RealCheckinRenewalService, RealCheckinTransport, RealReadWorkspaceStateProvider, RemintError,
-    ScanAuthorizationStore, SourceKeyActivation, SourceKeyProfileStore, SqlCipherCatalogRepository,
-    SqlCipherProbe, StorageDeletionPlan, StorageMigrationResult, StorageRootBinding,
-    WorkCnProcessController, WorkCnReadLocation, WorkCnReadLocationError, WorkCnSourceNormalizer,
-    WorkCnSyncExecutor, BASELINE_SOURCE_KEY_ID, DEFAULT_STORAGE_WARNING_BYTES,
+    AutoCheckinBatchState, AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore,
+    CatalogPathError, CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding,
+    CloudPluginItem, CredentialApplyOutcome, CredentialBinding, CredentialMaintenanceStateStore,
+    CredentialState, CredentialStatus, CredentialVault, CredentialVaultError, DeviceRemintService,
+    FilesystemSnapshotStore, FixtureCheckinTransport, FixturePathError, FixturePathGuard,
+    FixtureWorkspaceStateProvider, JsonHandoffIntentStore, JsonManagedAccountProfileStore,
+    MarketPluginItem, OperationLease, OperationLockStatus, PersistedScanAuthorization,
+    PlatformFileIdentityProvider, PluginCloudSyncOutcome, PluginManifest, PluginManifestEntry,
+    ProductionCatalogError, ProductionCatalogRuntime, RealCheckinRenewalService,
+    RealCheckinTransport, RealReadWorkspaceStateProvider, RemintError, ScanAuthorizationStore,
+    SourceKeyActivation, SourceKeyProfileStore, SqlCipherCatalogRepository, SqlCipherProbe,
+    StorageDeletionPlan, StorageMigrationResult, StorageRootBinding, WorkCnProcessController,
+    WorkCnReadLocation, WorkCnReadLocationError, WorkCnSourceNormalizer, WorkCnSyncExecutor,
+    BASELINE_SOURCE_KEY_ID, DEFAULT_STORAGE_WARNING_BYTES,
 };
 
 #[cfg(test)]
@@ -135,6 +134,7 @@ use traesync_infrastructure::master_history::{
 // P5-8a 会话归档通道（ADR-0022）：hidden_status 借用 + 真实删除（先备份铁律）。
 // 基础设施函数加 _inner 别名，避免与同名 Tauri 命令函数冲突（E0255）。
 use traesync_infrastructure::{
+    apply_master_archive_changes as apply_master_archive_changes_inner,
     archive_master_sessions as archive_master_sessions_inner,
     delete_master_sessions as delete_master_sessions_inner,
     merge_master_projects as merge_master_projects_inner,
@@ -3725,7 +3725,8 @@ fn spawn_auto_checkin_scheduler(
             std::thread::sleep(std::time::Duration::from_secs(AUTO_CHECKIN_TICK_SECONDS));
             let maintenance_due = last_credential_maintenance
                 .map(|last| {
-                    last.elapsed() >= std::time::Duration::from_secs(CREDENTIAL_MAINTENANCE_INTERVAL_SECONDS)
+                    last.elapsed()
+                        >= std::time::Duration::from_secs(CREDENTIAL_MAINTENANCE_INTERVAL_SECONDS)
                 })
                 .unwrap_or(true);
             if maintenance_due && maintain_all_credentials(&material_root, &execution_lock) {
@@ -5200,8 +5201,7 @@ fn set_account_mobile(
     // 校验二：与服务端脱敏号首尾比对（如 "138****0000" → 前 3 后 4）。
     // 脱敏号尚未采集（旧账号未刷新额度）时无基准，跳过比对只走格式校验。
     if let Some((prefix, suffix)) = masked_mobile_parts(&record.masked_mobile) {
-        let mismatch = !trimmed.starts_with(prefix.as_str())
-            || !trimmed.ends_with(suffix.as_str());
+        let mismatch = !trimmed.starts_with(prefix.as_str()) || !trimmed.ends_with(suffix.as_str());
         if mismatch {
             return Err("mobile_masked_mismatch".to_string());
         }
@@ -5501,10 +5501,7 @@ fn assess_master_self_check(input: MasterSelfCheckInput) -> MasterSelfCheckAsses
     let read_status = if !input.storage_exists {
         // 尚未登录不是故障，仍需让用户知道主库目前没有登录数据。
         MasterSelfCheckStatus::Attention
-    } else if !input.storage_readable
-        || !input.blob_decryptable
-        || !input.account_registered
-    {
+    } else if !input.storage_readable || !input.blob_decryptable || !input.account_registered {
         MasterSelfCheckStatus::Failed
     } else if !input.blob_present {
         MasterSelfCheckStatus::Attention
@@ -5539,7 +5536,10 @@ fn assess_master_self_check(input: MasterSelfCheckInput) -> MasterSelfCheckAsses
     ];
     let level = if statuses.contains(&MasterSelfCheckStatus::Failed) {
         MasterSelfCheckLevel::NeedsManual
-    } else if statuses.iter().any(|status| *status != MasterSelfCheckStatus::Passed) {
+    } else if statuses
+        .iter()
+        .any(|status| *status != MasterSelfCheckStatus::Passed)
+    {
         MasterSelfCheckLevel::SelfHealable
     } else {
         MasterSelfCheckLevel::Healthy
@@ -5833,10 +5833,7 @@ fn get_master_self_check_inner(
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         {
-            Some(value) => (
-                true,
-                value.get("iCubeAuthInfo://usertag").is_some(),
-            ),
+            Some(value) => (true, value.get("iCubeAuthInfo://usertag").is_some()),
             None => (false, false),
         }
     };
@@ -5878,7 +5875,9 @@ fn get_master_self_check_inner(
                 .unwrap_or(false)
         })
         .unwrap_or(true);
-    let ledger_valid = RelayLedger::new(storage_root.join("environments")).load().is_ok();
+    let ledger_valid = RelayLedger::new(storage_root.join("environments"))
+        .load()
+        .is_ok();
     let assessment = assess_master_self_check(MasterSelfCheckInput {
         storage_exists,
         storage_readable,
@@ -5993,9 +5992,7 @@ async fn get_master_self_check(
 
 /// 把自检观测到的账号写回环境缓存；只修正工具记录，不修改 TRAE 登录数据。
 #[tauri::command]
-async fn repair_master_current_account(
-    state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
+async fn repair_master_current_account(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("trae_real_mode_required".to_string());
     }
@@ -7636,10 +7633,10 @@ fn resolve_library_dir(library_id: Option<&str>) -> Result<PathBuf, String> {
     }
 }
 
-/// P5-3：读取主库历史（当前账号可见的项目 + 会话）。
+/// P5-3：读取主库历史（当前账号正常会话 + 全局归档会话）。
 ///
-/// 当前账号 = 主库登录态 blob 实测 user_id → 账号注册表 account_id；
-/// `project.user_id` 过滤（E1b 可见性口径）。`previous` 为前端保存的
+/// 当前账号 = 主库登录态 blob 实测 user_id → 账号注册表 account_id；正常会话按
+/// `project.user_id` 过滤，归档会话不受账号过滤影响。`previous` 为前端保存的
 /// 上一轮指纹，另带当前账号身份，避免切号后文件指纹未变时错误返回 unchanged。
 /// `library_id` 为库实例引用（ADR-0025，缺省主库）。
 #[tauri::command]
@@ -9073,13 +9070,14 @@ fn map_master_archive_error(error: MasterArchiveError) -> String {
         MasterArchiveError::WriteFailed => "master_archive_write_failed".to_string(),
         MasterArchiveError::BackupFailed => "master_archive_backup_failed".to_string(),
         MasterArchiveError::MergeInvalid => "master_merge_invalid".to_string(),
+        MasterArchiveError::ArchiveConflict => "master_archive_conflict".to_string(),
     }
 }
 
-/// P5-8a：归档会话（在线写，hidden_status → 'voice_discussion'）。
+/// P5-8a：兼容旧调用的单批归档原语（hidden_status → 'voice_discussion'）。
 ///
-/// 归档可逆、不改变记录归属（切号随行）；主库运行中可执行
-/// （busy_timeout 与 TRAE 写入错峰，绝不长锁——探针实证路径）。
+/// 当前界面使用 `apply_master_archive_changes` 统一完成关实例、备份、事务和重启；
+/// 该命令保留给旧调用方，不作为新的逐条交互入口。
 /// `library_id` 为库实例引用（ADR-0025，缺省主库）。
 #[tauri::command]
 async fn archive_master_sessions(
@@ -9115,11 +9113,10 @@ async fn archive_master_sessions(
     .map_err(|_| "master_archive_join_failed".to_string())?
 }
 
-/// P5-8a：恢复归档会话（在线写，hidden_status 还原 NULL）。
+/// P5-8a：兼容旧调用的单批恢复原语（hidden_status 还原 NULL）。
 ///
-/// 恢复即归位：侧栏按 work_mode 原生聚合，恢复的会话自动并入当前
-/// 同类型分组（ADR-0022 决策 3，真机实证）。`library_id` 为库实例
-/// 引用（ADR-0025，缺省主库）。
+/// 当前界面使用 `apply_master_archive_changes` 统一提交恢复；恢复后的会话
+/// 仍按 work_mode 原生聚合归入当前账号。`library_id` 为库实例引用。
 #[tauri::command]
 async fn restore_master_sessions(
     session_ids: Vec<String>,
@@ -9149,6 +9146,109 @@ async fn restore_master_sessions(
             affected: affected as u32,
         })
         .map_err(map_master_archive_error)
+    })
+    .await
+    .map_err(|_| "master_archive_join_failed".to_string())?
+}
+
+/// 归档草稿一次性提交回执；`relaunch_outcome=failed` 表示主库已更新，
+/// 但实例待用户重试启动，不会再次重复写数据库。
+#[derive(Clone, Serialize)]
+struct MasterArchiveApplyResultDto {
+    archived_sessions: u32,
+    restored_sessions: u32,
+    relaunch_outcome: String,
+}
+
+/// P5-8a：提交归档草稿（关实例 → 备份 → 单事务 → 重启）。
+///
+/// 前端可以连续调整归档/恢复集合，只有点击“应用”才进入这里；提交失败时
+/// 旧草稿由前端保留。数据库事务已提交但重启失败时返回成功回执与 failed
+/// 状态，避免用户再次点击造成重复改写。
+#[tauri::command]
+async fn apply_master_archive_changes(
+    archive_session_ids: Vec<String>,
+    restore_session_ids: Vec<String>,
+    library_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<MasterArchiveApplyResultDto, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    if state.source_raw_key.is_empty() {
+        return Err("source_key_unavailable".to_string());
+    }
+    let raw_key = state.source_raw_key.clone();
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    let storage_root_for_prune = state.storage_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let master_dir = resolve_library_dir(library_id.as_deref())?;
+        let current_account =
+            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let db_path = master_database_path(&master_dir);
+        let window_title = current_account
+            .display_name
+            .clone()
+            .unwrap_or_else(|| current_account.screen_name.clone());
+
+        if db_path.is_file()
+            && master_db_activity_detected(&db_path, std::time::Duration::from_millis(800))
+        {
+            return Err("master_archive_busy".to_string());
+        }
+
+        close_master_instance(&master_dir)
+            .map_err(|_| "master_archive_close_failed".to_string())?;
+
+        let restart_after_failure = || {
+            let _ = launch_instance_common(
+                &master_dir,
+                &window_title,
+                None,
+                trae_instance_module::command_line_matches_master,
+            );
+        };
+        let _backup_path = match backup_master_trio(&db_path) {
+            Ok(path) => path,
+            Err(error) => {
+                restart_after_failure();
+                return Err(match error {
+                    MasterHandoverError::DbUnavailable => "master_archive_no_data".to_string(),
+                    _ => "master_archive_backup_failed".to_string(),
+                });
+            }
+        };
+        prune_backups_if_enabled(&db_path, Path::new(&storage_root_for_prune));
+
+        let outcome = match apply_master_archive_changes_inner(
+            &master_dir,
+            &raw_key,
+            &archive_session_ids,
+            &restore_session_ids,
+            &current_account.account_id,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                restart_after_failure();
+                return Err(map_master_archive_error(error));
+            }
+        };
+
+        let relaunch_outcome = match launch_instance_common(
+            &master_dir,
+            &window_title,
+            None,
+            trae_instance_module::command_line_matches_master,
+        ) {
+            Ok(relaunch) => relaunch.outcome.to_string(),
+            Err(_) => "failed".to_string(),
+        };
+        Ok(MasterArchiveApplyResultDto {
+            archived_sessions: outcome.archived_sessions as u32,
+            restored_sessions: outcome.restored_sessions as u32,
+            relaunch_outcome,
+        })
     })
     .await
     .map_err(|_| "master_archive_join_failed".to_string())?
@@ -10378,6 +10478,7 @@ pub fn run() {
             // P5-8a 会话归档通道（ADR-0022）：归档/恢复/真实删除。
             archive_master_sessions,
             restore_master_sessions,
+            apply_master_archive_changes,
             delete_master_sessions,
             merge_master_projects,
             // P5-5 主库体检 + 一键收编（环境页）。
@@ -10690,7 +10791,9 @@ mod set_account_mobile_tests {
             bundle.device_id.clone(),
             bundle.device_public_key.clone(),
         );
-        store.set_mobile_full(&binding, Some("13812345678")).unwrap();
+        store
+            .set_mobile_full(&binding, Some("13812345678"))
+            .unwrap();
         assert_eq!(
             store.load(&binding).unwrap().mobile_full.as_deref(),
             Some("13812345678")
@@ -11261,7 +11364,10 @@ mod master_self_check_tests {
         assert_eq!(assessment.level, MasterSelfCheckLevel::Healthy);
         assert_eq!(assessment.read_status, MasterSelfCheckStatus::Passed);
         assert_eq!(assessment.consistency_status, MasterSelfCheckStatus::Passed);
-        assert_eq!(assessment.switchability_status, MasterSelfCheckStatus::Passed);
+        assert_eq!(
+            assessment.switchability_status,
+            MasterSelfCheckStatus::Passed
+        );
         assert_eq!(assessment.deep_status, MasterSelfCheckStatus::Passed);
     }
 
@@ -11273,7 +11379,10 @@ mod master_self_check_tests {
         });
 
         assert_eq!(assessment.level, MasterSelfCheckLevel::SelfHealable);
-        assert_eq!(assessment.consistency_status, MasterSelfCheckStatus::Attention);
+        assert_eq!(
+            assessment.consistency_status,
+            MasterSelfCheckStatus::Attention
+        );
     }
 
     #[test]
@@ -11306,7 +11415,10 @@ mod master_self_check_tests {
         });
 
         assert_eq!(assessment.level, MasterSelfCheckLevel::SelfHealable);
-        assert_eq!(assessment.switchability_status, MasterSelfCheckStatus::Blocked);
+        assert_eq!(
+            assessment.switchability_status,
+            MasterSelfCheckStatus::Blocked
+        );
     }
 
     #[test]

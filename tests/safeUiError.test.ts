@@ -76,6 +76,15 @@ describe("读取授权失效错误映射", () => {
     );
   });
 
+  it.each([
+    ["master_archive_busy", "主库正在生成回复，归档设置需等它完成；稍后重试即可。"],
+    ["master_archive_close_failed", "主库实例未能关闭，归档设置尚未写入；请关闭 TRAE 后重试。"],
+    ["master_archive_conflict", "同一会话同时出现在归档和恢复设置中，请调整后再应用。"],
+    ["master_archive_join_failed", "归档设置提交未完成，草稿仍保留；请稍后重试。"],
+  ])("归档批次错误 %s 使用稳定提示", (code, message) => {
+    expect(safeUiErrorMessage(code, "fallback")).toBe(message);
+  });
+
   it("凭据维护状态不可用时显示可执行提示而不暴露错误码", () => {
     expect(safeUiErrorMessage("credential_maintenance_state_unavailable", "fallback")).toBe(
       "凭据维护状态暂时不可读取，本次未发起自动刷新；请检查本地存储后重试。",

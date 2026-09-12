@@ -210,11 +210,13 @@ pub fn list_master_backups(db_path: &Path) -> Vec<MasterBackupEntry> {
     }
     let mut result: Vec<MasterBackupEntry> = chain
         .into_iter()
-        .map(|(stamp_unix_seconds, (total_bytes, has_wal))| MasterBackupEntry {
-            stamp_unix_seconds,
-            total_bytes,
-            has_wal,
-        })
+        .map(
+            |(stamp_unix_seconds, (total_bytes, has_wal))| MasterBackupEntry {
+                stamp_unix_seconds,
+                total_bytes,
+                has_wal,
+            },
+        )
         .collect();
     result.sort_by(|a, b| b.stamp_unix_seconds.cmp(&a.stamp_unix_seconds));
     result
@@ -300,6 +302,11 @@ fn columns(conn: &Connection, table: &str) -> Result<Vec<String>, MasterHandover
     Ok(rows)
 }
 
+/// 构造集合查询使用的参数占位符。
+fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
+}
+
 fn table_names(conn: &Connection) -> Result<Vec<String>, MasterHandoverError> {
     let mut statement = conn
         .prepare(
@@ -312,11 +319,6 @@ fn table_names(conn: &Connection) -> Result<Vec<String>, MasterHandoverError> {
         .collect::<Result<Vec<String>, _>>()
         .map_err(|_| MasterHandoverError::DbOpenFailed)?;
     Ok(rows)
-}
-
-fn scalar_i64(conn: &Connection, sql: &str, param: &str) -> Result<i64, MasterHandoverError> {
-    conn.query_row(sql, [param], |row| row.get(0))
-        .map_err(|_| MasterHandoverError::DbOpenFailed)
 }
 
 /// biz 短指纹（冲突报错用，非敏感：只取前 8 字符）。
@@ -364,22 +366,29 @@ pub fn handover_master_records_with_progress(
     conn.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))
         .map_err(|_| MasterHandoverError::DbOpenFailed)?;
 
-    // ===== 交接前快照：实际归属、待随行会话、各会话正文指纹 =====
-    let previous_owner: Option<String> = conn
-        .query_row(
-            "SELECT user_id FROM project WHERE user_id IS NOT NULL AND user_id != ?1
-             GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 1",
-            [target_user_id],
-            |row| row.get(0),
-        )
-        .ok();
+    // 归档只借用 TRAE 的会话级隐藏枚举；老库没有该列时按全部会话兼容。
+    let has_hidden_status = columns(&conn, "chat_session")?
+        .iter()
+        .any(|name| name == "hidden_status");
+    let normal_session_filter = if has_hidden_status {
+        " AND COALESCE(s.hidden_status, '') != 'voice_discussion'"
+    } else {
+        ""
+    };
+    let normal_subquery_filter = if has_hidden_status {
+        " AND COALESCE(cs.hidden_status, '') != 'voice_discussion'"
+    } else {
+        ""
+    };
+
+    // ===== 交接前快照：待随行的正常会话集合 =====
     let sessions_to_switch: Vec<(String, String, String)> = {
         let mut statement = conn
-            .prepare(
-                "SELECT s.session_id, s.project_id, p.user_id FROM chat_session s
-                 JOIN project p ON p.project_id = s.project_id
-                 WHERE p.user_id != ?1 AND COALESCE(s.deleted_at, 0) = 0",
-            )
+            .prepare(&format!(
+                    "SELECT s.session_id, s.project_id, p.user_id FROM chat_session s
+                     JOIN project p ON p.project_id = s.project_id
+                     WHERE p.user_id != ?1 AND COALESCE(s.deleted_at, 0) = 0{normal_session_filter}"
+                ))
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         let rows = statement
             .query_map([target_user_id], |row| {
@@ -394,28 +403,34 @@ pub fn handover_master_records_with_progress(
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         rows
     };
-    let before_digests: Vec<(String, String)> = sessions_to_switch
+    // 归档/冻结内容没有正常候选时直接结束：不再扫描项目、建立映射或发进度。
+    if sessions_to_switch.is_empty() {
+        return Ok(MasterHandover {
+            previous_owner_user_id: None,
+            transferred_projects: 0,
+            removed_mirror_rows: 0,
+            switched_sessions: Vec::new(),
+        });
+    }
+    let previous_owner: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT p.user_id FROM project p
+                 JOIN chat_session s ON s.project_id = p.project_id
+                 WHERE p.user_id IS NOT NULL AND p.user_id != ?1
+                   AND COALESCE(s.deleted_at, 0) = 0{normal_session_filter}
+                 GROUP BY p.user_id ORDER BY COUNT(*) DESC LIMIT 1"
+            ),
+            [target_user_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let session_ids: Vec<String> = sessions_to_switch
         .iter()
-        .map(|(session, _, _)| Ok((session.clone(), text_digest(&conn, session)?)))
-        .collect::<Result<_, _>>()?;
-    let before_counts: Vec<(String, i64, i64)> = sessions_to_switch
-        .iter()
-        .map(|(session, _, _)| {
-            Ok((
-                session.clone(),
-                scalar_i64(
-                    &conn,
-                    "SELECT COUNT(*) FROM chat_message WHERE session_id = ?1",
-                    session,
-                )?,
-                scalar_i64(
-                    &conn,
-                    "SELECT COUNT(*) FROM history_v2 WHERE session_id = ?1",
-                    session,
-                )?,
-            ))
-        })
-        .collect::<Result<_, _>>()?;
+        .map(|(session, _, _)| session.clone())
+        .collect();
+    let before_digests = text_digests(&conn, &session_ids)?;
+    let before_counts = session_counts(&conn, &session_ids)?;
 
     // ===== UNIQUE 冲突预处理（E5 坑位：空镜像自动清理 + 非空冲突报人工）=====
     let mut mirrors_to_delete: Vec<String> = Vec::new();
@@ -423,16 +438,20 @@ pub fn handover_master_records_with_progress(
     let mut nonempty_by_biz: HashMap<String, usize> = HashMap::new();
     {
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 // 同 biz 的跨账号行对：p = 非目标行（待随行），t = 目标名下已存在行。
                 "SELECT p.biz_project_id, p.project_id, t.project_id,
-                        (SELECT COUNT(*) FROM chat_session WHERE project_id = p.project_id),
-                        (SELECT COUNT(*) FROM chat_session WHERE project_id = t.project_id)
+                        (SELECT COUNT(*) FROM chat_session cs WHERE cs.project_id = p.project_id
+                         AND COALESCE(cs.deleted_at, 0) = 0{normal_subquery_filter}),
+                        (SELECT COUNT(*) FROM chat_session cs WHERE cs.project_id = t.project_id
+                         AND COALESCE(cs.deleted_at, 0) = 0{normal_subquery_filter}),
+                        (SELECT COUNT(*) FROM chat_session cs WHERE cs.project_id = p.project_id),
+                        (SELECT COUNT(*) FROM chat_session cs WHERE cs.project_id = t.project_id)
                  FROM project p
                  JOIN project t
                    ON t.biz_project_id = p.biz_project_id AND t.user_id = ?1
-                 WHERE p.user_id != ?1 AND p.biz_project_id IS NOT NULL",
-            )
+                 WHERE p.user_id != ?1 AND p.biz_project_id IS NOT NULL"
+            ))
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         let rows = statement
             .query_map([target_user_id], |row| {
@@ -442,22 +461,33 @@ pub fn handover_master_records_with_progress(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })
             .map_err(|_| MasterHandoverError::DbOpenFailed)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
-        for (biz, source_project, target_project, source_sessions, target_sessions) in rows {
+        for (
+            biz,
+            source_project,
+            target_project,
+            source_sessions,
+            target_sessions,
+            source_all_sessions,
+            target_all_sessions,
+        ) in rows
+        {
             if source_sessions > 0 {
                 *nonempty_by_biz.entry(biz.clone()).or_insert(0) += 1;
             }
             // 目标名下空镜像行：自动清理（E5 rmproject 同款断言——0 会话才允许删）。
-            if target_sessions == 0 {
+            if target_all_sessions == 0 {
                 mirrors_to_delete.push(target_project);
             } else if source_sessions > 0 {
                 // 双侧都有真实记录：禁止静默覆盖，报人工决策。
                 return Err(MasterHandoverError::TargetConflict(biz_fingerprint(&biz)));
-            } else {
+            } else if target_sessions > 0 && source_all_sessions == 0 {
                 // 目标名下已有同 biz 真实行、来源行只是空镜像：
                 // 空镜像同样必须清理，否则随行 UPDATE 在来源行上撞 UNIQUE。
                 mirrors_to_delete.push(source_project);
@@ -477,13 +507,17 @@ pub fn handover_master_records_with_progress(
     // 非首行，把带活跃会话的行删成孤儿，导致切换后会话从 UI 消失。
     {
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT biz_project_id, project_id,
-                        (SELECT COUNT(*) FROM chat_session WHERE project_id = project.project_id)
+                        (SELECT COUNT(*) FROM chat_session cs
+                         WHERE cs.project_id = project.project_id
+                           AND COALESCE(cs.deleted_at, 0) = 0{normal_subquery_filter}),
+                        (SELECT COUNT(*) FROM chat_session cs
+                         WHERE cs.project_id = project.project_id)
                  FROM project
                  WHERE user_id != ?1 AND biz_project_id IS NOT NULL
-                 ORDER BY biz_project_id, rowid",
-            )
+                 ORDER BY biz_project_id, rowid"
+            ))
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         let rows = statement
             .query_map([target_user_id], |row| {
@@ -491,29 +525,42 @@ pub fn handover_master_records_with_progress(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .map_err(|_| MasterHandoverError::DbOpenFailed)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
-        // biz → (当前保留行是否带会话, 当前保留行 project_id)。
-        let mut keep: HashMap<String, (bool, String)> = HashMap::new();
-        for (biz, project, sessions) in rows {
+        // biz → (当前保留行级别：0 空、1 归档、2 正常, project_id)。
+        let mut keep: HashMap<String, (i64, String)> = HashMap::new();
+        for (biz, project, normal_sessions, all_sessions) in rows {
+            let rank = if normal_sessions > 0 {
+                2
+            } else if all_sessions > 0 {
+                1
+            } else {
+                0
+            };
             match keep.get(&biz) {
-                // 已保留带会话行：当前行必为空行（多带会话行已报冲突），删除。
-                Some((true, _)) => mirrors_to_delete.push(project),
-                Some((false, kept)) => {
-                    if sessions > 0 {
-                        // 后出现的行带会话：改保留它，删掉先前保留的空行。
-                        mirrors_to_delete.push(kept.clone());
-                        keep.insert(biz, (true, project));
-                    } else {
+                // 归档项目不是空镜像：即使存在同 biz 活跃项目，也不能在
+                // 交接清理阶段删除它，只能让显式项目合并处理。
+                Some((kept_rank, _)) if rank == 0 => {
+                    if *kept_rank == 0 {
                         mirrors_to_delete.push(project);
                     }
                 }
-                None => {
-                    keep.insert(biz, (sessions > 0, project));
+                Some((kept_rank, kept)) if *kept_rank == 0 && rank > 0 => {
+                    mirrors_to_delete.push(kept.clone());
+                    keep.insert(biz, (rank, project));
                 }
+                Some((kept_rank, _)) if rank == 2 && *kept_rank == 1 => {
+                    // 活跃行承担交接，归档行继续留在原账号下冻结。
+                    keep.insert(biz, (rank, project));
+                }
+                None => {
+                    keep.insert(biz, (rank, project));
+                }
+                _ => {}
             }
         }
     }
@@ -553,11 +600,6 @@ pub fn handover_master_records_with_progress(
     let total_sessions = sessions_to_switch.len();
     let mut ids = IdGenerator::new();
     let mut leg_maps: Vec<(String, String)> = Vec::new(); // (旧 session, 新 session)，与 sessions_to_switch 同序
-    let mut message_map: Vec<(String, String)> = Vec::new();
-    let mut turn_map: Vec<(String, String)> = Vec::new();
-    let mut task_map: Vec<(String, String)> = Vec::new();
-    let mut history_map: Vec<(String, String)> = Vec::new();
-    let mut agent_run_map: Vec<(String, String)> = Vec::new();
     for (index, (session, _, _)) in sessions_to_switch.iter().enumerate() {
         on_progress(HandoverProgress {
             phase: "mapping",
@@ -566,12 +608,16 @@ pub fn handover_master_records_with_progress(
             label: session_labels[index].clone(),
         });
         leg_maps.push((session.clone(), ids.next()));
-        message_map.extend(map_column(&conn, "chat_message", "message_id", session, &mut ids)?);
-        turn_map.extend(map_column(&conn, "chat_turn", "turn_id", session, &mut ids)?);
-        task_map.extend(map_column(&conn, "task", "task_id", session, &mut ids)?);
-        history_map.extend(map_column(&conn, "history_v2", "history_v2_id", session, &mut ids)?);
-        agent_run_map.extend(map_column(&conn, "agent_run", "agent_run_id", session, &mut ids)?);
     }
+    // 每张身份表只读取一次集合，避免“会话数 × 表数”的往返查询。
+    let message_map =
+        map_column_batch(&conn, "chat_message", "message_id", &session_ids, &mut ids)?;
+    let turn_map = map_column_batch(&conn, "chat_turn", "turn_id", &session_ids, &mut ids)?;
+    let task_map = map_column_batch(&conn, "task", "task_id", &session_ids, &mut ids)?;
+    let history_map =
+        map_column_batch(&conn, "history_v2", "history_v2_id", &session_ids, &mut ids)?;
+    let agent_run_map =
+        map_column_batch(&conn, "agent_run", "agent_run_id", &session_ids, &mut ids)?;
 
     // ===== 单事务执行：镜像清理 → 归属随行 → 集合式批量换腿 =====
     let tx = conn
@@ -588,7 +634,14 @@ pub fn handover_master_records_with_progress(
     }
     let transferred_projects = tx
         .execute(
-            "UPDATE project SET user_id = ?1 WHERE user_id != ?1",
+            &format!(
+                "UPDATE project SET user_id = ?1 WHERE user_id != ?1
+                 AND EXISTS (
+                     SELECT 1 FROM chat_session s
+                     WHERE s.project_id = project.project_id
+                       AND COALESCE(s.deleted_at, 0) = 0{normal_session_filter}
+                 )"
+            ),
             [target_user_id],
         )
         .map_err(|_| MasterHandoverError::DbOpenFailed)? as usize;
@@ -616,7 +669,11 @@ pub fn handover_master_records_with_progress(
     // 重写顺序与逐会话版一致：五类身份引用列 → 会话引用列 → chat_session
     // 主键；server_history_info 永不改写（云端镜像证据，§19 铁律）。
     let identity_groups: [(&str, &str, &[&str]); 5] = [
-        ("消息", "id_map_message", &["message_id", "reply_to_message_id", "response_message_id"]),
+        (
+            "消息",
+            "id_map_message",
+            &["message_id", "reply_to_message_id", "response_message_id"],
+        ),
         ("对话轮次", "id_map_turn", &["turn_id"]),
         ("任务", "id_map_task", &["task_id"]),
         ("历史记录", "id_map_history", &["history_v2_id"]),
@@ -641,7 +698,12 @@ pub fn handover_master_records_with_progress(
     apply_map_batch(
         &tx,
         "id_map_session",
-        &["session_id", "chat_session_id", "creator_session_id", "writer_session_id"],
+        &[
+            "session_id",
+            "chat_session_id",
+            "creator_session_id",
+            "writer_session_id",
+        ],
         &["server_history_info", "chat_session"],
     )?;
     tx.execute(
@@ -655,22 +717,29 @@ pub fn handover_master_records_with_progress(
     let switched_sessions: Vec<HandoverSession> = sessions_to_switch
         .iter()
         .enumerate()
-        .map(|(index, (source_session, project_id, previous_user_id))| HandoverSession {
-            session_id: leg_maps[index].1.clone(),
-            previous_session_id: source_session.clone(),
-            project_id: project_id.clone(),
-            previous_user_id: previous_user_id.clone(),
-            message_count: before_counts
-                .iter()
-                .find(|(old, _, _)| old == source_session)
-                .map(|(_, count, _)| *count)
-                .unwrap_or(0),
-        })
+        .map(
+            |(index, (source_session, project_id, previous_user_id))| HandoverSession {
+                session_id: leg_maps[index].1.clone(),
+                previous_session_id: source_session.clone(),
+                project_id: project_id.clone(),
+                previous_user_id: previous_user_id.clone(),
+                message_count: before_counts
+                    .get(source_session)
+                    .map(|(count, _)| *count)
+                    .unwrap_or(0),
+            },
+        )
         .collect();
-    tx.commit()
-        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    tx.commit().map_err(|_| MasterHandoverError::DbOpenFailed)?;
 
-    // ===== 写后完整性校验（e5-r2 探针同款：正文指纹 + 行数守恒）=====
+    // ===== 写后完整性校验（集合读取：正文指纹 + 行数守恒）=====
+    let new_session_ids: Vec<String> = leg_maps
+        .iter()
+        .map(|(_, new_session)| new_session.clone())
+        .collect();
+    let after_digests = text_digests(&conn, &new_session_ids)?;
+    let after_counts = session_counts(&conn, &new_session_ids)?;
+    let after_server_counts = session_server_counts(&conn, &new_session_ids)?;
     for (index, (old_session, _, _)) in sessions_to_switch.iter().enumerate() {
         let new_session = &leg_maps[index].1;
         on_progress(HandoverProgress {
@@ -679,31 +748,14 @@ pub fn handover_master_records_with_progress(
             total: total_sessions,
             label: session_labels[index].clone(),
         });
-        let after_digest = text_digest(&conn, new_session)?;
-        if after_digest != before_digests[index].1 {
+        if after_digests.get(new_session) != before_digests.get(old_session) {
             return Err(MasterHandoverError::IntegrityFailed);
         }
-        let (_, message_count, history_count) = &before_counts[index];
-        let after_messages = scalar_i64(
-            &conn,
-            "SELECT COUNT(*) FROM chat_message WHERE session_id = ?1",
-            new_session,
-        )?;
-        let after_history = scalar_i64(
-            &conn,
-            "SELECT COUNT(*) FROM history_v2 WHERE session_id = ?1",
-            new_session,
-        )?;
-        if after_messages != *message_count || after_history != *history_count {
+        if after_counts.get(new_session) != before_counts.get(old_session) {
             return Err(MasterHandoverError::IntegrityFailed);
         }
         // 新腿不得携带旧云端镜像（e5-r2 验收标准 2）。
-        let after_server = scalar_i64(
-            &conn,
-            "SELECT COUNT(*) FROM server_history_info WHERE session_id = ?1",
-            new_session,
-        )?;
-        if after_server != 0 {
+        if after_server_counts.get(new_session).copied().unwrap_or(0) != 0 {
             return Err(MasterHandoverError::IntegrityFailed);
         }
         let _ = old_session;
@@ -717,69 +769,177 @@ pub fn handover_master_records_with_progress(
     })
 }
 
-/// 会话正文指纹（换腿前后一致性校验）：chat_message 骨架 + 两张内容表 +
-/// history_v2 正文，与 e5-r2 探针 `text_digest` 逐句一致。
-fn text_digest(conn: &Connection, session: &str) -> Result<String, MasterHandoverError> {
+/// 按会话集合读取正文指纹，保持单会话校验的字段与顺序不变。
+///
+/// 旧实现对每个会话执行 4 组查询；这里每张正文表只查询一次，归档会话
+/// 不在传入集合中，因此不会产生额外的正文扫描或校验成本。
+fn text_digests(
+    conn: &Connection,
+    sessions: &[String],
+) -> Result<HashMap<String, String>, MasterHandoverError> {
     use std::hash::Hasher;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if sessions.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut hashers: HashMap<String, std::collections::hash_map::DefaultHasher> = sessions
+        .iter()
+        .map(|session| {
+            (
+                session.clone(),
+                std::collections::hash_map::DefaultHasher::new(),
+            )
+        })
+        .collect();
+    let clause = placeholders(sessions.len());
     let queries = [
-        "SELECT message_role, message_index FROM chat_message WHERE session_id = ?1 ORDER BY message_index, id",
-        "SELECT content, created_at FROM chat_message_general WHERE message_id IN (SELECT message_id FROM chat_message WHERE session_id = ?1) ORDER BY id",
-        "SELECT content, created_at FROM chat_message_task WHERE message_id IN (SELECT message_id FROM chat_message WHERE session_id = ?1) ORDER BY id",
-        "SELECT messages, created_at FROM history_v2 WHERE session_id = ?1 ORDER BY id",
+        format!(
+            "SELECT session_id, message_role, message_index FROM chat_message \
+             WHERE session_id IN ({clause}) ORDER BY session_id, message_index, id"
+        ),
+        format!(
+            "SELECT cm.session_id, g.content, g.created_at \
+             FROM chat_message cm JOIN chat_message_general g ON g.message_id = cm.message_id \
+             WHERE cm.session_id IN ({clause}) ORDER BY cm.session_id, g.id"
+        ),
+        format!(
+            "SELECT cm.session_id, t.content, t.created_at \
+             FROM chat_message cm JOIN chat_message_task t ON t.message_id = cm.message_id \
+             WHERE cm.session_id IN ({clause}) ORDER BY cm.session_id, t.id"
+        ),
+        format!(
+            "SELECT session_id, messages, created_at FROM history_v2 \
+             WHERE session_id IN ({clause}) ORDER BY session_id, id"
+        ),
     ];
     for sql in queries {
-        let mut statement = conn.prepare(sql).map_err(|_| MasterHandoverError::DbOpenFailed)?;
-        let mut rows = statement
-            .query([session])
+        let mut statement = conn
+            .prepare(&sql)
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|_| MasterHandoverError::DbOpenFailed)?
-        {
-            let first: String = row.get(0).unwrap_or_default();
-            let second: String = row.get(1).unwrap_or_default();
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(
+                sessions.iter().map(String::as_str),
+            ))
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        while let Some(row) = rows.next().map_err(|_| MasterHandoverError::DbOpenFailed)? {
+            let session: String = row.get(0).map_err(|_| MasterHandoverError::DbOpenFailed)?;
+            let Some(hasher) = hashers.get_mut(&session) else {
+                continue;
+            };
+            let first: String = row.get(1).unwrap_or_default();
+            let second: String = row.get(2).unwrap_or_default();
             hasher.write(first.as_bytes());
             hasher.write_u8(0);
             hasher.write(second.as_bytes());
             hasher.write_u8(0xff);
         }
     }
-    Ok(format!("{:016x}", hasher.finish()))
+    Ok(hashers
+        .into_iter()
+        .map(|(session, hasher)| (session, format!("{:016x}", hasher.finish())))
+        .collect())
 }
 
-/// 收集某会话在某表的身份列（如 chat_message.message_id）→ 新 ID 映射。
+/// 批量读取会话行数，返回 session_id →（消息数、history_v2 数）。
+fn session_counts(
+    conn: &Connection,
+    sessions: &[String],
+) -> Result<HashMap<String, (i64, i64)>, MasterHandoverError> {
+    if sessions.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let clause = placeholders(sessions.len());
+    let mut result: HashMap<String, (i64, i64)> = sessions
+        .iter()
+        .map(|session| (session.clone(), (0, 0)))
+        .collect();
+    for (table, index) in [("chat_message", 0_usize), ("history_v2", 1_usize)] {
+        let sql = format!(
+            "SELECT session_id, COUNT(*) FROM {table} WHERE session_id IN ({clause}) GROUP BY session_id"
+        );
+        let mut statement = conn
+            .prepare(&sql)
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(sessions.iter().map(String::as_str)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        for row in rows {
+            let (session, count) = row.map_err(|_| MasterHandoverError::DbOpenFailed)?;
+            if let Some(entry) = result.get_mut(&session) {
+                entry.0 = if index == 0 { count } else { entry.0 };
+                entry.1 = if index == 1 { count } else { entry.1 };
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// 批量读取云端镜像行数，用于确认新腿没有携带旧镜像。
+fn session_server_counts(
+    conn: &Connection,
+    sessions: &[String],
+) -> Result<HashMap<String, i64>, MasterHandoverError> {
+    if sessions.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let clause = placeholders(sessions.len());
+    let sql = format!(
+        "SELECT session_id, COUNT(*) FROM server_history_info \
+         WHERE session_id IN ({clause}) GROUP BY session_id"
+    );
+    let mut result = HashMap::new();
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    let rows = statement
+        .query_map(
+            rusqlite::params_from_iter(sessions.iter().map(String::as_str)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    for row in rows {
+        let (session, count) = row.map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        result.insert(session, count);
+    }
+    Ok(result)
+}
+
+/// 收集会话集合在某表的身份列（如 chat_message.message_id）→ 新 ID 映射。
 /// 表不含该身份列或不含 session_id 列时返回空映射（行不可达，无需重写）。
-fn map_column(
+fn map_column_batch(
     conn: &Connection,
     table: &str,
     column: &str,
-    source_session: &str,
+    sessions: &[String],
     ids: &mut IdGenerator,
-) -> Result<HashMap<String, String>, MasterHandoverError> {
-    let names = columns(conn, table)?;
-    if !names.iter().any(|name| name == column) || !names.iter().any(|name| name == "session_id")
-    {
-        return Ok(HashMap::new());
+) -> Result<Vec<(String, String)>, MasterHandoverError> {
+    if sessions.is_empty() {
+        return Ok(Vec::new());
     }
-    let sql = format!("SELECT \"{column}\" FROM \"{table}\" WHERE session_id = ?1");
-    let mut statement = conn.prepare(&sql).map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    let names = columns(conn, table)?;
+    if !names.iter().any(|name| name == column) || !names.iter().any(|name| name == "session_id") {
+        return Ok(Vec::new());
+    }
+    let clause = placeholders(sessions.len());
+    let sql = format!("SELECT \"{column}\" FROM \"{table}\" WHERE session_id IN ({clause})");
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
     let mut rows = statement
-        .query([source_session])
+        .query(rusqlite::params_from_iter(
+            sessions.iter().map(String::as_str),
+        ))
         .map_err(|_| MasterHandoverError::DbOpenFailed)?;
     let mut result = HashMap::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|_| MasterHandoverError::DbOpenFailed)?
-    {
-        let old: Option<String> = row
-            .get(0)
-            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    while let Some(row) = rows.next().map_err(|_| MasterHandoverError::DbOpenFailed)? {
+        let old: Option<String> = row.get(0).map_err(|_| MasterHandoverError::DbOpenFailed)?;
         if let Some(old) = old.filter(|value| !value.is_empty()) {
             result.entry(old).or_insert_with(|| ids.next());
         }
     }
-    Ok(result)
+    Ok(result.into_iter().collect())
 }
 
 /// 批量插入映射条目进 temp 表（P7-3）。
@@ -938,9 +1098,11 @@ mod tests {
 
         let conn = open_fixture(&db_path, &raw_key);
         let owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(owner, "222");
 
@@ -950,9 +1112,11 @@ mod tests {
         assert_eq!(outcome.switched_sessions[0].project_id, "p1");
         assert_eq!(outcome.switched_sessions[0].message_count, 2);
         let old_session_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_session WHERE session_id = 's1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(old_session_rows, 0);
         // 消息行跟随新腿且引用重写（m2 的 reply_to 指向 m1 的新 ID）。
@@ -1024,6 +1188,61 @@ mod tests {
     }
 
     #[test]
+    fn handover_excludes_archived_sessions_and_frozen_projects() {
+        let db_path = temp_db_path("archive-boundary");
+        let raw_key = "ac".repeat(32);
+        create_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            conn.execute("ALTER TABLE chat_session ADD COLUMN hidden_status TEXT", [])
+                .unwrap();
+            // p1 是混合项目：活跃 s1 应交接，归档 s2 保留原身份。
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s2', 'p1', '归档会话', 1770000001, NULL, 'voice_discussion')",
+                [],
+            )
+            .unwrap();
+            // p2 只有归档会话：项目归属也必须保持不变。
+            conn.execute(
+                "INSERT INTO project VALUES ('p2', '333', 'biz-frozen', '冻结项目', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s3', 'p2', '冻结会话', 1770000002, NULL, 'voice_discussion')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome = handover_master_records(&db_path, &raw_key, "222").unwrap();
+        assert_eq!(outcome.switched_sessions.len(), 1, "归档会话不得进入交接");
+        assert_eq!(outcome.switched_sessions[0].previous_session_id, "s1");
+
+        let conn = open_fixture(&db_path, &raw_key);
+        let archived_session: (String, String) = conn
+            .query_row(
+                "SELECT session_id, hidden_status FROM chat_session WHERE session_id = 's2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            archived_session,
+            ("s2".to_string(), "voice_discussion".to_string())
+        );
+        let frozen_owner: String = conn
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frozen_owner, "333", "全归档项目不应随账号切换改归属");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
     fn handover_tolerates_null_project_name() {
         let db_path = temp_db_path("null-project-name");
         let raw_key = "ab".repeat(32);
@@ -1044,13 +1263,11 @@ mod tests {
         }
 
         let labels = RefCell::new(Vec::new());
-        let outcome = handover_master_records_with_progress(
-            &db_path,
-            &raw_key,
-            "222",
-            &|progress| labels.borrow_mut().push(progress.label),
-        )
-        .unwrap();
+        let outcome =
+            handover_master_records_with_progress(&db_path, &raw_key, "222", &|progress| {
+                labels.borrow_mut().push(progress.label)
+            })
+            .unwrap();
 
         assert_eq!(outcome.switched_sessions.len(), 2);
         assert!(labels.borrow().iter().any(|label| label == "未命名项目"));
@@ -1076,9 +1293,11 @@ mod tests {
         assert_eq!(outcome.transferred_projects, 1);
         let conn = open_fixture(&db_path, &raw_key);
         let mirror_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p-mirror'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p-mirror'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(mirror_rows, 0);
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
@@ -1104,15 +1323,19 @@ mod tests {
         // 冲突时库保持原状（事务未执行任何改写）。
         let conn = open_fixture(&db_path, &raw_key);
         let owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(owner, "111");
         let target_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p-target'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p-target'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(target_rows, 1);
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
@@ -1166,15 +1389,19 @@ mod tests {
         let conn = open_fixture(&db_path, &raw_key);
         // biz-x：空镜像删除，带会话行保留并随行到 222。
         let empty_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p-x-empty'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p-x-empty'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(empty_rows, 0, "空镜像行应被清理");
         let live_owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p-x-live'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p-x-live'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(live_owner, "222", "带会话行应保留并随行");
         // 活跃会话不再孤儿：换腿后仍指向 p-x-live。
@@ -1193,15 +1420,19 @@ mod tests {
         assert_eq!(live_session, 1, "换腿后会话应仍挂在 p-x-live 上");
         // biz-y：来源空镜像删除，目标真实行原样保留。
         let src_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p-y-src'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p-y-src'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(src_rows, 0, "来源空镜像应被清理而非撞 UNIQUE");
         let tgt_owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p-y-tgt'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p-y-tgt'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(tgt_owner, "222");
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
@@ -1239,31 +1470,19 @@ mod tests {
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO chat_turn VALUES ('t2', 's2', NULL)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO task VALUES ('k2', 's2', NULL)",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO chat_turn VALUES ('t2', 's2', NULL)", [])
+                .unwrap();
+            conn.execute("INSERT INTO task VALUES ('k2', 's2', NULL)", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO history_v2 (history_v2_id, session_id, messages, created_at) VALUES ('h2', 's2', '[]', '2026-08-30')",
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO agent_run VALUES ('ar2', 's2')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO session_project VALUES ('s2', 'p1')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO agent_run VALUES ('ar2', 's2')", [])
+                .unwrap();
+            conn.execute("INSERT INTO session_project VALUES ('s2', 'p1')", [])
+                .unwrap();
         }
 
         let outcome = handover_master_records(&db_path, &raw_key, "222").unwrap();
@@ -1275,7 +1494,12 @@ mod tests {
         let new_by_old: HashMap<String, String> = outcome
             .switched_sessions
             .iter()
-            .map(|session| (session.previous_session_id.clone(), session.session_id.clone()))
+            .map(|session| {
+                (
+                    session.previous_session_id.clone(),
+                    session.session_id.clone(),
+                )
+            })
             .collect();
         let s1_new = &new_by_old["s1"];
         let s2_new = &new_by_old["s2"];
@@ -1361,36 +1585,40 @@ mod tests {
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO session_project VALUES ('s2', 'p1')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO session_project VALUES ('s2', 'p1')", [])
+                .unwrap();
         }
 
         let events = std::sync::Mutex::new(Vec::new());
-        let outcome = handover_master_records_with_progress(
-            &db_path,
-            &raw_key,
-            "222",
-            &|progress| events.lock().unwrap().push(progress),
-        )
-        .unwrap();
+        let outcome =
+            handover_master_records_with_progress(&db_path, &raw_key, "222", &|progress| {
+                events.lock().unwrap().push(progress)
+            })
+            .unwrap();
         assert_eq!(outcome.switched_sessions.len(), 2);
 
         let events = events.into_inner().unwrap();
-        let mapping: Vec<&HandoverProgress> =
-            events.iter().filter(|event| event.phase == "mapping").collect();
+        let mapping: Vec<&HandoverProgress> = events
+            .iter()
+            .filter(|event| event.phase == "mapping")
+            .collect();
         assert_eq!(mapping.len(), 2, "mapping 逐会话上报");
         assert_eq!(mapping[0].current, 1);
         assert_eq!(mapping[0].total, 2);
         assert_eq!(mapping[0].label, "项目A", "label 用项目名");
-        let executing: Vec<&HandoverProgress> =
-            events.iter().filter(|event| event.phase == "executing").collect();
+        let executing: Vec<&HandoverProgress> = events
+            .iter()
+            .filter(|event| event.phase == "executing")
+            .collect();
         assert!(!executing.is_empty(), "executing 按身份组上报");
-        assert_eq!(executing.last().unwrap().current, executing.last().unwrap().total);
-        let verifying: Vec<&HandoverProgress> =
-            events.iter().filter(|event| event.phase == "verifying").collect();
+        assert_eq!(
+            executing.last().unwrap().current,
+            executing.last().unwrap().total
+        );
+        let verifying: Vec<&HandoverProgress> = events
+            .iter()
+            .filter(|event| event.phase == "verifying")
+            .collect();
         assert_eq!(verifying.len(), 2, "verifying 逐会话上报");
         assert_eq!(verifying[1].current, 2);
         assert_eq!(verifying[1].total, 2);
@@ -1457,7 +1685,10 @@ mod tests {
         assert!(!wal_activity_between(&None, &None));
         assert!(wal_activity_between(&None, &Some(sample.clone())));
         assert!(wal_activity_between(&Some(sample.clone()), &None));
-        assert!(!wal_activity_between(&Some(sample.clone()), &Some(sample.clone())));
+        assert!(!wal_activity_between(
+            &Some(sample.clone()),
+            &Some(sample.clone())
+        ));
         let changed = TrioSample {
             mtime_unix_nanos: 2,
             size: 10,

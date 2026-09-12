@@ -230,9 +230,13 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await panel.getByTestId("library-session-s2").click();
     await expect(panel.getByTestId("batch-count")).toContainText("已选 2 个会话 · 0 个项目");
 
-    // 归档所选 → p1 移空后行消失；未涉及的 p2 仍在；入口计数 3（s3 + 新归档 2）。
+    // 归档所选只先进入草稿，不立即写库或重启。
     await panel.getByTestId("batch-archive").click();
-    await expect(panel.getByTestId("action-notice")).toContainText("已归档 2 个会话。");
+    await expect(panel.getByTestId("action-notice")).toContainText("已加入待归档设置");
+    await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 2 个");
+    await panel.getByTestId("archive-draft-apply").click();
+    await expect(panel.getByTestId("action-notice")).toContainText("已应用归档设置：归档 2 个");
+    // 应用后 p1 移空后行消失；未涉及的 p2 仍在；入口计数 3（s3 + 新归档 2）。
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
     await expect(panel.getByTestId("library-session-s1")).toHaveCount(0);
     await expect(panel.getByTestId("library-project-p2")).toBeVisible();
@@ -250,7 +254,9 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await expect(panel.getByTestId("batch-archive")).toBeEnabled();
     await panel.getByTestId("batch-archive").click();
 
-    await expect(panel.getByTestId("action-notice")).toContainText("已归档 2 个会话。");
+    await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 2 个");
+    await panel.getByTestId("archive-draft-apply").click();
+    await expect(panel.getByTestId("action-notice")).toContainText("已应用归档设置：归档 2 个");
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
     await expect(panel.getByTestId("library-archive-entry")).toContainText("3");
   });
@@ -271,7 +277,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
   });
 
-  test("浏览态悬浮快捷归档：单会话直接归档不进选择模式", async ({ page }) => {
+  test("浏览态悬浮快捷归档：单会话进入草稿，不进选择模式", async ({ page }) => {
     await setup(page);
     const panel = detail(page);
 
@@ -281,7 +287,9 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await row.hover();
     await panel.getByTestId("library-quick-archive-s1").click();
 
-    await expect(panel.getByTestId("action-notice")).toContainText("已归档 1 个会话。");
+    await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 1 个");
+    await panel.getByTestId("archive-draft-apply").click();
+    await expect(panel.getByTestId("action-notice")).toContainText("已应用归档设置：归档 1 个");
     await expect(panel.getByTestId("library-session-s1")).toHaveCount(0);
     await expect(panel.getByTestId("library-archive-entry")).toContainText("2");
   });
@@ -345,7 +353,11 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await panel.getByTestId("library-session-s3").click();
     await expect(panel.getByTestId("batch-count")).toContainText("已选 1 个会话 · 0 个项目");
     await panel.getByTestId("batch-restore").click();
-    await expect(panel.getByTestId("action-notice")).toContainText("已恢复 1 个会话。");
+    await expect(panel.getByTestId("archive-draft-bar")).toContainText("恢复 1 个");
+    await panel.getByTestId("archive-draft-apply").click();
+    await expect(panel.getByTestId("action-notice")).toContainText(
+      "已应用归档设置：归档 0 个、恢复 1 个",
+    );
     await expect(panel.getByTestId("library-archive-empty")).toContainText("没有已归档的会话");
 
     // 返回主列表：s3 归位 p2 分组。

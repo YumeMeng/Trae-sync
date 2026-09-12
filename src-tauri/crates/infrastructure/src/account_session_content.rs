@@ -110,7 +110,24 @@ pub fn read_master_session_messages_page(
         Ok(conn) => conn,
         Err(_) => return SessionMessagesStatus::ReadFailed,
     };
-    match read_session_messages_page(&conn, session_id, offset, Some(current_user_id)) {
+    // 归档会话属于主库全局阅览范围，不能再用当前账号的项目归属拦截；
+    // 正常会话仍保持按项目归属过滤，避免跨账号读取未归档内容。
+    let archived = column_exists(&conn, "chat_session", "hidden_status")
+        && conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session \
+                 WHERE session_id = ?1 AND hidden_status = 'voice_discussion'",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+    let owner = if archived {
+        None
+    } else {
+        Some(current_user_id)
+    };
+    match read_session_messages_page(&conn, session_id, offset, owner) {
         Ok(messages) => SessionMessagesStatus::Ready(messages),
         Err(_) => SessionMessagesStatus::ReadFailed,
     }
@@ -243,7 +260,9 @@ fn resolve_message_content(
     chat_content: Option<&str>,
 ) -> SessionMessageContent {
     match message_type {
-        "task" => task_content.map(parse_task_trace).unwrap_or(SessionMessageContent::Text(String::new())),
+        "task" => task_content
+            .map(parse_task_trace)
+            .unwrap_or(SessionMessageContent::Text(String::new())),
         "chat" => chat_content
             .map(parse_text_blocks)
             .map(SessionMessageContent::Text)
@@ -316,6 +335,18 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, ()> {
     conn.query_row(sql, [table], |row| row.get::<_, i64>(0))
         .map(|count| count > 0)
         .map_err(|_| ())
+}
+
+/// 检测列是否存在；老主库缺少归档列时保持正常会话的旧过滤行为。
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info(\"{table}\")");
+    let Ok(mut statement) = conn.prepare(&sql) else {
+        return false;
+    };
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map(|rows| rows.flatten().any(|name| name == column))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -420,6 +451,64 @@ mod tests {
         match read_master_session_messages_page(&temp, "s2", &raw_key, 0, "111") {
             SessionMessagesStatus::Ready(messages) => assert!(messages.is_empty()),
             other => panic!("跨账号会话不应泄露消息，实际 {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn archived_master_messages_are_readable_across_accounts() {
+        let temp = std::env::temp_dir().join(format!(
+            "trae-sync-p53-archived-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db_path = crate::master_handover::master_database_path(&temp);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let raw_key = "ae".repeat(32);
+        create_encrypted_db_with_messages(&db_path, &raw_key, "s1");
+        {
+            let conn =
+                Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))
+                .unwrap();
+            conn.execute_batch("CREATE TABLE project (project_id TEXT PRIMARY KEY, user_id TEXT);")
+                .unwrap();
+            conn.execute("ALTER TABLE chat_session ADD hidden_status TEXT", [])
+                .unwrap();
+            conn.execute("INSERT INTO project VALUES ('p2', '222')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session (session_id, project_id, session_title, updated_at, deleted_at, hidden_status) \
+                 VALUES ('s2', 'p2', '他人归档会话', 1770000000000, NULL, 'voice_discussion')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_message (session_id, message_id, message_type, message_role, created_at, deleted_at) \
+                 VALUES ('s2', 'm4', 'general', 'user', 1770000300, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_message_general (message_id, content, deleted_at) \
+                 VALUES ('m4', '[{\"type\":\"text\",\"text_content\":\"他人归档内容\"}]', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        match read_master_session_messages_page(&temp, "s2", &raw_key, 0, "111") {
+            SessionMessagesStatus::Ready(messages) => {
+                assert_eq!(messages.len(), 1);
+                assert!(matches!(
+                    &messages[0].content,
+                    SessionMessageContent::Text(text) if text == "他人归档内容"
+                ));
+            }
+            other => panic!("全局归档会话应可阅览，实际 {:?}", other),
         }
         let _ = std::fs::remove_dir_all(&temp);
     }
@@ -534,7 +623,10 @@ mod tests {
                 assert_eq!(messages[0].message_id, "m1");
                 assert_eq!(messages[0].role, "user");
                 // 块数组提取：仅 text 块的 text_content，跳过非 text 块。
-                assert_eq!(messages[0].content, SessionMessageContent::Text("检查一下账号\n的状态".to_string()));
+                assert_eq!(
+                    messages[0].content,
+                    SessionMessageContent::Text("检查一下账号\n的状态".to_string())
+                );
                 assert_eq!(messages[0].created_at_unix_seconds, Some(1770000000));
 
                 assert_eq!(messages[1].message_id, "m2");
@@ -603,7 +695,10 @@ mod tests {
         // 空轨迹 / 空块数组。
         assert_eq!(
             parse_task_trace("{}"),
-            SessionMessageContent::TaskTrace { step_count: 0, thoughts: vec![] }
+            SessionMessageContent::TaskTrace {
+                step_count: 0,
+                thoughts: vec![]
+            }
         );
         assert_eq!(parse_text_blocks("[]"), "");
     }

@@ -258,6 +258,22 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "操作前的自动备份未完成，已取消本次操作；请稍后重试。",
   ],
   [
+    /master_archive_busy/i,
+    "主库正在生成回复，归档设置需等它完成；稍后重试即可。",
+  ],
+  [
+    /master_archive_close_failed/i,
+    "主库实例未能关闭，归档设置尚未写入；请关闭 TRAE 后重试。",
+  ],
+  [
+    /master_archive_conflict/i,
+    "同一会话同时出现在归档和恢复设置中，请调整后再应用。",
+  ],
+  [
+    /master_archive_join_failed/i,
+    "归档设置提交未完成，草稿仍保留；请稍后重试。",
+  ],
+  [
     /master_merge_running/i,
     "主库正在运行，合并分组需先关闭 TRAE（合并前会自动创建备份）。",
   ],

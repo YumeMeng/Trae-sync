@@ -41,6 +41,8 @@ pub enum MasterArchiveError {
     BackupFailed,
     /// 分组合并参数无效（无来源分组，或目标分组在来源集合中/不存在）。
     MergeInvalid,
+    /// 同一会话同时出现在归档与恢复集合中，批次语义不明确。
+    ArchiveConflict,
 }
 
 impl std::fmt::Display for MasterArchiveError {
@@ -52,6 +54,7 @@ impl std::fmt::Display for MasterArchiveError {
             Self::WriteFailed => "会话操作写入失败（已回滚）",
             Self::BackupFailed => "删除前主库备份失败（未执行删除）",
             Self::MergeInvalid => "分组合并参数无效",
+            Self::ArchiveConflict => "归档批次中同一会话同时要求归档和恢复",
         };
         formatter.write_str(message)
     }
@@ -72,7 +75,10 @@ pub struct MasterDeleteOutcome {
 }
 
 /// 以读写模式打开主库并设 key（在线写路径；busy_timeout 与 TRAE 错峰）。
-fn open_with_key_readwrite(db_path: &Path, raw_key: &str) -> Result<Connection, MasterArchiveError> {
+fn open_with_key_readwrite(
+    db_path: &Path,
+    raw_key: &str,
+) -> Result<Connection, MasterArchiveError> {
     let conn = Connection::open(db_path).map_err(|_| MasterArchiveError::DbOpenFailed)?;
     // busy_timeout 用原生 API 设置：`PRAGMA busy_timeout = N` 会返回结果行，
     // 与 PRAGMA key 同批 execute_batch 会报 ExecuteReturnedResults（与交接同款）。
@@ -220,6 +226,121 @@ pub fn restore_master_sessions(
     Ok(changed)
 }
 
+/// 归档批次提交回执：一次事务内完成归档、恢复和恢复后的项目归属更新。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterArchiveApplyOutcome {
+    pub archived_sessions: usize,
+    pub restored_sessions: usize,
+}
+
+/// 一次性提交归档草稿。
+///
+/// 归档只允许当前主库账号名下的正常会话；恢复允许从全局归档视图选择，
+/// 并把其项目归属切到当前账号。归档状态和项目归属在同一个事务里提交，
+/// 任一步失败都由 SQLite 回滚，调用方可保留原草稿等待重试。
+pub fn apply_master_archive_changes(
+    master_data_dir: &Path,
+    raw_key: &str,
+    archive_session_ids: &[String],
+    restore_session_ids: &[String],
+    current_user_id: &str,
+) -> Result<MasterArchiveApplyOutcome, MasterArchiveError> {
+    if archive_session_ids
+        .iter()
+        .any(|session_id| restore_session_ids.iter().any(|id| id == session_id))
+    {
+        return Err(MasterArchiveError::ArchiveConflict);
+    }
+    if archive_session_ids.is_empty() && restore_session_ids.is_empty() {
+        return Ok(MasterArchiveApplyOutcome {
+            archived_sessions: 0,
+            restored_sessions: 0,
+        });
+    }
+    let db_path = master_database_path(master_data_dir);
+    if !db_path.is_file() {
+        return Err(MasterArchiveError::DbUnavailable);
+    }
+    let conn = open_with_key_readwrite(&db_path, raw_key)?;
+    verify_key_readable(&conn)?;
+    if !hidden_status_column_exists(&conn) {
+        return Err(MasterArchiveError::ArchiveUnsupported);
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|_| MasterArchiveError::WriteFailed)?;
+    let result = (|| -> Result<(usize, usize), MasterArchiveError> {
+        let archived_sessions = if archive_session_ids.is_empty() {
+            0
+        } else {
+            let session_clause = placeholders(archive_session_ids.len());
+            let owner_param = archive_session_ids.len() + 1;
+            let sql = format!(
+                "UPDATE chat_session SET hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
+                 WHERE hidden_status IS NULL AND session_id IN ({session_clause}) \
+                 AND EXISTS (SELECT 1 FROM project p \
+                    WHERE p.project_id = chat_session.project_id AND p.user_id = ?{owner_param})"
+            );
+            let mut params: Vec<&str> = archive_session_ids.iter().map(String::as_str).collect();
+            params.push(current_user_id);
+            tx.execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(|_| MasterArchiveError::WriteFailed)?
+        };
+
+        if !restore_session_ids.is_empty() {
+            let session_clause = placeholders(restore_session_ids.len());
+            let mut params: Vec<&str> = vec![current_user_id];
+            params.extend(restore_session_ids.iter().map(String::as_str));
+            // 恢复选中的归档会话前，先让其项目归属当前账号；项目级恢复
+            // 与会话级恢复共用这一个批次，不让 UI 出现“恢复了但找不到”。
+            let move_projects_sql = format!(
+                "UPDATE project SET user_id = ?1 WHERE project_id IN (\
+                 SELECT DISTINCT project_id FROM chat_session \
+                 WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
+                   AND session_id IN ({session_clause}))"
+            );
+            tx.execute(
+                &move_projects_sql,
+                rusqlite::params_from_iter(params.iter().copied()),
+            )
+            .map_err(|_| MasterArchiveError::WriteFailed)?;
+        }
+
+        let restored_sessions = if restore_session_ids.is_empty() {
+            0
+        } else {
+            let session_clause = placeholders(restore_session_ids.len());
+            let sql = format!(
+                "UPDATE chat_session SET hidden_status = NULL \
+                 WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
+                   AND session_id IN ({session_clause})"
+            );
+            tx.execute(
+                &sql,
+                rusqlite::params_from_iter(restore_session_ids.iter().map(String::as_str)),
+            )
+            .map_err(|_| MasterArchiveError::WriteFailed)?
+        };
+
+        Ok((archived_sessions, restored_sessions))
+    })();
+
+    match result {
+        Ok((archived_sessions, restored_sessions)) => {
+            tx.commit().map_err(|_| MasterArchiveError::WriteFailed)?;
+            Ok(MasterArchiveApplyOutcome {
+                archived_sessions,
+                restored_sessions,
+            })
+        }
+        Err(error) => {
+            let _ = tx.rollback();
+            Err(error)
+        }
+    }
+}
+
 /// 真实删除会话（破坏性，单事务）：备份 → 内容三表 → chat_message →
 /// chat_session → 空壳项目行。
 ///
@@ -290,7 +411,11 @@ pub fn delete_master_sessions(
     let result = (|| -> Result<(usize, usize, usize), MasterArchiveError> {
         // 1. 消息内容三表（存在则删；关联键 message_id，随消息元数据行删除）。
         let mut deleted_messages = 0usize;
-        for table in ["chat_message_general", "chat_message_task", "chat_message_chat"] {
+        for table in [
+            "chat_message_general",
+            "chat_message_task",
+            "chat_message_chat",
+        ] {
             let table_exists: bool = tx
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -541,7 +666,8 @@ mod tests {
         assert_eq!(affected, 1);
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
         let conn = Connection::open_with_flags(master_database_path(&dir), flags).unwrap();
-        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";")).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
         assert_eq!(
             hidden_status_of(&conn, "s1").as_deref(),
             Some(ARCHIVE_HIDDEN_STATUS)
@@ -550,6 +676,79 @@ mod tests {
         // 恢复：s1 还原 NULL。
         let affected = restore_master_sessions(&dir, &key, &["s1".into()], "111").unwrap();
         assert_eq!(affected, 1);
+        assert_eq!(hidden_status_of(&conn, "s1"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_changes_apply_once_and_restore_moves_project_to_current_account() {
+        let dir = temp_dir("batch-apply");
+        let key = "ac".repeat(32);
+        create_archive_fixture(&master_database_path(&dir), &key);
+        {
+            let conn = Connection::open_with_flags(
+                master_database_path(&dir),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+                .unwrap();
+            conn.execute(
+                "UPDATE project SET user_id = '222' WHERE project_id = 'p2'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome =
+            apply_master_archive_changes(&dir, &key, &["s1".into()], &["s3".into()], "111")
+                .unwrap();
+        assert_eq!(
+            outcome,
+            MasterArchiveApplyOutcome {
+                archived_sessions: 1,
+                restored_sessions: 1,
+            }
+        );
+
+        let conn = Connection::open_with_flags(
+            master_database_path(&dir),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
+        assert_eq!(
+            hidden_status_of(&conn, "s1").as_deref(),
+            Some(ARCHIVE_HIDDEN_STATUS)
+        );
+        assert_eq!(hidden_status_of(&conn, "s3"), None);
+        let owner: String = conn
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "111");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_changes_reject_overlap_without_writing() {
+        let dir = temp_dir("batch-overlap");
+        let key = "ad".repeat(32);
+        create_archive_fixture(&master_database_path(&dir), &key);
+        let result =
+            apply_master_archive_changes(&dir, &key, &["s1".into()], &["s1".into()], "111");
+        assert_eq!(result, Err(MasterArchiveError::ArchiveConflict));
+        let conn = Connection::open_with_flags(
+            master_database_path(&dir),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
         assert_eq!(hidden_status_of(&conn, "s1"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -619,7 +818,8 @@ mod tests {
         let db_path = master_database_path(&dir);
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
         let conn = Connection::open_with_flags(&db_path, flags).unwrap();
-        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";")).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
         conn.execute_batch(
             "CREATE TABLE chat_session (session_id TEXT PRIMARY KEY, project_id TEXT);
              INSERT INTO chat_session VALUES ('s1', 'p1');",
@@ -650,7 +850,8 @@ mod tests {
 
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
         let conn = Connection::open_with_flags(master_database_path(&dir), flags).unwrap();
-        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";")).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
         let sessions: i64 = conn
             .query_row("SELECT COUNT(*) FROM chat_session", [], |row| row.get(0))
             .unwrap();
@@ -690,7 +891,8 @@ mod tests {
 
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
         let conn = Connection::open_with_flags(master_database_path(&dir), flags).unwrap();
-        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";")).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
         // s3 归档会话同样改挂（归位语义一致），归属列不变。
         let (project_of_s3, user_of_p2): (String, Option<String>) = conn
             .query_row(
