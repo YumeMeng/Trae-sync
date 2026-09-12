@@ -162,8 +162,12 @@ export function LibrarySessionsPanel({
   const [archiveDraft, setArchiveDraft] = useState<ArchiveDraft>(() =>
     readArchiveDraft(library.id),
   );
+  // 本地草稿写入失败时保留当前状态，但明确告知用户重启后可能无法恢复。
+  const [archiveDraftStorageError, setArchiveDraftStorageError] = useState<string | null>(null);
   // 操作回执（归档/恢复/删除/合并完成后的一句话提示，行内展示）。
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  // 数据库已更新但实例启动或列表刷新失败时，保留对应的恢复入口。
+  const [archiveRecovery, setArchiveRecovery] = useState<"relaunch" | "refresh" | null>(null);
   // 删除二次确认（ADR-0018：列明规模，单次确认）。
   const [deleteConfirm, setDeleteConfirm] = useState<readonly MasterSessionEntryDto[] | null>(null);
   // 合并确认弹层（两步：选保留目标 → 确认页）。
@@ -187,8 +191,14 @@ export function LibrarySessionsPanel({
       const key = archiveDraftStorageKey(library.id);
       if (!archiveDraftHasChanges) window.localStorage.removeItem(key);
       else window.localStorage.setItem(key, JSON.stringify(archiveDraft));
+      setArchiveDraftStorageError(null);
     } catch {
-      // 本地存储不可用时仍允许本次会话继续操作，提交失败不会隐藏草稿。
+      // 本地存储不可用时仍允许本次会话继续操作，但必须显式提示持久化风险。
+      setArchiveDraftStorageError(
+        archiveDraftHasChanges
+          ? "归档设置暂存失败，关闭应用可能丢失未提交草稿。请先恢复本地存储后再离开。"
+          : "未能清理本地归档草稿，重启后可能再次出现。",
+      );
     }
   }, [archiveDraft, archiveDraftHasChanges, library.id]);
 
@@ -576,6 +586,7 @@ export function LibrarySessionsPanel({
     async (action: () => Promise<unknown>, onDone: () => void, receipt: string | null) => {
       setBatchBusy(true);
       setBatchError(null);
+      setArchiveRecovery(null);
       try {
         await action();
         onDone();
@@ -698,6 +709,7 @@ export function LibrarySessionsPanel({
         };
       });
       setBatchError(null);
+      setArchiveRecovery(null);
       setActionNotice(
         mode === "archive"
           ? `已加入待归档设置，共 ${sessionIds.length} 个会话。完成选择后点击“应用归档设置”。`
@@ -732,6 +744,7 @@ export function LibrarySessionsPanel({
     if (!archiveDraftHasChanges || batchBusy) return;
     setBatchBusy(true);
     setBatchError(null);
+    setArchiveRecovery(null);
     try {
       const result = await invoke<MasterArchiveApplyResultDto>("apply_master_archive_changes", {
         archiveSessionIds: [...archiveDraft.archiveSessionIds],
@@ -753,6 +766,9 @@ export function LibrarySessionsPanel({
         result.relaunch_outcome === "failed"
           ? `主库已更新（归档 ${archivedCount} 个、恢复 ${restoredCount} 个），实例尚未启动，请重试启动。`
           : `已应用归档设置：归档 ${archivedCount} 个、恢复 ${restoredCount} 个会话。`;
+      setArchiveRecovery(
+        result.relaunch_outcome === "failed" ? "relaunch" : refreshFailed ? "refresh" : null,
+      );
       setActionNotice(
         refreshFailed ? `${resultNotice} 历史列表刷新失败，请手动刷新。` : resultNotice,
       );
@@ -762,6 +778,36 @@ export function LibrarySessionsPanel({
       setBatchBusy(false);
     }
   }, [archiveDraft, archiveDraftHasChanges, batchBusy, exitSelectMode, library.id, load]);
+
+  /** 数据库已提交后重试启动或刷新，避免用户只能离开页面自行猜测下一步。 */
+  const retryArchiveRecovery = useCallback(async () => {
+    if (!archiveRecovery || batchBusy) return;
+    const recovery = archiveRecovery;
+    let failureStage = recovery;
+    setBatchBusy(true);
+    setBatchError(null);
+    try {
+      if (recovery === "relaunch") await invoke("launch_master_library");
+      try {
+        await load(true);
+      } catch (reason: unknown) {
+        failureStage = "refresh";
+        setArchiveRecovery("refresh");
+        throw reason;
+      }
+      setArchiveRecovery(null);
+      setActionNotice(recovery === "relaunch" ? "主库实例已重新启动，历史列表已刷新。" : "历史列表已刷新。");
+    } catch (reason: unknown) {
+      setBatchError(
+        safeUiErrorMessage(
+          reason,
+          failureStage === "relaunch" ? "实例仍未启动，请稍后重试。" : "历史列表刷新失败，请稍后重试。",
+        ),
+      );
+    } finally {
+      setBatchBusy(false);
+    }
+  }, [archiveRecovery, batchBusy, load]);
 
   /** 放弃未提交的归档设置，不触碰主库。 */
   const discardArchiveDraft = useCallback(() => {
@@ -1115,8 +1161,36 @@ export function LibrarySessionsPanel({
             </div>
           )}
           {actionNotice && (
-            <div className="lib-notice" data-testid="action-notice" role="status">
-              {actionNotice}
+            <div
+              className={`lib-notice${archiveRecovery ? " lib-notice--action" : ""}`}
+              data-testid="action-notice"
+              role="status"
+            >
+              <span className="lib-notice__message">{actionNotice}</span>
+              {archiveRecovery && (
+                <button
+                  className="btn btn--quiet"
+                  type="button"
+                  onClick={() => void retryArchiveRecovery()}
+                  disabled={batchBusy}
+                  data-testid="archive-recovery-retry"
+                >
+                  {batchBusy
+                    ? "处理中…"
+                    : archiveRecovery === "relaunch"
+                      ? "重试启动"
+                      : "刷新历史列表"}
+                </button>
+              )}
+            </div>
+          )}
+          {archiveDraftStorageError && (
+            <div
+              className="lib-notice lib-notice--warning"
+              data-testid="archive-draft-storage-error"
+              role="alert"
+            >
+              {archiveDraftStorageError}
             </div>
           )}
 

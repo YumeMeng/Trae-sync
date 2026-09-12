@@ -469,15 +469,30 @@ type MutableSession = {
 };
 
 /** 可变历史 mock：归档草稿只在 apply 命令时一次性改写状态。 */
-function setupMutableHistory() {
+function setupMutableHistory(options: {
+  relaunchOutcomes?: readonly ("launched" | "failed")[];
+  refreshFailures?: number;
+} = {}) {
   const dto = historyDto();
   const sessions = dto.sessions.map((session) => ({ ...session })) as MutableSession[];
+  const relaunchOutcomes = options.relaunchOutcomes ?? ["launched"];
+  let archiveApplyCount = 0;
+  let historyLoaded = false;
+  let refreshFailuresRemaining = options.refreshFailures ?? 0;
   mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-    if (command === "get_master_history") return { ...dto, sessions: [...sessions] };
+    if (command === "get_master_history") {
+      if (historyLoaded && refreshFailuresRemaining > 0) {
+        refreshFailuresRemaining -= 1;
+        throw new Error("history_refresh_failed");
+      }
+      historyLoaded = true;
+      return { ...dto, sessions: [...sessions] };
+    }
     if (command === "get_relay_ledger") return ledgerEntries();
     if (command === "get_master_session_messages") {
       return sessionMessages((args as { sessionId: string }).sessionId);
     }
+    if (command === "launch_master_library") return { outcome: "launched", login_state: "logged_in" };
     if (command === "apply_master_archive_changes") {
       const { archiveSessionIds, restoreSessionIds } = args as {
         archiveSessionIds: string[];
@@ -499,7 +514,8 @@ function setupMutableHistory() {
       return {
         archived_sessions: archived,
         restored_sessions: restored,
-        relaunch_outcome: "launched",
+        relaunch_outcome:
+          relaunchOutcomes[Math.min(archiveApplyCount++, relaunchOutcomes.length - 1)] ?? "launched",
       };
     }
     if (command === "delete_master_sessions") {
@@ -587,6 +603,56 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.queryByTestId("library-action-bar")).not.toBeInTheDocument();
     expect(screen.getByTestId("action-notice")).toHaveTextContent("已应用归档设置：归档 2 个、恢复 0 个会话。");
     expect(screen.queryByTestId("library-session-s1")).not.toBeInTheDocument();
+  });
+
+  it("应用后实例启动失败显示重试入口，并可恢复", async () => {
+    setupMutableHistory({ relaunchOutcomes: ["failed"] });
+    render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("action-notice")).toHaveTextContent("实例尚未启动");
+      expect(screen.getByTestId("archive-recovery-retry")).toHaveTextContent("重试启动");
+    });
+
+    mockInvoke.mockClear();
+    fireEvent.click(screen.getByTestId("archive-recovery-retry"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("launch_master_library");
+      expect(screen.getByTestId("action-notice")).toHaveTextContent("实例已重新启动");
+    });
+    expect(screen.queryByTestId("archive-recovery-retry")).not.toBeInTheDocument();
+  });
+
+  it("应用后历史列表刷新失败显示刷新入口，并可重试", async () => {
+    setupMutableHistory({ refreshFailures: 1 });
+    render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("action-notice")).toHaveTextContent("历史列表刷新失败");
+      expect(screen.getByTestId("archive-recovery-retry")).toHaveTextContent("刷新历史列表");
+    });
+
+    mockInvoke.mockClear();
+    fireEvent.click(screen.getByTestId("archive-recovery-retry"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_history", {
+        previous: null,
+        previousCurrentUserId: null,
+        libraryId: "master",
+      });
+      expect(screen.getByTestId("action-notice")).toHaveTextContent("历史列表已刷新");
+    });
+    expect(screen.queryByTestId("archive-recovery-retry")).not.toBeInTheDocument();
   });
 
   it("勾选项目后可归档项目下的全部会话", async () => {
@@ -697,6 +763,25 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.queryByTestId("archive-draft-bar")).not.toBeInTheDocument();
     await expandProject("p1");
     expect(screen.getByTestId("library-session-s2")).toBeInTheDocument();
+  });
+
+  it("本地草稿保存失败时显示可见提示", async () => {
+    setupMutableHistory();
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("storage_quota");
+    });
+
+    try {
+      render(<LibrarySessionsPanel active />);
+      await expandProject("p1");
+      fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+
+      expect(await screen.findByTestId("archive-draft-storage-error")).toHaveTextContent(
+        "暂存失败",
+      );
+    } finally {
+      setItem.mockRestore();
+    }
   });
 
   it("删除确认列明规模：取消不删除、确认后调用真实删除", async () => {

@@ -129,10 +129,28 @@
   overflow-wrap: anywhere;
 }
 
+/* 需要用户继续操作时，让提示与恢复按钮保持同一行且不挤压文案。 */
+.lib-notice--action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.lib-notice__message {
+  flex: 1;
+  min-width: 0;
+}
+
 .lib-notice--error {
   border-color: var(--danger-line);
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+.lib-notice--warning {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
 }
 
 /* —— 项目树 —— */

@@ -544,10 +544,9 @@ pub fn handover_master_records_with_progress(
             match keep.get(&biz) {
                 // 归档项目不是空镜像：即使存在同 biz 活跃项目，也不能在
                 // 交接清理阶段删除它，只能让显式项目合并处理。
-                Some((kept_rank, _)) if rank == 0 => {
-                    if *kept_rank == 0 {
-                        mirrors_to_delete.push(project);
-                    }
+                Some(_) if rank == 0 => {
+                    // 后出现的空镜像始终应被清理，避免正常行先出现时留下唯一键冲突。
+                    mirrors_to_delete.push(project);
                 }
                 Some((kept_rank, kept)) if *kept_rank == 0 && rank > 0 => {
                     mirrors_to_delete.push(kept.clone());
@@ -1383,6 +1382,22 @@ mod tests {
                 [],
             )
             .unwrap();
+            // biz-z：带会话行先插入、空镜像后插入，覆盖反向 rowid 顺序。
+            conn.execute(
+                "INSERT INTO project VALUES ('p-z-live', '666', 'biz-z', '活跃项目2', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s-z', 'p-z-live', '活跃会话2', 1770000003, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project VALUES ('p-z-empty', '777', 'biz-z', '空镜像2', NULL)",
+                [],
+            )
+            .unwrap();
         }
         let outcome = handover_master_records(&db_path, &raw_key, "222").unwrap();
 
@@ -1435,6 +1450,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tgt_owner, "222");
+        // biz-z：即使活跃行的 rowid 更小，后面的空镜像也必须清理。
+        let reverse_empty_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p-z-empty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reverse_empty_rows, 0, "反向 rowid 的空镜像也应被清理");
+        let reverse_live_owner: String = conn
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p-z-live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reverse_live_owner, "222");
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
     }
 
