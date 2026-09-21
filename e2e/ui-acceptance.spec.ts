@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+﻿import { test, expect, type Page } from "@playwright/test";
 import { installMockBridge } from "./mock-bridge";
 
 // 桌面版验收矩阵：不把移动端作为产品目标，只检查 Windows/Tauri 对应的 CSS 视口。
@@ -449,7 +449,7 @@ test.describe("P5-8b 插件 tab 验收（ADR-0026 同步策略）", () => {
     await page.getByTestId("plugin-segment-installed").click();
     await page.getByTestId("plugin-uninstall-plug-rec-1").click();
     await expect(page.getByTestId("plugin-uninstall-confirm")).toContainText("将同时从 2 个账号移除");
-    await page.getByTestId("plugin-uninstall-confirm-ok").click();
+    await page.getByTestId("plugin-uninstall-confirm-confirm").click();
     await expect(page.getByTestId("plugin-row-plug-rec-1")).toHaveCount(0);
     await expect(page.getByTestId("plugin-notice")).toContainText("已从 2 个账号移除 飞书协作");
   });

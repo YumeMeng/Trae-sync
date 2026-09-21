@@ -161,17 +161,6 @@ export interface AccountRegistryViewDto {
   readonly accounts: readonly AccountRegistryEntryDto[];
 }
 
-export interface KeyStatusDto {
-  readonly source_key_configured: boolean;
-  readonly source_key_version: string;
-  /** 候选 key 已验证但等待下次启动激活。 */
-  readonly source_key_pending_version?: string | null;
-  readonly source_key_activation_pending?: boolean;
-  readonly catalog_key_configured: boolean;
-  readonly catalog_key_generation: number | null;
-  readonly probe_state: "not_probed" | "verified" | "rejected" | "verified_pending";
-}
-
 export interface CheckinCapabilityDto {
   readonly enabled: boolean;
   readonly transport: "fixture" | "disabled" | string;

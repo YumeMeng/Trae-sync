@@ -75,7 +75,7 @@ pub struct MasterDeleteOutcome {
 }
 
 /// 以读写模式打开主库并设 key（在线写路径；busy_timeout 与 TRAE 错峰）。
-fn open_with_key_readwrite(
+pub(crate) fn open_with_key_readwrite(
     db_path: &Path,
     raw_key: &str,
 ) -> Result<Connection, MasterArchiveError> {
@@ -104,7 +104,7 @@ fn hidden_status_column_exists(conn: &Connection) -> bool {
 /// 解密探测：SQLCipher 的 key 错误延迟到首次真实查询才报
 /// "file is not a database"，PRAGMA table_info 失败又会被列防御吞掉，
 /// 故归档/恢复路径先跑一次真实读取把 key 不匹配显式归位为 DbOpenFailed。
-fn verify_key_readable(conn: &Connection) -> Result<(), MasterArchiveError> {
+pub(crate) fn verify_key_readable(conn: &Connection) -> Result<(), MasterArchiveError> {
     conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
     })

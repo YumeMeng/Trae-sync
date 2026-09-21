@@ -147,10 +147,12 @@ export interface MasterCheckupAccountDto {
   readonly registered: boolean;
   /** 是否当前账号（收编目标）。 */
   readonly current: boolean;
-  /** 项目行数（全量含软删，与归属改写口径一致）。 */
+  /** 含至少一个正常会话的项目数。 */
   readonly project_count: number;
-  /** 会话数（全量含软删）。 */
+  /** 未删除且未归档的正常会话数。 */
   readonly session_count: number;
+  /** 空项目数（不含已删除项目，只报告不收编）。 */
+  readonly empty_project_count: number;
 }
 
 /** 主库体检报告（环境页体检区块数据源，只读）。 */
@@ -159,7 +161,7 @@ export interface MasterCheckupDto {
   readonly status: "ready" | "no_current_account" | "no_master_data" | "read_failed";
   /** 当前账号账号名（回执与引导文案用）；未登记为 null。 */
   readonly current_account_name: string | null;
-  /** 全库账号分布（按会话数降序）。 */
+  /** 可交接范围内的账号分布（按正常会话数降序）。 */
   readonly accounts: readonly MasterCheckupAccountDto[];
   /** 无归属项目行数（只报告，收编不动）。 */
   readonly orphan_project_count: number;
@@ -194,4 +196,14 @@ export interface MasterIncorporateProgressEvent {
     | "incorporating"
     | "restarting"
     | "done";
+}
+
+/** P5-5 清理空项目回执（cleanup_master_empty_projects 返回）。 */
+export interface MasterEmptyProjectCleanupDto {
+  /** 删除的空项目记录数。 */
+  readonly deleted_projects: number;
+  /** 清理前自动创建的备份路径（人工恢复定位）。 */
+  readonly backup_path: string;
+  /** 主库重启结果。 */
+  readonly relaunch_outcome: string;
 }

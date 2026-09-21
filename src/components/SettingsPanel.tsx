@@ -1,22 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CalendarClock, DatabaseBackup } from "lucide-react";
-import type { AutoCheckinStatusDto, KeyStatusDto } from "../types/account_switch";
+import type { AutoCheckinStatusDto } from "../types/account_switch";
 import type { BackupRetentionDto, MasterBackupChainDto } from "../types/masterLibrary";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 
 interface SettingsPanelProps {
-  /** 页面可见时才读取密钥状态，避免后台 IPC。 */
+  /** 页面可见时才读取设置，避免后台 IPC。 */
   active: boolean;
 }
 
-// 设置页：自动签到偏好 + 密钥维护（自账号页迁入，账号页专注账号档案）+ 主库备份。
-// 原始密钥只在后端内存中流转；界面只显示版本与探测结论，永不回显正文。
+// 设置页：自动签到偏好 + 主库备份。
 export function SettingsPanel({ active }: SettingsPanelProps) {
-  const [keyStatus, setKeyStatus] = useState<KeyStatusDto | null>(null);
-  const [candidateKey, setCandidateKey] = useState("");
-  const [candidateProductVersion, setCandidateProductVersion] = useState("TRAE Work CN");
-  const [keyBusy, setKeyBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   // 自动签到设置（ADR-0019 决策 5 / 2026-08-23 grill）：总开关 + 每日时间点 + 今日台账。
@@ -51,11 +46,6 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
-    void invoke<KeyStatusDto>("get_key_status")
-      .then((next) => { if (!cancelled) setKeyStatus(next); })
-      .catch((reason: unknown) => {
-        if (!cancelled) setError(safeUiErrorMessage(reason, "密钥状态暂时不可读取。"));
-      });
     void invoke<AutoCheckinStatusDto>("get_auto_checkin_settings")
       .then((next) => { if (!cancelled) setAutoStatus(next); })
       .catch(() => undefined); // 读取失败不阻塞页面；保存时会再次报错
@@ -109,42 +99,6 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       .catch((reason: unknown) => setError(safeUiErrorMessage(reason, "自动签到设置保存失败。")))
       .finally(() => setAutoBusy(false));
   }, [autoBusy]);
-
-  const handleProbeKey = useCallback(() => {
-    if (keyBusy) return;
-    setKeyBusy(true);
-    setError(null);
-    setMessage(null);
-    void invoke<KeyStatusDto>("probe_source_key")
-      .then((next) => {
-        setKeyStatus(next);
-        setMessage(next.probe_state === "verified" ? "当前密钥只读探测通过。" : "当前密钥未通过只读探测，已保持阻断。");
-      })
-      .catch((reason: unknown) => setError(safeUiErrorMessage(reason, "密钥探测未完成。")))
-      .finally(() => setKeyBusy(false));
-  }, [keyBusy]);
-
-  const handleRegisterKey = useCallback(() => {
-    const trimmedKey = candidateKey.trim();
-    if (!trimmedKey || keyBusy) {
-      if (!trimmedKey) setError("请输入候选 source key。");
-      return;
-    }
-    setKeyBusy(true);
-    setError(null);
-    setMessage(null);
-    void invoke<KeyStatusDto>("register_source_key_candidate", {
-      candidateKey: trimmedKey,
-      productVersion: candidateProductVersion.trim() || undefined,
-    })
-      .then((next) => {
-        setKeyStatus(next);
-        setCandidateKey("");
-        setMessage("候选 source key 已通过只读验证并登记，下一次启动才会激活。");
-      })
-      .catch((reason: unknown) => setError(safeUiErrorMessage(reason, "候选密钥登记未完成。")))
-      .finally(() => setKeyBusy(false));
-  }, [candidateKey, candidateProductVersion, keyBusy]);
 
   return (
     <section className="settings-panel" role="region" aria-label="设置">
@@ -206,54 +160,6 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
 
       {error && <p className="workbench__error" role="alert">{error}</p>}
       {message && <p className="settings-panel__key-message" role="status">{message}</p>}
-
-      {/* G3：密钥主视野只留结论，探测与候选维护动作默认收起。 */}
-      <details className="settings-panel__fold" data-testid="settings-key-details">
-        <summary>
-          <span>
-            <span className="workbench__eyebrow">安全维护</span>
-            <strong>密钥</strong>
-          </span>
-          <span className={`status-badge status-badge--${keyConclusion(keyStatus) === "密钥正常" ? "safe" : "neutral"}`}>
-            {keyConclusion(keyStatus)}
-          </span>
-        </summary>
-        <div className="settings-panel__fold-content">
-          <div className="settings-panel__section-heading">
-            <div>
-              <span className="workbench__eyebrow">当前状态</span>
-              <h3>密钥维护</h3>
-            </div>
-            <span className={`status-badge status-badge--${keyStatus?.probe_state === "verified" || keyStatus?.probe_state === "verified_pending" ? "safe" : "neutral"}`}>
-              {keyProbeLabel(keyStatus?.probe_state)}
-            </span>
-          </div>
-      <div className="account-center__key-grid">
-        <span>来源密钥：{keyStatus?.source_key_configured ? keyStatus.source_key_version : "不可用"}</span>
-        <span>历史库密钥：{keyStatus?.catalog_key_configured ? `代次 ${keyStatus.catalog_key_generation ?? "当前"}` : "不可用"}</span>
-        {keyStatus?.source_key_pending_version && <span>待激活候选：{keyStatus.source_key_pending_version}</span>}
-        <button className="btn btn--quiet" type="button" onClick={handleProbeKey} disabled={keyBusy || !keyStatus?.source_key_configured}>
-          {keyBusy ? "探测中…" : "重新探测密钥"}
-        </button>
-      </div>
-      <div className="account-center__key-grid" data-testid="source-key-candidate-form">
-        <label className="account-center__target-field">
-          <span>候选 source key</span>
-          <input type="password" value={candidateKey} onChange={(event) => setCandidateKey(event.target.value)} autoComplete="off" data-testid="source-key-candidate-input" />
-        </label>
-        <label className="account-center__target-field">
-          <span>产品版本</span>
-          <input type="text" value={candidateProductVersion} onChange={(event) => setCandidateProductVersion(event.target.value)} data-testid="source-key-product-version-input" />
-        </label>
-        <button className="btn btn--quiet" type="button" onClick={handleRegisterKey} disabled={keyBusy || candidateKey.trim().length === 0}>
-          {keyBusy ? "登记中…" : "登记候选密钥"}
-        </button>
-      </div>
-      {keyStatus?.source_key_activation_pending && (
-        <p className="account-center__meta" data-testid="source-key-pending-notice">候选密钥已登记，下一次启动激活；当前运行继续使用已激活版本。</p>
-      )}
-        </div>
-      </details>
 
       {/* P5-4 主库数据备份（ADR-0018）：备份链展示 + 手动创建 + 人工恢复指引。
           P5-9 备份保留：超出保留数的旧备份自动清理（可关闭）；恢复仍是人工操作，界面只给定位与步骤。 */}
@@ -352,22 +258,6 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       )}
     </section>
   );
-}
-
-function keyProbeLabel(state: KeyStatusDto["probe_state"] | undefined | null): string {
-  switch (state) {
-    case "verified": return "探测通过";
-    case "verified_pending": return "候选已登记";
-    case "rejected": return "探测拒绝";
-    default: return "未探测";
-  }
-}
-
-function keyConclusion(status: KeyStatusDto | null): "密钥正常" | "密钥异常需维护" {
-  const verified = status?.probe_state === "verified" || status?.probe_state === "verified_pending";
-  return status?.source_key_configured && status.catalog_key_configured && verified
-    ? "密钥正常"
-    : "密钥异常需维护";
 }
 
 /** 今日台账状态文案：未发起 / 错峰执行中 / 已完成（含跳过与失败计数）。 */

@@ -2,21 +2,10 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { SettingsPanel } from "../src/components/SettingsPanel";
-import type { KeyStatusDto } from "../src/types/account_switch";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
-
-const keyStatus: KeyStatusDto = {
-  source_key_configured: true,
-  source_key_version: "v2026.08",
-  source_key_pending_version: null,
-  source_key_activation_pending: false,
-  catalog_key_configured: true,
-  catalog_key_generation: 3,
-  probe_state: "verified",
-};
 
 describe("设置面板", () => {
   beforeEach(() => {
@@ -43,26 +32,8 @@ describe("设置面板", () => {
     expect(screen.queryByText("读取完成后重新打开 TRAE")).not.toBeInTheDocument();
   });
 
-  it("页面激活时读取密钥状态，只显示版本与代次，不回显正文", async () => {
+  it("G3：备份路径收进 details，创建入口可见", async () => {
     mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
-
-    render(<SettingsPanel active={true} />);
-
-    expect(await screen.findByText("密钥正常")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("settings-key-details").querySelector("summary")!);
-    expect(screen.getByText("探测通过")).toBeInTheDocument();
-    expect(screen.getByText(/来源密钥：v2026.08/)).toBeInTheDocument();
-    expect(screen.getByText(/历史库密钥：代次 3/)).toBeInTheDocument();
-    // 密钥正文永不回显：候选输入框是密码框，界面不出现密钥内容。
-    expect(screen.getByTestId("source-key-candidate-input")).toHaveAttribute("type", "password");
-  });
-
-  it("G3：密钥默认只显示健康结论，备份路径收进 details", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_master_backup_chain") {
         return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
       }
@@ -71,86 +42,12 @@ describe("设置面板", () => {
 
     render(<SettingsPanel active={true} />);
 
-    expect(await screen.findByTestId("settings-key-details")).toHaveTextContent("密钥正常");
-    expect(screen.getByTestId("master-backup-location-details")).toBeInTheDocument();
+    expect(await screen.findByTestId("master-backup-location-details")).toBeInTheDocument();
     expect(screen.getByTestId("master-backup-create")).toBeInTheDocument();
-  });
-
-  it("G3：密钥异常和操作错误在折叠状态下仍可见", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return { ...keyStatus, catalog_key_configured: false };
-      if (command === "probe_source_key") throw new Error("probe_failed");
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
-
-    render(<SettingsPanel active={true} />);
-    expect(await screen.findByText("密钥异常需维护")).toBeInTheDocument();
-
-    const details = screen.getByTestId("settings-key-details");
-    fireEvent.click(details.querySelector("summary")!);
-    fireEvent.click(screen.getByRole("button", { name: "重新探测密钥" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("密钥探测未完成");
-
-    // 折叠维护区后，错误仍留在主视野，避免把失败反馈藏进 details。
-    fireEvent.click(details.querySelector("summary")!);
-    expect(screen.getByRole("alert")).toBeVisible();
-  });
-
-  it("可发起只读密钥探测并显示结论", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
-      if (command === "probe_source_key") {
-        return { ...keyStatus, probe_state: "rejected" as const };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
-
-    render(<SettingsPanel active={true} />);
-    await screen.findByText("探测通过");
-
-    fireEvent.click(screen.getByRole("button", { name: "重新探测密钥" }));
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("probe_source_key"));
-    expect(await screen.findByText("当前密钥未通过只读探测，已保持阻断。")).toBeInTheDocument();
-    expect(screen.getByText("探测拒绝")).toBeInTheDocument();
-  });
-
-  it("登记候选密钥走只读验证，成功后清空输入并提示下次启动激活", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
-      if (command === "register_source_key_candidate") {
-        return {
-          ...keyStatus,
-          probe_state: "verified_pending" as const,
-          source_key_pending_version: "v2026.09-candidate",
-          source_key_activation_pending: true,
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
-
-    render(<SettingsPanel active={true} />);
-    await screen.findByText("探测通过");
-
-    const input = screen.getByTestId("source-key-candidate-input");
-    expect(screen.getByRole("button", { name: "登记候选密钥" })).toBeDisabled();
-    fireEvent.change(input, { target: { value: "candidate-key-material" } });
-    fireEvent.click(screen.getByRole("button", { name: "登记候选密钥" }));
-
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("register_source_key_candidate", {
-        candidateKey: "candidate-key-material",
-        productVersion: "TRAE Work CN",
-      });
-    });
-    expect(await screen.findByText(/候选 source key 已通过只读验证并登记/)).toBeInTheDocument();
-    expect(screen.getByTestId("source-key-pending-notice")).toHaveTextContent(/下一次启动激活/);
-    // 登记成功后输入框清空，密钥材料不留在界面。
-    expect(input).toHaveValue("");
   });
 
   it("自动签到区块展示开关、触发时间与今日台账", async () => {
     mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_auto_checkin_settings") {
         return {
           enabled: true,
@@ -180,7 +77,6 @@ describe("设置面板", () => {
   it("关闭自动签到后提交设置命令并回填关闭状态", async () => {
     let enabled = true;
     mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_auto_checkin_settings") {
         return { enabled, daily_time_hhmm: "10:00", ledger: null };
       }
@@ -219,7 +115,6 @@ describe("设置面板", () => {
     };
     let failChain = false;
     mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_master_backup_chain") {
         if (failChain) throw new Error("trae_real_mode_required");
         return backupChain;
@@ -252,7 +147,6 @@ describe("设置面板", () => {
   it("P5-4：点击立即备份提交命令并重读备份链", async () => {
     const backups: Array<{ stamp_unix_seconds: number; total_bytes: number; has_wal: boolean }> = [];
     mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_master_backup_chain") {
         // 每次返回新对象（后端语义）：mock 持有同一引用会让 React 状态不变、徽章不刷新。
         return { backups: [...backups], backup_dir: "D:\\bak", keep_policy: 5 };
@@ -279,7 +173,6 @@ describe("设置面板", () => {
 
   it("P5-4：主库运行中创建备份被拒并给出稳定提示", async () => {
     mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_master_backup_chain") {
         return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
       }
@@ -299,7 +192,6 @@ describe("设置面板", () => {
   it("P5-9：备份分区展示保留设置并随开关保存", async () => {
     let retention = { enabled: true, keep: 5 };
     mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_master_backup_chain") {
         return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
       }
@@ -331,7 +223,6 @@ describe("设置面板", () => {
     let retention = { enabled: true, keep: 5 };
     const calls: Array<{ enabled: boolean; keep: number }> = [];
     mockInvoke.mockImplementation(async (command, args) => {
-      if (command === "get_key_status") return keyStatus;
       if (command === "get_master_backup_chain") {
         return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
       }

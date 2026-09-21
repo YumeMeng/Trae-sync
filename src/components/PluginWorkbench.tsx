@@ -8,6 +8,7 @@ import type {
   PluginUninstallEverywhereDto,
 } from "../types/plugins";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 // ============================================================================
 // G23 插件 tab 工作台（ADR-0023 清单 + ADR-0026 实时同步）：表格化
@@ -448,49 +449,21 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
         ))}
       </div>
 
-      {/* 卸载确认（ADR-0026 决策 2：列明影响面，单次确认） */}
+      {/* 卸载确认（ADR-0026 决策 2：列明影响面，单次确认；统一 ConfirmDialog 形态）。 */}
       {pendingUninstall && (
-        <div
-          className="preview-veil preview-veil--open"
-          onClick={(event) => {
-            if (event.target === event.currentTarget) setPendingUninstall(null);
-          }}
-          data-testid="plugin-uninstall-confirm"
-        >
-          <div
-            className="preview confirm-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-label="确认移除插件"
-          >
-            <div className="preview__head">
-              <div className="preview__head-main">
-                <div className="preview__title">移除插件</div>
-                <div className="preview__meta">
-                  <span>{pendingUninstall.display_name || pendingUninstall.name}</span>
-                </div>
-              </div>
-            </div>
-            <div className="preview__body">
-              <p className="confirm-dialog__text">
-                将同时从 {state?.known_account_count ?? 1} 个账号移除；移除后切换账号不再带走该插件。插件本体文件不受影响，可随时重新安装。
-              </p>
-            </div>
-            <div className="confirm-dialog__foot">
-              <button className="btn" type="button" onClick={() => setPendingUninstall(null)}>
-                取消
-              </button>
-              <button
-                className="btn btn--danger"
-                type="button"
-                onClick={() => void confirmUninstall()}
-                data-testid="plugin-uninstall-confirm-ok"
-              >
-                <Trash2 size={15} aria-hidden="true" />确认移除
-              </button>
-            </div>
-          </div>
-        </div>
+        <ConfirmDialog
+          title="移除插件"
+          lines={[
+            `${pendingUninstall.display_name || pendingUninstall.name}`,
+            `将同时从 ${state?.known_account_count ?? 1} 个账号移除；移除后切换账号不再带走该插件。插件本体文件不受影响，可随时重新安装。`,
+          ]}
+          confirmLabel="确认移除"
+          confirmIcon={<Trash2 size={15} aria-hidden="true" />}
+          danger
+          onCancel={() => setPendingUninstall(null)}
+          onConfirm={() => void confirmUninstall()}
+          testId="plugin-uninstall-confirm"
+        />
       )}
     </section>
   );

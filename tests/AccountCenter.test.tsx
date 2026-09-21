@@ -300,7 +300,9 @@ describe("AccountCenter", () => {
 
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-credential-one"));
+    // 刷新凭据有二次确认弹层，确认后执行。
     fireEvent.click(screen.getByTestId("account-detail-refresh-credentials"));
+    fireEvent.click(screen.getByTestId("account-detail-credentials-confirm-confirm"));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credentials", {
@@ -338,7 +340,9 @@ describe("AccountCenter", () => {
 
     render(<AccountCenter active={true} />);
     await screen.findByText("凭据成功账号");
+    // 批量刷新凭据有二次确认弹层，确认后执行。
     fireEvent.click(screen.getByTestId("account-refresh-credentials"));
+    fireEvent.click(screen.getByTestId("account-refresh-credentials-confirm-confirm"));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credentials", {
@@ -437,31 +441,30 @@ describe("AccountCenter", () => {
       }
       throw new Error(`unexpected command: ${String(command)}`);
     });
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-login-1"));
+    // 删除账号有二次确认弹层，确认后执行。
     fireEvent.click(await screen.findByRole("button", { name: /删除账号/ }));
+    fireEvent.click(screen.getByTestId("account-detail-remove-confirm-confirm"));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("remove_checkin_account", { profileId: "profile-login-1" });
     });
     // 删除后回到列表，空状态出现。
     expect(await screen.findByText(/还没有账号/)).toBeInTheDocument();
-    confirmSpy.mockRestore();
   });
 
   it("删除账号取消确认时不发起删除命令", async () => {
     mockRealMode([overviewEntry("profile-login-1", "登录账号甲")]);
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
 
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-login-1"));
+    // 弹层点取消：不发起删除，留在详情页。
     fireEvent.click(await screen.findByRole("button", { name: /删除账号/ }));
+    fireEvent.click(screen.getByTestId("account-detail-remove-confirm-cancel"));
 
     expect(mockInvoke).not.toHaveBeenCalledWith("remove_checkin_account", expect.anything());
     expect(await screen.findByTestId("account-detail-usage")).toBeInTheDocument();
-    confirmSpy.mockRestore();
   });
 
   it("详情页重铸签到设备：确认后调用命令并提示下次使用新设备", async () => {
@@ -480,29 +483,28 @@ describe("AccountCenter", () => {
       if (command === "reset_checkin_device") return "1234567890123456";
       throw new Error(`unexpected command: ${String(command)}`);
     });
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-login-1"));
+    // 重置设备有二次确认弹层，确认后执行。
     fireEvent.click(await screen.findByTestId("account-detail-reset-device"));
+    fireEvent.click(screen.getByTestId("account-detail-reset-device-confirm-confirm"));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("reset_checkin_device", { profileId: "profile-login-1" });
     });
     expect(await screen.findByText(/签到设备已重置/)).toBeInTheDocument();
-    confirmSpy.mockRestore();
   });
 
   it("详情页重置签到设备：取消确认时不改绑", async () => {
     mockRealMode([overviewEntry("profile-login-1", "登录账号甲")]);
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
 
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-login-1"));
+    // 弹层点取消：不改绑设备。
     fireEvent.click(await screen.findByTestId("account-detail-reset-device"));
+    fireEvent.click(screen.getByTestId("account-detail-reset-device-confirm-cancel"));
 
     expect(mockInvoke).not.toHaveBeenCalledWith("reset_checkin_device", expect.anything());
-    confirmSpy.mockRestore();
   });
 
   it("列表页批量刷新额度对所有账号发起只读查询", async () => {
@@ -834,7 +836,6 @@ describe("AccountCenter", () => {
       overviewEntry("profile-m-1", "账号一"),
       overviewEntry("profile-m-2", "账号二", { mobile_full: "13912340000", masked_mobile: "139****0000" }),
     ]);
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
 
     render(<AccountCenter active={true} />);
     await screen.findByTestId("account-card-profile-m-1");
@@ -844,12 +845,11 @@ describe("AccountCenter", () => {
     fireEvent.change(input, { target: { value: "13912340000" } });
     fireEvent.click(screen.getByTestId("account-detail-mobile-save"));
 
-    // 第三层查重：提示已用于账号二；用户取消则不发起保存。
-    await waitFor(() =>
-      expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("账号二"))
-    );
+    // 第三层查重：确认弹层提示已用于账号二；点取消则不发起保存。
+    const dialog = await screen.findByTestId("account-mobile-duplicate-confirm");
+    expect(dialog).toHaveTextContent("账号二");
+    fireEvent.click(screen.getByTestId("account-mobile-duplicate-confirm-cancel"));
     expect(mockInvoke).not.toHaveBeenCalledWith("set_account_mobile", expect.anything());
-    confirmSpy.mockRestore();
   });
 
   it("选择本机浏览器登录时向登录命令传递系统浏览器标记", async () => {

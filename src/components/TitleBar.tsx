@@ -58,43 +58,43 @@ export function TitleBar({ platform }: TitleBarProps) {
         <span className="title-bar__subtitle">{platform.display_name}</span>
       </div>
       {/* 自绘窗控（无系统边框）：最小化 / 最大化切换 / 关闭。
+          三个按钮直接平铺在标题栏 flex 行内（无包裹容器）：首钮 margin-left:auto 推到右缘，
+          末钮贴壳层圆角；按钮 align-self:stretch 拉满标题栏 38px 高（Windows 窗控惯例）。
           失败静默（浏览器 preview 无法执行窗口命令，真机才生效）。 */}
-      <div className="title-bar__window-controls" aria-label="窗口控制">
-        <button
-          type="button"
-          className="title-bar__winctl"
-          title="最小化"
-          aria-label="最小化窗口"
-          data-testid="window-minimize"
-          onClick={() => void getCurrentWindow().minimize().catch(() => undefined)}
-        >
-          <Minus size={14} strokeWidth={2} aria-hidden="true" />
-        </button>
-        <button
-          type="button"
-          className="title-bar__winctl"
-          title={maximized ? "还原" : "最大化"}
-          aria-label={maximized ? "还原窗口" : "最大化窗口"}
-          data-testid="window-maximize"
-          onClick={() => void getCurrentWindow().toggleMaximize().catch(() => undefined)}
-        >
-          {maximized ? (
-            <Copy size={12} strokeWidth={2} aria-hidden="true" />
-          ) : (
-            <Square size={11} strokeWidth={2} aria-hidden="true" />
-          )}
-        </button>
-        <button
-          type="button"
-          className="title-bar__winctl title-bar__winctl--close"
-          title="关闭"
-          aria-label="关闭窗口"
-          data-testid="window-close"
-          onClick={() => void getCurrentWindow().close().catch(() => undefined)}
-        >
-          <X size={15} strokeWidth={2} aria-hidden="true" />
-        </button>
-      </div>
+      <button
+        type="button"
+        className="title-bar__winctl"
+        title="最小化"
+        aria-label="最小化窗口"
+        data-testid="window-minimize"
+        onClick={() => void getCurrentWindow().minimize().catch(() => undefined)}
+      >
+        <Minus size={14} strokeWidth={2} aria-hidden="true" />
+      </button>
+      <button
+        type="button"
+        className="title-bar__winctl"
+        title={maximized ? "还原" : "最大化"}
+        aria-label={maximized ? "还原窗口" : "最大化窗口"}
+        data-testid="window-maximize"
+        onClick={() => void getCurrentWindow().toggleMaximize().catch(() => undefined)}
+      >
+        {maximized ? (
+          <Copy size={12} strokeWidth={2} aria-hidden="true" />
+        ) : (
+          <Square size={11} strokeWidth={2} aria-hidden="true" />
+        )}
+      </button>
+      <button
+        type="button"
+        className="title-bar__winctl title-bar__winctl--close"
+        title="关闭"
+        aria-label="关闭窗口"
+        data-testid="window-close"
+        onClick={() => void getCurrentWindow().close().catch(() => undefined)}
+      >
+        <X size={15} strokeWidth={2} aria-hidden="true" />
+      </button>
     </header>
   );
 }

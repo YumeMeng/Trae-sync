@@ -65,7 +65,6 @@ pub mod relay_ledger;
 pub mod remint;
 pub mod scan_authorization;
 pub mod snapshot_store;
-pub mod source_key_profile;
 #[cfg(feature = "sqlcipher")]
 pub mod sqlcipher;
 pub mod storage_deletion;
@@ -193,10 +192,6 @@ pub use scan_authorization::{
     ScanAuthorizationStoreError,
 };
 pub use snapshot_store::{sha256_file, FilesystemSnapshotStore};
-pub use source_key_profile::{
-    SourceKeyActivation, SourceKeyProfileError, SourceKeyProfileMetadata, SourceKeyProfileState,
-    SourceKeyProfileStatus, SourceKeyProfileStore, BASELINE_SOURCE_KEY_ID,
-};
 #[cfg(feature = "sqlcipher")]
 pub use sqlcipher::{
     catalog_operation_matches, FollowProjectExecution, SqlCipherProbe, WorkCnSyncExecutor,

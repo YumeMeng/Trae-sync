@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+﻿import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { PluginWorkbench } from "../src/components/PluginWorkbench";
@@ -302,7 +302,7 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
       expect.anything(),
     );
 
-    fireEvent.click(screen.getByTestId("plugin-uninstall-confirm-ok"));
+    fireEvent.click(screen.getByTestId("plugin-uninstall-confirm-confirm"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("uninstall_plugin_everywhere", {
         recordId: "rec-1",
@@ -328,7 +328,7 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
 
     await screen.findByTestId("plugin-uninstall-rec-1");
     fireEvent.click(screen.getByTestId("plugin-uninstall-rec-1"));
-    fireEvent.click(screen.getByTestId("plugin-uninstall-confirm-ok"));
+    fireEvent.click(screen.getByTestId("plugin-uninstall-confirm-confirm"));
 
     await waitFor(() => {
       expect(screen.getByTestId("plugin-notice")).toHaveTextContent(

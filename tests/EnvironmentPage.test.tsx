@@ -193,9 +193,9 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       status: "ready",
       current_account_name: "账号甲",
       accounts: [
-        { user_id: "user-a", account_name: "账号甲", registered: true, current: true, project_count: 3, session_count: 5 },
-        { user_id: "user-b", account_name: "账号乙", registered: true, current: false, project_count: 2, session_count: 4 },
-        { user_id: "user-c", account_name: null, registered: false, current: false, project_count: 1, session_count: 1 },
+        { user_id: "user-a", account_name: "账号甲", registered: true, current: true, project_count: 3, session_count: 5, empty_project_count: 0 },
+        { user_id: "user-b", account_name: "账号乙", registered: true, current: false, project_count: 2, session_count: 4, empty_project_count: 0 },
+        { user_id: "user-c", account_name: null, registered: false, current: false, project_count: 1, session_count: 1, empty_project_count: 0 },
       ],
       orphan_project_count: 2,
       orphan_session_count: 0,
@@ -247,6 +247,171 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     expect(await screen.findByTestId("env-master-card")).toBeInTheDocument();
     expect(screen.queryByTestId("env-checkup")).not.toBeInTheDocument();
     expect(screen.getByTestId("env-current-name")).toHaveTextContent("账号甲");
+  });
+
+  it("P8-7：归档会话不进入收编，空项目行单独报告", async () => {
+    const report = {
+      ...checkupReport(),
+      accounts: [
+        checkupReport().accounts[0],
+        { user_id: "user-b", account_name: "归档账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 0 },
+        { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 1 },
+      ],
+    };
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "get_master_checkup") return report;
+      return undefined;
+    });
+
+    render(<EnvironmentPage active />);
+    const checkup = await screen.findByTestId("env-checkup");
+    expect(checkup).toHaveTextContent("另有 1 个空项目记录未进入归入范围");
+    expect(screen.getByTestId("env-empty-shell-list")).toHaveTextContent("空项目账号");
+    expect(screen.queryByTestId("env-incorporate-entry")).not.toBeInTheDocument();
+  });
+
+  it("P5-5：空项目显示清理入口，确认后清理并刷新体检", async () => {
+    let cleanupCalls = 0;
+    let checkupCalls = 0;
+    // 带空项目的体检报告（P8-7 同款 fixture，空项目数 2 便于验证数量文案）。
+    const reportWithEmpty = () => ({
+      ...checkupReport(),
+      accounts: [
+        checkupReport().accounts[0],
+        { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 2 },
+      ],
+    });
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "get_master_checkup") {
+        checkupCalls += 1;
+        // 清理完成后刷新：空项目清零（体检区块自然消失）。
+        return cleanupCalls > 0
+          ? { ...checkupReport(), accounts: checkupReport().accounts.filter((a) => a.current) }
+          : reportWithEmpty();
+      }
+      if (command === "cleanup_master_empty_projects") {
+        cleanupCalls += 1;
+        return { deleted_projects: 2, backup_path: "C:\\bak\\switch-bak-456", relaunch_outcome: "launched" };
+      }
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+
+    // 体检区块出现空项目行与清理入口。
+    await screen.findByTestId("env-checkup");
+    fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-entry"));
+
+    // 确认弹层：列明删除数量与备份提示（ADR-0018 单次确认，自然语言表述）。
+    const dialog = await screen.findByTestId("env-cleanup-empty-projects-dialog");
+    expect(dialog).toHaveTextContent("将删除 2 个空项目记录，删除前会自动备份。");
+    expect(dialog).toHaveTextContent("空项目记录不含任何对话，删除不影响对话历史。");
+    expect(dialog).not.toHaveTextContent("孤儿");
+    expect(dialog).not.toHaveTextContent("软删");
+
+    // 取消可关闭（无副作用）。
+    fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-dialog-cancel"));
+    expect(screen.queryByTestId("env-cleanup-empty-projects-dialog")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("cleanup_master_empty_projects");
+
+    // 重新进入并确认：invoke 清理命令。
+    fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-entry"));
+    fireEvent.click(await screen.findByTestId("env-cleanup-empty-projects-dialog-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("cleanup_master_empty_projects");
+    });
+
+    // 成功后弹层关闭、展示结果消息（数量表述）并刷新体检。
+    expect(await screen.findByRole("status")).toHaveTextContent("已删除 2 个空项目记录（已自动备份）。");
+    expect(screen.queryByTestId("env-cleanup-empty-projects-dialog")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(checkupCalls).toBeGreaterThanOrEqual(2);
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId("env-checkup")).not.toBeInTheDocument();
+    });
+  });
+
+  it("P5-5：清理失败走错误码映射，弹层关闭后体检区块保留", async () => {
+    const reportWithEmpty = () => ({
+      ...checkupReport(),
+      accounts: [
+        checkupReport().accounts[0],
+        { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 1 },
+      ],
+    });
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "get_master_checkup") return reportWithEmpty();
+      if (command === "cleanup_master_empty_projects") throw new Error("cleanup_master_busy");
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    await screen.findByTestId("env-checkup");
+    fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-entry"));
+    fireEvent.click(await screen.findByTestId("env-cleanup-empty-projects-dialog-confirm"));
+    // 失败提示：错误码映射后的用户文案（无底层码泄露）。
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("主库正在生成回复，清理需等它完成；稍后重试即可。");
+    expect(alert).not.toHaveTextContent("cleanup_master_busy");
+    // 弹层已关闭，体检区块保留（数据未变，可重试）。
+    expect(screen.queryByTestId("env-cleanup-empty-projects-dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("env-checkup")).toBeInTheDocument();
+  });
+
+  it("P5-5：仅当前账号名下存在空项目时，体检区块与清理入口仍出现", async () => {
+    // 无滞留账号（其余账号 0 会话 0 项目），空项目全部挂在当前账号名下。
+    const reportCurrentOnlyEmpty = () => ({
+      ...checkupReport(),
+      accounts: [
+        { user_id: "user-a", account_name: "账号甲", registered: true, current: true, project_count: 3, session_count: 5, empty_project_count: 1 },
+        { user_id: "user-b", account_name: "账号乙", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 0 },
+      ],
+    });
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "get_master_checkup") return reportCurrentOnlyEmpty();
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+
+    // 体检区块出现，提示行按全库口径计数；诊断列表只列非当前账号（此处无）。
+    await screen.findByTestId("env-checkup");
+    expect(screen.getByTestId("env-checkup")).toHaveTextContent("另有 1 个空项目记录未进入归入范围");
+    expect(screen.queryByTestId("env-empty-shell-list")).not.toBeInTheDocument();
+    // 清理入口出现（删除范围为全库空项目）；无滞留账号则无归入入口。
+    expect(screen.getByTestId("env-cleanup-empty-projects-entry")).toBeInTheDocument();
+    expect(screen.queryByTestId("env-incorporate-entry")).not.toBeInTheDocument();
+  });
+
+  it("P5-5：重启失败回执按已清理提示，不误导为清理未完成", async () => {
+    const reportWithEmpty = () => ({
+      ...checkupReport(),
+      accounts: [
+        checkupReport().accounts[0],
+        { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 1 },
+      ],
+    });
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "get_master_checkup") return reportWithEmpty();
+      if (command === "cleanup_master_empty_projects") {
+        // 删除已提交但重启失败：relaunch_outcome=failed 的成功回执。
+        return { deleted_projects: 1, backup_path: "C:\\bak\\switch-bak-789", relaunch_outcome: "failed" };
+      }
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    await screen.findByTestId("env-checkup");
+    fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-entry"));
+    fireEvent.click(await screen.findByTestId("env-cleanup-empty-projects-dialog-confirm"));
+
+    // 成功回执 + 重启失败：据实提示已删除与补救入口，不出现"清理未完成"。
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "已删除 1 个空项目记录（已自动备份）；主库 TRAE 未能自动启动，可从环境页重新打开。",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("P5-5：一键收编全流程（确认规模 → 进度事件 → 完成回执 → 刷新体检）", async () => {
@@ -599,11 +764,11 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     expect(dialog).toHaveTextContent("3 个项目、5 个会话");
     expect(dialog).toHaveTextContent("2.0 MB");
     // 取消可关闭（无副作用）。
-    fireEvent.click(screen.getByTestId("env-delete-cancel"));
+    fireEvent.click(screen.getByTestId("env-delete-dialog-cancel"));
     expect(screen.queryByTestId("env-delete-dialog")).not.toBeInTheDocument();
     // 重新进入并确认删除。
     fireEvent.click(screen.getByTestId("env-delete-env-x1"));
-    fireEvent.click(await screen.findByTestId("env-delete-confirm"));
+    fireEvent.click(await screen.findByTestId("env-delete-dialog-confirm"));
     await waitFor(() => {
       expect(deletes).toEqual(["env-x1"]);
     });
@@ -625,7 +790,7 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-delete-env-x1"));
-    fireEvent.click(await screen.findByTestId("env-delete-confirm"));
+    fireEvent.click(await screen.findByTestId("env-delete-dialog-confirm"));
     const dialog = await waitFor(() => {
       const node = screen.getByTestId("env-delete-dialog");
       expect(node).toHaveTextContent("该环境正在运行，请先关闭它的窗口再删除。");

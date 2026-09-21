@@ -19,6 +19,7 @@ import type {
 } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface AccountDetailProps {
   entry: CheckinOverviewEntryDto;
@@ -29,7 +30,8 @@ interface AccountDetailProps {
   onDataChanged: () => Promise<void>;
   /**
    * G11 保存手机号补录（父组件持有总览数据，负责第三层查重提示）：
-   * 空串 = 清除补录（回退脱敏号展示）；返回 false = 用户取消（重复号未保存）。
+   * 空串 = 清除补录（回退脱敏号展示）；返回 false = 本次未保存
+   * （用户取消，或查重命中转由确认弹层处理）。
    */
   onSaveMobile: (mobile: string) => Promise<boolean>;
   /** 账号删除成功或点击返回时回列表。 */
@@ -37,6 +39,9 @@ interface AccountDetailProps {
 }
 
 type DetailAction = "credentials" | "credits" | "checkin" | "remove" | "relogin" | "auto-checkin" | "reset-device" | "alias" | "mobile" | null;
+
+/** 需要二次确认的详情页操作（弹层确认后执行）。 */
+type ConfirmableAction = "credentials" | "reset-device" | "remove";
 
 /**
  * 单账号详情独立视图：基础信息 -> 登录健康度 -> 操作区 -> 折叠技术细节。
@@ -47,6 +52,8 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
   const [busy, setBusy] = useState<DetailAction>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // 待确认操作：非空即弹出统一确认弹层（ConfirmDialog）。
+  const [pendingAction, setPendingAction] = useState<ConfirmableAction | null>(null);
   // U-1 备注名草稿：进入详情时以档案值为准；外部数据刷新时同步重置。
   const [aliasDraft, setAliasDraft] = useState(entry.display_name ?? "");
   useEffect(() => {
@@ -108,17 +115,89 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
   }), [entry.profile_id, onDataChanged, runAction]);
 
   // 手动刷新登录凭据：只执行同设备换发，成功后写回本机加密凭据与 TRAE 登录 blob。
-  const handleRefreshCredentials = useCallback(() => void runAction("credentials", async () => {
-    const results = await invoke<CredentialRefreshEntryDto[]>("refresh_checkin_credentials", {
-      profileIds: [entry.profile_id],
-    });
-    const result = results[0];
-    if (!result?.refreshed) {
-      throw new Error(result?.error_code ?? "credential_refresh_failed");
+  // 入口只负责打开二次确认弹层，执行体在 executePendingAction。
+  const handleRefreshCredentials = useCallback(() => {
+    setPendingAction("credentials");
+  }, []);
+
+  // 重铸签到设备（ADR-0019 v5）：走网络完整流程（GetPCAuthCode →
+  // ExchangeToken → 凭据写回）；连续多日 9074/9095 时的人工兜底，
+  // 确认后执行（更换设备绑定与登录令牌）。入口只负责打开二次确认弹层。
+  const handleResetDevice = useCallback(() => {
+    setPendingAction("reset-device");
+  }, []);
+
+  // 删除账号：破坏性操作，二次确认（铁律：单次确认后执行）。入口只负责打开弹层。
+  const handleRemove = useCallback(() => {
+    setPendingAction("remove");
+  }, []);
+
+  // 确认弹层内容：标题 + 影响范围行 + 按钮形态（破坏性用危险色）。
+  const pendingActionMeta = pendingAction === null ? null : {
+    credentials: {
+      title: "刷新登录凭据",
+      lines: [
+        `将为账号“${entry.screen_name}”向服务端换发新的登录令牌，并更新本机保存的登录信息。`,
+        "期间不会打开新的登录页面。",
+      ],
+      confirmLabel: "刷新凭据",
+      busyLabel: "刷新中…",
+      danger: false,
+    },
+    "reset-device": {
+      title: "重置签到设备",
+      lines: [
+        `确定为账号“${entry.screen_name}”重置签到设备吗？`,
+        "将通过服务端生成全新设备并更新登录信息；不影响账号与其他数据。",
+      ],
+      confirmLabel: "重置设备",
+      busyLabel: "重置中…",
+      danger: false,
+    },
+    remove: {
+      title: "删除账号",
+      lines: [
+        `确定删除账号“${entry.screen_name}”吗？`,
+        "将移除：账号档案、本机加密登录凭据、积分缓存。",
+        "不影响其他账号与历史数据，删除后可通过重新登录找回。",
+      ],
+      confirmLabel: "删除",
+      busyLabel: "删除中…",
+      danger: true,
+    },
+  }[pendingAction];
+
+  // 确认后关闭弹层并执行对应操作（页面按钮同步进入 busy 态，失败信息走页面错误条）。
+  const executePendingAction = useCallback(() => {
+    const action = pendingAction;
+    if (!action) return;
+    setPendingAction(null);
+    if (action === "credentials") {
+      void runAction("credentials", async () => {
+        const results = await invoke<CredentialRefreshEntryDto[]>("refresh_checkin_credentials", {
+          profileIds: [entry.profile_id],
+        });
+        const result = results[0];
+        if (!result?.refreshed) {
+          throw new Error(result?.error_code ?? "credential_refresh_failed");
+        }
+        await onDataChanged();
+        setMessage("登录凭据已更新，无需重新登录。");
+      });
+    } else if (action === "reset-device") {
+      void runAction("reset-device", async () => {
+        await invoke("reset_checkin_device", { profileId: entry.profile_id });
+        await onDataChanged();
+        setMessage("签到设备已重置，下次签到将使用新设备。");
+      });
+    } else {
+      void runAction("remove", async () => {
+        await invoke("remove_checkin_account", { profileId: entry.profile_id });
+        await onDataChanged();
+        onBack();
+      });
     }
-    await onDataChanged();
-    setMessage("登录凭据已更新，无需重新登录。");
-  }), [entry.profile_id, onDataChanged, runAction]);
+  }, [pendingAction, entry.profile_id, onDataChanged, onBack, runAction]);
 
   // 立即签到：单账号批次，当日已签（缓存确认）时按钮禁用并显示已签状态。
   const checkedIn = entry.checked_in === true;
@@ -140,34 +219,6 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
       throw new Error("checkin_failed");
     }
   }), [entry.profile_id, onDataChanged, runAction]);
-
-  // 重铸签到设备（ADR-0019 v5）：走网络完整流程（GetPCAuthCode →
-  // ExchangeToken → 凭据写回）；连续多日 9074/9095 时的人工兜底，
-  // 确认后执行（更换设备绑定与登录令牌）。
-  const handleResetDevice = useCallback(() => {
-    const confirmed = window.confirm(
-      `确定为账号“${entry.screen_name}”重置签到设备吗？\n将通过服务端生成全新设备并更新登录信息；不影响账号与其他数据。`,
-    );
-    if (!confirmed) return;
-    void runAction("reset-device", async () => {
-      await invoke("reset_checkin_device", { profileId: entry.profile_id });
-      await onDataChanged();
-      setMessage("签到设备已重置，下次签到将使用新设备。");
-    });
-  }, [entry.profile_id, entry.screen_name, onDataChanged, runAction]);
-
-  // 删除账号：破坏性操作，先 window.confirm 二次确认（铁律：单次确认后执行）。
-  const handleRemove = useCallback(() => {
-    const confirmed = window.confirm(
-      `确定删除账号“${entry.screen_name}”吗？\n将移除：账号档案、本机加密登录凭据、积分缓存。\n不影响其他账号与历史数据，删除后可通过重新登录找回。`,
-    );
-    if (!confirmed) return;
-    void runAction("remove", async () => {
-      await invoke("remove_checkin_account", { profileId: entry.profile_id });
-      await onDataChanged();
-      onBack();
-    });
-  }, [entry.profile_id, entry.screen_name, onDataChanged, onBack, runAction]);
 
   const handleRelogin = useCallback(() => {
     void runAction("relogin", async () => {
@@ -419,6 +470,20 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
           </div>
         </dl>
       </details>
+
+      {/* 二次确认弹层：刷新凭据 / 重置设备 / 删除账号共用（与全工具确认形态统一）。 */}
+      {pendingActionMeta && (
+        <ConfirmDialog
+          title={pendingActionMeta.title}
+          lines={pendingActionMeta.lines}
+          confirmLabel={pendingActionMeta.confirmLabel}
+          busyLabel={pendingActionMeta.busyLabel}
+          danger={pendingActionMeta.danger}
+          onCancel={() => setPendingAction(null)}
+          onConfirm={executePendingAction}
+          testId={`account-detail-${pendingAction}-confirm`}
+        />
+      )}
     </section>
   );
 }

@@ -144,16 +144,6 @@ export async function installMockBridge(
       history_is_separate: true,
     };
 
-    const KEY_STATUS = {
-      source_key_configured: true,
-      source_key_version: "work-cn-baseline-v1",
-      source_key_pending_version: null,
-      source_key_activation_pending: false,
-      catalog_key_configured: true,
-      catalog_key_generation: 1,
-      probe_state: "not_probed",
-    };
-
     // init script 内共享时间基准（P5-3 fixture 相对时间都用它）。
     const NOW_LOCAL = Math.floor(Date.now() / 1000);
     const DAY = 86400;
@@ -497,7 +487,6 @@ export async function installMockBridge(
         return WS;
       }
       if (cmd === "get_managed_account_state") return MANAGED_ACCOUNT_STATE;
-      if (cmd === "get_key_status") return KEY_STATUS;
       if (cmd === "get_checkin_capability") {
         const realHttpEnabled = scn.realHttp === true;
         return {
@@ -909,15 +898,6 @@ export async function installMockBridge(
       }
       if (cmd === "cancel_checkin") return true;
       if (cmd === "refresh_managed_current_account") return MANAGED_ACCOUNT_STATE;
-      if (cmd === "probe_source_key") return { ...KEY_STATUS, probe_state: "verified" };
-      if (cmd === "register_source_key_candidate") {
-        return {
-          ...KEY_STATUS,
-          source_key_pending_version: "work-cn-candidate-v1",
-          source_key_activation_pending: true,
-          probe_state: "verified_pending",
-        };
-      }
       // Tauri event 插件 command 只返回句柄，不产生真实事件；页面会继续用轮询兜底。
       if (cmd === "plugin:event|listen") return 0;
       if (cmd === "plugin:event|unlisten") return null;

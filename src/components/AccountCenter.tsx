@@ -25,6 +25,7 @@ import {
 } from "./StatusBadges";
 import { OperationResultCard, type OperationResultIssue } from "./OperationResultCard";
 import { MasterSwitchDialog, type MasterSwitchTarget } from "./MasterSwitchDialog";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface AccountCenterProps {
   /** 页面可见时才发起账号状态读取，避免后台 IPC。 */
@@ -102,6 +103,16 @@ export function AccountCenter({ active }: AccountCenterProps) {
   const [mobilePromptValue, setMobilePromptValue] = useState("");
   const [mobilePromptBusy, setMobilePromptBusy] = useState(false);
   const [mobilePromptError, setMobilePromptError] = useState<string | null>(null);
+  // 批量刷新凭据二次确认弹层开关（确认后执行，防误触大范围换发）。
+  const [credentialConfirmOpen, setCredentialConfirmOpen] = useState(false);
+  // G11 查重命中：待确认的重复手机号保存请求（统一确认弹层）。
+  const [duplicateMobile, setDuplicateMobile] = useState<{
+    profileId: string;
+    mobile: string;
+    ownerName: string;
+    /** 从 G11 补录弹层发起：确认保存成功后一并关闭补录弹层。 */
+    closePrompt: boolean;
+  } | null>(null);
 
   const load = useCallback(async () => {
     const nextView = await invoke<ManagedAccountsViewDto>("get_managed_account_state");
@@ -298,7 +309,7 @@ export function AccountCenter({ active }: AccountCenterProps) {
 
   // G11 保存补录手机号：第三层查重在前端提示确认（前两层格式/脱敏比对在后端命令）。
   // 空串 = 清除补录（详情页“清空保存”路径；登录弹层保存按钮空值时禁用不会走到）。
-  // 返回 false = 用户取消（重复号拒绝保存）；错误原样抛出由调用方映射文案。
+  // 返回 false = 查重命中待弹层确认（或用户取消）；错误原样抛出由调用方映射文案。
   const saveMobileBackfill = useCallback(async (profileId: string, mobile: string) => {
     const trimmed = mobile.trim();
     if (trimmed !== "") {
@@ -306,16 +317,45 @@ export function AccountCenter({ active }: AccountCenterProps) {
         (entry) => entry.profile_id !== profileId && entry.mobile_full === trimmed,
       );
       if (owner) {
-        const confirmed = window.confirm(
-          `该手机号已用于账号“${effectiveDisplayName(owner)}”，仍要保存到当前账号吗？`,
-        );
-        if (!confirmed) return false;
+        // 查重命中：弹统一确认弹层，返回 false（本次未保存，由弹层确认后续走）。
+        setDuplicateMobile({
+          profileId,
+          mobile: trimmed,
+          ownerName: effectiveDisplayName(owner),
+          closePrompt: mobilePrompt !== null,
+        });
+        return false;
       }
     }
     await invoke("set_account_mobile", { profileId, mobile: trimmed === "" ? null : trimmed });
     await refreshOverview();
     return true;
-  }, [overview, refreshOverview]);
+  }, [overview, mobilePrompt, refreshOverview]);
+
+  // 查重确认：坚持把该手机号保存到当前账号。
+  const confirmDuplicateMobile = useCallback(() => {
+    const request = duplicateMobile;
+    if (!request) return;
+    setDuplicateMobile(null);
+    if (request.closePrompt) setMobilePromptBusy(true);
+    void (async () => {
+      try {
+        await invoke("set_account_mobile", { profileId: request.profileId, mobile: request.mobile });
+        await refreshOverview();
+        // 列表场景回写成功反馈；详情页场景由数据刷新呈现新号码。
+        setMessage("手机号已保存，账号列表与详情页都会显示完整号码。");
+        // 补录弹层发起的：保存成功后与原流程一致，一并关闭。
+        if (request.closePrompt) setMobilePrompt(null);
+      } catch (reason: unknown) {
+        // 失败：补录弹层场景回弹层内提示；详情页场景回页面错误条。
+        const text = safeUiErrorMessage(reason, "手机号保存未完成，请稍后重试。");
+        if (request.closePrompt) setMobilePromptError(text);
+        else setError(text);
+      } finally {
+        if (request.closePrompt) setMobilePromptBusy(false);
+      }
+    })();
+  }, [duplicateMobile, refreshOverview]);
 
   // G11 补录弹层保存：成功后关弹层；失败保留弹层与输入值，映射后的文案就地展示。
   const handleMobilePromptSave = useCallback(() => {
@@ -382,7 +422,15 @@ export function AccountCenter({ active }: AccountCenterProps) {
   }, [creditsBusy, overview, refreshOverview]);
 
   // 批量刷新登录凭据：逐账号执行同设备换发，不打开用户 OAuth、不签到、不过问额度。
+  // 入口只负责打开二次确认弹层（批量换发写回全部账号本机登录信息，防误触），执行体在下方。
   const handleRefreshAllCredentials = useCallback(() => {
+    if (credentialRefreshBusy || overview.length === 0) return;
+    setCredentialConfirmOpen(true);
+  }, [credentialRefreshBusy, overview.length]);
+
+  // 批量刷新凭据确认后执行。
+  const executeRefreshAllCredentials = useCallback(() => {
+    setCredentialConfirmOpen(false);
     if (credentialRefreshBusy || overview.length === 0) return;
     setCredentialRefreshBusy(true);
     setError(null);
@@ -462,6 +510,41 @@ export function AccountCenter({ active }: AccountCenterProps) {
 
   // G11 登录后手机号补录弹层（共享 JSX）：列表视图与详情视图都渲染——
   // 从详情页发起重新登录时弹层不再滞留到返回列表后才出现。
+
+  // 批量刷新凭据二次确认弹层（仅列表视图渲染——入口按钮只在列表页头部）。
+  const credentialConfirmDialog = credentialConfirmOpen && (
+    <ConfirmDialog
+      title="刷新全部账号凭据"
+      lines={[
+        `将为全部 ${overview.length} 个账号逐个向服务端换发新的登录令牌，并更新本机保存的登录信息。`,
+        "期间不会打开新的登录页面。",
+      ]}
+      confirmLabel="刷新凭据"
+      busyLabel="刷新中…"
+      busy={credentialRefreshBusy}
+      onCancel={() => setCredentialConfirmOpen(false)}
+      onConfirm={executeRefreshAllCredentials}
+      testId="account-refresh-credentials-confirm"
+    />
+  );
+
+  // G11 查重确认弹层：列表与详情视图都渲染（与 mobilePromptDialog 同模式）。
+  const duplicateMobileDialog = duplicateMobile && (
+    <ConfirmDialog
+      title="手机号已被其他账号使用"
+      lines={[
+        `该手机号已用于账号“${duplicateMobile.ownerName}”。`,
+        "仍要保存到当前账号吗？两个账号将显示同一手机号。",
+      ]}
+      confirmLabel="仍要保存"
+      busyLabel="保存中…"
+      busy={mobilePromptBusy}
+      onCancel={() => setDuplicateMobile(null)}
+      onConfirm={confirmDuplicateMobile}
+      testId="account-mobile-duplicate-confirm"
+    />
+  );
+
   const mobilePromptDialog = mobilePrompt && (
     <div className="switch-veil" role="presentation">
       <div className="mobile-prompt" role="dialog" aria-modal="true" aria-labelledby="mobile-prompt-title" data-testid="mobile-backfill-dialog">
@@ -553,6 +636,7 @@ export function AccountCenter({ active }: AccountCenterProps) {
           onBack={() => setSelectedProfileId("")}
         />
         {mobilePromptDialog}
+        {duplicateMobileDialog}
       </>
     );
   }
@@ -779,6 +863,10 @@ export function AccountCenter({ active }: AccountCenterProps) {
 
       {/* G11 登录后手机号补录弹层：共享变量（详情视图同样渲染）。 */}
       {mobilePromptDialog}
+      {duplicateMobileDialog}
+
+      {/* 批量刷新凭据二次确认弹层（入口按钮在列表页头部）。 */}
+      {credentialConfirmDialog}
     </section>
   );
 }

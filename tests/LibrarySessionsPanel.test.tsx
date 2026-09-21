@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+﻿import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { LibrarySessionsPanel } from "../src/components/LibrarySessionsPanel";
@@ -658,12 +658,15 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
   it("勾选项目后可归档项目下的全部会话", async () => {
     setupMutableHistory();
     render(<LibrarySessionsPanel active />);
-    await screen.findByTestId("library-project-p1");
+    await expandProject("p1");
 
     fireEvent.click(screen.getByTestId("library-select-mode"));
     fireEvent.click(screen.getByTestId("library-project-p1"));
 
-    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 0 个会话 · 1 个项目");
+    expect(screen.getByTestId("library-project-p1")).toHaveClass("lib-project--checked");
+    expect(screen.getByTestId("library-session-s1")).toHaveClass("lib-session--checked");
+    expect(screen.getByTestId("library-session-s2")).toHaveClass("lib-session--checked");
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 2 个会话 · 1 个项目");
     expect(screen.getByTestId("batch-archive")).not.toBeDisabled();
 
     fireEvent.click(screen.getByTestId("batch-archive"));
@@ -675,6 +678,34 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
         libraryId: "master",
       });
     });
+  });
+
+  it("取消项目中的一个会话会取消项目选择，但保留其他会话选择", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-project-p1"));
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+
+    expect(screen.getByTestId("library-project-p1")).not.toHaveClass("lib-project--checked");
+    expect(screen.getByTestId("library-session-s1")).not.toHaveClass("lib-session--checked");
+    expect(screen.getByTestId("library-session-s2")).toHaveClass("lib-session--checked");
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 1 个会话 · 0 个项目");
+  });
+
+  it("手动选中项目全部会话时不自动选中项目", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    fireEvent.click(screen.getByTestId("library-session-s2"));
+
+    expect(screen.getByTestId("library-project-p1")).not.toHaveClass("lib-project--checked");
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 2 个会话 · 0 个项目");
   });
 
   it("勾选项目后删除确认包含项目下全部会话", async () => {
@@ -689,7 +720,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     const dialog = await screen.findByTestId("delete-confirm");
     expect(dialog).toHaveTextContent("删除 2 个会话");
     expect(dialog).toHaveTextContent("共 13 条消息");
-    fireEvent.click(screen.getByTestId("delete-confirm-ok"));
+    fireEvent.click(screen.getByTestId("delete-confirm-confirm"));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("delete_master_sessions", {
@@ -805,7 +836,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
 
     // 再次发起并确认 → 真实删除 + 退出选择模式
     fireEvent.click(screen.getByTestId("batch-delete"));
-    fireEvent.click(await screen.findByTestId("delete-confirm-ok"));
+    fireEvent.click(await screen.findByTestId("delete-confirm-confirm"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("delete_master_sessions", {
         sessionIds: ["s1"],
@@ -889,12 +920,45 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.getByTestId("library-session-s10")).toBeInTheDocument();
   });
 
+  it("归档视图项目支持折叠，仍按项目分类展示会话", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active />);
+    fireEvent.click(await screen.findByTestId("library-archive-entry"));
+
+    const project = await screen.findByTestId("library-archive-project-p2");
+    expect(project).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("library-session-s3")).toBeInTheDocument();
+
+    fireEvent.click(project);
+    expect(project).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("library-session-s3")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(project);
+    expect(project).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("library-session-s3")).toHaveClass("lib-session--checked");
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 1 个会话 · 1 个项目");
+  });
+
   it("归档视图勾选项目后可恢复项目下全部归档会话", async () => {
     setupMutableHistory();
     render(<LibrarySessionsPanel active />);
     fireEvent.click(await screen.findByTestId("library-archive-entry"));
     fireEvent.click(screen.getByTestId("library-select-mode"));
     fireEvent.click(screen.getByTestId("library-archive-project-p2"));
+
+    expect(screen.getByTestId("library-archive-project-p2")).toHaveClass("lib-project--checked");
+    expect(screen.getByTestId("library-session-s3")).toHaveClass("lib-session--checked");
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 1 个会话 · 1 个项目");
+
+    fireEvent.click(screen.getByTestId("library-session-s3"));
+    expect(screen.getByTestId("library-archive-project-p2")).not.toHaveClass("lib-project--checked");
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 0 个会话 · 0 个项目");
+
+    fireEvent.click(screen.getByTestId("library-session-s3"));
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 1 个会话 · 0 个项目");
+    fireEvent.click(screen.getByTestId("library-archive-project-p2"));
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 1 个会话 · 1 个项目");
 
     expect(screen.getByTestId("batch-restore")).not.toBeDisabled();
     fireEvent.click(screen.getByTestId("batch-restore"));
@@ -952,7 +1016,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-select-mode"));
     fireEvent.click(screen.getByTestId("library-project-p1"));
     fireEvent.click(screen.getByTestId("library-project-p2"));
-    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 0 个会话 · 2 个项目");
+    expect(screen.getByTestId("batch-count")).toHaveTextContent("已选 4 个会话 · 2 个项目");
 
     // 打开确认弹层：默认保留第一个项目（p1）→ 移动 p2 的 3 个会话
     fireEvent.click(screen.getByTestId("batch-merge"));
@@ -968,7 +1032,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(dialog).toHaveTextContent("2 个会话将移入保留的项目（含已归档）");
 
     // 确认合并 → 调用后端（备份 + 事务改挂，带库参数）
-    fireEvent.click(screen.getByTestId("merge-confirm-ok"));
+    fireEvent.click(screen.getByTestId("merge-confirm-confirm"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("merge_master_projects", {
         sourceProjectIds: ["p1"],
@@ -1008,7 +1072,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-project-p1"));
     fireEvent.click(screen.getByTestId("library-project-p2"));
     fireEvent.click(screen.getByTestId("batch-merge"));
-    fireEvent.click(await screen.findByTestId("merge-confirm-ok"));
+    fireEvent.click(await screen.findByTestId("merge-confirm-confirm"));
 
     // 错误以自然语言提示（master_merge_running 的映射文案）
     await waitFor(() => {

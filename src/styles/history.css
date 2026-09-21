@@ -340,11 +340,11 @@
 }
 
 .lib-tree--archive .lib-project {
-  cursor: default;
+  cursor: pointer;
 }
 
 .lib-tree--archive .lib-project:hover {
-  background: transparent;
+  background: var(--fill-soft);
 }
 
 .lib-tree--archive .lib-project__name {
@@ -815,77 +815,13 @@
 }
 
 /* ============================================================
-   确认弹层骨架（删除/合并共用：遮罩 + 玻璃卡 + 底部动作条）
+   确认弹层正文样式（在统一 ConfirmDialog 的 children 中使用：
+   删除会话清单 / 合并项目单选列表；弹层骨架统一走 switch-dialog 家族）
    ============================================================ */
-.preview-veil {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(26, 34, 51, 0.18);
-  backdrop-filter: blur(3px);
-  -webkit-backdrop-filter: blur(3px);
-}
-
-.preview {
-  display: flex;
-  flex-direction: column;
-  width: min(680px, 92vw);
-  max-height: 82vh;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-panel);
-  background: var(--glass-dense);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  box-shadow: var(--shadow-float);
-  overflow: hidden;
-}
-
-.preview__head {
-  flex: none;
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 16px 20px 13px;
-  border-bottom: 1px solid var(--line-hair);
-}
-
-.preview__head-main {
-  flex: 1;
-  min-width: 0;
-}
-
-.preview__title {
-  font-size: 15px;
-  font-weight: 700;
-}
-
-.preview__meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 5px;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-
-.preview__body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 16px 20px;
-}
-
-/* —— 删除二次确认弹窗（复用 preview 骨架 + 底部动作条） —— */
-.confirm-dialog {
-  width: min(460px, 92vw);
-}
 
 .confirm-dialog__text {
-  margin: 0 0 10px;
+  /* switch-dialog 骨架为 grid gap 布局，这里不再额外压底部间距 */
+  margin: 0;
   font-size: 12.5px;
   color: var(--text-2);
 }
@@ -942,15 +878,6 @@
 .merge-choice__meta {
   color: var(--text-3);
   font-size: 11.5px;
-}
-
-.confirm-dialog__foot {
-  flex: none;
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 18px;
-  border-top: 1px solid var(--line-hair);
 }
 
 /* —— 窄视口降级：左栏收窄为可滚动区块 —— */

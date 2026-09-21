@@ -317,6 +317,39 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /master_incorporate_join_failed/i,
     "归入操作未能完成，请稍后重试。",
   ],
+  // ===== P5-5 清理空项目（体检诊断口径的空壳行，破坏性 + 自动备份）=====
+  [
+    /cleanup_master_busy/i,
+    "主库正在生成回复，清理需等它完成；稍后重试即可。",
+  ],
+  [
+    /cleanup_master_nothing_to_do/i,
+    "没有可清理的空项目记录，无需操作。",
+  ],
+  [
+    /cleanup_master_no_current_account/i,
+    "当前账号信息不可用，请先在环境页确认账号后再清理。",
+  ],
+  [
+    /cleanup_master_close_failed/i,
+    "主库窗口未能关闭，本次未做任何修改；请手动关闭后重试。",
+  ],
+  [
+    /cleanup_master_read_failed/i,
+    "主库对话库暂时无法读取，请稍后重试。",
+  ],
+  [
+    /cleanup_master_open_failed|cleanup_master_write_failed/i,
+    "清理未完成，数据保持操作前状态；请稍后重试。",
+  ],
+  [
+    /cleanup_master_backup_failed/i,
+    "清理前的自动备份未完成，已取消本次操作；请稍后重试。",
+  ],
+  [
+    /cleanup_master_join_failed/i,
+    "清理操作未能完成，请稍后重试。",
+  ],
   [
     /master_current_account_unavailable/i,
     "主库当前登录账号未确认，请先在环境页确认账号后重试。",

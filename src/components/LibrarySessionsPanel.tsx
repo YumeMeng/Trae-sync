@@ -31,6 +31,7 @@ import type {
 } from "../types/history";
 import type { SessionMessageDto } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 // ============================================================================
 // 库对话面板（G21 两栏式 + G22 统一选择模式，ADR-0025 Library 抽象）
@@ -149,6 +150,10 @@ export function LibrarySessionsPanel({
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(new Set());
   // 归档视图（同一棵树灰显，层级 模式 → 项目 → 会话）。
   const [archiveView, setArchiveView] = useState(false);
+  // 归档页项目文件夹默认展开；用户可单独折叠每个模式下的项目。
+  const [archiveCollapsedProjectKeys, setArchiveCollapsedProjectKeys] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   // 右栏查看器（null = 空态引导）。
   const [viewer, setViewer] = useState<ViewerState | null>(null);
   const [viewerTab, setViewerTab] = useState<"messages" | "relay">("messages");
@@ -616,32 +621,59 @@ export function LibrarySessionsPanel({
     setSelectedProjectIds(new Set());
   }, []);
 
-  /** 项目行统一切换选择；展示合并组一次勾选其下全部真实项目。 */
+  /** 项目行统一切换选择；项目选择同时覆盖当前视图中的全部子会话。 */
   const toggleProjectSelection = useCallback(
     (projectIds: readonly string[]) => {
       if (projectIds.length === 0) return;
+      const selectableSessions = archiveView ? archivedSessions : liveSessions;
+      const projectIdSet = new Set(projectIds);
+      const projectSessionIds = selectableSessions
+        .filter((session) => projectIdSet.has(session.project_id))
+        .map((session) => session.session_id);
+      const allSelected = projectIds.every((projectId) => selectedProjectIds.has(projectId));
+
       setSelectedProjectIds((current) => {
         const next = new Set(current);
-        const allSelected = projectIds.every((projectId) => next.has(projectId));
         for (const projectId of projectIds) {
           if (allSelected) next.delete(projectId);
           else next.add(projectId);
         }
         return next;
       });
+
+      setSelectedSessionIds((current) => {
+        const next = new Set(current);
+        for (const sessionId of projectSessionIds) {
+          if (allSelected) next.delete(sessionId);
+          else next.add(sessionId);
+        }
+        return next;
+      });
     },
-    [],
+    [archiveView, archivedSessions, liveSessions, selectedProjectIds],
   );
 
-  /** 勾选切换（项目行/会话行共用）。 */
-  const toggleInSet = useCallback(
-    (id: string, current: ReadonlySet<string>, setter: (next: ReadonlySet<string>) => void) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      setter(next);
+  /** 手动切换会话；取消项目中的任一会话时同步取消项目勾选。 */
+  const toggleSessionSelection = useCallback(
+    (sessionId: string) => {
+      const selectableSessions = archiveView ? archivedSessions : liveSessions;
+      const session = selectableSessions.find((item) => item.session_id === sessionId);
+      setSelectedSessionIds((current) => {
+        const next = new Set(current);
+        if (next.has(sessionId)) next.delete(sessionId);
+        else next.add(sessionId);
+        return next;
+      });
+      if (session) {
+        setSelectedProjectIds((current) => {
+          if (!current.has(session.project_id)) return current;
+          const next = new Set(current);
+          next.delete(session.project_id);
+          return next;
+        });
+      }
     },
-    [],
+    [archiveView, archivedSessions, liveSessions],
   );
 
   const toggleExpand = useCallback((projectId: string) => {
@@ -649,6 +681,15 @@ export function LibrarySessionsPanel({
       const next = new Set(current);
       if (next.has(projectId)) next.delete(projectId);
       else next.add(projectId);
+      return next;
+    });
+  }, []);
+
+  const toggleArchiveProject = useCallback((projectKey: string) => {
+    setArchiveCollapsedProjectKeys((current) => {
+      const next = new Set(current);
+      if (next.has(projectKey)) next.delete(projectKey);
+      else next.add(projectKey);
       return next;
     });
   }, []);
@@ -927,6 +968,12 @@ export function LibrarySessionsPanel({
     const activate = () => {
       if (selectMode) {
         toggleProjectSelection([group.id]);
+        // 选中项目后立即展开，用户可以看到项目下的全量会话已同步勾选。
+        setExpandedIds((current) => {
+          const next = new Set(current);
+          next.add(group.id);
+          return next;
+        });
       } else {
         toggleExpand(group.id);
       }
@@ -975,9 +1022,7 @@ export function LibrarySessionsPanel({
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
                 showQuickArchive={!selectMode}
-                onToggle={(sessionId) =>
-                  toggleInSet(sessionId, selectedSessionIds, setSelectedSessionIds)
-                }
+                onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
               />
@@ -994,8 +1039,15 @@ export function LibrarySessionsPanel({
     const projectChecked =
       unlinkedProjectIds.length > 0 && unlinkedProjectIds.every((projectId) => selectedProjectIds.has(projectId));
     const activate = () => {
-      if (selectMode) toggleProjectSelection(unlinkedProjectIds);
-      else toggleExpand(UNLINKED_GROUP_ID);
+      if (selectMode) {
+        toggleProjectSelection(unlinkedProjectIds);
+        // 合并展示组选择后展开，便于确认其下真实项目的会话选择结果。
+        setExpandedIds((current) => {
+          const next = new Set(current);
+          next.add(UNLINKED_GROUP_ID);
+          return next;
+        });
+      } else toggleExpand(UNLINKED_GROUP_ID);
     };
     return (
       <div className="lib-branch" key={UNLINKED_GROUP_ID}>
@@ -1040,9 +1092,7 @@ export function LibrarySessionsPanel({
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
                 showQuickArchive={!selectMode}
-                onToggle={(sessionId) =>
-                  toggleInSet(sessionId, selectedSessionIds, setSelectedSessionIds)
-                }
+                onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
               />
@@ -1206,27 +1256,46 @@ export function LibrarySessionsPanel({
                     {[...groups.entries()].map(([projectId, sessions]) => {
                       const selectableProjectIds =
                         projectId === UNLINKED_GROUP_ID ? unlinkedProjectIds : [projectId];
+                      const archiveProjectKey = `${mode}\u0000${projectId}`;
+                      const expanded = !archiveCollapsedProjectKeys.has(archiveProjectKey);
                       const projectChecked =
                         selectableProjectIds.length > 0 &&
                         selectableProjectIds.every((id) => selectedProjectIds.has(id));
                       const activate = () => {
-                        if (selectMode) toggleProjectSelection(selectableProjectIds);
+                        if (selectMode) {
+                          toggleProjectSelection(selectableProjectIds);
+                          // 选中折叠项目时展开，确保全量子会话的勾选结果可见。
+                          setArchiveCollapsedProjectKeys((current) => {
+                            if (!current.has(archiveProjectKey)) return current;
+                            const next = new Set(current);
+                            next.delete(archiveProjectKey);
+                            return next;
+                          });
+                        } else toggleArchiveProject(archiveProjectKey);
                       };
                       return (
                         <div className="lib-branch" key={projectId}>
                           <div
                             className={`lib-project${projectChecked ? " lib-project--checked" : ""}`}
-                            role={selectMode ? "button" : undefined}
-                            tabIndex={selectMode ? 0 : undefined}
+                            role="button"
+                            tabIndex={0}
+                            aria-expanded={expanded}
                             aria-pressed={selectMode ? projectChecked : undefined}
-                            onClick={selectMode ? activate : undefined}
+                            onClick={activate}
                             onKeyDown={(event) => {
-                              if (!selectMode || (event.key !== "Enter" && event.key !== " ")) return;
+                              if (event.key !== "Enter" && event.key !== " ") return;
                               event.preventDefault();
                               activate();
                             }}
                             data-testid={`library-archive-project-${projectId}`}
                           >
+                            <span className="lib-project__chevron" aria-hidden="true">
+                              {expanded ? (
+                                <ChevronDown size={14} strokeWidth={1.8} />
+                              ) : (
+                                <ChevronRight size={14} strokeWidth={1.8} />
+                              )}
+                            </span>
                             <span className="lib-project__icon" aria-hidden="true">
                               <FolderClosed size={15} strokeWidth={1.8} />
                             </span>
@@ -1238,22 +1307,22 @@ export function LibrarySessionsPanel({
                             <span className="lib-project__name">{projectName(projectId)}</span>
                             <span className="lib-project__count">{sessions.length}</span>
                           </div>
-                          <div className="lib-sessions">
-                            {sessions.map((session) => (
-                              <TreeSessionRow
-                                key={session.session_id}
-                                session={session}
-                                selectMode={selectMode}
-                                checked={selectedSessionIds.has(session.session_id)}
-                                showQuickArchive={false}
-                                onToggle={(sessionId) =>
-                                  toggleInSet(sessionId, selectedSessionIds, setSelectedSessionIds)
-                                }
-                                onOpen={(target) => void openSession(target)}
-                                onQuickArchive={() => undefined}
-                              />
-                            ))}
-                          </div>
+                          {expanded && (
+                            <div className="lib-sessions">
+                              {sessions.map((session) => (
+                                <TreeSessionRow
+                                  key={session.session_id}
+                                  session={session}
+                                  selectMode={selectMode}
+                                  checked={selectedSessionIds.has(session.session_id)}
+                                  showQuickArchive={false}
+                                  onToggle={toggleSessionSelection}
+                                  onOpen={(target) => void openSession(target)}
+                                  onQuickArchive={() => undefined}
+                                />
+                              ))}
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -1807,7 +1876,8 @@ function RelayTab({
 }
 
 // ============================================================================
-// 删除确认弹窗：列明规模，确认后执行真实删除（后端先备份）
+// 删除确认弹窗：列明规模，确认后执行真实删除（后端先备份）。
+// 统一 ConfirmDialog 形态：会话清单作为自定义正文。
 // ============================================================================
 
 function DeleteConfirmDialog({
@@ -1821,64 +1891,34 @@ function DeleteConfirmDialog({
 }) {
   const totalMessages = sessions.reduce((sum, session) => sum + session.message_count, 0);
   return (
-    <div
-      className="preview-veil preview-veil--open"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onCancel();
-      }}
-      data-testid="delete-confirm"
+    <ConfirmDialog
+      title={`删除 ${sessions.length} 个会话`}
+      confirmLabel="确认删除"
+      confirmIcon={<Trash2 size={15} aria-hidden="true" />}
+      busyLabel="删除中…"
+      danger
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+      testId="delete-confirm"
     >
-      <div
-        className="preview confirm-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="确认删除会话"
-      >
-        <div className="preview__head">
-          <div className="preview__head-main">
-            <div className="preview__title">删除 {sessions.length} 个会话</div>
-            <div className="preview__meta">
-              <span>共 {totalMessages} 条消息</span>
-              <span>删除前会自动备份</span>
-            </div>
-          </div>
-          <button className="btn" type="button" onClick={onCancel} data-testid="delete-confirm-cancel">
-            <X size={15} aria-hidden="true" />取消
-          </button>
-        </div>
-        <div className="preview__body">
-          <p className="confirm-dialog__text">
-            删除后这些会话将永久移除，无法在应用内恢复（备份文件保留，可人工恢复）。
-          </p>
-          <ul className="confirm-dialog__list">
-            {sessions.map((session) => (
-              <li key={session.session_id} data-testid={`delete-confirm-item-${session.session_id}`}>
-                {session.title?.trim() || "未命名会话"}
-                <span> · {session.message_count} 条消息</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div className="confirm-dialog__foot">
-          <button className="btn" type="button" onClick={onCancel}>
-            取消
-          </button>
-          <button
-            className="btn btn--danger"
-            type="button"
-            onClick={onConfirm}
-            data-testid="delete-confirm-ok"
-          >
-            <Trash2 size={15} aria-hidden="true" />确认删除
-          </button>
-        </div>
-      </div>
-    </div>
+      <p className="confirm-dialog__text">
+        共 {totalMessages} 条消息，删除前会自动备份。删除后这些会话将永久移除，无法在应用内恢复（备份文件保留，可人工恢复）。
+      </p>
+      <ul className="confirm-dialog__list">
+        {sessions.map((session) => (
+          <li key={session.session_id} data-testid={`delete-confirm-item-${session.session_id}`}>
+            {session.title?.trim() || "未命名会话"}
+            <span> · {session.message_count} 条消息</span>
+          </li>
+        ))}
+      </ul>
+    </ConfirmDialog>
   );
 }
 
 // ============================================================================
-// 合并确认弹窗：选择保留的项目，其余项目会话全部并入（后端先备份）
+// 合并确认弹窗：选择保留的项目，其余项目会话全部并入（后端先备份）。
+// 统一 ConfirmDialog 形态：单选项目列表作为自定义正文，确认回调带保留目标。
 // ============================================================================
 
 function MergeConfirmDialog({
@@ -1902,70 +1942,39 @@ function MergeConfirmDialog({
     .filter((project) => project.project_id !== target?.project_id)
     .reduce((sum, project) => sum + (sessionCounts.get(project.project_id) ?? 0), 0);
   return (
-    <div
-      className="preview-veil preview-veil--open"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onCancel();
-      }}
-      data-testid="merge-confirm"
+    <ConfirmDialog
+      title={`合并 ${projects.length} 个项目`}
+      confirmLabel="确认合并"
+      confirmIcon={<Merge size={15} aria-hidden="true" />}
+      busyLabel="合并中…"
+      onCancel={onCancel}
+      onConfirm={() => target && onConfirm(target)}
+      testId="merge-confirm"
     >
-      <div
-        className="preview confirm-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="确认合并项目"
-      >
-        <div className="preview__head">
-          <div className="preview__head-main">
-            <div className="preview__title">合并 {projects.length} 个项目</div>
-            <div className="preview__meta">
-              <span>{movedSessions} 个会话将移入保留的项目（含已归档）</span>
-              <span>合并前会自动备份</span>
-            </div>
-          </div>
-          <button className="btn" type="button" onClick={onCancel} data-testid="merge-confirm-cancel">
-            <X size={15} aria-hidden="true" />取消
-          </button>
-        </div>
-        <div className="preview__body">
-          <p className="confirm-dialog__text">
-            选择要保留的项目：其余项目的全部会话都会移入它，移空的项目会被清理。误合并可用备份人工恢复。
-          </p>
-          <ul className="confirm-dialog__list confirm-dialog__list--choice">
-            {projects.map((project) => (
-              <li key={project.project_id}>
-                <label className="merge-choice">
-                  <input
-                    type="radio"
-                    name="merge-target"
-                    checked={project.project_id === target?.project_id}
-                    onChange={() => setTargetId(project.project_id)}
-                    data-testid={`merge-target-${project.project_id}`}
-                  />
-                  <span className="merge-choice__name">{project.name?.trim() || "未命名项目"}</span>
-                  <span className="merge-choice__meta">
-                    {sessionCounts.get(project.project_id) ?? 0} 个会话
-                  </span>
-                </label>
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div className="confirm-dialog__foot">
-          <button className="btn" type="button" onClick={onCancel}>
-            取消
-          </button>
-          <button
-            className="btn btn--primary"
-            type="button"
-            onClick={() => target && onConfirm(target)}
-            data-testid="merge-confirm-ok"
-          >
-            <Merge size={15} aria-hidden="true" />确认合并
-          </button>
-        </div>
-      </div>
-    </div>
+      <p className="confirm-dialog__text">
+        {movedSessions} 个会话将移入保留的项目（含已归档），合并前会自动备份。
+        选择要保留的项目：其余项目的全部会话都会移入它，移空的项目会被清理。误合并可用备份人工恢复。
+      </p>
+      <ul className="confirm-dialog__list confirm-dialog__list--choice">
+        {projects.map((project) => (
+          <li key={project.project_id}>
+            <label className="merge-choice">
+              <input
+                type="radio"
+                name="merge-target"
+                checked={project.project_id === target?.project_id}
+                onChange={() => setTargetId(project.project_id)}
+                data-testid={`merge-target-${project.project_id}`}
+              />
+              <span className="merge-choice__name">{project.name?.trim() || "未命名项目"}</span>
+              <span className="merge-choice__meta">
+                {sessionCounts.get(project.project_id) ?? 0} 个会话
+              </span>
+            </label>
+          </li>
+        ))}
+      </ul>
+    </ConfirmDialog>
   );
 }
 

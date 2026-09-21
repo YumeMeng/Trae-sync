@@ -478,6 +478,18 @@
   font-weight: 650;
 }
 
+/* 通用确认弹层正文（ConfirmDialog）：每行一条影响说明 */
+.switch-dialog__body {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 /* 目标账号头部：头像 + 名称 + 随行说明 */
 .switch-dialog__target {
   display: flex;

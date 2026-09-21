@@ -8,9 +8,11 @@
   z-index: 10;
   display: flex;
   align-items: center;
-  gap: 12px;
+  /* 不用 gap：窗控三钮平铺时必须紧邻（hover 底色连片），
+     品牌区与窗控的间隔由首钮 margin-left:auto 承担（2026-09-21）。
+     右 padding 归零：末钮自然贴壳层右缘，不再用负 margin 抵消。 */
   min-height: 38px;
-  padding: 0 16px;
+  padding: 0 0 0 16px;
 }
 
 /* 标题栏玻璃化：强白玻璃 + 模糊（雾斑从其下方经过时被晕染）。 */
@@ -77,19 +79,20 @@
 }
 
 /* —— 自绘窗控（T8，decorations: false）——
-   Windows 语义：46px 命中宽 × 标题栏满高，hover 中性底，关闭 hover 红。
-   组容器推到标题栏右缘。 */
-.title-bar__window-controls {
-  display: flex;
-  align-items: stretch;
+   Windows 语义：46px 命中宽 × 标题栏满高、三钮紧邻，hover 中性底，关闭 hover 红。
+   三个按钮直接平铺在标题栏 flex 行内（无包裹容器，2026-09-21）。 */
+
+/* 首钮把窗控组推到标题栏右缘（按钮是 header 中仅有的 button 元素）。 */
+.title-bar__winctl:first-of-type {
   margin-left: auto;
-  margin-right: -16px; /* 抵消标题栏 padding，贴住窗口右缘（圆角内） */
 }
 
 .title-bar__winctl {
   display: grid;
   width: 46px;
-  min-height: 100%;
+  /* 满高拉伸：标题栏 align-items:center 会让按钮塌缩到图标行高，
+     必须 stretch 才能命中 38px 满高（Windows 窗控惯例）。 */
+  align-self: stretch;
   place-items: center;
   border: none;
   padding: 0;
@@ -259,17 +262,13 @@
     display: none;
   }
 
-  /* 38px 单行标题栏在窄屏保持 flex：左收内边距，右让窗控贴边 */
+  /* 38px 单行标题栏在窄屏保持 flex：左收内边距，窗控按钮自然贴右缘 */
   .title-bar {
     padding: 0 0 0 10px;
   }
 
   .title-bar__subtitle {
     display: none;
-  }
-
-  .title-bar__window-controls {
-    margin-right: 0;
   }
 
 }

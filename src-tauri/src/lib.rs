@@ -71,10 +71,9 @@ use traesync_infrastructure::{
     PlatformFileIdentityProvider, PluginCloudSyncOutcome, PluginManifest, PluginManifestEntry,
     ProductionCatalogError, ProductionCatalogRuntime, RealCheckinRenewalService,
     RealCheckinTransport, RealReadWorkspaceStateProvider, RemintError, ScanAuthorizationStore,
-    SourceKeyActivation, SourceKeyProfileStore, SqlCipherCatalogRepository, SqlCipherProbe,
-    StorageDeletionPlan, StorageMigrationResult, StorageRootBinding, WorkCnProcessController,
-    WorkCnReadLocation, WorkCnReadLocationError, WorkCnSourceNormalizer, WorkCnSyncExecutor,
-    BASELINE_SOURCE_KEY_ID, DEFAULT_STORAGE_WARNING_BYTES,
+    SqlCipherCatalogRepository, SqlCipherProbe, StorageDeletionPlan, StorageMigrationResult,
+    StorageRootBinding, WorkCnProcessController, WorkCnReadLocation, WorkCnReadLocationError,
+    WorkCnSourceNormalizer, WorkCnSyncExecutor, DEFAULT_STORAGE_WARNING_BYTES,
 };
 
 #[cfg(test)]
@@ -454,18 +453,6 @@ struct HandoffIntentWireDto {
     created_at: String,
     updated_at: String,
     failure_reason: Option<String>,
-}
-
-/// 密钥生命周期状态只返回版本和可用性，不返回 raw key 内容。
-#[derive(Debug, Clone, Serialize)]
-struct KeyStatusWireDto {
-    source_key_configured: bool,
-    source_key_version: String,
-    source_key_pending_version: Option<String>,
-    source_key_activation_pending: bool,
-    catalog_key_configured: bool,
-    catalog_key_generation: Option<u32>,
-    probe_state: String,
 }
 
 /// 签到能力白名单 DTO；真实 HTTP 未启用时明确显示，不伪装成线上签到。
@@ -2161,70 +2148,6 @@ fn recovery_error_runtime(recovery_root: &Path, reason: &str) -> ManagedAccountR
         },
         authorization_generation: None,
     }
-}
-
-fn source_key_profile_store_for_state(state: &AppState) -> Result<SourceKeyProfileStore, String> {
-    let recovery_root = match state.runtime_mode {
-        RuntimeMode::Fixture => PathBuf::from(&state.recovery_root),
-        RuntimeMode::RealReadPreview => state
-            .production_catalog
-            .as_ref()
-            .ok_or_else(|| "source_key_profile_unavailable".to_string())?
-            .recovery_root
-            .clone(),
-    };
-    if recovery_root.as_os_str().is_empty() {
-        return Err("source_key_profile_unavailable".to_string());
-    }
-    Ok(SourceKeyProfileStore::new(
-        recovery_root.join("source-key-profiles"),
-    ))
-}
-
-/// 生产启动唯一激活 source key 的入口；运行期间不调用。
-///
-/// 激活发布成功后必须使旧 handoff intent 过期，避免旧授权上下文和预览被复用。
-fn activate_production_source_key(recovery_root: &Path) -> Result<SourceKeyActivation, String> {
-    let profile_store = SourceKeyProfileStore::new(recovery_root.join("source-key-profiles"));
-    let activation = profile_store
-        .activate_pending(WORK_CN_SOURCE_RAW_KEY)
-        .map_err(|error| format!("source_key_activation_failed:{error}"))?;
-    if activation.activation_changed {
-        expire_handoff_intent_after_source_key_activation(recovery_root)?;
-    }
-    Ok(activation)
-}
-
-/// source key 发生版本切换后，仅更新持久承接意图状态，不执行账号切换或数据库访问。
-fn expire_handoff_intent_after_source_key_activation(recovery_root: &Path) -> Result<(), String> {
-    let store = JsonHandoffIntentStore::new(recovery_root);
-    let Some(mut intent) = store.load()? else {
-        return Ok(());
-    };
-    if intent.state == HandoffIntentState::Expired {
-        return Ok(());
-    }
-
-    let lease = OperationLease::acquire_shared(recovery_root, &intent.data_location_id)
-        .map_err(|error| format!("operation_lease_unavailable:{error}"))?;
-    // 取得租约后再次读取，避免启动时覆盖其他实例刚发布的意图。
-    let current = store
-        .load()?
-        .ok_or_else(|| "handoff_intent_conflict".to_string())?;
-    if current.intent_id != intent.intent_id
-        || current.updated_at != intent.updated_at
-        || current.state != intent.state
-    {
-        drop(lease);
-        return Err("handoff_intent_conflict".to_string());
-    }
-
-    intent.state = HandoffIntentState::Expired;
-    intent.updated_at = std::time::SystemTime::now();
-    intent.failure_reason = Some("source_key_activated".to_string());
-    let result = store.publish(&intent);
-    drop(lease);
-    result
 }
 
 fn credential_status_wire(status: CredentialStatus) -> ManagedCredentialStatusWireDto {
@@ -7886,10 +7809,12 @@ struct MasterCheckupAccountDto {
     registered: bool,
     /// 是否当前账号（收编目标）。
     current: bool,
-    /// 项目行数（全量含软删，与归属改写口径一致）。
+    /// 含至少一个正常会话的项目数。
     project_count: u64,
-    /// 会话数（全量含软删）。
+    /// 未删除且未归档的正常会话数。
     session_count: u64,
+    /// 空项目数（不含已删除项目；只报告，不收编）。
+    empty_project_count: u64,
 }
 
 /// P5-5 主库体检报告（get_master_checkup 返回，只读）。
@@ -7899,7 +7824,7 @@ struct MasterCheckupDto {
     status: &'static str,
     /// 当前账号账号名（回执与引导文案用；无当前账号为 None）。
     current_account_name: Option<String>,
-    /// 全库账号分布（按会话数降序）。
+    /// 可交接范围内的账号分布（按正常会话数降序）。
     accounts: Vec<MasterCheckupAccountDto>,
     /// 无归属（user_id IS NULL）项目行数（只报告，收编不动）。
     orphan_project_count: u64,
@@ -7959,6 +7884,7 @@ async fn get_master_checkup(state: tauri::State<'_, AppState>) -> Result<MasterC
                             current: current_user_id == Some(row.user_id.as_str()),
                             project_count: row.project_count,
                             session_count: row.session_count,
+                            empty_project_count: row.empty_project_count,
                         }
                     })
                     .collect();
@@ -8180,6 +8106,143 @@ fn append_incorporate_ledger(
     RelayLedger::new(storage_root.join("environments"))
         .append(&entries)
         .is_ok()
+}
+
+/// P5-5 清理空项目回执（cleanup_master_empty_projects 返回）。
+#[derive(Clone, Serialize)]
+struct MasterEmptyProjectCleanupDto {
+    /// 删除的空项目记录行数。
+    deleted_projects: u32,
+    /// 清理前自动创建的备份路径（人工恢复定位）。
+    backup_path: String,
+    /// 主库重启结果。
+    relaunch_outcome: String,
+}
+
+/// P5-5 清理空项目：硬删除体检诊断出的空项目记录行（破坏性批量操作）。
+///
+/// 编排与收编同构（关实例 → 备份 → 删除 → 重启）；执行前自动
+/// `.switch-bak-*` 备份（ADR-0018 铁律，备份失败不执行）。生成中拒绝
+/// （`cleanup_master_busy`）；孤儿行保持只报告不处理（保守口径）。
+#[tauri::command]
+async fn cleanup_master_empty_projects(
+    state: tauri::State<'_, AppState>,
+) -> Result<MasterEmptyProjectCleanupDto, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    if state.source_raw_key.is_empty() {
+        return Err("source_key_unavailable".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    let raw_key = state.source_raw_key.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        cleanup_master_empty_projects_inner(&material_root, &storage_root, &raw_key)
+    })
+    .await
+    .map_err(|_| "cleanup_master_join_failed".to_string())?
+}
+
+/// 清理空项目编排主体（阻塞上下文）：预检 → 关实例 → 备份 → 删除 → 重启。
+fn cleanup_master_empty_projects_inner(
+    material_root: &Path,
+    storage_root: &Path,
+    raw_key: &str,
+) -> Result<MasterEmptyProjectCleanupDto, String> {
+    use traesync_infrastructure::master_checkup::{
+        delete_master_empty_projects, read_master_checkup, MasterCheckupStatus,
+    };
+
+    let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+    // 重启主库需要窗口标题：与收编同源，取实测当前账号的展示名。
+    let record = resolve_actual_master_account(material_root, storage_root, &master_dir)?
+        .ok_or_else(|| "cleanup_master_no_current_account".to_string())?;
+    let window_title = record
+        .display_name
+        .clone()
+        .unwrap_or_else(|| record.screen_name.clone());
+
+    let db_path = master_database_path(&master_dir);
+
+    // 预检（只读）：确认确有空项目才关实例——避免空跑打扰正在使用的主库。
+    // 体检口径与删除范围一致（软删残留不计入），预检总数即预期删除规模。
+    let empty_total = match read_master_checkup(&master_dir, raw_key) {
+        MasterCheckupStatus::Ready(report) => report.empty_project_total(),
+        MasterCheckupStatus::NoMasterData => return Err("master_switch_db_missing".to_string()),
+        MasterCheckupStatus::ReadFailed => return Err("cleanup_master_read_failed".to_string()),
+    };
+    if empty_total == 0 {
+        return Err("cleanup_master_nothing_to_do".to_string());
+    }
+
+    // 生成中拒绝（清理非紧急操作，不做强制分支——等待完成后重试更安全）。
+    if db_path.is_file()
+        && master_db_activity_detected(&db_path, std::time::Duration::from_millis(800))
+    {
+        return Err("cleanup_master_busy".to_string());
+    }
+
+    // 第 1 步：关闭主库实例（与收编同纪律：删除前拿到静止一致的库）。
+    close_master_instance(&master_dir)
+        .map_err(|_| "cleanup_master_close_failed".to_string())?;
+
+    // 失败恢复：删除提交前的失败路径尽力重启主库，不把实例留在关闭态
+    // （与归档提交同纪律）。
+    let restart_after_failure = || {
+        let _ = launch_instance_common(
+            &master_dir,
+            &window_title,
+            None,
+            trae_instance_module::command_line_matches_master,
+        );
+    };
+
+    // 第 2 步：三件套备份（ADR-0018 铁律；create_new 永不覆盖备份链）。
+    let backup_path = match backup_master_trio(&db_path) {
+        Ok(path) => path,
+        Err(error) => {
+            restart_after_failure();
+            return Err(match error {
+                MasterHandoverError::DbUnavailable => "master_switch_db_missing".to_string(),
+                _ => "cleanup_master_backup_failed".to_string(),
+            });
+        }
+    };
+    // P5-9：备份生成后按保留策略清理旧备份（静默容错，不影响清理流程）。
+    prune_backups_if_enabled(&db_path, storage_root);
+
+    // 第 3 步：单事务删除空项目行（范围与体检口径一致，返回实际删除数）。
+    let deleted_projects = match delete_master_empty_projects(&master_dir, raw_key) {
+        Ok(count) => count,
+        Err(error) => {
+            restart_after_failure();
+            return Err(match error {
+                MasterArchiveError::DbUnavailable => "master_switch_db_missing".to_string(),
+                MasterArchiveError::DbOpenFailed => "cleanup_master_open_failed".to_string(),
+                _ => "cleanup_master_write_failed".to_string(),
+            });
+        }
+    };
+
+    // 第 4 步：重启主库（登录身份未变）。重启失败不回滚删除——数据已备份且
+    // 删除已提交，按 relaunch_outcome="failed" 回执标注，前端据实提示
+    // （与归档提交同口径，避免"清理未完成"的误导文案）。
+    let relaunch_outcome = match launch_instance_common(
+        &master_dir,
+        &window_title,
+        None,
+        trae_instance_module::command_line_matches_master,
+    ) {
+        Ok(relaunch) => relaunch.outcome.to_string(),
+        Err(_) => "failed".to_string(),
+    };
+
+    Ok(MasterEmptyProjectCleanupDto {
+        deleted_projects: deleted_projects as u32,
+        backup_path: backup_path.display().to_string(),
+        relaunch_outcome,
+    })
 }
 
 #[derive(Clone, Serialize)]
@@ -9519,117 +9582,6 @@ async fn get_relay_ledger(
     .map_err(|_| "relay_ledger_join_failed".to_string())?
 }
 
-/// 返回密钥生命周期状态；原始密钥只留在后端内存。
-#[tauri::command]
-fn get_key_status(state: tauri::State<AppState>) -> Result<KeyStatusWireDto, String> {
-    Ok(key_status_inner(&state, "not_probed"))
-}
-
-fn key_status_inner(state: &AppState, probe_state: &str) -> KeyStatusWireDto {
-    let (source_key_version, source_key_pending_version) =
-        source_key_profile_store_for_state(state)
-            .and_then(|store| store.status().map_err(|error| error.to_string()))
-            .map(|status| {
-                (
-                    status.active.key_id,
-                    status.pending.map(|profile| profile.key_id),
-                )
-            })
-            .unwrap_or_else(|_| (BASELINE_SOURCE_KEY_ID.to_string(), None));
-    KeyStatusWireDto {
-        source_key_configured: !state.source_raw_key.is_empty(),
-        source_key_version,
-        source_key_activation_pending: source_key_pending_version.is_some(),
-        source_key_pending_version,
-        catalog_key_configured: !state.catalog_key.is_empty(),
-        catalog_key_generation: state.production_catalog.as_ref().map(|_| 1),
-        probe_state: probe_state.to_string(),
-    }
-}
-
-/// 在当前已授权数据位置上执行只读 source key 探测，不修改源 DB/WAL/SHM。
-#[tauri::command]
-fn probe_source_key(state: tauri::State<AppState>) -> Result<KeyStatusWireDto, String> {
-    probe_source_key_inner(&state)
-}
-
-/// 登记用户明确提供的候选 source key。候选只在授权数据位置的只读副本上验证，
-/// 成功后进入 pending，下一次应用启动才激活。
-#[tauri::command]
-fn register_source_key_candidate(
-    candidate_key: String,
-    product_version: Option<String>,
-    state: tauri::State<AppState>,
-) -> Result<KeyStatusWireDto, String> {
-    register_source_key_candidate_inner(&state, &candidate_key, product_version.as_deref())
-}
-
-fn register_source_key_candidate_inner(
-    state: &AppState,
-    candidate_key: &str,
-    product_version: Option<&str>,
-) -> Result<KeyStatusWireDto, String> {
-    let (generation, authorization) = capture_authorized_read_context(state)?;
-    let (_, db_path, _) =
-        resolve_authorized_read_target_for_context(state, generation, &authorization)?;
-    let compatibility = state
-        .workbench_probe
-        .probe_database(&db_path, candidate_key);
-    let (schema_fingerprint, _) = match compatibility {
-        CompatibilityState::Verified {
-            schema_fingerprint,
-            counts,
-        } => (schema_fingerprint.0, counts),
-        CompatibilityState::Incompatible { .. } => {
-            return Err("source_key_candidate_rejected".to_string())
-        }
-    };
-    ensure_authorization_context_current(state, generation, &authorization)?;
-    let store = source_key_profile_store_for_state(state)?;
-    store
-        .register_verified_candidate(
-            candidate_key,
-            product_version.unwrap_or("TRAE Work CN unknown"),
-            &schema_fingerprint,
-            "work_cn_v1",
-        )
-        .map_err(|error| error.to_string())?;
-    // raw key 生命周期变化会让当前授权绑定、旧计划和承接预览失效；候选仍 pending，
-    // 因此本次运行只清理“候选登记前后”可能被误复用的预览。
-    state.pending_sync_plan.lock().unwrap().take();
-    if let Ok(Some(intent)) = load_handoff_intent_for_state(state) {
-        if matches!(
-            intent.state,
-            HandoffIntentState::Prepared
-                | HandoffIntentState::Switching
-                | HandoffIntentState::TargetVerified
-                | HandoffIntentState::PreviewReady
-        ) {
-            let _ = update_handoff_intent_state(
-                state,
-                HandoffIntentState::Expired,
-                Some("source_key_candidate_registered".to_string()),
-            );
-        }
-    }
-    Ok(key_status_inner(state, "verified_pending"))
-}
-
-fn probe_source_key_inner(state: &AppState) -> Result<KeyStatusWireDto, String> {
-    let (generation, authorization) = capture_authorized_read_context(state)?;
-    let (_, db_path, _) =
-        resolve_authorized_read_target_for_context(state, generation, &authorization)?;
-    let result = state
-        .workbench_probe
-        .probe_database(&db_path, &state.source_raw_key);
-    ensure_authorization_context_current(state, generation, &authorization)?;
-    let probe_state = match result {
-        CompatibilityState::Verified { .. } => "verified",
-        CompatibilityState::Incompatible { .. } => "rejected",
-    };
-    Ok(key_status_inner(state, probe_state))
-}
-
 /// 重新读取当前 TRAE 账号证据，并保存非敏感档案。
 #[tauri::command]
 fn refresh_managed_current_account(
@@ -10286,48 +10238,35 @@ pub fn run() {
             .and_then(|root| open_or_initialize_production_catalog(&root))
         {
             Ok(runtime) => {
-                match activate_production_source_key(&runtime.recovery_root) {
-                    Ok(activation) => {
-                        let catalog_path = resolve_current_catalog_path(&runtime.storage_root)
-                            .expect("生产目录库已经在启动阶段完成验证");
-                        // 启动阶段只做固定路径的元数据发现；未发现时保持 fail-closed，不能开放扫描。
-                        let provider = match WorkCnReadLocation::discover() {
-                            Ok(location) => RealReadWorkspaceStateProvider::new(
-                                Some(location.canonical_root().to_string_lossy().into_owned()),
-                                catalog_path,
-                                runtime.catalog_key.clone(),
-                            ),
-                            Err(_) => RealReadWorkspaceStateProvider::new(
-                                None,
-                                catalog_path,
-                                runtime.catalog_key.clone(),
-                            )
-                            .with_location_error("work_cn_location_unavailable"),
-                        };
-                        let provider: Arc<dyn WorkspaceStateProvider> = Arc::new(provider);
-                        let catalog_runtime = runtime.clone();
-                        (
-                            RuntimeMode::RealReadPreview,
-                            provider,
-                            activation.raw_key,
-                            runtime.catalog_key.clone(),
-                            runtime.storage_root.to_string_lossy().into_owned(),
-                            runtime.recovery_root.to_string_lossy().into_owned(),
-                            Some(catalog_runtime),
-                        )
-                    }
-                    Err(error) => (
-                        RuntimeMode::RealReadPreview,
-                        Arc::new(RealReadWorkspaceStateProvider::unavailable(format!(
-                            "生产 source key 启动激活失败：{error}"
-                        ))),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        default_recovery_root,
-                        None,
+                // 密钥机制收敛（2026-09-21）：source key 唯一来源是硬编码常量，
+                // 启动不再读取/激活候选 profile，磁盘上遗留的 source-key-profiles 数据不再使用。
+                let catalog_path = resolve_current_catalog_path(&runtime.storage_root)
+                    .expect("生产目录库已经在启动阶段完成验证");
+                // 启动阶段只做固定路径的元数据发现；未发现时保持 fail-closed，不能开放扫描。
+                let provider = match WorkCnReadLocation::discover() {
+                    Ok(location) => RealReadWorkspaceStateProvider::new(
+                        Some(location.canonical_root().to_string_lossy().into_owned()),
+                        catalog_path,
+                        runtime.catalog_key.clone(),
                     ),
-                }
+                    Err(_) => RealReadWorkspaceStateProvider::new(
+                        None,
+                        catalog_path,
+                        runtime.catalog_key.clone(),
+                    )
+                    .with_location_error("work_cn_location_unavailable"),
+                };
+                let provider: Arc<dyn WorkspaceStateProvider> = Arc::new(provider);
+                let catalog_runtime = runtime.clone();
+                (
+                    RuntimeMode::RealReadPreview,
+                    provider,
+                    WORK_CN_SOURCE_RAW_KEY.to_string(),
+                    runtime.catalog_key.clone(),
+                    runtime.storage_root.to_string_lossy().into_owned(),
+                    runtime.recovery_root.to_string_lossy().into_owned(),
+                    Some(catalog_runtime),
+                )
             }
             Err(ProductionCatalogError::CatalogWriteProtocolUpgradeRequired) => (
                 RuntimeMode::RealReadPreview,
@@ -10428,9 +10367,6 @@ pub fn run() {
             switch_account,
             switch_and_handoff,
             prepare_handoff_intent,
-            get_key_status,
-            probe_source_key,
-            register_source_key_candidate,
             get_checkin_capability,
             run_checkin,
             cancel_checkin,
@@ -10484,6 +10420,8 @@ pub fn run() {
             // P5-5 主库体检 + 一键收编（环境页）。
             get_master_checkup,
             incorporate_master_records,
+            // P5-5 清理空项目（体检诊断口径的空壳行，破坏性 + 自动备份）。
+            cleanup_master_empty_projects,
             // P5-8b 插件 tab（ADR-0023 清单 + ADR-0026 实时同步）：
             // 状态/市场/装（零确认）/卸（全账号传播）。
             get_plugin_tab_state,
@@ -10934,71 +10872,6 @@ mod credential_login_state_tests {
             trae_instance_module::InstanceLoginState::Uninitialized
         );
         assert!(archive);
-    }
-}
-
-#[cfg(all(test, windows))]
-mod source_key_startup_tests {
-    use super::*;
-
-    const CANDIDATE_RAW_KEY: &str =
-        "22b5b4d0b9e0c1784c2b0f8cfa6a2d5c0e41ec87c4c654720d6dcb6207fdbf5b";
-
-    fn handoff_intent() -> HandoffIntent {
-        HandoffIntent {
-            intent_id: "intent-startup-key".to_string(),
-            source_profile_id: Some("profile-source".to_string()),
-            target_profile_id: "profile-target".to_string(),
-            data_location_id: "location-startup-key".to_string(),
-            scope: SyncScope::AllHistory,
-            catalog_id: Some("catalog-test".to_string()),
-            catalog_generation: Some("generation-1".to_string()),
-            schema_version: Some("schema-1".to_string()),
-            mapping_version: Some("mapping-1".to_string()),
-            credential_operation_id: None,
-            state: HandoffIntentState::Prepared,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            updated_at: std::time::SystemTime::UNIX_EPOCH,
-            failure_reason: None,
-        }
-    }
-
-    #[test]
-    fn production_startup_activates_candidate_and_expires_handoff() {
-        let root = tempfile::tempdir().unwrap();
-        let profile_store = SourceKeyProfileStore::new(root.path().join("source-key-profiles"));
-        profile_store
-            .register_verified_candidate(CANDIDATE_RAW_KEY, "1.108", "schema-1", "mapping-1")
-            .unwrap();
-
-        let handoff_store = JsonHandoffIntentStore::new(root.path());
-        handoff_store.publish(&handoff_intent()).unwrap();
-
-        let activation = activate_production_source_key(root.path()).unwrap();
-
-        assert!(activation.activation_changed);
-        assert_eq!(activation.raw_key, CANDIDATE_RAW_KEY);
-        let persisted = handoff_store.load().unwrap().unwrap();
-        assert_eq!(persisted.state, HandoffIntentState::Expired);
-        assert_eq!(
-            persisted.failure_reason.as_deref(),
-            Some("source_key_activated")
-        );
-    }
-
-    #[test]
-    fn production_startup_rejects_invalid_profile_and_keeps_fail_closed() {
-        let root = tempfile::tempdir().unwrap();
-        let profile_root = root.path().join("source-key-profiles");
-        std::fs::create_dir_all(&profile_root).unwrap();
-        std::fs::write(profile_root.join("index.json"), b"invalid").unwrap();
-
-        let error = activate_production_source_key(root.path()).unwrap_err();
-
-        assert_eq!(
-            error,
-            "source_key_activation_failed:source_key_profile_invalid"
-        );
     }
 }
 

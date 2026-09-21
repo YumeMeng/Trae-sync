@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // 库对话面板 Playwright 端到端测试（G21 两栏式 + G22 统一选择模式，ADR-0025）
 // ============================================================================
 //
@@ -251,6 +251,9 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     await panel.getByTestId("library-select-mode").click();
     await panel.getByTestId("library-project-p1").click();
+    await expect(panel.getByTestId("library-session-s1")).toHaveClass(/lib-session--checked/);
+    await expect(panel.getByTestId("library-session-s2")).toHaveClass(/lib-session--checked/);
+    await expect(panel.getByTestId("batch-count")).toContainText("已选 2 个会话 · 1 个项目");
     await expect(panel.getByTestId("batch-archive")).toBeEnabled();
     await panel.getByTestId("batch-archive").click();
 
@@ -272,7 +275,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
     const dialog = panel.getByTestId("delete-confirm");
     await expect(dialog).toContainText("删除 2 个会话");
     await expect(dialog).toContainText("共 17 条消息");
-    await panel.getByTestId("delete-confirm-ok").click();
+    await panel.getByTestId("delete-confirm-confirm").click();
     await expect(panel.getByTestId("action-notice")).toContainText("已删除 2 个会话。");
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
   });
@@ -292,6 +295,9 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await expect(panel.getByTestId("action-notice")).toContainText("已应用归档设置：归档 1 个");
     await expect(panel.getByTestId("library-session-s1")).toHaveCount(0);
     await expect(panel.getByTestId("library-archive-entry")).toContainText("2");
+    await panel.getByTestId("library-archive-entry").click();
+    await expect(panel.getByTestId("library-archive-project-p1")).toContainText("项目阿尔法");
+    await expect(panel.getByTestId("library-session-s1")).toBeVisible();
   });
 
   test("Esc 退出选择模式", async ({ page }) => {
@@ -313,7 +319,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
     // 勾选两个项目作为合并源（选择模式下项目行点击 = 勾选）。
     await panel.getByTestId("library-project-p1").click();
     await panel.getByTestId("library-project-p2").click();
-    await expect(panel.getByTestId("batch-count")).toContainText("已选 0 个会话 · 2 个项目");
+    await expect(panel.getByTestId("batch-count")).toContainText("已选 3 个会话 · 2 个项目");
 
     await panel.getByTestId("batch-merge").click();
     const dialog = panel.getByTestId("merge-confirm");
@@ -323,7 +329,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     // 改选保留 p2 → 移动量变成 p1 的 2 个会话（s1 s2；s4 已删除不计）。
     await panel.getByTestId("merge-target-p2").check();
-    await panel.getByTestId("merge-confirm-ok").click();
+    await panel.getByTestId("merge-confirm-confirm").click();
 
     // 回执只用数量与动作结果表述（界面表达纪律）。
     await expect(panel.getByTestId("action-notice")).toContainText(
@@ -348,10 +354,20 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await expect(panel.getByTestId("library-archive-project-p2")).toContainText("项目贝塔");
     await expect(panel.getByTestId("library-session-s3")).toContainText("旧归档会话");
 
+    // 归档页项目默认展开，点击项目文件夹可折叠/展开会话树。
+    await panel.getByTestId("library-archive-project-p2").click();
+    await expect(panel.getByTestId("library-archive-project-p2")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    await expect(panel.getByTestId("library-session-s3")).toHaveCount(0);
+    await panel.getByTestId("library-archive-project-p2").click();
+    await expect(panel.getByTestId("library-session-s3")).toBeVisible();
+
     // 选择 → 恢复 → 归档视图清空。
     await panel.getByTestId("library-select-mode").click();
-    await panel.getByTestId("library-session-s3").click();
-    await expect(panel.getByTestId("batch-count")).toContainText("已选 1 个会话 · 0 个项目");
+    await panel.getByTestId("library-archive-project-p2").click();
+    await expect(panel.getByTestId("batch-count")).toContainText("已选 1 个会话 · 1 个项目");
     await panel.getByTestId("batch-restore").click();
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("恢复 1 个");
     await panel.getByTestId("archive-draft-apply").click();
@@ -388,7 +404,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     // 确认：真实删除 → 归档视图清空。
     await panel.getByTestId("batch-delete").click();
-    await panel.getByTestId("delete-confirm-ok").click();
+    await panel.getByTestId("delete-confirm-confirm").click();
     await expect(panel.getByTestId("library-archive-empty")).toBeVisible();
   });
 });
@@ -484,7 +500,14 @@ test.describe("账号档案", () => {
     await page.getByTestId("navigation-accounts").click();
 
     const accountCenter = page.getByRole("region", { name: "账号", exact: true });
+    // 刷新凭据有二次确认弹层：点取消不触发任何换发（防误触契约）。
     await accountCenter.getByTestId("account-refresh-credentials").click();
+    await accountCenter.getByTestId("account-refresh-credentials-confirm-cancel").click();
+    expect(await page.evaluate(() => (window as any).__mockCommandCalls as string[]))
+      .not.toContain("refresh_checkin_credentials");
+
+    await accountCenter.getByTestId("account-refresh-credentials").click();
+    await accountCenter.getByTestId("account-refresh-credentials-confirm-confirm").click();
     await expect(accountCenter.getByTestId("operation-result-card")).toContainText(
       "凭据刷新完成：2 个账号正常。",
     );
@@ -503,7 +526,9 @@ test.describe("账号档案", () => {
     const accountCenter = page.getByRole("region", { name: "账号", exact: true });
     await accountCenter.getByTestId("account-card-profile-current").click();
     const detailPage = page.getByRole("region", { name: "账号详情", exact: true });
+    // 刷新凭据有二次确认弹层，确认后继续。
     await detailPage.getByTestId("account-detail-refresh-credentials").click();
+    await detailPage.getByTestId("account-detail-credentials-confirm-confirm").click();
     await expect(detailPage.getByRole("status")).toContainText("登录凭据已更新，无需重新登录。");
 
     const calls = await page.evaluate(() => (window as any).__mockCommandCalls as string[]);

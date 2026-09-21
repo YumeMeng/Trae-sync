@@ -20,6 +20,7 @@ import type {
 } from "../types/environment";
 import type {
   MasterCheckupDto,
+  MasterEmptyProjectCleanupDto,
   MasterIncorporateProgressEvent,
   MasterIncorporateResultDto,
   MasterSelfCheckDto,
@@ -27,6 +28,7 @@ import type {
 import type { AccountProfileDto, ManagedAccountsViewDto } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { InstanceSlotBadge } from "./StatusBadges";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface EnvironmentPageProps {
   /** 页面可见时才读取环境状态，避免后台 IPC；隐藏时停止轮询。 */
@@ -51,6 +53,9 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
   const [envList, setEnvList] = useState<EnvironmentListItemDto[] | null>(null);
   // 收编弹层：null = 关闭；确认 → 运行（四阶段进度）→ 完成回执 / 失败提示。
   const [incorporating, setIncorporating] = useState<IncorporatePhase | null>(null);
+  // 清理空项目：弹层开关 + 执行中（后端编排：关实例 → 备份 → 删除 → 重启）。
+  const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
+  const [cleaningUp, setCleaningUp] = useState(false);
   // P6-4 辅助环境生命周期弹层（同一时刻至多一个）。
   const [createDialog, setCreateDialog] = useState<NameDialogState | null>(null);
   const [renameDialog, setRenameDialog] = useState<NameDialogState | null>(null);
@@ -198,11 +203,26 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
 
   // ===== P5-5 体检区块数据派生 + 一键收编 =====
 
-  // 滞留账号（非当前账号的分布行）——收编目标；无滞留时区块整体不渲染。
+  // 滞留账号（非当前且存在正常会话的分布行）——收编目标；无滞留时区块整体不渲染。
   const staleAccounts =
-    checkup?.status === "ready" ? checkup.accounts.filter((account) => !account.current) : [];
+    checkup?.status === "ready"
+      ? checkup.accounts.filter((account) => !account.current && account.session_count > 0)
+      : [];
+  // 空项目只作诊断展示，不进入收编规模；归档-only 项目不算空项目。
+  const emptyShellAccounts =
+    checkup?.status === "ready"
+      ? checkup.accounts.filter((account) => !account.current && account.empty_project_count > 0)
+      : [];
   const staleSessionTotal = staleAccounts.reduce((sum, a) => sum + a.session_count, 0);
   const staleProjectTotal = staleAccounts.reduce((sum, a) => sum + a.project_count, 0);
+  // 清理与提示行都按全库口径统计空项目（含当前账号名下的残留行），
+  // 与后端删除范围一致；诊断列表只列非当前账号的分布行。
+  const emptyProjectTotal =
+    checkup?.status === "ready"
+      ? checkup.accounts.reduce((sum, a) => sum + a.empty_project_count, 0)
+      : 0;
+  // 只要全库存在空项目（哪怕全在当前账号名下），体检区块与清理入口就要出现。
+  const hasCheckupNotice = staleAccounts.length > 0 || emptyProjectTotal > 0;
 
   /** 确认收编 → 后端四步编排（关实例 → 备份 → 归属改写 → 重启）。 */
   const startIncorporate = useCallback(async () => {
@@ -236,6 +256,33 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
   const closeIncorporate = useCallback(() => {
     setIncorporating((current) => (current?.kind === "running" ? current : null));
   }, []);
+
+  /** 确认清理空项目 → 后端编排（关实例 → 备份 → 删除 → 重启）。 */
+  const handleCleanupEmptyProjects = useCallback(async () => {
+    if (cleaningUp) return;
+    setCleaningUp(true);
+    setError(null);
+    try {
+      const receipt = await invoke<MasterEmptyProjectCleanupDto>("cleanup_master_empty_projects");
+      setCleanupDialogOpen(false);
+      // 清理完成即刷新体检（空项目清零，诊断行自然消失）。
+      await load();
+      // 重启失败不回滚删除：删除已提交且已备份，据实提示而非"清理未完成"。
+      setMessage(
+        receipt.deleted_projects > 0
+          ? receipt.relaunch_outcome === "failed"
+            ? `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）；主库 TRAE 未能自动启动，可从环境页重新打开。`
+            : `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）。`
+          : "没有可清理的空项目记录。",
+      );
+    } catch (reason: unknown) {
+      // 失败关闭弹层，错误走页面级错误条（ConfirmDialog 无内嵌错误插槽）。
+      setCleanupDialogOpen(false);
+      setError(safeUiErrorMessage(reason, "清理未完成，主库数据保持操作前状态；请稍后重试。"));
+    } finally {
+      setCleaningUp(false);
+    }
+  }, [cleaningUp, load]);
 
   return (
     <section className="environment-page" role="region" aria-label="环境">
@@ -292,15 +339,22 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
 
           {/* P5-5 主库体检：有滞留记录才出现（无差异静默，不打扰）。
               账号行用账号名表述；user_id 收进悬浮提示（界面表达纪律）。 */}
-          {checkup?.status === "ready" && staleAccounts.length > 0 && (
+          {checkup?.status === "ready" && hasCheckupNotice && (
             <div className="env-checkup" data-testid="env-checkup">
               <div className="env-checkup__head">
                 <TriangleAlert size={16} aria-hidden="true" />
-                <span>
-                  有 {staleAccounts.length} 个账号的 {staleSessionTotal} 个会话在主库中，未随当前账号展示
-                </span>
+                <div>
+                  {staleAccounts.length > 0 && (
+                    <div>
+                      有 {staleAccounts.length} 个账号的 {staleSessionTotal} 个会话在主库中，未随当前账号展示
+                    </div>
+                  )}
+                  {emptyProjectTotal > 0 && (
+                    <div>另有 {emptyProjectTotal} 个空项目记录未进入归入范围</div>
+                  )}
+                </div>
               </div>
-              <ul className="env-checkup__list">
+              {staleAccounts.length > 0 && <ul className="env-checkup__list">
                 {staleAccounts.map((account) => (
                   <li key={account.user_id} title={`账号标识：${account.user_id}`}>
                     <span className="env-checkup__name">
@@ -311,20 +365,46 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
                     </span>
                   </li>
                 ))}
-              </ul>
+              </ul>}
+              {emptyShellAccounts.length > 0 && (
+                <ul className="env-checkup__list" data-testid="env-empty-shell-list">
+                  {emptyShellAccounts.map((account) => (
+                    <li key={`empty-${account.user_id}`} title={`账号标识：${account.user_id}`}>
+                      <span className="env-checkup__name">
+                        {account.account_name ?? "未登记账号"}
+                      </span>
+                      <span className="env-checkup__meta">
+                        {account.empty_project_count} 个空项目
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {/* 空项目一键清理（破坏性，弹层单次确认后执行）。
+                  删除范围为全库空项目，执行前自动备份。 */}
+              {emptyProjectTotal > 0 && (
+                <button
+                  className="btn env-checkup__action"
+                  type="button"
+                  onClick={() => setCleanupDialogOpen(true)}
+                  data-testid="env-cleanup-empty-projects-entry"
+                >
+                  <Trash2 size={15} aria-hidden="true" />清理空项目
+                </button>
+              )}
               {checkup.orphan_project_count > 0 && (
                 <p className="env-checkup__note">
                   另有 {checkup.orphan_project_count} 条无归属记录不会被归入。
                 </p>
               )}
-              <button
+              {staleAccounts.length > 0 && <button
                 className="btn btn--primary env-checkup__action"
                 type="button"
                 onClick={() => setIncorporating({ kind: "confirm" })}
                 data-testid="env-incorporate-entry"
               >
                 <Combine size={15} aria-hidden="true" />一键归入当前账号
-              </button>
+              </button>}
             </div>
           )}
 
@@ -443,6 +523,27 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
           orphanProjectCount={checkup?.orphan_project_count ?? 0}
           onConfirm={() => void startIncorporate()}
           onClose={closeIncorporate}
+        />
+      )}
+
+      {/* P5-5 清理空项目确认弹层（破坏性，ADR-0018 单次确认）。
+          数量为全库空项目总数，与后端删除范围一致。 */}
+      {cleanupDialogOpen && (
+        <ConfirmDialog
+          title="清理空项目"
+          lines={[
+            `将删除 ${emptyProjectTotal} 个空项目记录，删除前会自动备份。`,
+            "空项目记录不含任何对话，删除不影响对话历史。",
+            "无归属记录不会被清理。",
+          ]}
+          confirmLabel="删除"
+          confirmIcon={<Trash2 size={15} aria-hidden="true" />}
+          busyLabel="清理中…"
+          busy={cleaningUp}
+          danger
+          onCancel={() => setCleanupDialogOpen(false)}
+          onConfirm={() => void handleCleanupEmptyProjects()}
+          testId="env-cleanup-empty-projects-dialog"
         />
       )}
 
@@ -997,58 +1098,42 @@ function EnvironmentDeleteDialog({
   })();
 
   return (
-    <div className="switch-veil" role="presentation" onClick={(event) => {
-      if (event.target === event.currentTarget && !busy) onClose();
-    }}>
-      <div
-        className="switch-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="删除环境"
-        data-testid="env-delete-dialog"
-      >
-        <div className="switch-dialog__title">删除环境「{env.name}」</div>
-
-        {scaleText !== null ? (
-          <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
-            <TriangleAlert size={18} aria-hidden="true" />
-            <div>
-              <strong>删除后无法恢复</strong>
-              <p>{scaleText}</p>
-            </div>
+    <ConfirmDialog
+      title={`删除环境「${env.name}」`}
+      confirmLabel="删除环境"
+      busyLabel="删除中…"
+      busy={busy}
+      danger
+      confirmDisabled={preview === null}
+      onCancel={onClose}
+      onConfirm={() => void confirm()}
+      testId="env-delete-dialog"
+    >
+      {/* 规模预览：有记录列明数量与体积；无记录轻描淡写；读不到时如实告知。 */}
+      {scaleText !== null ? (
+        <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+          <TriangleAlert size={18} aria-hidden="true" />
+          <div>
+            <strong>删除后无法恢复</strong>
+            <p>{scaleText}</p>
           </div>
-        ) : loadError ? (
-          <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
-            <TriangleAlert size={18} aria-hidden="true" />
-            <p>{loadError}</p>
-          </div>
-        ) : (
-          <p className="switch-dialog__prepare">正在读取环境数据规模…</p>
-        )}
-
-        {error && (
-          <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
-            <TriangleAlert size={18} aria-hidden="true" />
-            <p>{error}</p>
-          </div>
-        )}
-
-        <div className="switch-dialog__actions">
-          <button className="btn" type="button" onClick={onClose} disabled={busy} data-testid="env-delete-cancel">
-            取消
-          </button>
-          <button
-            className="btn btn--danger"
-            type="button"
-            onClick={() => void confirm()}
-            disabled={busy || preview === null}
-            data-testid="env-delete-confirm"
-          >
-            {busy ? "删除中…" : "删除环境"}
-          </button>
         </div>
-      </div>
-    </div>
+      ) : loadError ? (
+        <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+          <TriangleAlert size={18} aria-hidden="true" />
+          <p>{loadError}</p>
+        </div>
+      ) : (
+        <p className="switch-dialog__prepare">正在读取环境数据规模…</p>
+      )}
+
+      {error && (
+        <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+          <TriangleAlert size={18} aria-hidden="true" />
+          <p>{error}</p>
+        </div>
+      )}
+    </ConfirmDialog>
   );
 }
 
