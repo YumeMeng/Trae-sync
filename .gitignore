@@ -40,8 +40,27 @@ artifacts/
 e2e-run.log
 # 本地排障时的 cargo 输出捕获
 src-tauri/check.err
+src-tauri/err.txt
 # lib.rs 的历史遗留副本（本地排障用）
 src-tauri/.git-lib-*.rs
+
+# ---- AI 工具本地配置（开源仓库不入库，本地保留）----
+.claude/
+.codebuddy/
+.gemini/
+.qoder/
+.windsurfrules
+CLAUDE.md
+CODEBUDDY.md
+GEMINI.md
+QODER.md
+
+# ---- 根目录一次性开发脚本（历史排障/截图工具，本地保留）----
+/step1.ps1
+/step2_scan.ps1
+/step3_scan.ps1
+/copy_pics.ps1
+/final_shots.ps1
 
 # Added by cargo
 
