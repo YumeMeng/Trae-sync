@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+> **纯 AI Vibe Coding**：本项目全部代码由 AI 生成，人类只负责提需求与验收。
+
 个人使用的 Trae Work CN 多账号登录管理工具（非官方产品，仅供学习与自用）。
 
 基于 Tauri 2 的 Windows 桌面应用，围绕四个核心需求构建：**账号保存**（OAuth 登录、DPAPI 加密凭据）、**对话主库**（所有账号共用一套历史记录，切号不丢）、**直连签到**（HTTP 直连完成每日签到）、**账号切换**（一键切换、环境管理）。
