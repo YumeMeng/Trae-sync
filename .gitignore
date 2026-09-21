@@ -49,7 +49,12 @@ src-tauri/.git-lib-*.rs
 .codebuddy/
 .gemini/
 .qoder/
+.kiro/
+.github/
 .windsurfrules
+.cursorrules
+.mcp.json
+opencode.jsonc
 CLAUDE.md
 CODEBUDDY.md
 GEMINI.md
