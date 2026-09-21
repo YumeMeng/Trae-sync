@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **纯 AI Vibe Coding**：本项目全部代码由 AI 生成，人类只负责提需求与验收。
+> **纯 AI Vibe Coding**：本项目全部内容（含 README 与代码）均由 AI 生成。作者仅对基础功能做过有限测试，主要确认了**签到**与**账号切换**两条核心链路的可用性；其余功能细节尚未充分验证，使用前请自行评估。
 
 个人使用的 Trae Work CN 多账号登录管理工具（非官方产品，仅供学习与自用）。
 
@@ -39,7 +39,7 @@ Trae Work CN 官方客户端把你的全部对话记录保存在一个本地数�
 - Node.js ≥ 18（建议 20 LTS）与 pnpm ≥ 8
 - Rust stable 工具链（含 `cargo`）
 - MSVC Build Tools（链接 Tauri 依赖需要）
-- Tauri 2 系统依赖：参见 https://tauri.app/v2/guides/prerequisites/
+- Tauri 2 系统依赖：参见 <https://tauri.app/v2/guides/prerequisites/>
 
 ### 安装与开发运行
 
@@ -81,12 +81,12 @@ cargo fmt --all -- --check             # Rust 格式检查
 
 ## 文档导航
 
-| 文档 | 内容 |
-|------|------|
-| [docs/GUIDE.md](docs/GUIDE.md) | 使用手册：各页面操作、主库概念、数据转移实现、常见问题 |
-| [docs/TECHNICAL_BASELINE.md](docs/TECHNICAL_BASELINE.md) | 协议与技术事实基线（解密、数据库结构、迁移契约） |
-| [docs/adr/](docs/adr/README.md) | 架构决策记录（ADR 索引） |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 参与贡献指南 |
+| 文档                                                        | 内容                          |
+| --------------------------------------------------------- | --------------------------- |
+| [docs/GUIDE.md](docs/GUIDE.md)                            | 使用手册：各页面操作、主库概念、数据转移实现、常见问题 |
+| [docs/TECHNICAL\_BASELINE.md](docs/TECHNICAL_BASELINE.md) | 协议与技术事实基线（解密、数据库结构、迁移契约）    |
+| [docs/adr/](docs/adr/README.md)                           | 架构决策记录（ADR 索引）              |
+| [CONTRIBUTING.md](CONTRIBUTING.md)                        | 参与贡献指南                      |
 
 ## License
 
