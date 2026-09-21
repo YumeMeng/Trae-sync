@@ -174,6 +174,12 @@ export default function App() {
           </div>
         </main>
       </div>
+      {/* 窗口边缘拖动热区：四周 5px 透明条（配合标题栏）让整圈边缘都能拖动/双击最大化窗口。
+          顶部无需单独热区（标题栏整行已是拖拽区）；元素本身命中才触发 drag-region，
+          z=5 低于弹层，模态遮罩打开时热区自然被覆盖。 */}
+      <div className="window-drag-edge window-drag-edge--left" data-tauri-drag-region="" aria-hidden="true" />
+      <div className="window-drag-edge window-drag-edge--right" data-tauri-drag-region="" aria-hidden="true" />
+      <div className="window-drag-edge window-drag-edge--bottom" data-tauri-drag-region="" aria-hidden="true" />
     </div>
   );
 }

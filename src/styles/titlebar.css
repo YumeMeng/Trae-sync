@@ -110,8 +110,9 @@
 }
 
 .title-bar__winctl--close {
-  /* 关闭钮 hover 红为 Windows 惯例色；右上角贴合窗口圆角 */
-  border-radius: 0 15px 0 0;
+  /* 关闭钮 hover 红为 Windows 惯例色；右上角贴合系统 DWM 圆角
+     （Win11 无边框窗口约 8px，2026-09-21 随呼吸带移除同步调整） */
+  border-radius: 0 8px 0 0;
 }
 
 .title-bar__winctl--close:hover,

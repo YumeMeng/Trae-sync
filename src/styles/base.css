@@ -13,14 +13,14 @@ body,
 
 body {
   margin: 0;
-  /* 不透明圆角窗口（2026-08-28 崩溃修复）：transparent: true 的
+  /* 不透明窗口（2026-08-28 崩溃修复）：transparent: true 的
      DirectComposition 路径与 TRAE(Electron) 实例启动时的前台合成冲突，
-     导致主进程被静默终止（无崩溃转储）。改回不透明窗口后，12px 呼吸带
-     露出的是窗口底色而非桌面，圆角/投影视觉保留；最大化时由
-     html.is-maximized 收回。 */
+     导致主进程被静默终止（无崩溃转储），窗口必须保持不透明。
+     2026-09-21 消除外部边框：原 12px 呼吸带（窗口底色环绕内容，形似
+     多余外框且不可拖动）移除，内容铺满窗口；窗口圆角交给系统 DWM，
+     四周边缘拖动由 window-drag-edge 热区承担。 */
   box-sizing: border-box;
   height: 100%;
-  padding: 12px;
   background: var(--app-bg);
   color: var(--text-1);
   font-size: 14px;
@@ -54,18 +54,15 @@ input:focus-visible {
 }
 
 /* 应用壳层：标题栏保持可见，主体只允许内容区域滚动。
-   圆角窗口：高度随 body 呼吸带收缩，圆角与投影在壳层上定义。 */
+   窗口铺满（2026-09-21 消除外部边框）：壳层直角贴窗口边，1px 描边
+   圈定边界；投影已随呼吸带移除（不透明窗口上投影只落在自身底色上）。 */
 .app-shell {
   display: flex;
   height: 100%;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
-  /* 16px 圆角 + 投影 + 1px 描边圈定窗口边界（2026-08-28 崩溃修复后
-     窗口不透明，投影落在窗口底色的呼吸带上而非桌面）；maximized 一并收回。 */
   border: 1px solid var(--line-control);
-  border-radius: 16px;
-  box-shadow: 0 24px 60px rgba(26, 34, 51, 0.16);
 }
 
 .app-loading,
@@ -124,15 +121,49 @@ input:focus-visible {
   background: var(--app-bg);
 }
 
-/* 最大化态（TitleBar 置 html.is-maximized）：贴边铺满，收回呼吸带/圆角/投影。 */
-html.is-maximized body {
-  padding: 0;
+/* 最大化态（TitleBar 置 html.is-maximized）：贴边铺满，描边隐去。 */
+html.is-maximized .app-shell {
+  border-color: transparent;
 }
 
-html.is-maximized .app-shell {
-  border-radius: 0;
-  border-color: transparent;
-  box-shadow: none;
+/* —— 窗口边缘拖动热区（2026-09-21）——
+   消除呼吸带后，在系统 resize 手柄内侧放 5px 透明条作为窗口移动热区
+   （配合标题栏）：命中条本身即触发 Tauri drag-region（拖动/双击最大化）。
+   最外缘 0-8px 由系统 DWM/tao 占用为调整大小手柄（WM_NCHITTEST=HTLEFT，
+   2026-09-21 实测），CSS 层收不到事件，故热区从 8px 起内移。
+   z=5：低于标题栏(10)与全部弹层(55+)，模态遮罩打开时热区被覆盖。 */
+.window-drag-edge {
+  position: fixed;
+  z-index: 5;
+  background: transparent;
+}
+
+.window-drag-edge--left {
+  top: 0;
+  bottom: 0;
+  left: 8px;
+  width: 5px;
+}
+
+.window-drag-edge--right {
+  top: 0;
+  bottom: 0;
+  right: 8px;
+  width: 5px;
+}
+
+.window-drag-edge--bottom {
+  right: 8px;
+  bottom: 8px;
+  left: 8px;
+  height: 5px;
+}
+
+@media (max-width: 720px) {
+  /* 窄屏底部为贴底导航栏，热区让位避免干扰按钮命中。 */
+  .window-drag-edge--bottom {
+    display: none;
+  }
 }
 
 .app-shell::before {

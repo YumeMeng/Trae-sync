@@ -1,4 +1,4 @@
-﻿import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { installMockBridge } from "./mock-bridge";
 
 // 桌面版验收矩阵：不把移动端作为产品目标，只检查 Windows/Tauri 对应的 CSS 视口。
@@ -84,9 +84,8 @@ test.describe("桌面尺寸与滚动验收", () => {
       expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.clientWidth + 1);
       expect(metrics.titleBarHeight).toBeLessThanOrEqual(124);
       expect(metrics.titleBarTop).toBeGreaterThanOrEqual(-1);
-      // T8 透明圆角窗口：标题栏随壳层浮起于 body 12px 呼吸带内（+1px 壳描边），
-      // 上界从贴边 1px 放宽到呼吸带常量 13px。
-      expect(metrics.titleBarTop).toBeLessThanOrEqual(13);
+      // 2026-09-21 消除外部边框：壳层直角贴窗口边，标题栏紧贴顶缘（+1px 壳描边）。
+      expect(metrics.titleBarTop).toBeLessThanOrEqual(1);
       expect(metrics.titleItems.every((item) => item.width >= 80)).toBe(true);
       // 两栏均渲染且树内行完整落在左栏面板内。
       expect(metrics.panels.every((panel) => panel !== null)).toBe(true);
