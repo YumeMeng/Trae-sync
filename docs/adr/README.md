@@ -2,7 +2,7 @@
 
 > 2026-08-22 建立并清理。本目录只保留与现行方向一致的决策文档。
 
-## 现行 ADR（共 11 份，全部必读）
+## 现行 ADR（共 14 份，全部必读）
 
 | ADR | 主题 | 约束什么 |
 |-----|------|---------|
@@ -17,6 +17,9 @@
 | [0026](0026-plugin-sync-policy.md) | 插件同步策略 | 新增零确认、移除单确认且全账号传播、切号静默应用（含移除才单确认）；取代 ADR-0023 决策 2 确认语义；对账条移除 |
 | [0027](0027-first-login-credential-acceptance.md) | 首次登录凭据验收与一次 OAuth 约束 | access 未过期时同设备 AuthCode 滚动换发；不自动重铸签到设备；禁止静默第二次 OAuth；失败保留证据 |
 | [0028](0028-archived-session-freeze-boundary.md) | 归档会话冻结与账号切换边界 | 正常会话随账号交接；归档会话留在主库且不改写；归档/取消归档先编辑后一次提交；不可即时完成时必须显式刷新并回执 |
+| [0029](0029-multi-product-workbench-boundary.md) | 多产品工作台边界与产品适配状态 | 产品/账号切换分离；能力清单驱动导航；身份与产品凭据分离；跨产品凭据和数据库默认隔离；Trae CN 先身份发现与重新授权 |
+| [0030](0030-trae-cn-credential-maintenance-boundary.md) | Trae CN 凭据维护边界 | Trae CN 使用独立 OAuth/client/凭据根；健康检测与续期进入共享账号模块；不继承 Work 签到/额度；真实续期需独立验收 |
+| [0031](0031-account-remote-device-management.md) | 账号级远程设备管理能力 | 设备列表/退出是账号级共享能力（能力清单声明接入）；原生 ListDevices 主路径 + 官方页兜底；本机禁退（UI 隐藏 + 后端拒绝双防线）；退出逐台单次确认；协议独立 `remote_device` 模块；remint 语义不动 |
 
 配套决策记录：`docs/DECISIONS-20260822-GRILL.md`（项目方向历史锚点，九问九答全量；部分决策已被本表 ADR 取代，见其头部标注）。
 

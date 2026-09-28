@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::product_adapter::TraeProduct;
+
 /// 实例管理错误；`code()` 返回前端可映射文案的稳定错误码。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraeInstanceError {
@@ -77,10 +79,20 @@ pub fn instance_data_dir(
 /// account_id 必须为纯数字（拼接目录名，防路径注入）；非法返回 None。
 /// U-6 W4 占用统计与彻底删除记录按同一命名规则定位该目录。
 pub fn native_account_dir(appdata: &Path, account_id: &str) -> Option<PathBuf> {
+    native_account_dir_for(TraeProduct::WorkCn, appdata, account_id)
+}
+
+/// 按产品形态定位原生账号目录；未确认的产品规则安全返回 None。
+pub fn native_account_dir_for(
+    product: TraeProduct,
+    appdata: &Path,
+    account_id: &str,
+) -> Option<PathBuf> {
     if account_id.is_empty() || !account_id.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    Some(appdata.join(format!("TRAE SOLO CN_{account_id}")))
+    let prefix = product.native_account_dir_prefix()?;
+    Some(appdata.join(format!("{prefix}_{account_id}")))
 }
 
 /// 递归统计目录占用字节数（文件大小之和，不跟踪符号链接）。
@@ -293,12 +305,15 @@ fn parse_registry_json(raw: &str) -> Vec<TraeInstallRecord> {
         .collect()
 }
 
-/// 注册表记录中提取存在的 exe 路径；DisplayIcon 优先，InstallLocation 下
-/// 扫描文件名含 "trae" 的 exe 兜底。
-fn exe_from_install_record(record: &TraeInstallRecord) -> Option<PathBuf> {
+/// 注册表记录中提取目标产品 exe 路径；DisplayIcon 优先，InstallLocation 下
+/// 扫描目标产品主程序文件名兜底。
+fn exe_from_install_record(
+    product: TraeProduct,
+    record: &TraeInstallRecord,
+) -> Option<PathBuf> {
     if let Some(icon) = &record.exe_path {
         let path = PathBuf::from(icon);
-        if path.is_file() {
+        if path.is_file() && product.matches_executable(&path) {
             return Some(path);
         }
     }
@@ -310,15 +325,7 @@ fn exe_from_install_record(record: &TraeInstallRecord) -> Option<PathBuf> {
                 let mut candidates: Vec<PathBuf> = entries
                     .flatten()
                     .map(|entry| entry.path())
-                    .filter(|path| {
-                        path.extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-                            && path
-                                .file_stem()
-                                .and_then(|stem| stem.to_str())
-                                .is_some_and(|stem| stem.to_lowercase().contains("trae"))
-                    })
+                    .filter(|path| path.is_file() && product.matches_executable(path))
                     .collect();
                 candidates.sort();
                 if let Some(first) = candidates.first() {
@@ -339,11 +346,22 @@ fn exe_from_install_record(record: &TraeInstallRecord) -> Option<PathBuf> {
 pub fn discover_trae_executable(
     processes: &[TraeProcessInfo],
 ) -> Result<PathBuf, TraeInstanceError> {
+    discover_trae_executable_for(TraeProduct::WorkCn, processes)
+}
+
+/// 发现指定 TRAE 产品的可执行文件路径。
+///
+/// 产品适配入口只返回目标产品的主程序，避免 Work CN 与 Trae CN 同时运行时
+/// 错选另一个产品；默认入口保留 Work CN 行为。
+pub fn discover_trae_executable_for(
+    product: TraeProduct,
+    processes: &[TraeProcessInfo],
+) -> Result<PathBuf, TraeInstanceError> {
     // 1. 运行中进程的真实路径。
     for process in processes {
         if let Some(exe) = &process.exe_path {
             let path = PathBuf::from(exe);
-            if path.is_file() {
+            if path.is_file() && product.matches_executable(&path) {
                 return Ok(path);
             }
         }
@@ -366,13 +384,13 @@ pub fn discover_trae_executable(
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 let records = parse_registry_json(&stdout);
-                // Work CN 优先（本项目定位），其余 Trae 记录按名称排序保持稳定。
+                // 目标产品优先，其余记录保持稳定顺序，避免跨产品误选。
                 let mut ordered: Vec<&TraeInstallRecord> = records.iter().collect();
                 ordered.sort_by_key(|record| {
-                    !record.display_name.to_lowercase().contains("work")
+                    !product.matches_install_name(&record.display_name)
                 });
                 for record in ordered {
-                    if let Some(exe) = exe_from_install_record(record) {
+                    if let Some(exe) = exe_from_install_record(product, record) {
                         return Ok(exe);
                     }
                 }
@@ -391,7 +409,7 @@ pub fn discover_trae_executable(
                         && path
                             .file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.to_lowercase().starts_with("trae"))
+                            .is_some_and(|name| name.to_ascii_lowercase().starts_with("trae"))
                 })
                 .collect();
             roots.sort();
@@ -400,15 +418,7 @@ pub fn discover_trae_executable(
                     let mut candidates: Vec<PathBuf> = files
                         .flatten()
                         .map(|entry| entry.path())
-                        .filter(|path| {
-                            path.extension()
-                                .and_then(|ext| ext.to_str())
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-                                && path
-                                    .file_stem()
-                                    .and_then(|stem| stem.to_str())
-                                    .is_some_and(|stem| stem.to_lowercase().contains("trae"))
-                        })
+                        .filter(|path| path.is_file() && product.matches_executable(path))
                         .collect();
                     candidates.sort();
                     if let Some(first) = candidates.first() {
@@ -543,7 +553,7 @@ fn is_session_dir_name(name: &str) -> bool {
 
 /// 判定实例登录态：读 `{instance_dir}/User/globalStorage/storage.json`
 /// 检查 `iCubeAuthInfo://usertag` 键（2026-08-24 三实例实证：已登录实例
-/// LY/import 均含此键，未登录实例梦梦不含），键存在时再用最近启动日志
+/// LY/import 均含此键，未登录实例账号M不含），键存在时再用最近启动日志
 /// 裁决真伪——blob 是加密黑盒无法本地验证，但 TRAE 启动时会在日志里
 /// 留下服务端验证结果（正向 `User info loaded` / 负向 `User not
 /// authenticated`，2026-08-24 LY 实例"键在会话死"实证）。
@@ -880,12 +890,15 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::product_adapter::TraeProduct;
+
     use super::{
         command_line_matches_master, command_line_uses_data_dir, dir_size_recursive,
-        instance_data_dir, instance_login_state,
-        is_session_dir_name, native_account_dir,
+        discover_trae_executable_for, instance_data_dir, instance_login_state,
+        is_session_dir_name, native_account_dir, native_account_dir_for,
         parse_process_json, seed_login_state_from_donor, seed_login_state_with_appdata,
         write_window_title, InstanceLoginState, SeedOutcome, TraeInstanceError,
+        TraeProcessInfo,
     };
 
     #[test]
@@ -1043,6 +1056,37 @@ mod tests {
         for bad in ["", "abc", "12-34", "../escape", "12 34"] {
             assert!(native_account_dir(appdata, bad).is_none(), "应拒绝: {bad}");
         }
+        // CN 的原生账号目录规则尚未实测，适配层必须安全停用而不是猜路径。
+        assert!(native_account_dir_for(TraeProduct::TraeCn, appdata, "1234567890").is_none());
+    }
+
+    #[test]
+    fn executable_discovery_keeps_products_separate() {
+        let root = tempdir().unwrap();
+        let work = root.path().join("TRAE SOLO CN.exe");
+        let cn = root.path().join("Trae CN.exe");
+        fs::write(&work, b"work").unwrap();
+        fs::write(&cn, b"cn").unwrap();
+        let processes = vec![
+            TraeProcessInfo {
+                pid: 1,
+                exe_path: Some(work.to_string_lossy().into_owned()),
+                command_line: None,
+            },
+            TraeProcessInfo {
+                pid: 2,
+                exe_path: Some(cn.to_string_lossy().into_owned()),
+                command_line: None,
+            },
+        ];
+        assert_eq!(
+            discover_trae_executable_for(TraeProduct::WorkCn, &processes).unwrap(),
+            work
+        );
+        assert_eq!(
+            discover_trae_executable_for(TraeProduct::TraeCn, &processes).unwrap(),
+            cn
+        );
     }
 
     #[test]

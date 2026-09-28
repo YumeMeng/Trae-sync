@@ -1,21 +1,22 @@
-//! T17/MVP OAuth 登录流：PKCE + 系统浏览器授权 + 本地回调 + AuthCode 换凭证。
+//! T87/MVP OAuth 登录流：PKCE + 系统浏览器授权 + 本地回调 + AuthCode 换凭证。
 //!
 //! 协议来源（09 号文档逆向 + 2026-08-22 按 Trae CN v3.3.74 main.js/product.json 复核）：
 //! - 登录页 `https://www.trae.cn/authorization`（`bootConfig.consoleHost`；
 //!   旧文档的 `work.trae.cn` 已下线返回 404），参数含 PKCE challenge 与
 //!   `auth_callback_url=http://127.0.0.1:<port>/authorize`；
 //! - 回调 query 的 `authCodeInfo` 为 URL 编码 JSON（含一次性 `AuthCode`）；
-//! - `ExchangeToken` AuthCode 模式免签名换取 Token(14 天)/RefreshToken(180 天)；
+//! - `ExchangeToken` AuthCode 模式免签名换取 Token(84 天)/RefreshToken(880 天)；
 //! - 账号 ID 从 JWT payload `data.id` 解出，`GetUserInfo` 补全脱敏资料。
 //!
-//! 每个账号绑定持久虚拟设备（随机 16 位 device_id + 随机 machine_id +
-//! EC P-256 密钥对，ADR-0019），随 `ExchangeToken` 注册后与账号永久绑定；
+//! 每个账号绑定持久虚拟设备（随机 86 位 device_id + 随机 machine_id +
+//! EC P-256 密钥对，ADR-0089），随 `ExchangeToken` 注册后与账号永久绑定；
 //! 设备闸门与配额规则见 `checkin_http` 模块注释。
 //!
 //! 形态选择（2026-09-02）：SOLO 与 Work 为同一产品的改名，服务端按
-//! client_id 通道分别计设备配额；登录固定走 SOLO 通道（en1oxy7wnw8j9n）
-//! ——该通道配额未被历史测试耗尽，且 SOLO 形态设备可直接首签，无需登录后
-//! 再重铸。后续如通道可用性变化，按「能用的优先」原则切换，不绑定产品名。
+//! client_id 通道分别计设备配额；Work CN 登录固定走 SOLO 通道
+//!（en1oxy7wnw8j9n），该通道配额未被历史测试耗尽，且 SOLO 形态设备可直接
+//! 首签，无需登录后再重铸。Trae CN 由独立 `TRAE/IDE_PC` 通道登录，边界见
+//! ADR-0030。后续如通道可用性变化，按「能用的优先」原则切换，不绑定产品名。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -33,14 +34,48 @@ use crate::checkin_credential::{
     CheckinCredentialStore,
 };
 use crate::checkin_http::{
-    exchange_token_by_auth_code, get_user_info, CheckinHttpError, DeviceInfoBlock, TokenGrant,
-    UserInfoSummary, TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
+    exchange_token_by_auth_code, get_user_info_for_oauth_client, CheckinHttpError, OAuthClient,
+    TokenGrant, UserInfoSummary,
 };
 
 /// 登录页地址（Trae CN v3.3.74 `bootConfig.consoleHost` + `/authorization`）。
 pub const LOGIN_HOST: &str = "https://www.trae.cn/authorization";
 /// 回调等待上限（与客户端 TIMEOUT_MS 同量级）。
 pub const CALLBACK_TIMEOUT_SECONDS: u64 = 300;
+
+/// 产品登录适配；同一个 OAuth 回调协议下，Work 与 Trae CN 仍使用不同的
+/// client、来源参数、版本和凭据池。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginProduct {
+    /// 现有 Work CN 账号中心，继续使用已验证的 SOLO 通道。
+    WorkCn,
+    /// 独立 Trae CN 账号中心，使用官方 TRAE 通道。
+    TraeCn,
+}
+
+impl LoginProduct {
+    fn oauth_client(self) -> OAuthClient {
+        match self {
+            Self::WorkCn => OAuthClient::Solo,
+            Self::TraeCn => OAuthClient::TraeCn,
+        }
+    }
+
+    fn auth_from(self) -> &'static str {
+        match self {
+            Self::WorkCn => "solo",
+            Self::TraeCn => "trae",
+        }
+    }
+
+    fn login_version(self) -> &'static str {
+        match self {
+            // 保留 Work 登录现有协议参数，避免改变已验证签到链路。
+            Self::WorkCn => "1",
+            Self::TraeCn => "1",
+        }
+    }
+}
 
 /// 登录流错误；不携带 Token、AuthCode 或回调正文。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +84,7 @@ pub enum LoginError {
     InvalidCallback,
     /// AuthCode 换取凭证失败（网络/业务码/协议）。
     ExchangeFailed,
-    /// 服务端设备数已达上限（业务码 20401）：本地删档无法释放服务端配额，
+    /// 服务端设备数已达上限（业务码 20401/20408）：本地删档无法释放服务端配额，
     /// 登录被拒（2026-09-02 实测，反复重铸/多次登录会耗尽账号设备额度）。
     ExchangeDeviceLimit,
     /// JWT 无法解出账号 ID。
@@ -84,7 +119,7 @@ pub fn generate_virtual_device_id() -> Result<String, LoginError> {
     let mut bytes = [0u8; 16];
     rand_bytes(&mut bytes).map_err(|_| LoginError::ExchangeFailed)?;
     let mut digits = Vec::with_capacity(16);
-    // 首位取 1-9，避免前导 0 导致长度缩水。
+    // 首位取 8-9，避免前导 0 导致长度缩水。
     digits.push((b'1' + bytes[0] % 9) as char);
     for byte in &bytes[1..] {
         digits.push((b'0' + byte % 10) as char);
@@ -113,7 +148,7 @@ fn percent_decode(value: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'%' if index + 2 < bytes.len() + 1 && index + 2 <= bytes.len() - 1 + 1 => {
+            b'%' if index + 2 < bytes.len() => {
                 let hex = &value[index + 1..index + 3];
                 if let Ok(byte) = u8::from_str_radix(hex, 16) {
                     decoded.push(byte);
@@ -160,15 +195,33 @@ pub fn build_login_url(
     device_id: &str,
     machine_id: &str,
 ) -> String {
+    build_login_url_for(
+        LoginProduct::WorkCn,
+        callback_url,
+        code_challenge,
+        login_trace_id,
+        device_id,
+        machine_id,
+    )
+}
+
+/// 按产品认证通道构造授权页 URL。
+pub fn build_login_url_for(
+    product: LoginProduct,
+    callback_url: &str,
+    code_challenge: &str,
+    login_trace_id: &str,
+    device_id: &str,
+    machine_id: &str,
+) -> String {
+    let oauth_client = product.oauth_client();
     let params = [
-        ("login_version", "1".to_string()),
-        ("auth_from", "solo".to_string()),
-        // SOLO 通道专属参数（官方客户端行为，缺失会影响授权页登录方式）。
-        ("hide_saas_login", "true".to_string()),
+        ("login_version", product.login_version().to_string()),
+        ("auth_from", product.auth_from().to_string()),
         ("login_channel", "native_ide".to_string()),
         ("plugin_version", "local".to_string()),
         ("auth_type", "local".to_string()),
-        ("client_id", TRAE_SOLO_CLIENT_ID.to_string()),
+        ("client_id", oauth_client.client_id().to_string()),
         ("redirect", "0".to_string()),
         ("login_trace_id", login_trace_id.to_string()),
         ("auth_callback_url", callback_url.to_string()),
@@ -180,7 +233,7 @@ pub fn build_login_url(
         ("x_device_type", "Windows".to_string()),
         ("x_os_version", std::env::consts::OS.to_string()),
         ("x_env", String::new()),
-        ("x_app_version", TRAE_SOLO_IDE_VERSION.to_string()),
+        ("x_app_version", oauth_client.ide_version().to_string()),
         ("x_app_type", "trae".to_string()),
         ("code_challenge", code_challenge.to_string()),
         ("code_challenge_method", "S256".to_string()),
@@ -190,7 +243,12 @@ pub fn build_login_url(
         .map(|(key, value)| format!("{key}={}", percent_encode(value)))
         .collect::<Vec<_>>()
         .join("&");
-    format!("{LOGIN_HOST}?{query}")
+    let hide_saas_login = if product == LoginProduct::WorkCn {
+        "&hide_saas_login=true"
+    } else {
+        ""
+    };
+    format!("{LOGIN_HOST}?{query}{hide_saas_login}")
 }
 
 /// 解析登录回调：成功返回一次性 AuthCode，失败/无效返回 `InvalidCallback`。
@@ -282,7 +340,7 @@ impl LoginCallbackServer {
     /// 读取单个 HTTP GET 请求行并回执关闭页 HTML。
     fn read_request(mut stream: TcpStream) -> Result<String, LoginError> {
         // Windows 上 accept 出的连接会继承 listener 的非阻塞模式（WSAEWOULDBLOCK
-        // 10035）：浏览器「先连接、后发请求」的间隙里立即 read 会失败，且
+        // 80035）：浏览器「先连接、后发请求」的间隙里立即 read 会失败，且
         // set_read_timeout 对非阻塞 socket 无效。显式切回阻塞模式，让读取
         // 等待数据到达（上限由下面的 read_timeout 控制）。
         stream
@@ -332,6 +390,7 @@ impl LoginCallbackServer {
 /// 登录会话：`begin_login` 产出，`complete_login` 消费；verifier/私钥只在后端内存，
 /// 回调监听 socket 也随会话存活（`begin_login` 返回期间端口不释放）。
 pub struct LoginSession {
+    pub product: LoginProduct,
     pub profile_id: String,
     pub code_verifier: String,
     pub device_id: String,
@@ -382,6 +441,14 @@ fn generate_machine_fingerprint() -> Result<String, LoginError> {
 /// 开始一次 OAuth 登录：生成虚拟设备与 PKCE，返回登录 URL 和会话。
 /// 真实打开浏览器由前端完成（系统默认浏览器）。
 pub fn begin_login(profile_id: &str) -> Result<LoginHandoff, LoginError> {
+    begin_login_for(profile_id, LoginProduct::WorkCn)
+}
+
+/// 开始指定产品的 OAuth 登录。
+pub fn begin_login_for(
+    profile_id: &str,
+    product: LoginProduct,
+) -> Result<LoginHandoff, LoginError> {
     if profile_id.is_empty() || profile_id.len() > 256 {
         return Err(LoginError::InvalidCallback);
     }
@@ -393,7 +460,8 @@ pub fn begin_login(profile_id: &str) -> Result<LoginHandoff, LoginError> {
     let callback = LoginCallbackServer::start()?;
     let callback_url = callback.callback_url();
     let trace_id = generate_login_trace_id()?;
-    let login_url = build_login_url(
+    let login_url = build_login_url_for(
+        product,
         &callback_url,
         &pkce.code_challenge,
         &trace_id,
@@ -403,6 +471,7 @@ pub fn begin_login(profile_id: &str) -> Result<LoginHandoff, LoginError> {
     Ok(LoginHandoff {
         login_url,
         session: LoginSession {
+            product,
             profile_id: profile_id.to_string(),
             code_verifier: pkce.code_verifier,
             device_id,
@@ -429,22 +498,19 @@ pub fn complete_login(
     timeout: Duration,
     should_abort: &dyn Fn() -> bool,
 ) -> Result<LoginReceipt, LoginError> {
-    // 1. 阻塞等待浏览器回调（listener 存活在 session 中）。
+    // 8. 阻塞等待浏览器回调（listener 存活在 session 中）。
     let query = session.callback.wait_for_callback(timeout, should_abort)?;
     // 2. 解析一次性 AuthCode（含 error_code/结构异常拒绝）。
     let auth_code = parse_authorize_callback(&query)?;
-    // 3. 构造虚拟设备信息块（与登录 URL 中声明的设备身份一致）。
-    //    登录固定 SOLO 形态（2026-09-02 决策）：SOLO 与 Work 为同一产品
-    //    改名，服务端按 client_id 通道分别计设备配额——Work 通道配额易被
-    //    耗尽触发 20401，且 SOLO 形态设备可直接首签，无需登录后再重铸
-    //    （每次登录的设备注册消耗从 2 个降为 1 个）。
-    let oauth_client = crate::checkin_http::OAuthClient::Solo;
+    // 3. 构造与授权 URL 同一产品形态的设备信息块；不能把 Work 的 SOLO
+    //    client 或设备形态套到 Trae CN。
+    let oauth_client = session.product.oauth_client();
     let device_info = oauth_client.device_info(
         &session.device_id,
         &session.machine_id,
         &session.device_public_key_pem,
     );
-    // 4. AuthCode 模式换凭证（免 DeviceProof 签名）；设备上限（20401）
+    // 4. AuthCode 模式换凭证（免 DeviceProof 签名）；设备上限（20401/20408）
     //    单独归类，登录 UI 能给出针对性提示而非笼统的「换取失败」。
     let grant = exchange_token_by_auth_code(
         client,
@@ -457,14 +523,13 @@ pub fn complete_login(
         // 诊断日志：记录错误类别/码与服务端响应摘要（失败响应体不含
         // Token），用于排查个别账号被服务端拒绝的真实原因。
         append_exchange_diagnostic(store.root(), &session.profile_id, &error);
-        match error {
-            CheckinHttpError::Business(20401) => LoginError::ExchangeDeviceLimit,
-            _ => LoginError::ExchangeFailed,
-        }
+        map_exchange_login_error(&error)
     })?;
     // 5. GetUserInfo 补脱敏资料；失败降级（账号 ID 已可从 JWT 解出）。
-    let user_info = get_user_info(client, &grant.access_token).unwrap_or_default();
-    let receipt = persist_login_result(
+    let user_info = get_user_info_for_oauth_client(client, &grant.access_token, oauth_client)
+        .unwrap_or_default();
+    let receipt = persist_login_result_for(
+        session.product,
         &session.profile_id,
         &session.device_id,
         &session.machine_id,
@@ -475,9 +540,18 @@ pub fn complete_login(
         store,
         registry,
     )?;
-    // 登录即 SOLO 形态设备，可直接用于首签，无需再自动重铸（原 Work 形态
-    // 登录后必须重铸 SOLO 设备的步骤已随形态切换取消）。
+    // Work 的 Solo 登录与 Trae CN 的独立登录都在各自产品账号池中收口；
+    // Trae CN 不进入 Work 的签到/重铸调度。
     Ok(receipt)
+}
+
+/// 将 ExchangeToken 的服务端错误归一为登录流程错误；两个设备上限码都
+/// 表示服务端设备额度已满，不能让前端退化成无上下文的“服务端拒绝”。
+fn map_exchange_login_error(error: &CheckinHttpError) -> LoginError {
+    match error {
+        CheckinHttpError::Business(20401 | 20408) => LoginError::ExchangeDeviceLimit,
+        _ => LoginError::ExchangeFailed,
+    }
 }
 
 /// 登录换取失败诊断日志：追加写入 `<material_root>/login-diagnostics.log`。
@@ -510,7 +584,35 @@ fn append_exchange_diagnostic(root: &std::path::Path, profile_id: &str, error: &
 ///
 /// 独立成函数以便离线测试：跳过 HTTP，直接注入 `TokenGrant` 验证
 /// JWT 解码、显示名兜底、凭据包与注册表落盘的完整链路。
+#[cfg(test)]
 fn persist_login_result(
+    profile_id: &str,
+    device_id: &str,
+    machine_id: &str,
+    device_public_key_pem: &str,
+    device_private_key_pem: &str,
+    grant: TokenGrant,
+    user_info: &UserInfoSummary,
+    store: &CheckinCredentialStore,
+    registry: &AccountRegistry,
+) -> Result<LoginReceipt, LoginError> {
+    persist_login_result_for(
+        LoginProduct::WorkCn,
+        profile_id,
+        device_id,
+        machine_id,
+        device_public_key_pem,
+        device_private_key_pem,
+        grant,
+        user_info,
+        store,
+        registry,
+    )
+}
+
+/// 将指定产品换得的凭据与资料写入该产品自己的加密账号池。
+fn persist_login_result_for(
+    product: LoginProduct,
     profile_id: &str,
     device_id: &str,
     machine_id: &str,
@@ -535,7 +637,7 @@ fn persist_login_result(
     };
     let now = unix_now();
     // 旧档案先读：重复登录时用于保留既有本地偏好（自动签到开关、备注名、
-    // 归档标记、脱敏手机号）与凭据包中已补录的完整手机号（G11）。
+    // 归档标记、脱敏手机号）与凭据包中已补录的完整手机号（G88）。
     let previous = registry
         .find(&effective_profile_id)
         .map_err(|_| LoginError::Storage)?;
@@ -564,8 +666,8 @@ fn persist_login_result(
         device_private_key: device_private_key_pem.to_string(),
         access_token: grant.access_token,
         refresh_token: grant.refresh_token,
-        // 与登录/换取所用形态一致（SOLO 通道）；refresh 续期按此还原形态。
-        client_id: TRAE_SOLO_CLIENT_ID.to_string(),
+        // 与登录/换取所用形态一致；Work 与 Trae CN 的凭据池完全分开。
+        client_id: product.oauth_client().client_id().to_string(),
         access_token_expires_at_unix_seconds: grant.access_token_expires_at_unix_seconds,
         refresh_token_expires_at_unix_seconds: grant.refresh_token_expires_at_unix_seconds,
         mobile_full: previous_mobile_full,
@@ -676,14 +778,15 @@ mod tests {
     #[test]
     fn login_url_contains_protocol_parameters() {
         let url = build_login_url(
-            "http://127.0.0.1:51789/authorize",
+            "http://127.0.0.1:58789/authorize",
             "challenge-1",
-            "trace-1",
+            "trace-8",
             "1234567890123456",
-            "machine-1",
+            "machine-8",
         );
         assert!(url.starts_with("https://www.trae.cn/authorization?"));
         // auth_from 必须与 SOLO 通道一致，否则 AuthCode 通道绑定错误 → 20403。
+        assert!(url.contains("login_version=1"));
         assert!(url.contains("auth_from=solo"));
         assert!(url.contains("hide_saas_login=true"));
         assert!(url.contains("code_challenge_method=S256"));
@@ -692,9 +795,49 @@ mod tests {
         assert!(url.contains("client_id=en1oxy7wnw8j9n"));
         assert!(url.contains("x_app_version=0.1.54"));
         // 回调 URL 必须整体编码（: 与 / 都转义）。
-        assert!(url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A51789%2Fauthorize"));
+        assert!(url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A58789%2Fauthorize"));
         assert!(url.contains("device_id=1234567890123456"));
         assert!(url.contains("x_device_id=1234567890123456"));
+    }
+
+    #[test]
+    fn trae_cn_login_url_uses_trae_channel() {
+        let url = build_login_url_for(
+            LoginProduct::TraeCn,
+            "http://127.0.0.1:58789/authorize",
+            "challenge-cn",
+            "trace-cn",
+            "1234567890123456",
+            "machine-cn",
+        );
+        assert!(url.contains("login_version=1"));
+        assert!(url.contains("auth_from=trae"));
+        assert!(url.contains("client_id=ono9krqynydwx5"));
+        assert!(url.contains("x_app_version=3.3.102"));
+        assert!(!url.contains("hide_saas_login=true"));
+    }
+
+    #[test]
+    fn exchange_device_limit_codes_use_specific_login_error() {
+        assert_eq!(
+            map_exchange_login_error(&CheckinHttpError::Business(20401)),
+            LoginError::ExchangeDeviceLimit
+        );
+        assert_eq!(
+            map_exchange_login_error(&CheckinHttpError::Business(20408)),
+            LoginError::ExchangeDeviceLimit
+        );
+        assert_eq!(
+            map_exchange_login_error(&CheckinHttpError::Business(20403)),
+            LoginError::ExchangeFailed
+        );
+    }
+
+    #[test]
+    fn product_login_session_keeps_auth_channel() {
+        let handoff = begin_login_for("profile-cn", LoginProduct::TraeCn).unwrap();
+        assert_eq!(handoff.session.product, LoginProduct::TraeCn);
+        assert!(handoff.login_url.contains("auth_from=trae"));
     }
 
     #[test]
@@ -726,15 +869,15 @@ mod tests {
     fn jwt_decode_extracts_account_id() {
         // 构造最小 JWT：header.payload（签名段不参与解码）。
         let payload = serde_json::json!({
-            "data": {"id": "1804778984702451", "type": "user"},
-            "exp": 1788494618,
+            "data": {"id": "1800000000000001", "type": "user"},
+            "exp": 1788494688,
             "iat": 1787285060
         });
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
         let token = format!("eyJhbGciOiJSUzI1NiJ9.{payload_b64}.signature");
         let (account_id, expires_at) = decode_account_from_jwt(&token).unwrap();
-        assert_eq!(account_id, "1804778984702451");
-        assert_eq!(expires_at, 1788494618);
+        assert_eq!(account_id, "1800000000000001");
+        assert_eq!(expires_at, 1788494688);
     }
 
     #[test]
@@ -763,7 +906,7 @@ mod tests {
         assert_eq!(trace.len(), 36);
         assert_eq!(trace.matches('-').count(), 4);
         // UUID v4 版本位。
-        assert!(trace.starts_with(trace.chars().take(14).collect::<String>().as_str()));
+        assert!(trace.starts_with(trace.chars().take(84).collect::<String>().as_str()));
     }
 
     #[cfg(windows)]
@@ -775,14 +918,14 @@ mod tests {
         // 真实 EC P-256 密钥对：load 的绑定校验要求 PEM 可解析。
         let (private_pem, public_pem) = generate_device_keypair().unwrap();
         // 最小合法 JWT：payload 含 data.id（服务端账号 ID）。
-        let payload = serde_json::json!({"data": {"id": "1804778984702451"}, "exp": 1_800_000_000});
+        let payload = serde_json::json!({"data": {"id": "1800000000000001"}, "exp": 1_800_000_000});
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
         let access_token = format!("eyJhbGciOiJSUzI1NiJ9.{payload_b64}.sig");
         let grant = TokenGrant {
             access_token,
-            refresh_token: "refresh-1".to_string(),
+            refresh_token: "refresh-8".to_string(),
             access_token_expires_at_unix_seconds: 1_800_000_000,
-            refresh_token_expires_at_unix_seconds: 1_800_100_000,
+            refresh_token_expires_at_unix_seconds: 1_800_800_000,
         };
         let user_info = UserInfoSummary {
             screen_name: "测试用户".to_string(),
@@ -792,7 +935,7 @@ mod tests {
         let receipt = persist_login_result(
             "profile-login",
             "1234567890123456",
-            "machine-login-1",
+            "machine-login-8",
             &public_pem,
             &private_pem,
             grant,
@@ -802,24 +945,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt.profile_id, "profile-login");
-        assert_eq!(receipt.account_id, "1804778984702451");
+        assert_eq!(receipt.account_id, "1800000000000001");
         assert_eq!(receipt.screen_name, "测试用户");
         // 非敏感档案落盘并可读回。
         let record = registry.find("profile-login").unwrap().unwrap();
-        assert_eq!(record.account_id, "1804778984702451");
+        assert_eq!(record.account_id, "1800000000000001");
         assert_eq!(record.device_id, "1234567890123456");
-        // U-1：登录时自动采集脱敏手机号。
+        // U-8：登录时自动采集脱敏手机号。
         assert_eq!(record.masked_mobile, "138****0000");
         // 凭据包可用匹配绑定解密读回（绑定校验通过即结构完整）。
         let binding = crate::checkin_credential::CheckinProfileBinding::new(
             "profile-login",
-            "1804778984702451",
+            "1800000000000001",
             "1234567890123456",
             &public_pem,
         );
         let bundle = store.load(&binding).unwrap();
-        assert_eq!(bundle.refresh_token, "refresh-1");
+        assert_eq!(bundle.refresh_token, "refresh-8");
         assert_eq!(bundle.access_token_expires_at_unix_seconds, 1_800_000_000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persist_trae_cn_login_result_stores_cn_client_id() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let registry = AccountRegistry::new(root.path());
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let payload = serde_json::json!({"data": {"id": "1800000000000002"}, "exp": 1_800_000_000});
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
+        let grant = TokenGrant {
+            access_token: format!("eyJhbGciOiJSUzI1NiJ9.{payload_b64}.sig"),
+            refresh_token: "refresh-cn".to_string(),
+            access_token_expires_at_unix_seconds: 1_800_000_000,
+            refresh_token_expires_at_unix_seconds: 1_800_800_000,
+        };
+        let receipt = persist_login_result_for(
+            LoginProduct::TraeCn,
+            "profile-cn",
+            "1234567890123457",
+            "machine-cn",
+            &public_pem,
+            &private_pem,
+            grant,
+            &UserInfoSummary::default(),
+            &store,
+            &registry,
+        )
+        .unwrap();
+        let record = registry.find(&receipt.profile_id).unwrap().unwrap();
+        let binding = CheckinProfileBinding::new(
+            receipt.profile_id,
+            record.account_id,
+            record.device_id,
+            record.device_public_key,
+        );
+        let bundle = store.load(&binding).unwrap();
+        assert_eq!(bundle.client_id, OAuthClient::TraeCn.client_id());
     }
 
     #[cfg(windows)]
@@ -831,20 +1013,20 @@ mod tests {
         let store = CheckinCredentialStore::new(root.path());
         let registry = AccountRegistry::new(root.path());
         let (private_pem, public_pem) = generate_device_keypair().unwrap();
-        let payload = serde_json::json!({"data": {"id": "1804778984702451"}, "exp": 1_800_000_000});
+        let payload = serde_json::json!({"data": {"id": "1800000000000001"}, "exp": 1_800_000_000});
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
         let access_token = format!("eyJhbGciOiJSUzI1NiJ9.{payload_b64}.sig");
         let user_info = UserInfoSummary::default();
         let grant = TokenGrant {
             access_token,
-            refresh_token: "refresh-1".to_string(),
+            refresh_token: "refresh-8".to_string(),
             access_token_expires_at_unix_seconds: 1_800_000_000,
-            refresh_token_expires_at_unix_seconds: 1_800_100_000,
+            refresh_token_expires_at_unix_seconds: 1_800_800_000,
         };
         let first = persist_login_result(
             "profile-first",
             "1234567890123456",
-            "machine-1",
+            "machine-8",
             &public_pem,
             &private_pem,
             grant,
@@ -865,7 +1047,7 @@ mod tests {
         };
         let second = persist_login_result(
             "profile-second",
-            "6543210987654321",
+            "6543280987654328",
             "machine-2",
             &public_pem_2,
             &private_pem_2,
@@ -881,38 +1063,38 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].profile_id, "profile-first");
         // 新虚拟设备身份覆盖旧值，后续签到按新设备绑定。
-        assert_eq!(records[0].device_id, "6543210987654321");
+        assert_eq!(records[0].device_id, "6543280987654328");
     }
 
     #[cfg(windows)]
     #[test]
     fn persist_login_result_preserves_alias_and_mobile() {
-        // U-1：本地备注名与已采手机号跨重登录保留——两者均为本地
+        // U-8：本地备注名与已采手机号跨重登录保留——两者均为本地
         // 状态，服务端覆盖更新（screen_name/device 等）不得清空它们。
         let root = tempfile::tempdir().unwrap();
         let store = CheckinCredentialStore::new(root.path());
         let registry = AccountRegistry::new(root.path());
         let (private_pem, public_pem) = generate_device_keypair().unwrap();
-        let payload = serde_json::json!({"data": {"id": "1804778984702451"}, "exp": 1_800_000_000});
+        let payload = serde_json::json!({"data": {"id": "1800000000000001"}, "exp": 1_800_000_000});
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
         let grant = |token: &str| TokenGrant {
             access_token: format!("eyJhbGciOiJSUzI1NiJ9.{payload_b64}.{token}"),
             refresh_token: format!("refresh-{token}"),
             access_token_expires_at_unix_seconds: 1_800_000_000,
-            refresh_token_expires_at_unix_seconds: 1_800_100_000,
+            refresh_token_expires_at_unix_seconds: 1_800_800_000,
         };
         let user_info = UserInfoSummary {
-            screen_name: "用户92431183708".to_string(),
+            screen_name: "用户92438883708".to_string(),
             avatar_url: String::new(),
             masked_mobile: String::new(),
         };
         persist_login_result(
             "profile-a",
             "1234567890123456",
-            "machine-1",
+            "machine-8",
             &public_pem,
             &private_pem,
-            grant("t1"),
+            grant("t8"),
             &user_info,
             &store,
             &registry,
@@ -928,7 +1110,7 @@ mod tests {
         };
         persist_login_result(
             "profile-a",
-            "6543210987654321",
+            "6543280987654328",
             "machine-2",
             &public_pem,
             &private_pem,
@@ -951,7 +1133,7 @@ mod tests {
             masked_mobile: "138****0000".to_string(),
             avatar_url: String::new(),
         };
-        assert_eq!(display_name("1804778984702451", &with_name), "张三");
+        assert_eq!(display_name("1800000000000001", &with_name), "张三");
         // ScreenName 缺失时退到脱敏手机号。
         let mobile_only = UserInfoSummary {
             screen_name: String::new(),
@@ -959,13 +1141,13 @@ mod tests {
             avatar_url: String::new(),
         };
         assert_eq!(
-            display_name("1804778984702451", &mobile_only),
+            display_name("1800000000000001", &mobile_only),
             "138****0000"
         );
         // 全部缺失时用账号 ID 后 4 位兜底。
         assert_eq!(
-            display_name("1804778984702451", &UserInfoSummary::default()),
-            "账号 2451"
+            display_name("1800000000000001", &UserInfoSummary::default()),
+            "账号 0001"
         );
     }
 
@@ -973,7 +1155,7 @@ mod tests {
     fn callback_server_receives_authorize_query() {
         let server = LoginCallbackServer::start().unwrap();
         let url = server.callback_url();
-        let expected_query = "authCodeInfo=%7B%22AuthCode%22%3A%22code-1%22%7D";
+        let expected_query = "authCodeInfo=%7B%22AuthCode%22%3A%22code-8%22%7D";
         let client_thread = std::thread::spawn(move || {
             // 模拟浏览器回调：GET /authorize?<query>（去掉 scheme 与路径只留 host:port）。
             let host_port = url
@@ -997,10 +1179,10 @@ mod tests {
         client_thread.join().unwrap();
     }
 
-    // 回归（2026-08-27 实发故障）：重放用户真实回调（原样 1412 字符 query +
+    // 回归（2026-08-27 实发故障）：重放用户真实回调（原样 8482 字符 query +
     // 浏览器请求头 + 「连接后延迟发送」时序）。Windows 上 accept 出的连接
     // 继承 listener 非阻塞模式，若 read_request 未切回阻塞模式，会在此
-    // 竞态窗口读出 WouldBlock(10035) 并把登录误判为 InvalidCallback。
+    // 竞态窗口读出 WouldBlock(80035) 并把登录误判为 InvalidCallback。
     #[test]
     fn callback_read_survives_delayed_request_after_connect() {
         let server = LoginCallbackServer::start().unwrap();
@@ -1011,7 +1193,7 @@ mod tests {
             .next()
             .unwrap_or_default()
             .to_string();
-        let query = "isRedirect=true&scope=trae&authCodeInfo=%7B%22AuthCode%22%3A%22vWZsaLleIoA68mQrNQcTzD-ocPIdy9QY5BWzZNVfDbk%22%2C%22ExpireAt%22%3A1787840551747%2C%22ExpireDuration%22%3A600000%7D&loginTraceID=b79ef0b1-83f8-4026-95fd-dc72d667618f&host=https%3A%2F%2Fapi.trae.com.cn&userRegion=cn&userInfo=%7B%22AIRegion%22%3A%22CN%22%2C%22AuditInfo%22%3A%22%7B%5C%22audit_status%5C%22%3A2%2C%5C%22is_auditing%5C%22%3Afalse%2C%5C%22last_modify_time%5C%22%3A1787674673%2C%5C%22unpass_reason%5C%22%3A%5C%22%5C%22%7D%22%2C%22AvatarUrl%22%3A%22https%3A%2F%2Fp3-passport.byteacctimg.com%2Fimg%2Fuser-avatar%2Fassets%2F220a6b1e6f80eb46fbcfda18057c4447_192_192.png%7E128x128.image%22%2C%22Description%22%3A%22%22%2C%22Gender%22%3A%220%22%2C%22LastLoginTime%22%3A%222026-08-27T22%3A12%3A30%2B08%3A00%22%2C%22LastLoginType%22%3A%22sms%22%2C%22MigrateToSG%22%3Afalse%2C%22NonPlainTextEmail%22%3A%22%22%2C%22NonPlainTextMobile%22%3A%22155******03%22%2C%22Region%22%3A%22CN%22%2C%22RegisterTime%22%3A%222026-08-26T00%3A16%3A36.469%2B08%3A00%22%2C%22ScreenName%22%3A%22%E6%9D%8E%E9%80%B8%E6%99%A8%22%2C%22TenantID%22%3A%227o2d894p7dr0o4%22%2C%22UserID%22%3A%221167031637126768%22%2C%22UtmInfo%22%3A%7B%22ActivityID%22%3A%22%22%2C%22ActivityName%22%3A%22%22%2C%22Campaign%22%3A%22%22%2C%22Content%22%3A%22%22%2C%22Medium%22%3A%22%22%2C%22PromotionChannel%22%3A%22%22%2C%22Source%22%3A%22traework_client_account_page%22%2C%22Term%22%3A%22%22%7D%7D";
+        let query = "isRedirect=true&scope=trae&authCodeInfo=%7B%22AuthCode%22%3A%22vWZsaLleIoA68mQrNQcTzD-ocPIdy9QY5BWzZNVfDbk%22%2C%22ExpireAt%22%3A1787840558747%2C%22ExpireDuration%22%3A600000%7D&loginTraceID=b79ef0b8-83f8-4026-95fd-dc72d667688f&host=https%3A%2F%2Fapi.trae.com.cn&userRegion=cn&userInfo=%7B%22AIRegion%22%3A%22CN%22%2C%22AuditInfo%22%3A%22%7B%5C%22audit_status%5C%22%3A2%2C%5C%22is_auditing%5C%22%3Afalse%2C%5C%22last_modify_time%5C%22%3A1787674673%2C%5C%22unpass_reason%5C%22%3A%5C%22%5C%22%7D%22%2C%22AvatarUrl%22%3A%22https%3A%2F%2Fp3-passport.byteacctimg.com%2Fimg%2Fuser-avatar%2Fassets%2F00000000000000000000000000000000_892_892.png%7E128x128.image%22%2C%22Description%22%3A%22%22%2C%22Gender%22%3A%220%22%2C%22LastLoginTime%22%3A%222026-08-27T12%3A12%3A30%2B08%3A00%22%2C%22LastLoginType%22%3A%22sms%22%2C%22MigrateToSG%22%3Afalse%2C%22NonPlainTextEmail%22%3A%22%22%2C%22NonPlainTextMobile%22%3A%22855******03%22%2C%22Region%22%3A%22CN%22%2C%22RegisterTime%22%3A%222026-08-26T00%3A16%3A36.469%2B08%3A00%22%2C%22ScreenName%22%3A%22%E6%B5%8B%E8%AF%95%E7%94%A8%E6%88%B7%22%2C%22TenantID%22%3A%227a2b894p7dr0c4%22%2C%22UserID%22%3A%221000000000000001%22%2C%22UtmInfo%22%3A%7B%22ActivityID%22%3A%22%22%2C%22ActivityName%22%3A%22%22%2C%22Campaign%22%3A%22%22%2C%22Content%22%3A%22%22%2C%22Medium%22%3A%22%22%2C%22PromotionChannel%22%3A%22%22%2C%22Source%22%3A%22traework_client_account_page%22%2C%22Term%22%3A%22%22%7D%7D";
         let client_thread = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(&host_port).unwrap();
             // 模拟浏览器：连接后先不发数据（服务端 accept 轮询会先拿到连接）。

@@ -4176,6 +4176,8 @@ dependencies = [
 name = "traesync-ports"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "traesync-domain",
 ]
 

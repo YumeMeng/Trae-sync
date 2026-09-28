@@ -243,7 +243,7 @@ integrity_check: ok
 
 ## 已验证新设备注册与签到闭环（2026-08-25）
 
-目标账号：`2873473361250299`。本节只记录已通过真实 HTTP 的路线，禁止用 refresh-mode 新设备铸造替代。
+目标账号：`账号D`。本节只记录已通过真实 HTTP 的路线，禁止用 refresh-mode 新设备铸造替代。
 
 ### 可重复设备铸造
 
@@ -317,10 +317,12 @@ status-after:  HTTP 200, code=0, checked_in=true
 4. **代码侧适配**：`parse_exchange_envelope` 已改为非 200 响应也解析响应体业务码（20401 等不再被吞成 Http(403)）；登录流新增 `LoginError::ExchangeDeviceLimit` 单独归类 20401，UI 提示设备上限的真实原因。
 5. **（15:33 修正并推翻早前「账号级网关 403」结论）**：LY 重登的裸 `Http(403)` 实为 20401 设备上限——诊断日志捕获的完整响应体含 `"Code":"20401","Message":"Device limit reached."`。此前识别失败的根因：**服务端返回的业务码是 JSON 字符串形态**，解析只认数字导致 20401 被吞成裸 403。`exchange_error_code` 与 `GetPCAuthCode` 解析已改为数字/字符串双兼容。另：设备配额按 client_id 通道独立计数——LY 在 Work 通道（ono9krqynydwx5）配额耗尽，官方客户端（SOLO 通道）同账号可正常登录。
 6. **（15:46 补充）`auth_from` 必须与登录通道一致**：官方 main.js 逆向实证 `auth_from = isSolo ? "solo" : "trae"`，SOLO 通道另追加 `hide_saas_login=true`。授权页按 `auth_from` 决定 AuthCode 的通道绑定：client_id 用 SOLO 而 auth_from 发 "trae" 时，ExchangeToken 报 20403 "Token device not match"（LY 实测，401 + 响应体业务码）。已修复 `build_login_url`。
-7. **（15:40 决策）登录链路固定 SOLO 通道**：SOLO 与 Work 为同一产品改名（原 Trae SOLO → 现 Trae Work），服务端按 client_id 通道分别计设备配额。登录/换取/凭据存储统一切到 SOLO 通道（en1oxy7wnw8j9n）：a) Work 通道配额易被历史测试耗尽（20401）；b) SOLO 形态设备可直接首签，取消登录后自动重铸（每次登录设备注册 2 → 1）。后续通道可用性变化时按「能用的优先」原则切换，不绑定产品名。
-8. **（16:05 LY 恢复实录）设备配额满 ≠ 账号不可用**：`checkin/retired/` 下的退役凭据包（DPAPI 加密，`{account_id}-{时间戳}.checkin`）含旧设备完整凭证。LY（3559551364241212）双通道配额满（20401）无法新登录，但其 8 月 26 日退役设备 2971060318912937 的 access token（至 09-05）与 refresh token（至 2027-02）均仍有效——GetUserInfo 实测 HTTP 200。恢复方法：凭据包复制到 `sha256(profile_id).checkin` 标准路径 + 重建 `accounts.json` 注册条目（`retired-devices.json` 提供 account_id↔profile_id 映射）。**refresh 模式续期用既有设备，不注册新设备，不触发 20401**——配额耗尽账号的标准救援路径。
-9. **（16:07 修正第 2 条「账号级 9074」结论）9074 是设备信任门禁，非账号级封禁**：LY 恢复旧设备 2971060318912937 后 claim-only 探针实测 `business_0` 成功签到（status_before `[false,200]` → checked_in_after `true`）。此前当日 12:42/14:06 的 9074 拒绝全部发生在**新铸设备**上——有历史签到记录的老设备不受影响。结论：9074 拒「陌生设备」不拒「熟悉设备」，LY 账号本身在签到通道健康。
+7. **（15:40 决策）Work CN 登录链路固定 SOLO 通道**：SOLO 与 Work 为同一产品改名（原 Trae SOLO → 现 Trae Work），服务端按 client_id 通道分别计设备配额。Work CN 登录/换取/凭据存储统一切到 SOLO 通道（en1oxy7wnw8j9n）：a) Work 通道配额易被历史测试耗尽（20401）；b) SOLO 形态设备可直接首签，取消登录后自动重铸（每次登录设备注册 2 → 1）。Trae CN 的 `TRAE/IDE_PC` 通道不属于本条，独立凭据维护边界见 ADR-0030。后续通道可用性变化时按「能用的优先」原则切换，不绑定产品名。
+8. **（16:05 LY 恢复实录）设备配额满 ≠ 账号不可用**：`checkin/retired/` 下的退役凭据包（DPAPI 加密，`{account_id}-{时间戳}.checkin`）含旧设备完整凭证。LY（用户F）双通道配额满（20401）无法新登录，但其 8 月 26 日退役设备 旧设备（编号从略） 的 access token（至 09-05）与 refresh token（至 2027-02）均仍有效——GetUserInfo 实测 HTTP 200。恢复方法：凭据包复制到 `sha256(profile_id).checkin` 标准路径 + 重建 `accounts.json` 注册条目（`retired-devices.json` 提供 account_id↔profile_id 映射）。**refresh 模式续期用既有设备，不注册新设备，不触发 20401**——配额耗尽账号的标准救援路径。
+9. **（16:07 修正第 2 条「账号级 9074」结论）9074 是设备信任门禁，非账号级封禁**：LY 恢复旧设备 旧设备（编号从略） 后 claim-only 探针实测 `business_0` 成功签到（status_before `[false,200]` → checked_in_after `true`）。此前当日 12:42/14:06 的 9074 拒绝全部发生在**新铸设备**上——有历史签到记录的老设备不受影响。结论：9074 拒「陌生设备」不拒「熟悉设备」，LY 账号本身在签到通道健康。
 10. **（16:40 代码固化）9074/9095 触发后「恢复退役优先于重铸」已进主链路**：`RemintCheckinRunner` 决策树变更为 常规签到 → 9074/9095 → ①恢复退役设备（`DeviceRemintService::restore_retired`，检索 `retired/retired-devices.json` 未消耗条目，校验账号匹配 + refresh 未过期，凭据写回 + 注册表对齐 + 条目标记 consumed）→ 立即重试（老设备无频率冷却）；②无可用退役 → 原重铸路径。**恢复的老设备重试仍被拒时不再重铸**（每次运行至多换一次设备，防配额空烧）。恢复路径 0 设备注册、不触 20401；恢复失败的档案切换零副作用。
+
+> **现行决策覆盖（2026-09-02，必须以 ADR-0019 v6 为准）**：本节第 2、10 条记录的是当时的实验结果和曾经进入代码的恢复策略，不再代表当前行为契约。当前签到遇到 9074/9095 时不自动恢复退役设备、不自动重铸、不冷却重试；只返回具体业务码，由用户明确发起等待后重试或设备重置。凭据续期与签到设备变更也必须遵循 ADR-0019 v6 及 ADR-0027，不能依据本节历史描述恢复旧自动链。
 
 ## 已验证当前账号证据
 

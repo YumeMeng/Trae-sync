@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { AccountCenter } from "../src/components/AccountCenter";
+import { createTraeCnAccountAdapter } from "../src/platform/accountAdapter";
 import type {
   AccountProfileDto,
   ManagedAccountsViewDto,
@@ -159,6 +160,10 @@ describe("AccountCenter", () => {
     render(<AccountCenter active={true} />);
     expect(await screen.findByText("工作账号 A")).toBeInTheDocument();
     expect(screen.getByText("工作账号 B")).toBeInTheDocument();
+    expect(screen.getByTestId("account-saved-card-profile-current")).toHaveClass("account-item");
+    expect(screen.getByTestId("account-saved-card-profile-current")).toHaveClass("account-list__row");
+    expect(screen.getAllByText("状态待验证").length).toBe(2);
+    expect(screen.getByTestId("account-view-list")).toBeInTheDocument();
     expect(mockInvoke).not.toHaveBeenCalledWith("get_checkin_overview");
     expect(screen.queryByTestId("account-add-primary")).not.toBeInTheDocument();
   });
@@ -1381,5 +1386,143 @@ describe("AccountCenter", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
     expect(callsOf("get_trae_instance_states")).toBe(statesBefore);
     expect(callsOf("refresh_checkin_credits")).toBe(creditsBefore);
+  });
+
+  it("Work 详情页内嵌登录设备模块：默认折叠不触网，展开才按该账号拉取（P10-5）", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") {
+        return [overviewEntry("profile-detail-1", "详情账号甲")];
+      }
+      if (command === "get_trae_instance_states") return [];
+      if (command === "list_remote_devices") {
+        return {
+          profile_id: "profile-detail-1",
+          account_label: "详情账号甲",
+          used_count: 2,
+          max_count: 10,
+          devices: [
+            {
+              device_id: "dev-local",
+              device_type: "IDE_PC",
+              device_name: "本机电脑",
+              bound_products: ["TRAE Work CN"],
+              last_active_at: null,
+              is_local: true,
+            },
+            {
+              device_id: "dev-remote-1",
+              device_type: "MOBILE",
+              device_name: "出差的手机",
+              bound_products: [],
+              last_active_at: null,
+              is_local: false,
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+
+    // 列表页不再有独立设备区块：入口只存在于账号详情页。
+    await screen.findByTestId("account-card-profile-detail-1");
+    expect(screen.queryByTestId("remote-devices-panel")).not.toBeInTheDocument();
+
+    // 进入详情：设备模块出现但默认折叠，未发任何设备命令（懒加载）。
+    fireEvent.click(screen.getByTestId("account-card-profile-detail-1"));
+    expect(await screen.findByTestId("remote-devices-panel")).toBeInTheDocument();
+    expect(
+      mockInvoke.mock.calls.filter(([name]) => name === "list_remote_devices"),
+    ).toHaveLength(0);
+
+    // 展开后按该账号的 profile_id 拉取列表：本机行无退出按钮，非本机行有。
+    fireEvent.click(screen.getByTestId("remote-devices-toggle"));
+    expect(await screen.findByTestId("remote-device-row-dev-local")).toBeInTheDocument();
+    expect(mockInvoke).toHaveBeenCalledWith("list_remote_devices", {
+      productId: "work_cn",
+      profileId: "profile-detail-1",
+    });
+    expect(screen.getByTestId("remote-devices-summary")).toHaveTextContent("已用 2 / 上限 10 台");
+    expect(screen.getByTestId("remote-device-row-dev-local")).toHaveTextContent("本机");
+    expect(screen.queryByTestId("remote-device-signout-dev-local")).not.toBeInTheDocument();
+    // 其他设备分组默认折叠：先展开再断言非本机行退出按钮。
+    fireEvent.click(screen.getByTestId("remote-devices-others-toggle"));
+    expect(screen.getByTestId("remote-device-signout-dev-remote-1")).toBeInTheDocument();
+  });
+
+  it("Trae CN 适配器：卡片点击进入账号详情，设备模块内嵌详情页且展开才触网（P10-5）", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_product_identity_state") return [];
+      if (command === "list_trae_cn_accounts") {
+        return [{
+          profile_id: "cn-a",
+          display_name: "CN 主账号",
+          avatar_url: "",
+          last_verified_at: null,
+          status: "active",
+          is_current: true,
+        }];
+      }
+      if (command === "list_remote_devices") {
+        return {
+          profile_id: "cn-a",
+          account_label: "CN 主账号",
+          used_count: 2,
+          max_count: 10,
+          devices: [
+            {
+              device_id: "dev-local",
+              device_type: "IDE_PC",
+              device_name: "本机电脑",
+              bound_products: ["Trae CN"],
+              last_active_at: null,
+              is_local: true,
+            },
+            {
+              device_id: "dev-remote-1",
+              device_type: "MOBILE",
+              device_name: "出差的手机",
+              bound_products: [],
+              last_active_at: null,
+              is_local: false,
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+
+    // 列表页无设备面板；卡片可点击（当前账号显示「使用中」标记）。
+    await screen.findByTestId("account-adapter-card-cn-a");
+    expect(screen.queryByTestId("remote-devices-panel")).not.toBeInTheDocument();
+
+    // 点击卡片进入详情：详情页含基础信息与设备模块（折叠、未触网）。
+    fireEvent.click(screen.getByTestId("account-adapter-card-cn-a"));
+    expect(await screen.findByTestId("adapter-account-detail")).toBeInTheDocument();
+    expect(screen.getByTestId("adapter-account-detail-back")).toBeInTheDocument();
+    expect(screen.getByTestId("adapter-account-detail-status")).toHaveTextContent("登录有效");
+    expect(screen.getByTestId("adapter-account-detail-current")).toHaveTextContent("使用中");
+    expect(screen.getByTestId("remote-devices-panel")).toBeInTheDocument();
+    expect(
+      mockInvoke.mock.calls.filter(([name]) => name === "list_remote_devices"),
+    ).toHaveLength(0);
+
+    // 展开后按详情账号拉取设备列表：本机无退出按钮，非本机有。
+    fireEvent.click(screen.getByTestId("remote-devices-toggle"));
+    expect(await screen.findByTestId("remote-device-row-dev-local")).toBeInTheDocument();
+    expect(mockInvoke).toHaveBeenCalledWith("list_remote_devices", {
+      productId: "trae_cn",
+      profileId: "cn-a",
+    });
+    expect(screen.getByTestId("remote-devices-summary")).toHaveTextContent("已用 2 / 上限 10 台");
+    expect(screen.queryByTestId("remote-device-signout-dev-local")).not.toBeInTheDocument();
+    // 其他设备分组默认折叠：先展开再断言非本机行退出按钮。
+    fireEvent.click(screen.getByTestId("remote-devices-others-toggle"));
+    expect(screen.getByTestId("remote-device-signout-dev-remote-1")).toBeInTheDocument();
   });
 });

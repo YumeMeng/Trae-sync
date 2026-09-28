@@ -108,6 +108,228 @@
   white-space: nowrap;
 }
 
+/* 多产品首阶段账号页：只呈现产品凭据边界，不复用 Work 账号卡片。 */
+.product-account-page {
+  min-width: 0;
+}
+
+.product-account-page__header {
+  margin-bottom: 18px;
+}
+
+.product-account-page__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.product-account-page__card {
+  display: flex;
+  gap: 14px;
+  min-height: 138px;
+  padding: 20px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+}
+
+.product-account-page__card--note {
+  background: var(--glass-dense);
+}
+
+.product-account-page__card-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--line-control);
+  border-radius: 11px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.product-account-page__card h2 {
+  margin: 0 0 7px;
+  font-size: 14px;
+}
+
+.product-account-page__card strong {
+  display: block;
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.product-account-page__card p,
+.product-account-page__footer p {
+  margin: 8px 0 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.product-account-page__accounts {
+  margin-top: 16px;
+  padding: 20px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+}
+
+.product-account-page__section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.product-account-page__section-header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.product-account-page__section-header p {
+  margin: 6px 0 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.product-account-page__empty {
+  margin: 16px 0 0;
+  padding: 22px;
+  border: 1px dashed var(--line-control);
+  border-radius: 11px;
+  color: var(--text-2);
+  font-size: 12px;
+  text-align: center;
+}
+
+.product-account-page__empty strong {
+  display: block;
+  color: var(--text-1);
+  font-size: 14px;
+}
+
+.product-account-page__empty p {
+  margin: 6px 0 0;
+}
+
+.product-account-page__account-list {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.product-account-page__account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line-hair);
+  border-radius: 11px;
+  background: var(--glass-dense);
+}
+
+.product-account-page__account-avatar {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.product-account-page__account-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 4px;
+}
+
+.product-account-page__account-copy strong {
+  overflow: hidden;
+  color: var(--text-1);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.product-account-page__account-copy span {
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.product-account-page__current-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.product-account-page .workbench__error,
+.product-account-page__message {
+  margin: 0 0 14px;
+}
+
+.product-account-page__message {
+  padding: 10px 12px;
+  border: 1px solid var(--line-control);
+  border-radius: 9px;
+  background: var(--fill-soft);
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.product-account-page__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 16px;
+  padding: 16px 20px;
+  border: 1px solid var(--line-hair);
+  border-radius: 12px;
+  background: var(--glass-dense);
+}
+
+.product-account-page__footer p {
+  margin: 0;
+}
+
+@media (max-width: 800px) {
+  .product-account-page__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .product-account-page__footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .product-account-page__section-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .product-account-page__section-header .btn {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
 .workbench__summary span:last-child {
   border-right: 0;
 }

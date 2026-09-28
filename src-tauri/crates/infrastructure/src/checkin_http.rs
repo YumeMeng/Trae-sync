@@ -59,6 +59,11 @@ pub const TRAE_IDE_VERSION: &str = "3.3.74";
 pub const TRAE_SOLO_CLIENT_ID: &str = "en1oxy7wnw8j9n";
 /// TRAE SOLO CN 客户端版本（r34 探针实测值）。
 pub const TRAE_SOLO_IDE_VERSION: &str = "0.1.54";
+/// Trae CN 客户端 ID：来自 Trae CN `product.json` 的 `authConfig.TRAE.stable`。
+/// 这是公开的 OAuth client 标识，不是用户凭据；它与 Work 使用的 SOLO client 分离。
+pub const TRAE_CN_CLIENT_ID: &str = "ono9krqynydwx5";
+/// Trae CN 当前安装包的 `appVersion`，用于 OAuth 的客户端版本字段。
+pub const TRAE_CN_IDE_VERSION: &str = "3.3.102";
 const REQUEST_TIMEOUT_SECONDS: u64 = 15;
 
 /// 真实 HTTP 调用错误；不携带 Token、refresh token 或响应正文。
@@ -470,7 +475,7 @@ pub struct DeviceInfoBlock {
 }
 
 impl DeviceInfoBlock {
-    /// SOLO 形态虚拟设备（v6 唯一形态；完整硬件字段，新设备首签依赖）。
+    /// Work CN 的 SOLO 形态虚拟设备（完整硬件字段，新设备首签依赖）。
     pub fn for_virtual_device(device_id: &str, machine_id: &str, device_public_key: &str) -> Self {
         OAuthClient::Solo.device_info(device_id, machine_id, device_public_key)
     }
@@ -493,35 +498,42 @@ impl DeviceInfoBlock {
     }
 }
 
-/// OAuth 客户端形态（ADR-0019 v6：SOLO 是唯一形态）。
+/// OAuth 客户端形态。
 ///
 /// 协议事实（2026-08-25/26 实测）：
 /// - SOLO 形态（en1oxy7wnw8j9n / SOLO_PC / 完整硬件字段）的 AuthCode
-///   新设备可立即首签（手册 5.1，账号 2873473361250299 完整闭环）；
+///   新设备可立即首签（手册 5.1，账号D 完整闭环）；
 /// - 原 Work 形态（IDE_PC / 空硬件字段）设备配额耗尽且新设备首签被
 ///   9074 稳定拒绝，代码已删除（2026-09-02）。
+/// - Trae CN 形态（ono9krqynydwx5 / IDE_PC / 官方 `TRAE_CN` appVersion）
+///   只用于独立的 Trae CN OAuth 账号池，不进入 Work CN 的签到续期路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthClient {
-    /// TRAE SOLO CN 桌面客户端（登录、铸造、续期全链路唯一形态）。
+    /// TRAE Work CN 桌面客户端（登录、铸造、续期使用 SOLO 形态）。
     Solo,
+    /// 独立 Trae CN 桌面客户端登录形态。
+    TraeCn,
 }
 
 impl OAuthClient {
     pub fn client_id(&self) -> &'static str {
         match self {
             Self::Solo => TRAE_SOLO_CLIENT_ID,
+            Self::TraeCn => TRAE_CN_CLIENT_ID,
         }
     }
 
     pub fn platform_code(&self) -> &'static str {
         match self {
             Self::Solo => "SOLO_PC",
+            Self::TraeCn => "IDE_PC",
         }
     }
 
     pub fn ide_version(&self) -> &'static str {
         match self {
             Self::Solo => TRAE_SOLO_IDE_VERSION,
+            Self::TraeCn => TRAE_CN_IDE_VERSION,
         }
     }
 
@@ -543,6 +555,21 @@ impl OAuthClient {
                 device_cpu: "Intel(R) Core(TM) i7-9750H CPU".to_string(),
                 os_info: "windows".to_string(),
                 os_version: "Windows 11 Home".to_string(),
+            },
+            Self::TraeCn => DeviceInfoBlock {
+                device_id: device_id.to_string(),
+                machine_id: machine_id.to_string(),
+                platform_code: self.platform_code().to_string(),
+                client_version: self.ide_version().to_string(),
+                device_public_key: device_public_key.to_string(),
+                // CN OAuth 只在 Trae Sync 的独立账号池中保存；硬件描述沿用
+                // 官方 TRAE 客户端的 DeviceInfo 形态，不复用 Work 的认证材料。
+                device_name: "Trae Sync 管理设备".to_string(),
+                device_model: "Trae Sync managed device".to_string(),
+                device_brand: "Trae Sync".to_string(),
+                device_cpu: "Trae Sync managed device".to_string(),
+                os_info: std::env::consts::OS.to_string(),
+                os_version: String::new(),
             },
         }
     }
@@ -977,15 +1004,55 @@ pub fn get_user_info(
     })
 }
 
+/// 按 OAuth 产品形态查询账号资料；Work 与 Trae CN 使用各自的客户端版本和
+/// `ReqSource`，但都只返回非敏感资料。
+pub fn get_user_info_for_oauth_client(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    oauth_client: OAuthClient,
+) -> Result<UserInfoSummary, CheckinHttpError> {
+    let full = get_user_info_full_for_oauth_client(client, token, oauth_client)?;
+    Ok(UserInfoSummary {
+        screen_name: full.screen_name,
+        avatar_url: full.avatar_url,
+        masked_mobile: full.masked_mobile,
+    })
+}
+
 /// 只读查询完整账号资料（P7-1 E2 构造路径输入；同协议同端点，
 /// 解析全部资料与区域字段——字段映射表见 `.scratch/e2-credential-login/REPORT.md`）。
 pub fn get_user_info_full(
     client: &reqwest::blocking::Client,
     token: &str,
 ) -> Result<UserInfoFull, CheckinHttpError> {
+    get_user_info_full_with_request(client, token, "IDE", TRAE_IDE_VERSION)
+}
+
+/// 按 OAuth 产品形态查询完整账号资料；不会读取或写入任何本地认证文件。
+pub fn get_user_info_full_for_oauth_client(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    oauth_client: OAuthClient,
+) -> Result<UserInfoFull, CheckinHttpError> {
+    let ide_version = match oauth_client {
+        // 保持 Work 原有 GetUserInfo 请求，不把登录 Exchange 的 SOLO 版本号
+        // 混入已验证的资料查询协议。
+        OAuthClient::Solo => TRAE_IDE_VERSION,
+        OAuthClient::TraeCn => TRAE_CN_IDE_VERSION,
+    };
+    get_user_info_full_with_request(client, token, "IDE", ide_version)
+}
+
+/// 发送 GetUserInfo 请求并解析共同响应结构；请求参数由产品 OAuth 形态决定。
+fn get_user_info_full_with_request(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    req_source: &str,
+    ide_version: &str,
+) -> Result<UserInfoFull, CheckinHttpError> {
     let body = serde_json::json!({
-        "ReqSource": "IDE",
-        "IDEVersion": TRAE_IDE_VERSION,
+        "ReqSource": req_source,
+        "IDEVersion": ide_version,
     });
     let response = client
         .post(format!("{API_BASE}{GET_USER_INFO_PATH}"))
@@ -1022,15 +1089,25 @@ pub fn get_user_info_full(
 pub struct RealCheckinRenewalService<'a> {
     store: &'a CheckinCredentialStore,
     http: Box<dyn CredentialRenewalHttpAdapter>,
+    oauth_client: OAuthClient,
 }
 
 impl<'a> RealCheckinRenewalService<'a> {
     pub fn new(store: &'a CheckinCredentialStore) -> Self {
+        Self::new_for_oauth_client(store, OAuthClient::Solo)
+    }
+
+    /// 按产品 OAuth 形态创建续期服务；凭据仓库根仍由调用方隔离。
+    pub fn new_for_oauth_client(
+        store: &'a CheckinCredentialStore,
+        oauth_client: OAuthClient,
+    ) -> Self {
         Self {
             store,
             http: Box::new(ReqwestCredentialRenewalHttpAdapter {
                 client: http_client(),
             }),
+            oauth_client,
         }
     }
 
@@ -1040,7 +1117,11 @@ impl<'a> RealCheckinRenewalService<'a> {
         store: &'a CheckinCredentialStore,
         http: Box<dyn CredentialRenewalHttpAdapter>,
     ) -> Self {
-        Self { store, http }
+        Self {
+            store,
+            http,
+            oauth_client: OAuthClient::Solo,
+        }
     }
 
     /// 剩余寿命高于阈值时跳过（`Ok(None)`）；需要时执行一次真实续期。
@@ -1085,9 +1166,8 @@ impl<'a> RealCheckinRenewalService<'a> {
         bundle: CheckinCredentialBundle,
         now_unix_seconds: u64,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
-        // ADR-0019 v6：旧 Work 通道已退役，必须在任何换发/救援前快速失败，
-        // 避免无效网络请求和消耗该凭据代次唯一一次 rescue 机会。
-        if bundle.client_id != TRAE_SOLO_CLIENT_ID {
+        // 凭据包必须使用与当前产品一致的 client；跨产品材料不能进入续期。
+        if bundle.client_id != self.oauth_client.client_id() {
             return Err(CheckinCredentialError::CredentialRefreshFailed);
         }
         // 真实实测：同一设备用仍有效的 access token 申请 AuthCode，再交换新
@@ -1120,7 +1200,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         binding: &CheckinProfileBinding,
         bundle: CheckinCredentialBundle,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
-        let oauth_client = OAuthClient::Solo;
+        let oauth_client = self.oauth_client;
         let pkce = generate_pkce_pair()
             .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
         let auth_code = self.http.get_pc_auth_code(
@@ -1150,20 +1230,22 @@ impl<'a> RealCheckinRenewalService<'a> {
         let mut updated = bundle;
         updated.access_token = grant.access_token;
         updated.refresh_token = grant.refresh_token;
-        updated.client_id = TRAE_SOLO_CLIENT_ID.to_string();
+        updated.client_id = oauth_client.client_id().to_string();
         updated.access_token_expires_at_unix_seconds = grant.access_token_expires_at_unix_seconds;
         updated.refresh_token_expires_at_unix_seconds =
             grant.refresh_token_expires_at_unix_seconds;
         let operation_id = self.store.write_back(binding, &updated)?;
-        // 新 token 写回后同步当前实例登录 blob；失败不影响已验证的凭据包。
-        crate::blob_keepalive::keepalive_after_renewal(
-            self.store.root(),
-            &binding.profile_id,
-            &updated.access_token,
-            &updated.refresh_token,
-            updated.access_token_expires_at_unix_seconds,
-            updated.refresh_token_expires_at_unix_seconds,
-        );
+        // Work 的实例 blob 保活属于 Work 专属能力；Trae CN 只更新自己的凭据仓库。
+        if matches!(oauth_client, OAuthClient::Solo) {
+            crate::blob_keepalive::keepalive_after_renewal(
+                self.store.root(),
+                &binding.profile_id,
+                &updated.access_token,
+                &updated.refresh_token,
+                updated.access_token_expires_at_unix_seconds,
+                updated.refresh_token_expires_at_unix_seconds,
+            );
+        }
         Ok(RenewalReceipt {
             profile_id: binding.profile_id.clone(),
             operation_id,
@@ -1177,10 +1259,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         bundle: CheckinCredentialBundle,
         timestamp_unix_seconds: u64,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
-        // 续期固定 SOLO 形态（v6 唯一形态）；旧 Work 凭据的续期会被
-        // 服务端按签名/形态校验拒绝，失败即 CredentialRefreshFailed，
-        // 由 UI 引导重新登录。
-        let oauth_client = OAuthClient::Solo;
+        let oauth_client = self.oauth_client;
         // DeviceInfo 必须与登录/铸造时一致（设备绑定校验依据）。
         let device_info = oauth_client.device_info(
             &bundle.device_id,
@@ -1207,21 +1286,21 @@ impl<'a> RealCheckinRenewalService<'a> {
         let mut updated = bundle;
         updated.access_token = grant.access_token;
         updated.refresh_token = grant.refresh_token;
-        updated.client_id = TRAE_SOLO_CLIENT_ID.to_string();
+        updated.client_id = oauth_client.client_id().to_string();
         updated.access_token_expires_at_unix_seconds = grant.access_token_expires_at_unix_seconds;
         updated.refresh_token_expires_at_unix_seconds = grant.refresh_token_expires_at_unix_seconds;
         let operation_id = self.store.write_back(binding, &updated)?;
-        // U-7 C1 保活：续期成功即把新凭据同步进实例登录 blob（TRAE 下次启动
-        // 免登录）。保活是增强能力：失败只记 stderr 日志，不影响续期结果；
-        // 签到失败路径在本函数之前就已返回，绝不触碰 blob。
-        crate::blob_keepalive::keepalive_after_renewal(
-            self.store.root(),
-            &binding.profile_id,
-            &updated.access_token,
-            &updated.refresh_token,
-            updated.access_token_expires_at_unix_seconds,
-            updated.refresh_token_expires_at_unix_seconds,
-        );
+        // Work 的实例 blob 保活属于 Work 专属能力；Trae CN 只更新自己的凭据仓库。
+        if matches!(oauth_client, OAuthClient::Solo) {
+            crate::blob_keepalive::keepalive_after_renewal(
+                self.store.root(),
+                &binding.profile_id,
+                &updated.access_token,
+                &updated.refresh_token,
+                updated.access_token_expires_at_unix_seconds,
+                updated.refresh_token_expires_at_unix_seconds,
+            );
+        }
         Ok(RenewalReceipt {
             profile_id: binding.profile_id.clone(),
             operation_id,
@@ -1430,6 +1509,20 @@ mod tests {
         assert_eq!(json["PlatformCode"], "SOLO_PC");
         assert_eq!(json["ClientVersion"], TRAE_SOLO_IDE_VERSION);
         assert_eq!(json["DevicePublicKey"], "pub-1");
+    }
+
+    #[test]
+    fn trae_cn_oauth_client_keeps_independent_channel() {
+        let client = OAuthClient::TraeCn;
+        assert_eq!(client.client_id(), TRAE_CN_CLIENT_ID);
+        assert_eq!(client.platform_code(), "IDE_PC");
+        assert_eq!(client.ide_version(), TRAE_CN_IDE_VERSION);
+        assert_ne!(client.client_id(), OAuthClient::Solo.client_id());
+
+        let block = client.device_info("1234567890123456", "machine-cn", "pub-cn");
+        assert_eq!(block.platform_code, "IDE_PC");
+        assert_eq!(block.client_version, TRAE_CN_IDE_VERSION);
+        assert_eq!(block.device_public_key, "pub-cn");
     }
 
     #[cfg(windows)]

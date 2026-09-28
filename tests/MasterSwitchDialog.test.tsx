@@ -32,7 +32,7 @@ function receipt(): MasterAccountSwitchDto {
   return {
     profile_id: "profile-b",
     to_user_id: "4050081351",
-    from_user_id: "4050081350",
+    from_user_id: "4000000001",
     transferred_projects: 4,
     removed_mirror_rows: 1,
     switched_sessions: 7,

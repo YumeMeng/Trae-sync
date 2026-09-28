@@ -99,7 +99,11 @@ describe("读取授权失效错误映射", () => {
     ["login_callback_invalid", "浏览器登录回调无效，请重新发起登录。"],
     [
       "login_exchange_failed",
-      "登录凭证换取失败（服务端拒绝）；详细原因已记录在诊断日志（数据目录 checkin/login-diagnostics.log），可重新发起登录再试一次。",
+      "登录凭证换取失败（服务端拒绝）；详细原因已记录在当前产品的数据目录中，可重新发起登录再试一次。",
+    ],
+    [
+      "login_exchange_device_limit",
+      "该账号在服务端的登录设备数量已达上限，登录暂时被拒；可打开该账号的详情页，在「登录设备」中退出不用的设备后重试。",
     ],
     ["login_token_invalid", "服务端返回的登录凭证无效，请重新登录。"],
     ["login_storage_failed", "登录信息保存失败，请重试。"],

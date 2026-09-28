@@ -65,6 +65,25 @@ describe("应用工作区入口", () => {
           message: "签到能力当前不可读取。",
         };
       }
+      if (command === "get_product_identity_state") {
+        return [
+          {
+            product_id: "work_cn",
+            display_name: "TRAE Work CN",
+            identity_status: "recognized",
+            credential_status: "managed_by_work",
+            relation_to_work: "current_product",
+          },
+          {
+            product_id: "trae_cn",
+            display_name: "Trae CN",
+            identity_status: "recognized",
+            credential_status: "need_authorization",
+            relation_to_work: "different_identity",
+          },
+        ];
+      }
+      if (command === "list_trae_cn_accounts") return [];
       throw new Error(`未模拟的命令: ${command}`);
     });
   });
@@ -278,6 +297,34 @@ describe("应用工作区入口", () => {
     expect(await screen.findByRole("region", { name: "环境" })).toBeVisible();
     await waitFor(() => {
       expect(screen.getByRole("heading", { name: "环境", level: 1 })).toHaveFocus();
+    });
+  });
+
+  it("P10：产品切换改变能力导航且不把 Work 账号页带入 Trae CN", async () => {
+    render(<App />);
+    await screen.findByTestId("current-account-context");
+    await waitFor(() => {
+      expect(screen.getByTestId("current-account-name")).toHaveTextContent("主库账号");
+    });
+
+    fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {
+      target: { value: "trae_cn" },
+    });
+
+    expect(await screen.findByRole("region", { name: "Trae CN 账号" })).toBeVisible();
+    expect(screen.getByTestId("product-credential-status")).toHaveTextContent("需要授权");
+    expect(screen.getByText("已发现账号材料")).toBeInTheDocument();
+    expect(screen.getByText(/已发现 Trae CN 当前保存的是另一个 TRAE 身份/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "签到" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "账号" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("navigation-accounts")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {
+      target: { value: "work_cn" },
+    });
+    expect(screen.getByRole("button", { name: "签到" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId("current-account-name")).toHaveTextContent("主库账号");
     });
   });
 });

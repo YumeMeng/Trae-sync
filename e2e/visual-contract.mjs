@@ -1,12 +1,12 @@
 /**
- * U-2/U-3 视觉契约 DOM 断言（一次性工具）。
+ * U-2/U-5 视觉契约 DOM 断言（一次性工具）。
  * 验证 DESIGN_TOKENS 关键点在真实渲染中的落地：玻璃面板、两槽位徽章、
  * 四动作、危险分区、meta 文字化、主库详情页玻璃基底（G21 两栏）。
  * 与 visual-shots 共用 mock 边界。
  */
 import { chromium } from "@playwright/test";
 
-const BASE = "http://127.0.0.1:4173";
+const BASE = "http://127.0.0.1:4175";
 const results = [];
 const check = (name, ok, extra = "") =>
   results.push(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? `  (${extra})` : ""}`);
@@ -15,18 +15,18 @@ async function mockInvoke(command, args) {
   const NOW_LOCAL = Math.floor(Date.now() / 1000);
   const DAY_LOCAL = 86400;
   const overview = [
-    { profile_id: "p1", screen_name: "梦梦", account_id: "a-p1", created_at: "2026-08-01T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
+    { profile_id: "p1", screen_name: "账号M", account_id: "a-p1", created_at: "2026-08-01T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
       credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 1600, usage_cached_at: "2026-08-26T01:00:00Z",
-      checked_in: true, access_token_expires_at_unix_seconds: NOW_LOCAL + 13 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
-      device_tail: "9012", device_id: "3569646294624771", display_name: null, masked_mobile: "156******19", auto_checkin_enabled: true },
+      checked_in: true, access_token_expires_at_unix_seconds: NOW_LOCAL + 15 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
+      device_tail: "9012", device_id: "5569646294624771", display_name: null, masked_mobile: "156******19", auto_checkin_enabled: true },
     { profile_id: "p2", screen_name: "LY", account_id: "a-p2", created_at: "2026-08-02T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
       credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 1400, usage_cached_at: "2026-08-26T01:00:00Z",
       checked_in: false, access_token_expires_at_unix_seconds: NOW_LOCAL + 8 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 170 * DAY_LOCAL,
-      device_tail: "7701", device_id: "2229135200000002", display_name: null, masked_mobile: "158******27", auto_checkin_enabled: true },
-    { profile_id: "p5", screen_name: "17513301392", account_id: "a-p5", created_at: "2026-08-05T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
+      device_tail: "7701", device_id: "2229155200000002", display_name: null, masked_mobile: "158******27", auto_checkin_enabled: true },
+    { profile_id: "p5", screen_name: "账号E", account_id: "a-p5", created_at: "2026-08-05T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
       credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 400, usage_cached_at: "2026-08-26T01:00:00Z",
       checked_in: false, access_token_expires_at_unix_seconds: NOW_LOCAL + 5 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 175 * DAY_LOCAL,
-      device_tail: "4738", device_id: "2611766200000005", display_name: null, masked_mobile: "175******92", auto_checkin_enabled: false },
+      device_tail: "4758", device_id: "2611766200000005", display_name: null, masked_mobile: "175******92", auto_checkin_enabled: false },
   ];
   const instanceStates = [
     { profile_id: "p1", running: true, login_state: "logged_in" },
@@ -63,7 +63,7 @@ async function mockInvoke(command, args) {
     case "get_environment_state": return {
       env_id: "master",
       current_profile_id: "p1",
-      current_account_name: "梦梦",
+      current_account_name: "账号M",
       data_dir: "C:\\TraeSync\\data\\environments\\master",
       running: false,
       login_state: "logged_in",
@@ -89,7 +89,7 @@ async function mockInvoke(command, args) {
       session_id: "s1", from_session_id: null, project_id: "p1",
       from_user_id: "u-a", from_account_name: "账号A",
       to_user_id: "u-b", to_account_name: "账号B",
-      message_count_at_switch: 4, switched_at_unix_seconds: NOW_LOCAL - 3600,
+      message_count_at_switch: 4, switched_at_unix_seconds: NOW_LOCAL - 5600,
     }];
     case "get_master_session_messages": return {
       session_id: String(args?.sessionId ?? "s1"), status: "ready",
@@ -116,7 +116,7 @@ const overviewCheckin = await page.locator('[data-testid="overview-checkin"]').c
 check("总览签到摘要区块（真实模式）", overviewCheckin === 1);
 if (overviewCheckin === 1) {
   const statsText = await page.locator('[data-testid="overview-checkin"]').innerText();
-  check("四统计卡含今日签到 X/Y", statsText.includes("今日签到") && statsText.includes("1/3"), statsText.replace(/\n/g, "|").slice(0, 80));
+  check("四统计卡含今日签到 X/Y", statsText.includes("今日签到") && statsText.includes("1/5"), statsText.replace(/\n/g, "|").slice(0, 80));
 }
 
 // —— 全局玻璃契约（T10 加固：blur 与背景透明度双断言，杜绝"有 blur 无透明"假绿灯） ——
@@ -143,7 +143,7 @@ check(
   bars.rail.blur.includes("blur") && alphaOf(bars.rail.bg) < 1,
   `${bars.rail.blur} / ${bars.rail.bg}`,
 );
-// 玻璃面板最小覆盖（T3 全面板玻璃化）：统计可见的 backdrop-filter 元素。
+// 玻璃面板最小覆盖（T5 全面板玻璃化）：统计可见的 backdrop-filter 元素。
 const glassPanels = await page.evaluate(() => {
   let n = 0;
   for (const el of document.querySelectorAll("body *")) {
@@ -154,7 +154,7 @@ const glassPanels = await page.evaluate(() => {
   return n;
 });
 check("玻璃面板覆盖（总览页可见 ≥ 6 处）", glassPanels >= 6, `${glassPanels} 处`);
-// 雾斑 computed 实测（T2）：对角贯穿大尺寸、靛蓝约 20% 径向渐变、36s alternate 漂移。
+// 雾斑 computed 实测（T2）：对角贯穿大尺寸、靛蓝约 20% 径向渐变、56s alternate 漂移。
 const mist = await page.evaluate(() => {
   const s = getComputedStyle(document.querySelector(".app-shell"), "::before");
   return {
@@ -175,15 +175,15 @@ check(
 );
 check("雾斑柔化 filter（blur）", mist.filter.includes("blur"), mist.filter);
 check(
-  "雾斑漂移动画（mist-drift 36s infinite alternate）",
-  mist.name === "mist-drift" && mist.duration === "36s" && mist.iteration === "infinite" && mist.direction === "alternate",
+  "雾斑漂移动画（mist-drift 56s infinite alternate）",
+  mist.name === "mist-drift" && mist.duration === "56s" && mist.iteration === "infinite" && mist.direction === "alternate",
   `${mist.name} ${mist.duration} ${mist.direction}`,
 );
 
 // —— 账号页契约 ——
 await page.click('[data-testid="navigation-accounts"]');
 await page.waitForTimeout(700);
-check("默认列表视图（宽行）", (await page.locator(".account-list__row").count()) === 3);
+check("默认列表视图（宽行）", (await page.locator(".account-list__row").count()) === 5);
 check("分段控件存在", (await page.locator(".seg-control").count()) === 1);
 check("排序控件存在", (await page.locator('[data-testid="account-sort"]').count()) === 1);
 
@@ -204,10 +204,10 @@ check("p5 令牌临期 meta 琥珀", p5metaWarn === 1);
 // —— 卡片视图切换 ——
 await page.click('[data-testid="account-view-card"]');
 await page.waitForTimeout(400);
-check("卡片视图生效", (await page.locator(".account-card--clickable").count()) === 3);
+check("卡片视图生效", (await page.locator(".account-card--clickable").count()) === 5);
 check("视图偏好持久化", (await page.evaluate(() => localStorage.getItem("accounts.view"))) === "card");
 await page.click('[data-testid="account-view-list"]');
-await page.waitForTimeout(300);
+await page.waitForTimeout(500);
 
 // —— 详情页危险分区 ——
 await page.click('[data-testid="account-card-p1"]');
@@ -230,7 +230,7 @@ check("一键补签计数（2 未签）", pendingLabel.includes("2"), pendingLab
 check("签到所选隐藏（默认全选）", (await page.locator('[data-testid="checkin-run-selected"]').count()) === 0);
 check("行内单签按钮（未签可点）", (await page.locator('[data-testid="checkin-inline-p2"]:not([disabled])').count()) === 1);
 check("行内单签禁用（已签）", (await page.locator('[data-testid="checkin-inline-p1"][disabled]').count()) === 1);
-check("单列表演进式列表", (await page.locator(".checkin-flow__row").count()) === 3);
+check("单列表演进式列表", (await page.locator(".checkin-flow__row").count()) === 5);
 
 // —— 主库详情页契约（G21 两栏：左栏项目树 + 右栏查看器玻璃面板） ——
 // 进入路径 = 环境页 → 主库卡「详情」（主库详情页是对话面板宿主）。

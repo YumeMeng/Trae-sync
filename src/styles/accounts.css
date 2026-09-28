@@ -584,7 +584,8 @@
   min-width: 0;
 }
 
-/* 卡片本体是按钮：点击进入详情视图。纵向布局，信息自上而下扫描。 */
+/* 卡片骨架由 Work 与 Trae CN 共用；只有可进入详情时才增加交互样式。 */
+.account-card,
 .account-card--clickable {
   display: grid;
   width: 100%;
@@ -601,6 +602,9 @@
   -webkit-backdrop-filter: var(--glass-blur);
   box-shadow: var(--glass-shadow), var(--glass-edge);
   text-align: left;
+}
+
+.account-card--clickable {
   cursor: pointer;
   transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
 }
@@ -768,17 +772,20 @@
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
   box-shadow: var(--glass-shadow), var(--glass-edge);
+}
+
+.account-list__row--interactive {
   cursor: pointer;
   transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
 }
 
-.account-list__row:hover {
+.account-list__row--interactive:hover {
   border-color: var(--line-control);
   box-shadow: 0 4px 14px rgba(26, 34, 51, 0.08), var(--glass-edge);
   transform: translateY(-1px); /* 微浮起（契约动效规范） */
 }
 
-.account-list__row:focus-visible {
+.account-list__row--interactive:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -1300,4 +1307,169 @@
 
 .account-detail__tech .account-detail__facts {
   padding: 14px 16px;
+}
+
+/* —— ADR-0031 远程设备面板（账号工作台内嵌，默认折叠懒加载） —— */
+
+.remote-devices__owner {
+  margin: 10px 0 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+/* 已用/上限汇总行：贴近上限（余量 ≤1）时转警示色。 */
+.remote-devices__summary {
+  margin: 10px 0 0;
+  color: var(--text-1);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.remote-devices__summary--warn {
+  color: var(--warn);
+}
+
+/* 本机设备区块：置顶强调容器，accent 组合突出「当前正在使用的设备」。 */
+.remote-devices__local {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-control);
+  background: var(--accent-soft);
+}
+
+/* 本机行嵌在强调容器内：去掉行级玻璃底与额外间距，避免双层卡片感。 */
+.remote-devices__local .remote-devices__list {
+  margin: 0;
+}
+
+.remote-devices__local .remote-devices__row {
+  padding: 0;
+  border: none;
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* 本机区块空态：匹配失败是合法状态，中性提示不给危险暗示。 */
+.remote-devices__local-empty {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+/* 「其他设备」折叠分组：头部可点；展开后行样式与原列表一致。 */
+.remote-devices__others {
+  margin-top: 12px;
+}
+
+.remote-devices__others-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.remote-devices__others-toggle:hover {
+  color: var(--text-1);
+}
+
+/* 折叠指示箭头：展开时旋转 180°。 */
+.remote-devices__others-chevron {
+  transition: transform 0.15s ease;
+}
+
+.remote-devices__others-toggle[aria-expanded="true"] .remote-devices__others-chevron {
+  transform: rotate(180deg);
+}
+
+.remote-devices__list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.remote-devices__row {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  /* 行级玻璃标准组合（与账号行同源） */
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-control);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.remote-devices__row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.remote-devices__name {
+  color: var(--text-1);
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.remote-devices__type {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+/* 本机徽章：强调当前正在使用的设备（该行无退出按钮）。 */
+.remote-devices__badge {
+  padding: 1px 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.remote-devices__signout {
+  margin-left: auto;
+}
+
+.remote-devices__row-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+/* 绑定产品标签组：逐产品小标签，只读展示。 */
+.remote-devices__products {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.remote-devices__product-tag {
+  padding: 1px 8px;
+  border: 1px solid var(--line-hair);
+  border-radius: 999px;
+  background: var(--fill-soft);
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.remote-devices__state {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  margin-top: 10px;
 }

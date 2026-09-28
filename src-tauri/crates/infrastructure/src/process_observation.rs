@@ -16,8 +16,7 @@ use traesync_ports::{
     ProcessObservationStatus,
 };
 
-// Work CN 安装包实际使用带空格的产品名；保留 trae.exe 兼容旧版安装包。
-const TRAE_EXECUTABLE_NAMES: &[&str] = &["trae.exe", "trae solo cn.exe"];
+use crate::product_adapter::TraeProduct;
 
 #[derive(Debug, Clone)]
 pub struct WorkCnProcessController {
@@ -27,7 +26,8 @@ pub struct WorkCnProcessController {
 impl Default for WorkCnProcessController {
     fn default() -> Self {
         Self {
-            executable_names: TRAE_EXECUTABLE_NAMES
+            executable_names: TraeProduct::WorkCn
+                .executable_file_names()
                 .iter()
                 .map(|name| name.to_ascii_lowercase())
                 .collect(),
@@ -1005,7 +1005,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn default_controller_accepts_work_cn_solo_executable_name() {
-        assert!(TRAE_EXECUTABLE_NAMES.contains(&"trae solo cn.exe"));
+        assert!(TraeProduct::WorkCn
+            .executable_file_names()
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("trae solo cn.exe")));
     }
 
     #[cfg(windows)]

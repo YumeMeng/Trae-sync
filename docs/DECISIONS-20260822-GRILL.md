@@ -91,7 +91,7 @@
 
 ### D6 账号来源：仅 OAuth
 
-Manager 的 accounts.json 导入路径**不做**（用户明确：Manager 只是参考工具，不应成为挂带产品）。现有 A/LY/梦梦等账号在 App 内重新 OAuth 授权一次。凭据结构因此完全统一（access + refresh + 设备密钥对）。
+Manager 的 accounts.json 导入路径**不做**（用户明确：Manager 只是参考工具，不应成为挂带产品）。现有 A/LY/账号M等账号在 App 内重新 OAuth 授权一次。凭据结构因此完全统一（access + refresh + 设备密钥对）。
 
 ### D7 实例模型：默认单开 + 可多开
 

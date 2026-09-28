@@ -50,7 +50,7 @@ pub struct AccountRecord {
     pub last_verified_at_unix_seconds: u64,
     /// 当前签到设备的铸造/重铸时刻（Unix 秒）；0 = 未知（存量档案）。
     /// 9074 报错时用于区分「设备刚创建、稍后重试即可」与「设备被拒、
-    /// 需要重置」两种引导（2026-09-02 用户4993529391 实测：新设备
+    /// 需要重置」两种引导（2026-09-02 用户B 实测：新设备
     /// 铸造后 12 秒首签被 9074 拒，192 秒后同设备重试成功）。
     #[serde(default)]
     pub device_created_at_unix_seconds: u64,

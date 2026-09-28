@@ -23,11 +23,11 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
   ],
   [
     /login_exchange_failed/i,
-    "登录凭证换取失败（服务端拒绝）；详细原因已记录在诊断日志（数据目录 checkin/login-diagnostics.log），可重新发起登录再试一次。",
+    "登录凭证换取失败（服务端拒绝）；详细原因已记录在当前产品的数据目录中，可重新发起登录再试一次。",
   ],
   [
     /login_exchange_device_limit/i,
-    "该账号在服务端的设备数量已达上限，登录暂时被拒；本地删除账号不会释放服务端的设备配额，请隔天再试或通过 TRAE 官方渠道处理旧设备。",
+    "该账号在服务端的登录设备数量已达上限，登录暂时被拒；可打开该账号的详情页，在「登录设备」中退出不用的设备后重试。",
   ],
   [
     /login_token_invalid/i,
@@ -494,6 +494,27 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
   [
     /environment_(list|create|rename|preview|delete|launch|login)_join_failed/i,
     "环境操作未能完成，请稍后重试。",
+  ],
+  // ADR-0031 远程设备管理：稳定原因码映射（码只用于匹配，不进入界面）。
+  [
+    /remote_device_business_20401|remote_device_business_20408/i,
+    "该账号在服务端的登录设备数量已达上限。",
+  ],
+  [
+    /remote_device_local_device_targeted/i,
+    "不能通过工具退出正在使用的本机设备。",
+  ],
+  [
+    /remote_device_credential_/i,
+    "登录凭据不可用，请先完成登录或刷新登录凭据。",
+  ],
+  [
+    /remote_device_network|remote_device_http_/i,
+    "网络或服务暂时不可用，请稍后重试。",
+  ],
+  [
+    /remote_device_protocol/i,
+    "服务端返回了无法识别的设备信息，请稍后重试或使用官方管理页。",
   ],
 ];
 

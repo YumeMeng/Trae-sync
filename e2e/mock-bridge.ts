@@ -14,7 +14,7 @@
 
 import type { Page } from "@playwright/test";
 
-// P5-3 主库历史读取状态（get_master_history.status 同构）。
+// P5-5 主库历史读取状态（get_master_history.status 同构）。
 export type MasterHistoryMode =
   | "ready"
   | "no_master_data"
@@ -27,10 +27,12 @@ export interface MockScenario {
   production?: boolean;
   // 真实签到能力 mock：让账号页显示凭据维护入口，但仍只调用合成命令。
   realHttp?: boolean;
-  // P5-3：主库历史读取状态（默认 ready，两栏数据可见）。
+  // P5-5：主库历史读取状态（默认 ready，两栏数据可见）。
   masterHistory?: MasterHistoryMode;
   // 会话消息窗口：bulk = 首页 2000 条，滚到顶部可继续取一页更早消息。
   sessionMessages?: "normal" | "bulk";
+  // P10-5：Trae CN 已保存账号（默认无账号；登录设备 e2e 需要账号详情入口）。
+  traeCnAccounts?: boolean;
 }
 
 /**
@@ -144,7 +146,7 @@ export async function installMockBridge(
       history_is_separate: true,
     };
 
-    // init script 内共享时间基准（P5-3 fixture 相对时间都用它）。
+    // init script 内共享时间基准（P5-5 fixture 相对时间都用它）。
     const NOW_LOCAL = Math.floor(Date.now() / 1000);
     const DAY = 86400;
 
@@ -161,10 +163,10 @@ export async function installMockBridge(
         usage_remaining_credits: 1600,
         usage_cached_at: "2026-08-26T01:00:00Z",
         checked_in: true,
-        access_token_expires_at_unix_seconds: NOW_LOCAL + 13 * 86400,
+        access_token_expires_at_unix_seconds: NOW_LOCAL + 15 * 86400,
         refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * 86400,
         device_tail: "9012",
-        device_id: "3569646294624771",
+        device_id: "5569646294624771",
         display_name: null,
         masked_mobile: "156******19",
         auto_checkin_enabled: true,
@@ -183,7 +185,7 @@ export async function installMockBridge(
         access_token_expires_at_unix_seconds: NOW_LOCAL + 8 * 86400,
         refresh_token_expires_at_unix_seconds: NOW_LOCAL + 170 * 86400,
         device_tail: "7701",
-        device_id: "2229135200000002",
+        device_id: "2229155200000002",
         display_name: null,
         masked_mobile: "158******27",
         auto_checkin_enabled: true,
@@ -192,7 +194,7 @@ export async function installMockBridge(
 
     // ===== 库历史 fixture（G21 两栏式）：三项目 + 六会话（含一条三跳接力链）=====
     // 项目覆盖三种树分组形态：具名双会话（p1）/ 具名单会话（p2）/ 空名项目
-    // （p3 → 「未关联文件夹」末位合并组，G19）。
+    // （p5 → 「未关联文件夹」末位合并组，G19）。
 
     // 环境页 mock 用的账号名录（profile ↔ user_id ↔ 显示名）。
     const ACCOUNTS = [
@@ -223,7 +225,7 @@ export async function installMockBridge(
         to_user_id: "user-A",
         to_account_name: "工作账号 A",
         message_count_at_switch: 7,
-        switched_at_unix_seconds: NOW_LOCAL - 3 * DAY,
+        switched_at_unix_seconds: NOW_LOCAL - 5 * DAY,
       },
       {
         session_id: "s1",
@@ -261,7 +263,7 @@ export async function installMockBridge(
         { project_id: "p1", name: "项目阿尔法", absolute_path: null },
         { project_id: "p2", name: "项目贝塔", absolute_path: null },
         // 空名项目：会话归并「未关联文件夹」末位分组（G19）。
-        { project_id: "p3", name: "", absolute_path: null },
+        { project_id: "p5", name: "", absolute_path: null },
       ],
       sessions: [
         {
@@ -269,7 +271,7 @@ export async function installMockBridge(
           project_id: "p1",
           title: "会话一 关于构建稳定的历史库",
           message_count: 12,
-          updated_at_unix_seconds: NOW_LOCAL - 3600,
+          updated_at_unix_seconds: NOW_LOCAL - 5600,
           deleted: false,
           hidden_status: null,
           work_mode: "code",
@@ -296,9 +298,9 @@ export async function installMockBridge(
           work_mode: "work",
         },
         {
-          // 空名项目 p3 的会话：归并「未关联文件夹」组。
+          // 空名项目 p5 的会话：归并「未关联文件夹」组。
           session_id: "s6",
-          project_id: "p3",
+          project_id: "p5",
           title: "零散会话 无项目落点",
           message_count: 2,
           updated_at_unix_seconds: NOW_LOCAL - 6 * DAY,
@@ -307,10 +309,11 @@ export async function installMockBridge(
           work_mode: null,
         },
         {
+          // p2 的归档会话：不入主列表，进归档视图（G22 删除用例与合并源断言数据）。
           session_id: "s3",
           project_id: "p2",
           title: "旧归档会话",
-          message_count: 3,
+          message_count: 5,
           updated_at_unix_seconds: NOW_LOCAL - 40 * DAY,
           deleted: false,
           // P5-8a：voice_discussion 借用为归档 → 不入主列表，进归档视图。
@@ -323,7 +326,7 @@ export async function installMockBridge(
           project_id: "p1",
           title: "已删除会话",
           message_count: 2,
-          updated_at_unix_seconds: NOW_LOCAL - 3600,
+          updated_at_unix_seconds: NOW_LOCAL - 5600,
           deleted: true,
           hidden_status: null,
           work_mode: null,
@@ -358,7 +361,7 @@ export async function installMockBridge(
               content: { kind: "text", text: "通过主库交接把记录转移给接收账号。", step_count: 0, thoughts: [] },
             },
             {
-              message_id: "m3",
+              message_id: "m5",
               role: "assistant",
               message_type: "task",
               created_at_unix_seconds: NOW_LOCAL - DAY,
@@ -394,7 +397,7 @@ export async function installMockBridge(
     const NOW = Math.floor(Date.now() / 1000);
     let masterBackups = [
       { stamp_unix_seconds: NOW - 86400, total_bytes: 2 * 1024 * 1024, has_wal: true },
-      { stamp_unix_seconds: NOW - 3 * 86400, total_bytes: 512 * 1024, has_wal: false },
+      { stamp_unix_seconds: NOW - 5 * 86400, total_bytes: 512 * 1024, has_wal: false },
     ];
 
     // P5-8b：插件 tab 可变状态（装/卸/吸收直接改，刷新后列表与对账条联动）。
@@ -419,7 +422,7 @@ export async function installMockBridge(
         registry: "builtin",
         builtin: true,
       },
-      // 对账偏移：TRAE 内手动装（云端有、清单无）。
+      // 仅此账号：云端已装但不在环境清单（in_manifest=false → 仅此账号标签）。
       {
         record_id: "plug-rec-3",
         marketplace_plugin_id: "plug-uuid-3",
@@ -472,6 +475,29 @@ export async function installMockBridge(
       },
     ];
 
+    // ADR-0031 登录设备面板 fixture：两行设备（一本机一非本机），保证任何 e2e
+    // 流程碰到面板不挂；device_id 仅作为内部定位，不进入断言与截图文案。
+    // 可变状态（必须在 mockInvoke 外声明）：clear_remote_device 退出成功后
+    // 删除对应行，供「列表刷新后少一行」断言（与 pluginInstalled 同理）。
+    let remoteDevices = [
+      {
+        device_id: "dev-mock-local",
+        device_type: "IDE_PC",
+        device_name: "本机设备",
+        bound_products: ["Trae CN", "TRAE SOLO"],
+        last_active_at: Date.now(),
+        is_local: true,
+      },
+      {
+        device_id: "dev-mock-mobile",
+        device_type: "MOBILE",
+        device_name: "移动设备",
+        bound_products: ["TRAE 移动端"],
+        last_active_at: Date.now() - 3 * 3600 * 1000,
+        is_local: false,
+      },
+    ];
+
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
       const scn = (window as any).__activeScenario || {};
@@ -485,6 +511,70 @@ export async function installMockBridge(
       if (cmd === "get_workspace_state") {
         if (scn.production) return PRODUCTION_WS;
         return WS;
+      }
+      if (cmd === "get_product_identity_state") {
+        return [
+          {
+            product_id: "work_cn",
+            display_name: "TRAE Work CN",
+            identity_status: "recognized",
+            credential_status: "managed_by_work",
+            relation_to_work: "current_product",
+          },
+          {
+            product_id: "trae_cn",
+            display_name: "Trae CN",
+            identity_status: "unknown",
+            credential_status: "need_authorization",
+            relation_to_work: "unknown",
+          },
+        ];
+      }
+      // P10-5：场景开启时返回一个与登录设备 fixture 同源的账号
+      // （profile_id / 显示名对齐 list_remote_devices 的归属标注），
+      // 让登录设备 e2e 能从账号列表进入 Trae CN 详情页。
+      if (cmd === "list_trae_cn_accounts") {
+        if (!scn.traeCnAccounts) return [];
+        return [{
+          profile_id: "trae-cn-profile",
+          display_name: "Trae CN 测试账号",
+          avatar_url: "",
+          last_verified_at: new Date().toISOString(),
+          status: "active",
+          is_current: true,
+        }];
+      }
+      if (cmd === "check_trae_cn_account_health") return [];
+      if (cmd === "refresh_trae_cn_credentials") return [];
+      if (cmd === "begin_trae_cn_login") {
+        return { login_url: "https://www.trae.cn/authorization?auth_from=trae" };
+      }
+      if (cmd === "complete_trae_cn_login") {
+        return { profile_id: "trae-cn-profile", screen_name: "Trae CN 测试账号", avatar_url: "" };
+      }
+      if (cmd === "switch_trae_cn_account") return [];
+      // ADR-0031 登录设备面板：设备行取自可变 fixture（退出后少一行）。
+      if (cmd === "list_remote_devices") {
+        return {
+          profile_id: "trae-cn-profile",
+          account_label: "Trae CN 测试账号",
+          used_count: remoteDevices.length,
+          max_count: 10,
+          devices: remoteDevices,
+        };
+      }
+      // ADR-0031 决策 3/4 后端防线模拟：目标是本机设备直接拒绝（稳定原因码），
+      // 其余设备从 fixture 删除（下次 list 即少一行）。
+      if (cmd === "clear_remote_device") {
+        const targetId = String(args?.deviceId ?? "");
+        if (targetId === "dev-mock-local") {
+          throw new Error("remote_device_local_device_targeted");
+        }
+        if (!remoteDevices.some((device) => device.device_id === targetId)) {
+          throw new Error("remote_device_device_not_found");
+        }
+        remoteDevices = remoteDevices.filter((device) => device.device_id !== targetId);
+        return null;
       }
       if (cmd === "get_managed_account_state") return MANAGED_ACCOUNT_STATE;
       if (cmd === "get_checkin_capability") {
@@ -564,8 +654,8 @@ export async function installMockBridge(
           from_user_id: fromProfileId,
           transferred_projects: 2,
           removed_mirror_rows: 0,
-          switched_sessions: 3,
-          backup_path: "C:\\TraeSync\\data\\environments\\master\\.switch-bak-20260831",
+          switched_sessions: 5,
+          backup_path: "C:\\TraeSync\\data\\environments\\master\\.switch-bak-20260851",
           relay_ledger_written: true,
           plugin_sync: {
             source_count: 0,
@@ -586,8 +676,8 @@ export async function installMockBridge(
           project_count: 4,
           session_count: 16,
           message_count: 128,
-          participating_account_count: 3,
-          last_active_unix_seconds: Math.floor(Date.now() / 1000) - 3600,
+          participating_account_count: 5,
+          last_active_unix_seconds: Math.floor(Date.now() / 1000) - 5600,
           size_bytes: 712 * 1024 * 1024,
         };
       }
@@ -598,7 +688,7 @@ export async function installMockBridge(
         // 手动备份语义：追加新条目（create_new 永不覆盖），徽章计数随之 +1。
         masterBackups.push({
           stamp_unix_seconds: Math.floor(Date.now() / 1000),
-          total_bytes: 3 * 1024 * 1024,
+          total_bytes: 5 * 1024 * 1024,
           has_wal: false,
         });
         return "C:\\TraeSync\\data\\environments\\master\\ModularData\\ai-agent\\.switch-bak-manual";
@@ -778,7 +868,7 @@ export async function installMockBridge(
         }
         return makeMasterMessages(String(args?.sessionId ?? ""));
       }
-      // ===== P5-8b 插件 tab（ADR-0023 环境插件清单）=====
+      // ===== P5-8b 插件 tab（ADR-0025 环境插件清单）=====
       // 状态与市场目录见 mockInvoke 外的 pluginInstalled/pluginManifest/PLUGIN_MARKET。
       if (cmd === "get_plugin_tab_state") {
         const manifestIds = new Set(pluginManifest.map((entry) => entry.marketplace_plugin_id));

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::product_adapter::TraeProduct;
 
 const REGISTRY_FILE: &str = "environments.json";
 const MAX_REGISTRY_BYTES: u64 = 256 * 1024;
@@ -137,9 +138,28 @@ pub fn master_data_dir() -> Result<PathBuf, EnvironmentRegistryError> {
     Ok(official_data_dir_from_appdata(Path::new(&appdata)))
 }
 
+/// 返回指定 TRAE 产品的官方主库数据目录。
+///
+/// 默认入口仍固定使用 Work CN；CN 适配必须显式选择产品，避免在两套
+/// 官方数据库之间发生静默串用。
+pub fn master_data_dir_for(
+    product: TraeProduct,
+) -> Result<PathBuf, EnvironmentRegistryError> {
+    let appdata = std::env::var("APPDATA").map_err(|_| EnvironmentRegistryError::Io)?;
+    Ok(official_data_dir_from_appdata_for(
+        Path::new(&appdata),
+        product,
+    ))
+}
+
 /// 纯函数形态（单测用）：由 APPDATA 根拼出官方目录。
 fn official_data_dir_from_appdata(appdata: &Path) -> PathBuf {
-    appdata.join(crate::work_cn_location::DEFAULT_WORK_CN_ROOT_NAME)
+    official_data_dir_from_appdata_for(appdata, TraeProduct::WorkCn)
+}
+
+/// 纯函数形态：由 APPDATA 根和产品形态拼出官方目录。
+fn official_data_dir_from_appdata_for(appdata: &Path, product: TraeProduct) -> PathBuf {
+    appdata.join(product.data_root_name())
 }
 
 /// 副环境 data_dir：`{storage_root}\environments\{env_id}`（P6-4 固定规则，
@@ -427,6 +447,15 @@ mod tests {
         // 官方目录 = APPDATA 下 TRAE SOLO CN（与 work_cn_location 固定发现同源）。
         let dir = official_data_dir_from_appdata(Path::new("C:/Users/u/AppData/Roaming"));
         assert_eq!(dir, Path::new("C:/Users/u/AppData/Roaming/TRAE SOLO CN"));
+    }
+
+    #[test]
+    fn product_master_data_dir_shape_is_explicit() {
+        let appdata = Path::new("C:/Users/u/AppData/Roaming");
+        assert_eq!(
+            official_data_dir_from_appdata_for(appdata, TraeProduct::TraeCn),
+            Path::new("C:/Users/u/AppData/Roaming/Trae CN")
+        );
     }
 
     #[test]

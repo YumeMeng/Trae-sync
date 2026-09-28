@@ -27,7 +27,7 @@ use traesync_infrastructure::{
 use traesync_ports::{DatabaseProbePort, SyncPlanEvidencePort, SyncPlanExecutorPort};
 
 const TRIO_NAMES: [&str; 3] = ["database.db", "database.db-wal", "database.db-shm"];
-const OLD_USER_ID: &str = "3559551364241212";
+const OLD_USER_ID: &str = "3559000000000001";
 const SYNTHETIC_SOURCE_USER_ID: &str = "9000000000000001";
 
 fn required_env(name: &str) -> String {

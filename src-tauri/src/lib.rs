@@ -31,8 +31,8 @@ use traesync_application::{
     checkin_transport_error_code, AccountEvidenceReaderPort, ApplySyncPlanService,
     AssignProjectSourceService, BatchCheckinRunner, BrowseHistoryService, BuildSyncPlanService,
     CatalogRepository, CheckinService, CheckinTransport, DatabaseProbePort,
-    ManagedAccountSwitchService, ProcessControllerPort, ScanHistoryService, SyncPlanEvidencePort,
-    WorkbenchReadService, WorkspaceStateProvider,
+    ManagedAccountSwitchService, ProcessControllerPort, RemoteDeviceManager, ScanHistoryService,
+    SyncPlanEvidencePort, WorkbenchReadService, WorkspaceStateProvider,
 };
 use traesync_commands as commands;
 // R8：组合根直接使用 commands::HistoryCommandError 构造授权失败错误消息
@@ -70,10 +70,12 @@ use traesync_infrastructure::{
     MarketPluginItem, OperationLease, OperationLockStatus, PersistedScanAuthorization,
     PlatformFileIdentityProvider, PluginCloudSyncOutcome, PluginManifest, PluginManifestEntry,
     ProductionCatalogError, ProductionCatalogRuntime, RealCheckinRenewalService,
-    RealCheckinTransport, RealReadWorkspaceStateProvider, RemintError, ScanAuthorizationStore,
+    RealCheckinTransport, RealReadWorkspaceStateProvider, RealRemoteDeviceManager, RemintError,
+    ScanAuthorizationStore,
     SqlCipherCatalogRepository, SqlCipherProbe, StorageDeletionPlan, StorageMigrationResult,
-    StorageRootBinding, WorkCnProcessController, WorkCnReadLocation, WorkCnReadLocationError,
-    WorkCnSourceNormalizer, WorkCnSyncExecutor, DEFAULT_STORAGE_WARNING_BYTES,
+    StorageRootBinding, ProductAccountStateStore, TraeProduct, WorkCnProcessController,
+    WorkCnReadLocation, WorkCnReadLocationError, WorkCnSourceNormalizer, WorkCnSyncExecutor,
+    DEFAULT_STORAGE_WARNING_BYTES,
 };
 
 #[cfg(test)]
@@ -88,8 +90,10 @@ use traesync_infrastructure::{
 // P7-1 追加 get_user_info_full（切号 E2 构造的实调身份校验与资料来源）。
 // P7-5 追加 CheckinHttpError / UserInfoFull（健康度凭据包实调判定）。
 use traesync_infrastructure::{
-    begin_login, complete_login, get_user_info_full, trae_http_client, CheckinHttpError,
-    LoginError, LoginSession, UserInfoFull, CALLBACK_TIMEOUT_SECONDS,
+    begin_login_for, complete_login, get_user_info_full, get_user_info_full_for_oauth_client,
+    trae_http_client, CheckinHttpError, LoginError, LoginProduct, LoginSession, OAuthClient,
+    UserInfoFull,
+    CALLBACK_TIMEOUT_SECONDS,
 };
 // P2-2 TRAE 实例管理：路径发现、进程状态、窗口聚焦、登录态种子。
 // U-6 W4 追加 native_account_dir / dir_size_recursive（占用统计与彻底删除定位原生目录）。
@@ -464,6 +468,16 @@ struct CheckinCapabilityWireDto {
     message: String,
 }
 
+/// 产品身份只读结果：不返回 userId、token 或任何 native storage 正文。
+#[derive(Debug, Clone, Serialize)]
+struct ProductIdentityStateWireDto {
+    product_id: String,
+    display_name: String,
+    identity_status: String,
+    credential_status: String,
+    relation_to_work: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CheckinStatusWireDto {
     enabled: bool,
@@ -764,6 +778,13 @@ fn preview_account_label(user_id: &str, fallback: &str) -> String {
 
 fn system_time_to_rfc3339(value: std::time::SystemTime) -> String {
     DateTime::<Utc>::from(value).to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn optional_system_time_to_rfc3339(value: Option<std::time::SystemTime>) -> Option<String> {
@@ -1634,6 +1655,70 @@ fn progress_phase_for_outcome(outcome: &SyncPlanExecutionOutcome) -> ProgressPha
 #[tauri::command]
 fn get_workspace_state(state: tauri::State<AppState>) -> WorkspaceState {
     workspace_state_for_app(&state)
+}
+
+/// 只读发现已安装产品中的账号身份关系。
+///
+/// 该命令只解析固定产品根目录中的账号证据，不写 storage、数据库或凭据，
+/// 也不做 token 交换、refresh、签到、设备注册或设备重铸。
+#[tauri::command]
+fn get_product_identity_state() -> Vec<ProductIdentityStateWireDto> {
+    let products = [TraeProduct::WorkCn, TraeProduct::TraeCn];
+    let evidence: Vec<(TraeProduct, Option<UserId>, String)> = products
+        .into_iter()
+        .map(|product| {
+            let result = WorkCnReadLocation::discover_for(product)
+                .ok()
+                .map(|location| {
+                    let account = AccountEvidenceReader::new().read_account_evidence(
+                        location.canonical_root(),
+                        std::time::SystemTime::now(),
+                    );
+                    let status = match account.evidence_state {
+                        EvidenceState::Conflict => "conflict",
+                        _ if account.user_id.is_some() => "recognized",
+                        _ => "unknown",
+                    };
+                    (account.user_id, status.to_string())
+                });
+            let (user_id, identity_status) = result.unwrap_or((None, "unknown".to_string()));
+            (product, user_id, identity_status)
+        })
+        .collect();
+
+    let work_user_id = evidence
+        .iter()
+        .find(|(product, _, status)| *product == TraeProduct::WorkCn && status == "recognized")
+        .and_then(|(_, user_id, _)| user_id.as_ref())
+        .cloned();
+
+    evidence
+        .into_iter()
+        .map(|(product, user_id, identity_status)| {
+            let relation_to_work = match product {
+                TraeProduct::WorkCn => "current_product".to_string(),
+                TraeProduct::TraeCn => {
+                    match (work_user_id.as_ref(), user_id.as_ref(), identity_status.as_str()) {
+                        (Some(work), Some(cn), "recognized") if work == cn => {
+                            "same_identity".to_string()
+                        }
+                        (Some(_), Some(_), "recognized") => "different_identity".to_string(),
+                        _ => "unknown".to_string(),
+                    }
+                }
+            };
+            ProductIdentityStateWireDto {
+                product_id: product.product_id().to_string(),
+                display_name: product.display_name().to_string(),
+                identity_status,
+                credential_status: match product {
+                    TraeProduct::WorkCn => "managed_by_work".to_string(),
+                    TraeProduct::TraeCn => "need_authorization".to_string(),
+                },
+                relation_to_work,
+            }
+        })
+        .collect()
 }
 
 /// 组合启动状态与授权后的实时账号证据；未授权时绝不读取真实认证目录。
@@ -3514,6 +3599,17 @@ fn checkin_material_root(state: &AppState) -> Result<PathBuf, String> {
     Ok(Path::new(&state.storage_root).join("checkin"))
 }
 
+/// Trae CN 产品账号根目录：与 Work CN 的签到材料、官方 Trae CN 目录均隔离。
+/// 这里只保存 Trae Sync 自己的加密凭据、非敏感档案和当前账号指针。
+fn trae_cn_material_root(state: &AppState) -> Result<PathBuf, String> {
+    if state.storage_root.is_empty() {
+        return Err("trae_cn_storage_unavailable".to_string());
+    }
+    Ok(Path::new(&state.storage_root)
+        .join("products")
+        .join("trae_cn"))
+}
+
 /// 自动签到调度器循环间隔（秒）：兼顾触发及时性与存储读取频率。
 const AUTO_CHECKIN_TICK_SECONDS: u64 = 30;
 
@@ -4115,7 +4211,7 @@ fn run_real_checkin(
 }
 
 /// 9074 上下文标注（ADR-0019 v6）：设备铸造后 5 分钟内被 9074 拒绝时，
-/// detail_code 改为 `device_too_new`——2026-09-02 实测（用户4993529391）：
+/// detail_code 改为 `device_too_new`——2026-09-02 实测（用户B）：
 /// 新设备 12 秒首签被拒、192 秒后同设备重试成功，属频率风控而非设备被拉黑，
 /// 正确引导是"稍等几分钟再试"而非"重置设备"。设备创建时刻未知（存量
 /// 档案值为 0）按旧设备处理，保持 business_9074 引导重置。
@@ -4241,6 +4337,35 @@ struct CheckinLoginReceiptWireDto {
     account_id: String,
     screen_name: String,
     avatar_url: String,
+}
+
+/// Trae CN 登录完成回执；只返回产品账号页需要的非敏感展示字段。
+#[derive(Debug, Clone, Serialize)]
+struct TraeCnLoginReceiptWireDto {
+    profile_id: String,
+    screen_name: String,
+    avatar_url: String,
+}
+
+/// Trae CN 独立账号池条目；不把账号 ID、设备绑定或令牌发给前端。
+#[derive(Debug, Clone, Serialize)]
+struct TraeCnAccountWireDto {
+    profile_id: String,
+    display_name: String,
+    avatar_url: String,
+    last_verified_at: Option<String>,
+    /// 本地凭据可用性；不代替健康检测的服务端实调结果。
+    status: &'static str,
+    is_current: bool,
+}
+
+/// Trae CN 健康检测逐账号回执；只返回结果和稳定错误码。
+#[derive(Debug, Clone, Serialize)]
+struct TraeCnHealthEntryDto {
+    profile_id: String,
+    screen_name: String,
+    healthy: bool,
+    error_code: Option<String>,
 }
 
 /// 生成新登录会话的 profile_id（时间 + 进程指纹哈希；同一账号重复登录
@@ -4414,7 +4539,21 @@ fn begin_checkin_login_inner(state: &AppState) -> Result<(String, LoginSession),
     // 存储根可用性预检：登录入库需要凭据存储位置。
     checkin_material_root(state)?;
     let profile_id = generate_login_profile_id();
-    let handoff = begin_login(&profile_id).map_err(|_| "login_begin_failed".to_string())?;
+    let handoff = begin_login_for(&profile_id, LoginProduct::WorkCn)
+        .map_err(|_| "login_begin_failed".to_string())?;
+    Ok((handoff.login_url, handoff.session))
+}
+
+/// 开始 Trae CN 独立 OAuth 登录；浏览器会话可复用，但认证参数和落盘账号池
+/// 与 Work CN 完全不同。
+fn begin_trae_cn_login_inner(state: &AppState) -> Result<(String, LoginSession), String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("login_real_mode_required".to_string());
+    }
+    trae_cn_material_root(state)?;
+    let profile_id = generate_login_profile_id();
+    let handoff = begin_login_for(&profile_id, LoginProduct::TraeCn)
+        .map_err(|_| "trae_cn_login_begin_failed".to_string())?;
     Ok((handoff.login_url, handoff.session))
 }
 
@@ -4450,12 +4589,52 @@ fn begin_checkin_login(
     Ok(CheckinLoginBeginWireDto { login_url })
 }
 
-/// 取出进行中的登录会话（一次性消费）；无会话时立即失败。
-fn take_pending_login(state: &AppState) -> Result<LoginSession, String> {
+/// 开始 Trae CN OAuth 登录。默认使用本机浏览器 profile，方便复用网页端已有的
+/// TRAE 登录会话；这只复用网页授权，不复制 Work 的本地 token/blob。
+#[tauri::command]
+fn begin_trae_cn_login(
+    use_system_browser: Option<bool>,
+    state: tauri::State<AppState>,
+) -> Result<CheckinLoginBeginWireDto, String> {
+    let (login_url, session) = begin_trae_cn_login_inner(&state)?;
     state
-        .pending_login
-        .lock()
-        .unwrap()
+        .login_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    *state.pending_login.lock().unwrap() = Some(session);
+    #[cfg(windows)]
+    {
+        let (profile, browser) =
+            open_login_url_in_browser(&login_url, use_system_browser.unwrap_or(true));
+        *state.active_oauth_profile.lock().unwrap() = profile;
+        *state.active_login_browser.lock().unwrap() = browser;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = use_system_browser;
+        *state.active_login_browser.lock().unwrap() = None;
+    }
+    Ok(CheckinLoginBeginWireDto { login_url })
+}
+
+/// 取出进行中的登录会话（一次性消费）；无会话时立即失败。
+#[cfg(test)]
+fn take_pending_login(state: &AppState) -> Result<LoginSession, String> {
+    take_pending_login_for(state, LoginProduct::WorkCn)
+}
+
+/// 只允许与命令产品一致的会话完成，防止 Work/CN 两个完成命令交叉消费。
+fn take_pending_login_for(
+    state: &AppState,
+    product: LoginProduct,
+) -> Result<LoginSession, String> {
+    let mut pending = state.pending_login.lock().unwrap();
+    let Some(session) = pending.as_ref() else {
+        return Err("login_not_started".to_string());
+    };
+    if session.product != product {
+        return Err("login_product_mismatch".to_string());
+    }
+    pending
         .take()
         .ok_or("login_not_started".to_string())
 }
@@ -4463,15 +4642,15 @@ fn take_pending_login(state: &AppState) -> Result<LoginSession, String> {
 /// 等待浏览器回调并完成登录（阻塞直到回调、失败、被取消或超时）。
 /// 会话一次性消费；任何失败都不产生入库副作用。
 /// 登录流程终结（无论成败）后清理当次隔离浏览器档案。
-#[tauri::command]
-async fn complete_checkin_login(
-    state: tauri::State<'_, AppState>,
+async fn complete_product_login_inner(
+    state: &AppState,
+    product: LoginProduct,
+    material_root: PathBuf,
 ) -> Result<CheckinLoginReceiptWireDto, String> {
     // 先取走会话（一次性）：没有进行中的登录立即失败，不占用阻塞线程。
-    let session = take_pending_login(&state)?;
+    let session = take_pending_login_for(state, product)?;
     // 会话已消费即登录流程终结：取出当次隔离档案目录，结束后删除。
     let finished_profile = state.active_oauth_profile.lock().unwrap().take();
-    let material_root = checkin_material_root(&state)?;
     // P7-4 中止判定的共享状态：取消标记 + 隔离浏览器子进程（克隆 Arc 进
     // 阻塞线程；子进程退出 = 用户关闭了登录窗口，等待即时收尾）。
     let cancel_flag = state.login_cancel.clone();
@@ -4525,13 +4704,40 @@ async fn complete_checkin_login(
     result
 }
 
+#[tauri::command]
+async fn complete_checkin_login(
+    state: tauri::State<'_, AppState>,
+) -> Result<CheckinLoginReceiptWireDto, String> {
+    let material_root = checkin_material_root(&state)?;
+    complete_product_login_inner(&state, LoginProduct::WorkCn, material_root).await
+}
+
+/// 完成 Trae CN OAuth 回调并写入 Trae CN 独立账号池。
+#[tauri::command]
+async fn complete_trae_cn_login(
+    state: tauri::State<'_, AppState>,
+) -> Result<TraeCnLoginReceiptWireDto, String> {
+    let material_root = trae_cn_material_root(&state)?;
+    let receipt = complete_product_login_inner(&state, LoginProduct::TraeCn, material_root.clone())
+        .await?;
+    // 登录成功后把新账号设为当前 CN 账号；该指针仍属于 Trae Sync 自己的
+    // CN 账号池，不会改写官方 Trae CN 原生存储。
+    ProductAccountStateStore::new(&material_root)
+        .save(&receipt.profile_id)
+        .map_err(|_| "trae_cn_account_state_failed".to_string())?;
+    Ok(TraeCnLoginReceiptWireDto {
+        profile_id: receipt.profile_id,
+        screen_name: receipt.screen_name,
+        avatar_url: receipt.avatar_url,
+    })
+}
+
 /// 取消进行中的 OAuth 登录（P7-4）：
 /// - 置位取消标记 → complete 的等待循环在一个轮询周期内以 login_cancelled 收尾；
 /// - 结束隔离浏览器子进程（登录窗口随之中页关闭，不留后台浏览器）；
 /// - 兜底清理：complete 尚未被调用时（前端异常路径），顺带丢弃挂起会话
 ///   与隔离档案目录，避免按钮锁死后资源滞留。
-#[tauri::command]
-fn cancel_checkin_login(state: tauri::State<AppState>) -> Result<(), String> {
+fn cancel_login_inner(state: &AppState) -> Result<(), String> {
     state
         .login_cancel
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4549,6 +4755,16 @@ fn cancel_checkin_login(state: tauri::State<AppState>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+fn cancel_checkin_login(state: tauri::State<AppState>) -> Result<(), String> {
+    cancel_login_inner(&state)
+}
+
+#[tauri::command]
+fn cancel_trae_cn_login(state: tauri::State<AppState>) -> Result<(), String> {
+    cancel_login_inner(&state)
 }
 
 /// 列出已登录账号（非敏感白名单）；注册表尚未创建时返回空表。
@@ -4583,6 +4799,467 @@ fn list_checkin_accounts(
     state: tauri::State<AppState>,
 ) -> Result<Vec<CheckinAccountWireDto>, String> {
     list_checkin_accounts_inner(&state)
+}
+
+/// 列出 Trae CN 自己的账号池；只返回展示字段和当前选择标记。
+fn list_trae_cn_accounts_inner(state: &AppState) -> Result<Vec<TraeCnAccountWireDto>, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("login_real_mode_required".to_string());
+    }
+    let material_root = trae_cn_material_root(state)?;
+    let current_profile_id = ProductAccountStateStore::new(&material_root)
+        .load()
+        .map_err(|_| "trae_cn_account_state_invalid".to_string())?;
+    let records = AccountRegistry::new(&material_root)
+        .load()
+        .map_err(|_| "trae_cn_registry_invalid".to_string())?;
+    let store = CheckinCredentialStore::new(&material_root);
+    let now = unix_now_seconds();
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let status = trae_cn_local_credential_status(&store, &record, now);
+            TraeCnAccountWireDto {
+                profile_id: record.profile_id.clone(),
+                display_name: record
+                    .display_name
+                    .unwrap_or_else(|| record.screen_name.clone()),
+                avatar_url: record.avatar_url,
+                last_verified_at: std::time::SystemTime::UNIX_EPOCH
+                    .checked_add(std::time::Duration::from_secs(
+                        record.last_verified_at_unix_seconds,
+                    ))
+                    .map(system_time_to_rfc3339),
+                status,
+                is_current: current_profile_id.as_deref() == Some(record.profile_id.as_str()),
+            }
+        })
+        .collect())
+}
+
+/// 仅根据本地加密凭据与 access token 到期时间推导列表徽章，不发起网络请求。
+fn trae_cn_local_credential_status(
+    store: &CheckinCredentialStore,
+    record: &AccountRecord,
+    now_unix_seconds: u64,
+) -> &'static str {
+    let binding = CheckinProfileBinding::new(
+        record.profile_id.clone(),
+        record.account_id.clone(),
+        record.device_id.clone(),
+        record.device_public_key.clone(),
+    );
+    match store.load(&binding) {
+        Ok(bundle)
+            if bundle.client_id == OAuthClient::TraeCn.client_id()
+                && bundle.access_token_expires_at_unix_seconds > now_unix_seconds =>
+        {
+            "active"
+        }
+        Ok(bundle) if bundle.client_id == OAuthClient::TraeCn.client_id() => "expired",
+        Err(_) => "unknown",
+        // 凭据根被手工混入其他产品材料时，按未知处理，不把它显示成 CN 已登录。
+        Ok(_) => "unknown",
+    }
+}
+
+#[tauri::command]
+fn list_trae_cn_accounts(
+    state: tauri::State<AppState>,
+) -> Result<Vec<TraeCnAccountWireDto>, String> {
+    list_trae_cn_accounts_inner(&state)
+}
+
+/// 对 Trae CN 账号执行只读健康检测：使用 CN 自己的 OAuth client 查询账号资料，
+/// 不签到、不读取额度、不打开新的 OAuth，也不把 Work 凭据带入 CN。
+#[tauri::command]
+async fn check_trae_cn_account_health(
+    profile_ids: Option<Vec<String>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<TraeCnHealthEntryDto>, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("login_real_mode_required".to_string());
+    }
+    let selected = validate_product_profile_ids(profile_ids)?;
+    let material_root = trae_cn_material_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        check_trae_cn_account_health_inner(&material_root, &selected)
+    })
+    .await
+    .map_err(|_| "trae_cn_health_join_failed".to_string())?
+}
+
+fn check_trae_cn_account_health_inner(
+    material_root: &Path,
+    selected: &[String],
+) -> Result<Vec<TraeCnHealthEntryDto>, String> {
+    let registry = AccountRegistry::new(material_root);
+    let records = registry
+        .load()
+        .map_err(|_| "trae_cn_registry_invalid".to_string())?;
+    let store = CheckinCredentialStore::new(material_root);
+    let client = trae_http_client();
+    let now = unix_now_seconds();
+    let mut results = Vec::with_capacity(selected.len());
+
+    for profile_id in selected {
+        let Some(record) = records.iter().find(|record| &record.profile_id == profile_id) else {
+            results.push(TraeCnHealthEntryDto {
+                profile_id: profile_id.clone(),
+                screen_name: String::new(),
+                healthy: false,
+                error_code: Some("credential_missing".to_string()),
+            });
+            continue;
+        };
+        let binding = CheckinProfileBinding::new(
+            record.profile_id.clone(),
+            record.account_id.clone(),
+            record.device_id.clone(),
+            record.device_public_key.clone(),
+        );
+        let result = store
+            .load(&binding)
+            .map_err(|error| credential_maintenance_error_code(&error).to_string())
+            .and_then(|bundle| {
+                if bundle.client_id != OAuthClient::TraeCn.client_id() {
+                    return Err("credential_invalid".to_string());
+                }
+                get_user_info_full_for_oauth_client(
+                    &client,
+                    &bundle.access_token,
+                    OAuthClient::TraeCn,
+                )
+                .map_err(|error| trae_cn_health_error_code(&error))
+                .and_then(|info| {
+                    if info.user_id == record.account_id {
+                        Ok(())
+                    } else {
+                        Err("auth_mismatch".to_string())
+                    }
+                })
+            });
+
+        match result {
+            Ok(()) => {
+                let mut verified = record.clone();
+                verified.last_verified_at_unix_seconds = now;
+                registry
+                    .upsert(&verified)
+                    .map_err(|_| "trae_cn_registry_invalid".to_string())?;
+                results.push(TraeCnHealthEntryDto {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    healthy: true,
+                    error_code: None,
+                });
+            }
+            Err(error_code) => results.push(TraeCnHealthEntryDto {
+                profile_id: profile_id.clone(),
+                screen_name: record.screen_name.clone(),
+                healthy: false,
+                error_code: Some(error_code),
+            }),
+        }
+    }
+    Ok(results)
+}
+
+fn trae_cn_health_error_code(error: &CheckinHttpError) -> String {
+    match error {
+        CheckinHttpError::Network => "network_error".to_string(),
+        CheckinHttpError::Http(401 | 403) => "credential_invalid".to_string(),
+        CheckinHttpError::Http(_) => "health_check_failed".to_string(),
+        CheckinHttpError::Business(code) => format!("business_{code}"),
+        CheckinHttpError::Protocol => "health_check_failed".to_string(),
+    }
+}
+
+// ===== ADR-0031 账号级远程设备管理（P10-5 切片 2）：设备列表只读命令 =====
+
+/// 远程设备行 DTO：与 ports::RemoteDeviceEntry 对齐的 wire 形态（snake_case）。
+/// device_id 仅用于前端退出定位与内部流转，UI 不渲染。
+#[derive(Serialize)]
+struct RemoteDeviceEntryDto {
+    device_id: String,
+    device_type: Option<String>,
+    device_name: Option<String>,
+    bound_products: Vec<String>,
+    /// 服务端原样保留（字符串/毫秒时间戳双形态），格式化交给 UI 层。
+    last_active_at: Option<serde_json::Value>,
+    is_local: bool,
+}
+
+/// 设备列表快照 DTO：账号归属标注（展示名）+ 全量设备行 + 已用/上限摘要。
+#[derive(Serialize)]
+struct RemoteDeviceSnapshotDto {
+    profile_id: String,
+    /// 账号展示名（本地备注名优先，其次服务端昵称；均不可用回退中性文案「当前账号」）。
+    account_label: String,
+    devices: Vec<RemoteDeviceEntryDto>,
+    used_count: usize,
+    max_count: Option<u32>,
+}
+
+/// 查看账号的远程设备占用列表（只读，ADR-0031 决策 5：按账号全量展示）。
+/// Work CN 与 Trae CN 共用同一命令；凭据按产品各自的材料根解析。
+#[tauri::command]
+async fn list_remote_devices(
+    product_id: String,
+    profile_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<RemoteDeviceSnapshotDto, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("login_real_mode_required".to_string());
+    }
+    let material_root = match product_id.as_str() {
+        "work_cn" => checkin_material_root(&state)?,
+        "trae_cn" => trae_cn_material_root(&state)?,
+        _ => return Err("unknown_product".to_string()),
+    };
+    let storage_root = state.storage_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        list_remote_devices_inner(&material_root, &storage_root, &product_id, profile_id)
+    })
+    .await
+    .map_err(|_| "remote_devices_join_failed".to_string())?
+}
+
+/// 产品账号路由（list_remote_devices / clear_remote_device 共用，ADR-0031）：
+/// work_cn → 主库登录态解析（指定 profile 或主库当前账号）+ OAuthClient::Solo；
+/// trae_cn → 产品账号池当前指针（或指定 profile）+ OAuthClient::TraeCn；
+/// 其他产品 → unknown_product。
+fn resolve_remote_device_account(
+    material_root: &Path,
+    storage_root: &str,
+    product_id: &str,
+    profile_id: Option<&str>,
+) -> Result<(AccountRecord, OAuthClient), String> {
+    match product_id {
+        // Work CN：默认账号走主库登录态实测解析（与环境页/插件 tab 同一路径）。
+        "work_cn" => {
+            let account = match profile_id {
+                Some(profile) => {
+                    let records = AccountRegistry::new(material_root)
+                        .load()
+                        .map_err(|_| "checkin_registry_invalid".to_string())?;
+                    records
+                        .into_iter()
+                        .find(|record| record.profile_id == profile)
+                        .ok_or_else(|| "account_not_found".to_string())?
+                }
+                None => {
+                    let master_dir = master_data_dir()
+                        .map_err(|_| "environment_registry_invalid".to_string())?;
+                    resolve_actual_master_account(material_root, Path::new(storage_root), &master_dir)?
+                        .ok_or_else(|| "current_account_unresolved".to_string())?
+                }
+            };
+            Ok((account, OAuthClient::Solo))
+        }
+        // Trae CN：默认账号取产品账号池当前指针（switch 命令写入的同一状态）。
+        "trae_cn" => {
+            let target = match profile_id {
+                Some(profile) => profile.to_string(),
+                None => ProductAccountStateStore::new(material_root)
+                    .load()
+                    .map_err(|_| "trae_cn_account_state_invalid".to_string())?
+                    .ok_or_else(|| "current_account_unresolved".to_string())?,
+            };
+            let records = AccountRegistry::new(material_root)
+                .load()
+                .map_err(|_| "trae_cn_registry_invalid".to_string())?;
+            let account = records
+                .into_iter()
+                .find(|record| record.profile_id == target)
+                .ok_or_else(|| "account_not_found".to_string())?;
+            Ok((account, OAuthClient::TraeCn))
+        }
+        _ => Err("unknown_product".to_string()),
+    }
+}
+
+/// 命令主体（阻塞线程执行）：解析目标账号 → 构造产品对应的远程设备管理器
+/// → 直连服务端拉取列表。协议错误透传稳定原因码（RemoteDeviceError Display）。
+fn list_remote_devices_inner(
+    material_root: &Path,
+    storage_root: &str,
+    product_id: &str,
+    profile_id: Option<String>,
+) -> Result<RemoteDeviceSnapshotDto, String> {
+    let (record, oauth_client) = resolve_remote_device_account(
+        material_root,
+        storage_root,
+        product_id,
+        profile_id.as_deref(),
+    )?;
+
+    // 归属标注：本地备注名优先，其次服务端昵称；两者都为空回退中性文案
+    //（界面表达纪律：profile_id 等内部标识不进主视野）。
+    let account_label = record
+        .display_name
+        .clone()
+        .unwrap_or_else(|| record.screen_name.clone());
+    let account_label = if account_label.trim().is_empty() {
+        "当前账号".to_string()
+    } else {
+        account_label
+    };
+
+    let binding = CheckinProfileBinding::new(
+        record.profile_id.clone(),
+        record.account_id.clone(),
+        record.device_id.clone(),
+        record.device_public_key.clone(),
+    );
+    let manager = RealRemoteDeviceManager::new(material_root, binding, oauth_client);
+    let snapshot = manager
+        .list_devices(&record.profile_id)
+        .map_err(|error| error.to_string())?;
+    Ok(RemoteDeviceSnapshotDto {
+        profile_id: record.profile_id.clone(),
+        account_label,
+        devices: snapshot
+            .devices
+            .into_iter()
+            .map(|device| RemoteDeviceEntryDto {
+                device_id: device.device_id,
+                device_type: device.device_type,
+                device_name: device.device_name,
+                bound_products: device.bound_products,
+                last_active_at: device.last_active_at,
+                is_local: device.is_local,
+            })
+            .collect(),
+        used_count: snapshot.used_count,
+        max_count: snapshot.max_count,
+    })
+}
+
+/// 远程退出目标设备并清除其刷新令牌（ADR-0031 决策 3/4：逐台单次确认由前端
+/// 保证，目标是本机设备时协议层 clear_refresh_token 直接拒绝，为第二道防线）。
+/// 纯服务端操作：不写任何本地状态文件，成功即返回。
+#[tauri::command]
+async fn clear_remote_device(
+    product_id: String,
+    profile_id: Option<String>,
+    device_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("login_real_mode_required".to_string());
+    }
+    // 参数防御：空目标无法定位设备，直接给稳定原因码。
+    if device_id.is_empty() {
+        return Err("remote_device_empty_target".to_string());
+    }
+    let material_root = match product_id.as_str() {
+        "work_cn" => checkin_material_root(&state)?,
+        "trae_cn" => trae_cn_material_root(&state)?,
+        _ => return Err("unknown_product".to_string()),
+    };
+    let storage_root = state.storage_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        clear_remote_device_inner(
+            &material_root,
+            &storage_root,
+            &product_id,
+            profile_id.as_deref(),
+            &device_id,
+        )
+    })
+    .await
+    .map_err(|_| "remote_device_join_failed".to_string())?
+}
+
+/// 命令主体（阻塞线程执行）：与 list_remote_devices 同一账号路由
+/// → 构造产品对应的远程设备管理器 → 直连服务端清除目标设备凭据。
+/// 协议错误透传稳定原因码（RemoteDeviceError Display）。
+fn clear_remote_device_inner(
+    material_root: &Path,
+    storage_root: &str,
+    product_id: &str,
+    profile_id: Option<&str>,
+    device_id: &str,
+) -> Result<(), String> {
+    let (record, oauth_client) =
+        resolve_remote_device_account(material_root, storage_root, product_id, profile_id)?;
+    let binding = CheckinProfileBinding::new(
+        record.profile_id.clone(),
+        record.account_id.clone(),
+        record.device_id.clone(),
+        record.device_public_key.clone(),
+    );
+    let manager = RealRemoteDeviceManager::new(material_root, binding, oauth_client);
+    manager
+        .clear_refresh_token(&record.profile_id, device_id)
+        .map_err(|error| error.to_string())
+}
+
+/// 官方设备管理文档页（研究文档 .scratch/research-trae-device-management-20260923.md
+/// 记录的唯一官方入口；官方授权页无公开稳定 URL，以文档页兜底）。
+#[cfg(windows)]
+const DEVICE_MANAGEMENT_DOCS_URL: &str = "https://docs.trae.cn/ide_device-limit";
+
+/// 打开官方设备管理页（ADR-0031 决策 2：原生列表失败时的兜底入口）。
+/// 复用 OAuth 登录同一浏览器拉起机制（系统浏览器 + rundll32 回退）；
+/// 固定 URL 不接受前端传参，避免被诱导打开任意地址。失败静默（无跟进动作）。
+#[tauri::command]
+fn open_device_management_docs() {
+    // 非 Windows 平台与登录命令同策略：不由后端拉起浏览器。
+    #[cfg(windows)]
+    let _ = open_login_url_in_browser(DEVICE_MANAGEMENT_DOCS_URL, true);
+}
+
+fn validate_product_profile_ids(profile_ids: Option<Vec<String>>) -> Result<Vec<String>, String> {
+    let selected = profile_ids.unwrap_or_default();
+    let mut unique = Vec::with_capacity(selected.len());
+    for profile_id in selected {
+        if profile_id.is_empty() || profile_id.len() > 256 {
+            return Err("checkin_profile_invalid".to_string());
+        }
+        if !unique.contains(&profile_id) {
+            unique.push(profile_id);
+        }
+    }
+    if unique.is_empty() {
+        return Err("checkin_profile_empty".to_string());
+    }
+    Ok(unique)
+}
+
+/// 切换 Trae CN 当前账号：先验证档案与 DPAPI 凭据绑定，再原子更新当前指针。
+/// 不向官方 Trae CN 目录写入 token、blob、设备身份或数据库。
+#[tauri::command]
+fn switch_trae_cn_account(
+    profile_id: String,
+    state: tauri::State<AppState>,
+) -> Result<Vec<TraeCnAccountWireDto>, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("login_real_mode_required".to_string());
+    }
+    let material_root = trae_cn_material_root(&state)?;
+    let registry = AccountRegistry::new(&material_root);
+    let record = registry
+        .find(&profile_id)
+        .map_err(|_| "trae_cn_registry_invalid".to_string())?
+        .ok_or_else(|| "trae_cn_account_not_found".to_string())?;
+    let binding = CheckinProfileBinding::new(
+        record.profile_id,
+        record.account_id,
+        record.device_id,
+        record.device_public_key,
+    );
+    let bundle = CheckinCredentialStore::new(&material_root)
+        .load(&binding)
+        .map_err(|_| "trae_cn_credential_invalid".to_string())?;
+    if bundle.client_id != OAuthClient::TraeCn.client_id() {
+        return Err("trae_cn_credential_invalid".to_string());
+    }
+    ProductAccountStateStore::new(&material_root)
+        .save(&profile_id)
+        .map_err(|_| "trae_cn_account_state_failed".to_string())?;
+    list_trae_cn_accounts_inner(&state)
 }
 
 /// 账号总览（只读聚合）：档案 + 积分缓存 + 令牌到期 + 设备尾号。
@@ -4814,9 +5491,40 @@ async fn refresh_checkin_credentials(
     .map_err(|_| "credential_refresh_join_failed".to_string())?
 }
 
+/// 手动刷新 Trae CN 自己的登录凭据；使用 CN OAuth client 和独立凭据根。
+#[tauri::command]
+async fn refresh_trae_cn_credentials(
+    profile_ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<CredentialRefreshEntryDto>, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("checkin_http_disabled".to_string());
+    }
+    let selected = validate_product_profile_ids(Some(profile_ids))?;
+    let material_root = trae_cn_material_root(&state)?;
+    let execution_lock = Arc::clone(&state.checkin_execution_lock);
+    tauri::async_runtime::spawn_blocking(move || {
+        // Work 与 Trae CN 共享进程内写入互斥，但各自使用独立凭据根。
+        let _guard = execution_lock
+            .try_lock()
+            .map_err(|_| "credential_refresh_busy".to_string())?;
+        refresh_product_credentials_inner(&material_root, &selected, OAuthClient::TraeCn)
+    })
+    .await
+    .map_err(|_| "credential_refresh_join_failed".to_string())?
+}
+
 fn refresh_checkin_credentials_inner(
     material_root: &std::path::Path,
     selected: &[String],
+) -> Result<Vec<CredentialRefreshEntryDto>, String> {
+    refresh_product_credentials_inner(material_root, selected, OAuthClient::Solo)
+}
+
+fn refresh_product_credentials_inner(
+    material_root: &std::path::Path,
+    selected: &[String],
+    oauth_client: OAuthClient,
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     let store = CheckinCredentialStore::new(material_root);
     // 有未收口写回时整批停止，避免把现场继续推进到更难恢复的状态。
@@ -4827,11 +5535,8 @@ fn refresh_checkin_credentials_inner(
         return Err("manual_recovery_required".to_string());
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let renewal = RealCheckinRenewalService::new(&store);
+    let now = unix_now_seconds();
+    let renewal = RealCheckinRenewalService::new_for_oauth_client(&store, oauth_client);
     refresh_checkin_credentials_inner_with(material_root, selected, now, &|binding, timestamp| {
         renewal.renew_now(binding, timestamp).map(|_| ())
     })
@@ -5053,7 +5758,7 @@ fn reset_checkin_device(
 }
 
 /// 设置/清除账号本地备注名（空串或 None = 清除，回退服务端名）。
-/// U-1 数据层：解决服务端 ScreenName（如「用户4050081350」）辨识度差的问题。
+/// U-1 数据层：解决服务端 ScreenName（如「用户A」）辨识度差的问题。
 #[tauri::command]
 fn set_account_display_name(
     profile_id: String,
@@ -10349,6 +11054,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_workspace_state,
+            get_product_identity_state,
             read_work_cn_state,
             get_account_registry,
             restore_operation,
@@ -10373,10 +11079,22 @@ pub fn run() {
             // M4：OAuth 登录两段式命令 + 已登录账号列表。
             begin_checkin_login,
             complete_checkin_login,
+            begin_trae_cn_login,
+            complete_trae_cn_login,
+            cancel_trae_cn_login,
             list_checkin_accounts,
+            list_trae_cn_accounts,
+            check_trae_cn_account_health,
+            switch_trae_cn_account,
+            // ADR-0031 账号级远程设备管理（P10-5 切片 2/3）：列表只读 + 远程退出。
+            list_remote_devices,
+            clear_remote_device,
+            // ADR-0031 决策 2：原生列表失败时的官方设备管理页兜底入口。
+            open_device_management_docs,
             get_checkin_overview,
             refresh_checkin_credits,
             refresh_checkin_credentials,
+            refresh_trae_cn_credentials,
             remove_checkin_account,
             // ADR-0019 v4：手动重置签到设备（生成新随机设备并设为 home）。
             reset_checkin_device,

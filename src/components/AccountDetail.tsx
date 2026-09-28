@@ -20,6 +20,7 @@ import type {
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { RemoteDevicesPanel } from "./RemoteDevicesPanel";
 
 interface AccountDetailProps {
   entry: CheckinOverviewEntryDto;
@@ -451,6 +452,19 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
           </button>
         </div>
       </section>
+
+      {/* P10-5 登录设备模块：内嵌本账号详情（设备管理绑定在账号上）。
+          默认折叠，展开才触网；退出成功后刷新总览数据，让列表侧
+          状态保持一致（健康检测由列表页自行发起，详情页不重复触发）。 */}
+      <RemoteDevicesPanel
+        productId="work_cn"
+        productName="TRAE Work CN"
+        profileId={entry.profile_id}
+        accountLabel={effectiveDisplayName(entry)}
+        onSignedOut={() => {
+          void onDataChanged();
+        }}
+      />
 
       {/* 技术细节：排障用标识，默认折叠 */}
       <details className="account-detail__tech">

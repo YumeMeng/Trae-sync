@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // 库对话面板 Playwright 端到端测试（G21 两栏式 + G22 统一选择模式，ADR-0025）
 // ============================================================================
 //
@@ -392,10 +392,10 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await panel.getByTestId("library-session-s3").click();
     await panel.getByTestId("batch-delete").click();
 
-    // 确认弹窗列明会话数与消息量（s3 = 1 个会话 3 条消息，ADR-0018 单次确认）。
+    // 确认弹窗列明会话数与消息量（s3 = 1 个会话 5 条消息，ADR-0018 单次确认）。
     const dialog = panel.getByTestId("delete-confirm");
     await expect(dialog).toContainText("删除 1 个会话");
-    await expect(dialog).toContainText("共 3 条消息");
+    await expect(dialog).toContainText("共 5 条消息");
     await expect(dialog).toContainText("删除前会自动备份");
 
     // 取消：不执行删除。

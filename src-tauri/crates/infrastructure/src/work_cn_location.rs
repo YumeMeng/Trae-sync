@@ -9,13 +9,14 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::data_location::{capture_location_identity, LocationWitness, WitnessError};
 use crate::file_identity::PlatformFileIdentityProvider;
+use crate::product_adapter::TraeProduct;
 use traesync_ports::FileIdentityProvider;
 
 /// TRAE Work CN 默认用户数据根目录名。
-pub const DEFAULT_WORK_CN_ROOT_NAME: &str = "TRAE SOLO CN";
+pub const DEFAULT_WORK_CN_ROOT_NAME: &str = TraeProduct::WorkCn.data_root_name();
 
 /// TRAE Work CN 默认活动数据库相对路径。
-pub const DEFAULT_WORK_CN_DB_RELATIVE_PATH: &str = "ModularData/ai-agent/database.db";
+pub const DEFAULT_WORK_CN_DB_RELATIVE_PATH: &str = TraeProduct::WorkCn.database_relative_path();
 
 /// 真实只读位置发现失败原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,13 +27,13 @@ pub enum WorkCnReadLocationError {
     AppdataNotAbsolute { raw: String },
     /// APPDATA 无法规范化或不是目录。
     AppdataUnavailable { raw: String },
-    /// 默认 TRAE 根目录不存在或不是目录。
+    /// TRAE 官方数据根目录不存在或不是目录。
     RootMissing { path: String },
-    /// 默认 TRAE 根目录包含符号链接或 junction。
+    /// TRAE 官方数据根目录包含符号链接或 junction。
     RootReparsePoint { path: String },
-    /// 规范化根目录不再等于 APPDATA 下固定默认根。
+    /// 规范化根目录不再等于 APPDATA 下固定官方根目录。
     RootPathMismatch { expected: String, actual: String },
-    /// 默认数据库不存在或不是普通文件。
+    /// TRAE 对话数据库不存在或不是普通文件。
     DatabaseMissing { path: String },
     /// 数据库相对路径不符合固定安全规则。
     InvalidDatabasePath,
@@ -49,17 +50,17 @@ impl std::fmt::Display for WorkCnReadLocationError {
             Self::AppdataMissing => f.write_str("APPDATA 未设置"),
             Self::AppdataNotAbsolute { raw } => write!(f, "APPDATA 必须为绝对路径: {raw}"),
             Self::AppdataUnavailable { raw } => write!(f, "APPDATA 不可用: {raw}"),
-            Self::RootMissing { path } => write!(f, "TRAE 默认根目录不存在: {path}"),
+            Self::RootMissing { path } => write!(f, "TRAE 官方数据根目录不存在: {path}"),
             Self::RootReparsePoint { path } => {
-                write!(f, "TRAE 默认根目录不能是符号链接或 junction: {path}")
+                write!(f, "TRAE 官方数据根目录不能是符号链接或 junction: {path}")
             }
             Self::RootPathMismatch { expected, actual } => {
                 write!(
                     f,
-                    "规范化 TRAE 根目录偏离默认位置: expected={expected}, actual={actual}"
+                    "规范化 TRAE 根目录偏离官方位置: expected={expected}, actual={actual}"
                 )
             }
-            Self::DatabaseMissing { path } => write!(f, "TRAE 默认数据库不存在: {path}"),
+            Self::DatabaseMissing { path } => write!(f, "TRAE 对话数据库不存在: {path}"),
             Self::InvalidDatabasePath => f.write_str("TRAE 默认数据库相对路径不安全"),
             Self::DatabaseReparsePoint { path } => {
                 write!(f, "TRAE 数据库路径不能包含符号链接或 junction: {path}")
@@ -80,13 +81,19 @@ impl From<WitnessError> for WorkCnReadLocationError {
     }
 }
 
-/// 已通过固定路径边界校验的 TRAE Work CN 只读位置。
+/// 已通过固定路径边界校验的 TRAE 产品只读位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkCnReadLocation {
+    product: TraeProduct,
     canonical_root: PathBuf,
     db_relative_path: PathBuf,
     canonical_db_path: PathBuf,
 }
+
+/// 泛化后的 TRAE 只读位置类型；旧名称保留给现有 Work CN 调用方。
+pub type TraeReadLocation = WorkCnReadLocation;
+/// 泛化后的 TRAE 只读位置错误类型；旧名称保留给现有 Work CN 调用方。
+pub type TraeReadLocationError = WorkCnReadLocationError;
 
 impl WorkCnReadLocation {
     /// 从当前 Windows 用户 APPDATA 发现固定 TRAE Work CN 位置。
@@ -95,6 +102,20 @@ impl WorkCnReadLocation {
     pub fn discover() -> Result<Self, WorkCnReadLocationError> {
         let appdata = env::var_os("APPDATA").ok_or(WorkCnReadLocationError::AppdataMissing)?;
         Self::discover_from_appdata(Path::new(&appdata))
+    }
+
+    /// 从当前 Windows 用户 APPDATA 发现指定 TRAE 产品的官方数据位置。
+    ///
+    /// 这是产品适配入口；仍只接受 APPDATA 下的固定官方目录，不接受调用者
+    /// 传入任意源路径，也不会创建或修改源文件。
+    pub fn discover_for(product: TraeProduct) -> Result<Self, WorkCnReadLocationError> {
+        let appdata = env::var_os("APPDATA").ok_or(WorkCnReadLocationError::AppdataMissing)?;
+        Self::discover_from_appdata_for(product, Path::new(&appdata))
+    }
+
+    /// 返回位置对应的产品形态。
+    pub fn product(&self) -> TraeProduct {
+        self.product
     }
 
     /// 返回已规范化的固定 TRAE 根目录。
@@ -119,12 +140,12 @@ impl WorkCnReadLocation {
         &self,
         provider: &dyn FileIdentityProvider,
     ) -> Result<LocationWitness, WorkCnReadLocationError> {
-        capture_location_identity(
-            provider,
-            &self.canonical_root,
-            DEFAULT_WORK_CN_DB_RELATIVE_PATH,
-        )
-        .map_err(Into::into)
+        let db_relative_path = self
+            .db_relative_path
+            .to_str()
+            .ok_or(WorkCnReadLocationError::InvalidDatabasePath)?;
+        capture_location_identity(provider, &self.canonical_root, db_relative_path)
+            .map_err(Into::into)
     }
 
     /// 使用平台身份提供器捕获读身份。
@@ -135,6 +156,13 @@ impl WorkCnReadLocation {
     }
 
     fn discover_from_appdata(appdata: &Path) -> Result<Self, WorkCnReadLocationError> {
+        Self::discover_from_appdata_for(TraeProduct::WorkCn, appdata)
+    }
+
+    fn discover_from_appdata_for(
+        product: TraeProduct,
+        appdata: &Path,
+    ) -> Result<Self, WorkCnReadLocationError> {
         if !appdata.is_absolute() {
             return Err(WorkCnReadLocationError::AppdataNotAbsolute {
                 raw: appdata.to_string_lossy().into_owned(),
@@ -158,7 +186,7 @@ impl WorkCnReadLocation {
                 .map_err(|_| WorkCnReadLocationError::AppdataUnavailable {
                     raw: appdata.to_string_lossy().into_owned(),
                 })?;
-        let expected_root = appdata.join(DEFAULT_WORK_CN_ROOT_NAME);
+        let expected_root = appdata.join(product.data_root_name());
         let root_metadata = fs::symlink_metadata(&expected_root).map_err(|_| {
             WorkCnReadLocationError::RootMissing {
                 path: expected_root.to_string_lossy().into_owned(),
@@ -192,7 +220,7 @@ impl WorkCnReadLocation {
             });
         }
 
-        let expected_canonical_root = canonical_appdata.join(DEFAULT_WORK_CN_ROOT_NAME);
+        let expected_canonical_root = canonical_appdata.join(product.data_root_name());
         if !same_path(&canonical_root, &expected_canonical_root) {
             return Err(WorkCnReadLocationError::RootPathMismatch {
                 expected: expected_canonical_root.to_string_lossy().into_owned(),
@@ -200,7 +228,7 @@ impl WorkCnReadLocation {
             });
         }
 
-        let db_relative_path = PathBuf::from(DEFAULT_WORK_CN_DB_RELATIVE_PATH);
+        let db_relative_path = PathBuf::from(product.database_relative_path());
         validate_relative_path(&db_relative_path)?;
         let db_path = canonical_root.join(&db_relative_path);
         let db_metadata = fs::symlink_metadata(&db_path).map_err(|_| {
@@ -242,6 +270,7 @@ impl WorkCnReadLocation {
         }
 
         Ok(Self {
+            product,
             canonical_root,
             db_relative_path,
             canonical_db_path,
@@ -318,10 +347,14 @@ mod tests {
     use super::*;
 
     fn fixture_appdata() -> tempfile::TempDir {
+        fixture_appdata_for(TraeProduct::WorkCn)
+    }
+
+    fn fixture_appdata_for(product: TraeProduct) -> tempfile::TempDir {
         let appdata = tempfile::tempdir().unwrap();
         let db = appdata
             .path()
-            .join(DEFAULT_WORK_CN_ROOT_NAME)
+            .join(product.data_root_name())
             .join("ModularData")
             .join("ai-agent");
         fs::create_dir_all(&db).unwrap();
@@ -359,12 +392,28 @@ mod tests {
     fn discovers_fixed_paths_without_touching_source() {
         let appdata = fixture_appdata();
         let location = WorkCnReadLocation::discover_from_appdata(appdata.path()).unwrap();
+        assert_eq!(location.product(), TraeProduct::WorkCn);
         assert!(location
             .canonical_root()
             .ends_with(DEFAULT_WORK_CN_ROOT_NAME));
         assert_eq!(
             location.db_relative_path(),
             Path::new(DEFAULT_WORK_CN_DB_RELATIVE_PATH)
+        );
+        assert!(location.canonical_db_path().is_file());
+    }
+
+    #[test]
+    fn discovers_trae_cn_fixed_paths_without_touching_source() {
+        let appdata = fixture_appdata_for(TraeProduct::TraeCn);
+        let location =
+            WorkCnReadLocation::discover_from_appdata_for(TraeProduct::TraeCn, appdata.path())
+                .unwrap();
+        assert_eq!(location.product(), TraeProduct::TraeCn);
+        assert!(location.canonical_root().ends_with("Trae CN"));
+        assert_eq!(
+            location.db_relative_path(),
+            Path::new(TraeProduct::TraeCn.database_relative_path())
         );
         assert!(location.canonical_db_path().is_file());
     }
@@ -377,7 +426,7 @@ mod tests {
             Err(WorkCnReadLocationError::RootMissing { .. })
         ));
 
-        let root = appdata.path().join(DEFAULT_WORK_CN_ROOT_NAME);
+        let root = appdata.path().join(TraeProduct::WorkCn.data_root_name());
         fs::create_dir_all(root.join("ModularData").join("ai-agent")).unwrap();
         assert!(matches!(
             WorkCnReadLocation::discover_from_appdata(appdata.path()),
@@ -396,7 +445,7 @@ mod tests {
     fn root_reparse_point_is_rejected() {
         let appdata = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let root = appdata.path().join(DEFAULT_WORK_CN_ROOT_NAME);
+        let root = appdata.path().join(TraeProduct::WorkCn.data_root_name());
         assert!(
             make_directory_link(outside.path(), &root),
             "无法建立 symlink/junction fixture"

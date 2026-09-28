@@ -60,6 +60,35 @@
   line-height: 1.2;
 }
 
+/* 产品切换是空间级操作，紧贴品牌放在标题栏左侧；账号切换仍属于产品页。 */
+.title-bar__product-switcher {
+  display: inline-flex;
+  min-width: 0;
+  margin-left: 14px;
+  pointer-events: auto;
+}
+
+.title-bar__product-switcher select {
+  max-width: 190px;
+  padding: 4px 26px 4px 9px;
+  border: 1px solid var(--line-control);
+  border-radius: 8px;
+  background: var(--glass-dense);
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.title-bar__product-switcher select:hover {
+  border-color: var(--accent-border);
+}
+
+.title-bar__product-switcher select:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
+}
+
 .title-bar__subtitle {
   color: var(--text-3);
   font-size: 11px;
@@ -268,8 +297,16 @@
     padding: 0 0 0 10px;
   }
 
-  .title-bar__subtitle {
-    display: none;
+.title-bar__subtitle {
+  display: none;
+}
+
+  .title-bar__product-switcher {
+    margin-left: 8px;
+  }
+
+  .title-bar__product-switcher select {
+    max-width: 132px;
   }
 
 }
@@ -294,4 +331,3 @@
   }
 
 }
-

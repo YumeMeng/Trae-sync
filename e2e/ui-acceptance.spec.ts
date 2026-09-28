@@ -198,6 +198,28 @@ test.describe("桌面尺寸与滚动验收", () => {
       });
     }
   });
+
+  test("P10 产品切换器按能力切换工作区，不复用 Work CN 账号页", async ({ page }) => {
+    await installMockBridge(page);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+
+    const productSwitcher = page.getByRole("combobox", { name: "当前产品" });
+    await expect(productSwitcher).toHaveValue("work_cn");
+    await productSwitcher.selectOption("trae_cn");
+
+    await expect(page.getByRole("region", { name: "Trae CN 账号" })).toBeVisible();
+    await expect(page.getByTestId("product-credential-status")).toHaveText("需要授权");
+    await expect(page.getByTestId("navigation-checkin")).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "账号", exact: true })).toHaveCount(0);
+    // 产品凭据边界由共享账号工作台展示；不能把浏览器会话复用误报成凭据迁移。
+    await expect(page.getByText("尚未确认与 Work CN 的 TRAE 身份关系。")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "我的账号", level: 3 })).toBeVisible();
+
+    await productSwitcher.selectOption("work_cn");
+    await expect(page.getByTestId("navigation-checkin")).toBeVisible();
+    await expect(page.getByTestId("current-account-context")).toBeVisible();
+  });
 });
 
 test.describe("键盘与焦点验收", () => {

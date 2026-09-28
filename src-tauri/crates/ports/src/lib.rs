@@ -13,6 +13,7 @@ pub mod handoff_intent;
 pub mod history;
 pub mod process_control;
 pub mod recovery;
+pub mod remote_device;
 pub mod sync_apply;
 pub mod workbench_read;
 
@@ -30,6 +31,9 @@ pub use process_control::{
 pub use recovery::{
     KeyWrapperError, KeyWrapperPort, KeyWrapperReceipt, KeyWrapperRequest, RecoveryImportError,
     RecoveryImportRequest, RecoveryPackageImportPort, VerifiedRecoveryMaterial,
+};
+pub use remote_device::{
+    RemoteDeviceEntry, RemoteDeviceError, RemoteDeviceManager, RemoteDeviceSnapshot,
 };
 pub use sync_apply::{SyncPlanEvidencePort, SyncPlanExecutorPort};
 pub use workbench_read::{AccountEvidenceReaderPort, DatabaseProbePort};

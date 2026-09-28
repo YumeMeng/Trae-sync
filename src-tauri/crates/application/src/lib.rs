@@ -31,6 +31,8 @@ pub use traesync_ports::{
 // 重导出签到 transport port：重铸 factory 需要返回装箱 transport
 pub use traesync_ports::CheckinTransport;
 pub use traesync_ports::CheckinDeviceRemint;
+// 重导出 ADR-0031 远程设备管理 port：组合根的设备命令需要 trait 在作用域内
+pub use traesync_ports::RemoteDeviceManager;
 
 pub use account_switch::{ManagedAccountSwitchError, ManagedAccountSwitchService};
 pub use checkin::{checkin_transport_error_code, BatchCheckinRunner, CheckinService};

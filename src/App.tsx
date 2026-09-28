@@ -1,14 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { WorkspaceStateDto } from "./types/workspace";
 import { TitleBar } from "./components/TitleBar";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { AccountCenter } from "./components/AccountCenter";
+import { AccountWorkbench } from "./components/AccountWorkbench";
 import { CheckinPage } from "./components/CheckinPage";
 import { EnvironmentPage } from "./components/EnvironmentPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
+import {
+  PRODUCT_DEFINITIONS,
+  productDefinitionOf,
+  workspaceStateForProduct,
+  type ProductCapability,
+  type ProductId,
+} from "./platform/productRegistry";
+import { accountAdapterFor } from "./platform/accountAdapter";
 import { safeUiErrorMessage } from "./utils/safeUiError";
 
 // stagger 重放守卫（T9，2026-08-27）：这些列表的进场动画只播首批。
@@ -17,18 +25,48 @@ import { safeUiErrorMessage } from "./utils/safeUiError";
 const STAGGER_LISTS = ["account-list", "account-card-grid", "checkin-flow"];
 const playedStaggerLists = new Set<string>();
 
-// 应用根组件：五个导航工作区（总览/账号/签到/环境/设置）；
-// 主库对话列表嵌入主库详情页，账号档案与签到分别收敛在对应工作区。
+// 应用根组件：导航工作区由当前产品能力清单生成；
+// Work CN 保留完整工作区，Trae CN 首阶段只显示账号适配页。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<AppPage>("overview");
+  const [selectedProductId, setSelectedProductId] = useState<ProductId>("work_cn");
+  // 每个产品保留自己的安全页面；切换产品不把详情对象和数据库状态带过去。
+  const [productPages, setProductPages] = useState<Record<ProductId, AppPage>>({
+    work_cn: "overview",
+    trae_cn: "accounts",
+  });
   const [workspaceRefreshPending, setWorkspaceRefreshPending] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const navigationMountedRef = useRef(false);
   // 工作台刷新按请求代次收口，避免撤销授权后的旧响应覆盖新状态。
   const workspaceRefreshGenerationRef = useRef(0);
   const mountedRef = useRef(true);
+
+  const selectedProduct = productDefinitionOf(selectedProductId);
+  const accountAdapter = useMemo(
+    () => accountAdapterFor(selectedProductId),
+    [selectedProductId],
+  );
+  const selectedState = state
+    ? workspaceStateForProduct(state, selectedProduct)
+    : null;
+
+  const handlePageChange = useCallback((page: AppPage) => {
+    setActivePage(page);
+    setProductPages((current) => ({ ...current, [selectedProductId]: page }));
+  }, [selectedProductId]);
+
+  const handleProductChange = useCallback((productId: ProductId) => {
+    const product = productDefinitionOf(productId);
+    const rememberedPage = productPages[productId];
+    const page = rememberedPage && product.capabilities.includes(rememberedPage as ProductCapability)
+      ? rememberedPage
+      : product.id === "trae_cn" ? "accounts" : "overview";
+    setSelectedProductId(productId);
+    setActivePage(page);
+  }, [productPages]);
 
   const refreshWorkspaceState = useCallback(async () => {
     const generation = (workspaceRefreshGenerationRef.current += 1);
@@ -143,35 +181,53 @@ export default function App() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>
-      <TitleBar platform={state.platform} />
+      <TitleBar
+        platform={selectedState?.platform ?? state.platform}
+        products={PRODUCT_DEFINITIONS}
+        selectedProductId={selectedProductId}
+        onProductChange={handleProductChange}
+      />
       <div className="app-body">
-        <NavigationRail activePage={activePage} onPageChange={setActivePage} />
+        <NavigationRail
+          activePage={activePage}
+          onPageChange={handlePageChange}
+          capabilities={selectedProduct.capabilities}
+        />
         <main id="main-content" className="app-main" ref={mainRef}>
-          <div className="app-page" hidden={activePage !== "overview"}>
-            <OverviewPage
-              state={state}
-              active={activePage === "overview"}
-              onNavigate={setActivePage}
-            />
-          </div>
+          {selectedState && selectedProductId === "work_cn" && (
+            <div className="app-page" hidden={activePage !== "overview"}>
+              <OverviewPage
+                state={selectedState}
+                active={activePage === "overview"}
+                onNavigate={handlePageChange}
+              />
+            </div>
+          )}
           <div className="app-page" hidden={activePage !== "accounts"}>
-            <AccountCenter active={activePage === "accounts"} />
-          </div>
-          <div className="app-page" hidden={activePage !== "checkin"}>
-            <CheckinPage active={activePage === "checkin"} onNavigate={setActivePage} />
-          </div>
-          <div className="app-page" hidden={activePage !== "environment"}>
-            <EnvironmentPage
-              active={activePage === "environment"}
-              onOpenMasterDetail={() => setActivePage("master-library")}
+            <AccountWorkbench
+              active={activePage === "accounts"}
+              adapter={accountAdapter}
             />
           </div>
-          <div className="app-page" hidden={activePage !== "master-library"}>
-            <MasterLibraryDetail active={activePage === "master-library"} onNavigate={setActivePage} />
-          </div>
-          <div className="app-page" hidden={activePage !== "settings"}>
-            <SettingsPanel active={activePage === "settings"} />
-          </div>
+          {selectedProductId === "work_cn" && (
+            <>
+              <div className="app-page" hidden={activePage !== "checkin"}>
+                <CheckinPage active={activePage === "checkin"} onNavigate={handlePageChange} />
+              </div>
+              <div className="app-page" hidden={activePage !== "environment"}>
+                <EnvironmentPage
+                  active={activePage === "environment"}
+                  onOpenMasterDetail={() => handlePageChange("master-library")}
+                />
+              </div>
+              <div className="app-page" hidden={activePage !== "master-library"}>
+                <MasterLibraryDetail active={activePage === "master-library"} onNavigate={handlePageChange} />
+              </div>
+              <div className="app-page" hidden={activePage !== "settings"}>
+                <SettingsPanel active={activePage === "settings"} />
+              </div>
+            </>
+          )}
         </main>
       </div>
       {/* 窗口边缘拖动热区：四周 5px 透明条（配合标题栏）让整圈边缘都能拖动/双击最大化窗口。

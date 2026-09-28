@@ -56,6 +56,8 @@ pub mod operation_manifest;
 pub mod plugin_cloud_sync;
 pub mod plugin_manifest;
 pub mod process_observation;
+pub mod product_adapter;
+pub mod product_account_state;
 #[cfg(feature = "sqlcipher")]
 pub mod production_catalog;
 pub mod progress;
@@ -63,6 +65,7 @@ pub mod progress;
 pub mod recovery_package;
 pub mod relay_ledger;
 pub mod remint;
+pub mod remote_device;
 pub mod scan_authorization;
 pub mod snapshot_store;
 #[cfg(feature = "sqlcipher")]
@@ -114,14 +117,16 @@ pub use checkin_credential::{
 };
 pub use checkin_http::{
     checkin_claim_request, checkin_status_request, exchange_token_by_auth_code,
-    exchange_token_by_refresh, get_pc_auth_code, get_user_info, get_user_info_full,
-    trae_http_client, CheckinHttpError, CredentialRenewalHttpAdapter, DeviceInfoBlock, OAuthClient,
-    RealCheckinRenewalService, RealCheckinTransport, TokenGrant, UserInfoFull, UserInfoSummary,
-    TRAE_IDE_VERSION, TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
+    exchange_token_by_refresh, get_pc_auth_code, get_user_info, get_user_info_for_oauth_client,
+    get_user_info_full, get_user_info_full_for_oauth_client, trae_http_client, CheckinHttpError,
+    CredentialRenewalHttpAdapter, DeviceInfoBlock, OAuthClient, RealCheckinRenewalService,
+    RealCheckinTransport, TokenGrant, UserInfoFull, UserInfoSummary, TRAE_CN_CLIENT_ID,
+    TRAE_CN_IDE_VERSION, TRAE_IDE_VERSION, TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
 };
 pub use checkin_login::{
-    begin_login, complete_login, LoginCallbackServer, LoginError, LoginHandoff, LoginReceipt,
-    LoginSession, CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
+    begin_login, begin_login_for, build_login_url_for, complete_login, LoginCallbackServer,
+    LoginError, LoginHandoff, LoginProduct, LoginReceipt, LoginSession, CALLBACK_TIMEOUT_SECONDS,
+    LOGIN_HOST,
 };
 pub use content_graph::DeterministicContentGraphHasher;
 pub use credential_maintenance::{
@@ -165,6 +170,7 @@ pub use operation_lease::{
     inspect_lock_status, OperationLease, OperationLeaseError, OperationLockStatus,
 };
 pub use operation_manifest::{list_operation_summaries, OperationManifestError, OperationSummary};
+pub use product_account_state::{ProductAccountStateError, ProductAccountStateStore};
 pub use plugin_cloud_sync::{
     fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, install_market_plugin,
     reconcile_plan, sync_account_cloud_plugins, uninstall_cloud_plugin, CloudPluginItem,
@@ -172,6 +178,7 @@ pub use plugin_cloud_sync::{
 };
 pub use plugin_manifest::{PluginManifest, PluginManifestEntry, PluginManifestError};
 pub use process_observation::{FixedProcessController, WorkCnProcessController};
+pub use product_adapter::TraeProduct;
 #[cfg(feature = "sqlcipher")]
 pub use production_catalog::{
     open_or_initialize_production_catalog, ProductionCatalogError, ProductionCatalogRuntime,
@@ -187,6 +194,9 @@ pub use recovery_package::{
 };
 pub use relay_ledger::{RelayLedger, RelayLedgerEntry, RelayLedgerError};
 pub use remint::{DeviceRemintService, RemintError};
+pub use remote_device::{
+    RealRemoteDeviceManager, RemoteDeviceHttpAdapter, ReqwestRemoteDeviceHttpAdapter,
+};
 pub use scan_authorization::{
     persisted_record_matches, PersistedScanAuthorization, ScanAuthorizationStore,
     ScanAuthorizationStoreError,
@@ -209,8 +219,8 @@ pub use storage_root::{
     DEFAULT_STORAGE_WARNING_BYTES,
 };
 pub use work_cn_location::{
-    WorkCnReadLocation, WorkCnReadLocationError, DEFAULT_WORK_CN_DB_RELATIVE_PATH,
-    DEFAULT_WORK_CN_ROOT_NAME,
+    TraeReadLocation, TraeReadLocationError, WorkCnReadLocation, WorkCnReadLocationError,
+    DEFAULT_WORK_CN_DB_RELATIVE_PATH, DEFAULT_WORK_CN_ROOT_NAME,
 };
 #[cfg(feature = "sqlcipher")]
 pub use work_cn_normalizer::WorkCnSourceNormalizer;

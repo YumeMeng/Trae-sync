@@ -1,17 +1,17 @@
 /**
- * U-2/U-3 视觉验收截图脚本（一次性工具，非测试）。
+ * U-2/U-5 视觉验收截图脚本（一次性工具，非测试）。
  *
  * 用 mock invoke 边界（同 e2e/mock-bridge 约束：不启动 Tauri、不访问真实数据）
  * 驱动构建产物，对账号页（列表/卡片）、签到页、总览页、主库详情页截图，
  * 供与 DESIGN_TOKENS 样张（方案 02 亮白通用玻璃）对照验收。
  *
- * 运行前置：pnpm build && pnpm preview --port 4173
+ * 运行前置：pnpm build && pnpm preview --port 4175
  * 运行方式：node e2e/visual-shots.mjs
  */
 import { chromium } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 
-const BASE = "http://127.0.0.1:4173";
+const BASE = "http://127.0.0.1:4175";
 const OUT = "artifacts/ui-shots";
 mkdirSync(OUT, { recursive: true });
 
@@ -25,31 +25,31 @@ async function mockInvoke(command, args) {
   const NOW_LOCAL = Math.floor(Date.now() / 1000);
   const DAY_LOCAL = 86400;
   const overview = [
-    { profile_id: "p1", screen_name: "梦梦", account_id: "a-p1", created_at: "2026-08-01T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
+    { profile_id: "p1", screen_name: "账号M", account_id: "a-p1", created_at: "2026-08-01T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
       credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 1600, usage_cached_at: "2026-08-26T01:00:00Z",
-      checked_in: true, access_token_expires_at_unix_seconds: NOW_LOCAL + 13 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
-      device_tail: "9012", device_id: "3569646294624771", display_name: null, masked_mobile: "156******19", auto_checkin_enabled: true },
+      checked_in: true, access_token_expires_at_unix_seconds: NOW_LOCAL + 15 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
+      device_tail: "9012", device_id: "5569646294624771", display_name: null, masked_mobile: "156******19", auto_checkin_enabled: true },
     { profile_id: "p2", screen_name: "LY", account_id: "a-p2", created_at: "2026-08-02T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
       credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 1400, usage_cached_at: "2026-08-26T01:00:00Z",
       checked_in: false, access_token_expires_at_unix_seconds: NOW_LOCAL + 8 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 170 * DAY_LOCAL,
-      device_tail: "7701", device_id: "2229135200000002", display_name: null, masked_mobile: "158******27", auto_checkin_enabled: true },
-    { profile_id: "p3", screen_name: "用户92431183708", account_id: "a-p3", created_at: "2026-08-03T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
+      device_tail: "7701", device_id: "2229155200000002", display_name: null, masked_mobile: "158******27", auto_checkin_enabled: true },
+    { profile_id: "p5", screen_name: "用户E", account_id: "a-p5", created_at: "2026-08-05T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
       credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 1720.9, usage_cached_at: "2026-08-26T01:00:00Z",
-      checked_in: true, access_token_expires_at_unix_seconds: NOW_LOCAL + 13 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
-      device_tail: "6509", device_id: "1928709300000003", display_name: "主力号", masked_mobile: "133******04", auto_checkin_enabled: true },
-    { profile_id: "p4", screen_name: "用户4050081350", account_id: "a-p4", created_at: "2026-08-04T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
-      credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 623.9, usage_cached_at: "2026-08-26T01:00:00Z",
-      checked_in: false, access_token_expires_at_unix_seconds: NOW_LOCAL + 13 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
-      device_tail: "0030", device_id: "2379904400000004", display_name: null, masked_mobile: "156******86", auto_checkin_enabled: true },
-    { profile_id: "p5", screen_name: "17513301392", account_id: "a-p5", created_at: "2026-08-05T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
+      checked_in: true, access_token_expires_at_unix_seconds: NOW_LOCAL + 15 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
+      device_tail: "6509", device_id: "1928709500000005", display_name: "主力号", masked_mobile: "155******04", auto_checkin_enabled: true },
+    { profile_id: "p4", screen_name: "用户A", account_id: "a-p4", created_at: "2026-08-04T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
+      credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 625.9, usage_cached_at: "2026-08-26T01:00:00Z",
+      checked_in: false, access_token_expires_at_unix_seconds: NOW_LOCAL + 15 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 179 * DAY_LOCAL,
+      device_tail: "0050", device_id: "2579904400000004", display_name: null, masked_mobile: "156******86", auto_checkin_enabled: true },
+    { profile_id: "p5", screen_name: "账号E", account_id: "a-p5", created_at: "2026-08-05T00:00:00Z", last_verified_at: "2026-08-26T00:00:00Z",
       credits: 200, credits_cached_at: "2026-08-26T01:00:00Z", usage_remaining_credits: 400, usage_cached_at: "2026-08-26T01:00:00Z",
       checked_in: false, access_token_expires_at_unix_seconds: NOW_LOCAL + 5 * DAY_LOCAL, refresh_token_expires_at_unix_seconds: NOW_LOCAL + 175 * DAY_LOCAL,
-      device_tail: "4738", device_id: "2611766200000005", display_name: null, masked_mobile: "175******92", auto_checkin_enabled: false },
+      device_tail: "4758", device_id: "2611766200000005", display_name: null, masked_mobile: "175******92", auto_checkin_enabled: false },
   ];
   const instanceStates = [
     { profile_id: "p1", running: true, login_state: "logged_in" },
     { profile_id: "p2", running: true, login_state: "logged_out" },   // 琥珀：运行中·待登录
-    { profile_id: "p3", running: false, login_state: "logged_in" },   // 停止态：登录有效
+    { profile_id: "p5", running: false, login_state: "logged_in" },   // 停止态：登录有效
     { profile_id: "p4", running: false, login_state: "uninitialized" },
     { profile_id: "p5", running: false, login_state: "stale" },       // 琥珀加强：登录失效
   ];
@@ -73,7 +73,7 @@ async function mockInvoke(command, args) {
     case "get_environment_state": return {
       env_id: "master",
       current_profile_id: "p1",
-      current_account_name: "梦梦",
+      current_account_name: "账号M",
       data_dir: "C:\\TraeSync\\data\\environments\\master",
       running: false,
       login_state: "logged_in",
@@ -134,13 +134,13 @@ await page.screenshot({ path: `${OUT}/02-accounts-list.png` });
 // —— 账号页：卡片视图 ——
 await page.click('[data-testid="account-view-card"]');
 await page.waitForTimeout(500);
-await page.screenshot({ path: `${OUT}/03-accounts-cards.png` });
+await page.screenshot({ path: `${OUT}/05-accounts-cards.png` });
 // 切回列表（保持默认偏好纯净）。
 await page.click('[data-testid="account-view-list"]');
-await page.waitForTimeout(300);
+await page.waitForTimeout(500);
 
 // —— 账号详情（含备注名编辑 + 危险分区）——
-await page.click('[data-testid="account-card-p3"]');
+await page.click('[data-testid="account-card-p5"]');
 await page.waitForTimeout(500);
 await page.screenshot({ path: `${OUT}/04-account-detail.png`, fullPage: true });
 

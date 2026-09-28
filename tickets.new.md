@@ -58,7 +58,7 @@
 - **验收**：A1 补齐 e2e + 组件测试后全绿（vitest 172/172、e2e 47/47）；积分随签到结果刷新、离线显示缓存值并标注时间随 U-2/U-3 验收覆盖。
 
 ### P1-4 签到链路 v6 改造：失败即报错 + 手动重置（ADR-0019 v6）✅（2026-09-02 六项决议全部落地）
-- **背景**：v5 自动重铸链在生产暴露三类问题——a) 9074 时间窗不可预测（盈国新账号实测：同 SOLO 形态同 180 秒铸签间隔，距登录 17 分钟拒、20 分钟过；冷却 3 分钟对新账号不成立），自动重试撞墙且每轮重铸消耗服务端设备配额；b) 冷却期 sleep(180) 阻塞持锁 + 前端倒计时为组件本地状态（退出页面即丢）+ 重复点击静默排队 → "一直签到中"；c) `credential_refresh_failed` 无文案映射落入"稍后重试"兜底误导用户（旧 Work 凭据账号实际出路是重新登录）。
+- **背景**：v5 自动重铸链在生产暴露三类问题——a) 9074 时间窗不可预测（账号Y新账号实测：同 SOLO 形态同 180 秒铸签间隔，距登录 17 分钟拒、20 分钟过；冷却 3 分钟对新账号不成立），自动重试撞墙且每轮重铸消耗服务端设备配额；b) 冷却期 sleep(180) 阻塞持锁 + 前端倒计时为组件本地状态（退出页面即丢）+ 重复点击静默排队 → "一直签到中"；c) `credential_refresh_failed` 无文案映射落入"稍后重试"兜底误导用户（旧 Work 凭据账号实际出路是重新登录）。
 - **目标**（grill 六项决议）：
   1. Work 通道代码彻底删除（`OAuthClient::Work` / `TRAE_CLIENT_ID` / `from_client_id` 未知回退），全链路仅 SOLO；
   2. 自动链整体取消：`RemintCheckinRunner` 退化为 status → 单次 claim → status 复核；删除自动重铸、退役设备自动恢复、冷却 sleep 与 `checkin-phase` cooldown 事件；
@@ -66,7 +66,7 @@
   4. 签到命令 try-lock 快速失败：执行中重复触发立即返回"签到正在进行中"；
   5. 失败文案按语义细分：9074 按重置时间上下文化（刚重置→引导等待；未重置→引导重置设备）、9095 设备日配额、`credential_refresh_failed` 引导重新登录、20401 设备数上限；
   6. 完整遥测头集合（trae-mate 式 `x-market-user-id`/`vscode-sessionid`/每请求 `x-request-id`/`x-tt-trace-id`/固定头）：探针实测通过后纳入 `checkin_http.rs`。
-- **完成情况（六项决议全部落地，2026-09-02）**：Work 通道全删（`OAuthClient` 仅剩 `Solo`，探针/实测收编脚本同步改写）；`RemintCheckinRunner` 重命名为 `BatchCheckinRunner` 并退化为 status→单次 claim→status，自动重铸/冷却/退役恢复链全删；`AccountRecord` 新增 `device_created_at_unix_seconds`（登录与重铸两个写入点），9074 在设备铸造后 5 分钟内被拒时 detail_code 改标 `device_too_new`（用户4993529391 实测：登录后 192 秒同设备重试即过，证明首签失败是时间窗而非设备问题）；签到命令 try-lock 快速失败（`checkin_already_running`）；前端删除冷却倒计时 UI/监听（`checkin-phase` 仅剩 inter_wait）、`fallback_device_id` 字段与"已自动更换设备"文案全清；`safeUiError` 补 `checkin_already_running`/`device_too_new` 映射并改写 9074/9095 文案。**决议 6（遥测头）**：探针实测 PASS（status 端点 2 账号 × 3 组带头/裸头对比全部 200/code=0 且业务字段一致，报告 `.scratch/checkin-http/reports/telemetry-headers-probe-20260902-234021.json`），据此 `checkin_body` 统一附完整头集合（固定头 + 设备 ID SHA-256 确定性派生 `x-market-user-id`/`vscode-sessionid` + 每请求刷新 `x-request-id`/`x-tt-trace-id`），3 个形状/稳定性单测全绿。
+- **完成情况（六项决议全部落地，2026-09-02）**：Work 通道全删（`OAuthClient` 仅剩 `Solo`，探针/实测收编脚本同步改写）；`RemintCheckinRunner` 重命名为 `BatchCheckinRunner` 并退化为 status→单次 claim→status，自动重铸/冷却/退役恢复链全删；`AccountRecord` 新增 `device_created_at_unix_seconds`（登录与重铸两个写入点），9074 在设备铸造后 5 分钟内被拒时 detail_code 改标 `device_too_new`（用户B 实测：登录后 192 秒同设备重试即过，证明首签失败是时间窗而非设备问题）；签到命令 try-lock 快速失败（`checkin_already_running`）；前端删除冷却倒计时 UI/监听（`checkin-phase` 仅剩 inter_wait）、`fallback_device_id` 字段与"已自动更换设备"文案全清；`safeUiError` 补 `checkin_already_running`/`device_too_new` 映射并改写 9074/9095 文案。**决议 6（遥测头）**：探针实测 PASS（status 端点 2 账号 × 3 组带头/裸头对比全部 200/code=0 且业务字段一致，报告 `.scratch/checkin-http/reports/telemetry-headers-probe-20260902-234021.json`），据此 `checkin_body` 统一附完整头集合（固定头 + 设备 ID SHA-256 确定性派生 `x-market-user-id`/`vscode-sessionid` + 每请求刷新 `x-request-id`/`x-tt-trace-id`），3 个形状/稳定性单测全绿。
 - **验收**：Rust 全量测试 + 前端 typecheck/vitest/e2e 全绿；手动签到路径无任何静默等待（秒级返回或明确报错）；9074 场景文案按上下文给出正确下一步；探针头集合实测记录落档 `.scratch/checkin-http/reports/`。
 - **实施注意**：取消自动链后 `RemintCheckinRunner` 相关 7 单测需同步重写；`restore_retired_device` 路径删除但 `checkin/retired/` 留档不删（铁律）；LY 账号凭据仍为 Work 形态，需用户重新登录一次换发 SOLO 凭据（非代码任务，提醒用户）。
 
@@ -76,7 +76,7 @@
 ## Phase 2：账号注册表与切换
 
 ### P2-1 账号注册表与卡片列表 ✅（功能已落地：注册表 + OAuth 登录 + DPAPI 凭据包由 P1-0 全账号真机闭环；卡片/列表/健康度由 U-2 重设计落地。残余项「主力账号 OAuth 注册」并入 P5-A 批次 0 用户配合步骤）
-- **目标**：账号档案完整管理（OAuth 登录入口、列表、基础信息、积分、签到状态、凭据健康度）；现有 A/LY/梦梦重新授权。
+- **目标**：账号档案完整管理（OAuth 登录入口、列表、基础信息、积分、签到状态、凭据健康度）；现有 A/LY/账号M重新授权。
 - **验收**：OAuth 登录 → 档案建立 → 凭据包落盘 → 重启 App 后凭据可用；卡片信息完整。
 
 ### P2-2 data_dir 实例管理与快速切换 ✅（2026-08-23 实施完成；真机验收由 P2-3 E2E 同日覆盖——双实例并行启动/聚焦/关闭全路径实测通过）
@@ -89,11 +89,11 @@
 - **目标**：启动/关闭/状态检测/异常清理（僵死进程检测）。
 - **验收**：E2E 覆盖启动、切换、关闭全流程。
 - **完成情况**：启动/状态检测随 P2-2 完成；本项补齐关闭——`close_trae_instance` 命令（taskkill 主进程 WM_CLOSE 优雅 3 秒 → 强制兜底多次复查；CREATE_NO_WINDOW 防控制台闪烁；幂等 not_running）。E2E 实测：TRAE 收 WM_CLOSE 后驻留托盘不退出，强制兜底为常态路径且数据无损（storage.json + 对话库完好，SQLite WAL）；关闭只影响目标实例进程树，其他并行实例与用户主实例不受波及。前端运行中卡片显示电源图标关闭按钮。僵死进程检测并入状态轮询（进程消失自动回未启动），不再单列。
-- **E2E 验收（2026-08-23 computer-use 实测，UI + PowerShell 进程交叉验证）**：双实例并行启动（梦梦 + 用户4050081350，26 进程/2 独立目录）→ 关闭其一无"关闭失败"误报（修复前 taskkill /F 终止滞后 1~3 秒会误报，已加 3 次复查吸收）→ 强杀后 10 秒内重启成功（code.lock 复用无占用报错，证明实例目录可循环使用）→ 最终关闭全部清理（0 管理进程残留，用户原生实例全程不受影响）。附带确认：状态检测不误报原生实例（user-data-dir 前缀匹配生效）。
+- **E2E 验收（2026-08-23 computer-use 实测，UI + PowerShell 进程交叉验证）**：双实例并行启动（账号M + 用户A，26 进程/2 独立目录）→ 关闭其一无"关闭失败"误报（修复前 taskkill /F 终止滞后 1~3 秒会误报，已加 3 次复查吸收）→ 强杀后 10 秒内重启成功（code.lock 复用无占用报错，证明实例目录可循环使用）→ 最终关闭全部清理（0 管理进程残留，用户原生实例全程不受影响）。附带确认：状态检测不误报原生实例（user-data-dir 前缀匹配生效）。
 
 ### P2-4 实例登录态可见性 ✅（2026-08-24 实施完成，同日升级四态 + 健康检测）
-- **目标**：让"启动过实例但未在 TRAE 内登录"的账号状态可见（2026-08-24 诊断：梦梦账号 5 次启动均显示登录页，用户不知需手动登录一次；且 seed 的 NativeMissing 分支只报一次，storage.json 空壳存在后不再提示）。
-- **完成情况**：`instance_login_state()` 纯函数（读实例 storage.json 判 `iCubeAuthInfo://usertag` 键，三实例实证：LY/import 有键=已登录，梦梦无键=未登录；解析失败按待登录处理，登录幂等无害）；`launch_trae_instance` / `get_trae_instance_states` 返回 `login_state`；账号卡片登录态徽章；启动消息按登录态分支（未登录给"在 TRAE 窗口内登录一次"引导）。用户在 TRAE 内登录后徽章 5 秒内自动翻转（轮询闭环）。
+- **目标**：让"启动过实例但未在 TRAE 内登录"的账号状态可见（2026-08-24 诊断：账号M账号 5 次启动均显示登录页，用户不知需手动登录一次；且 seed 的 NativeMissing 分支只报一次，storage.json 空壳存在后不再提示）。
+- **完成情况**：`instance_login_state()` 纯函数（读实例 storage.json 判 `iCubeAuthInfo://usertag` 键，三实例实证：LY/import 有键=已登录，账号M无键=未登录；解析失败按待登录处理，登录幂等无害）；`launch_trae_instance` / `get_trae_instance_states` 返回 `login_state`；账号卡片登录态徽章；启动消息按登录态分支（未登录给"在 TRAE 窗口内登录一次"引导）。用户在 TRAE 内登录后徽章 5 秒内自动翻转（轮询闭环）。
 - **四态升级 + 健康检测（2026-08-24 二次诊断驱动）**：LY 案例（徽章绿但 TRAE 实际未登录）暴露"键在会话死"盲区——TRAE 会话过期时不清除失效 blob，键存在性判定是乐观信号。升级：`instance_login_state()` 并入最近启动日志证据裁决（正向 `User info loaded {userId}` / 负向 `User not authenticated`、`[ckg] not login`，正向优先，均 2026-08-24 实证），新增 `stale` 第四态（红「登录已失效」徽章 + 启动消息引导重新登录）；账号页新增「健康检测」按钮（本地四态深度检测即时刷徽章 → 复用 `refresh_checkin_credits` 网络探测签到会话 → 汇总消息区分实例登录分布与签到会话异常账号）；已登录徽章 tooltip 去承诺化（"若 TRAE 显示登录页，重新登录一次即可"）。日志证据读取对目录名做 TRAE 时间戳格式校验，读取失败退化为键存在性判定（TRAE 更新日志结构时不误报）。Rust 单测 11 项（新增日志证据 4 分支）、前端 161 项全过。
 - **已知问题（mutex 弹窗，不修）**：原生 TRAE 与账号实例并行运行时，账号实例启动会弹 TRAE 主进程自身的 JS 报错窗（`Error: Error mutex already exists`，模块级单例锁冲突，弹窗来自 TRAE 的 Electron uncaught exception dialog，App 无法外部抑制）。实测全部 8 次启动均弹（含已成功登录的实例），ckg/ai-agent health check 正常、登录态读写正常——点掉继续即可，功能无损。决定不做 UI 预警迎合（弹窗是 TRAE 行为，文档记录即可）。
 
@@ -240,7 +240,7 @@
   - `infrastructure/relay_ledger.rs`（新模块）：接力台账（`environments/relay-ledger.json`），每次换腿逐会话记录 from/to/消息数快照；损坏拒绝重建（防伪造）、追加失败不阻断切号（只影响历史页轨迹展示）。
   - `lib.rs` 编排命令 `switch_master_account`（`force` 参数处理生成中切换）+ `master-switch-progress` 六阶段进度事件（closing → backing_up → switching_login → handing_over → restarting → done）；交接成功后环境档案写回当前账号。前端类型 `src/types/account_switch.ts`（MasterSwitchStage/ProgressEvent/Dto/ErrorCode 全量错误码）。
 - **验收（2026-08-31 实测）**：cargo test 全绿（app crate + infrastructure 617 passed；master_handover 6 测试 / relay_ledger 5 测试 / blob_keepalive 含身份互换 10 测试全过）；typecheck 通过。
-- **真机端到端验收（2026-08-31 通过，CDP 驱动）**：梦梦 → 用户4050081350 五步事务全链路完成——弹层六阶段推进正常；备份链 `.switch-bak-*` 两份（create_new 语义验证）；TRAE 重启后 renderer.log 出现 `User info loaded {"userId":"1307767855650905"}`（互换凭据被服务端接受）；`project.user_id` 随行为 1307767855650905（inspect 探针只读核验）。**注意**：目标账号实例的登录 blob 会被 TRAE 清理（陈旧吊销），LY 实例 blob 已失效报 `switch_donor_login_missing`（文案与判定均正确），切换前需目标账号实例保持有效登录；本次改用 blob 有效的用户4050081350 验收。
+- **真机端到端验收（2026-08-31 通过，CDP 驱动）**：账号M → 用户A 五步事务全链路完成——弹层六阶段推进正常；备份链 `.switch-bak-*` 两份（create_new 语义验证）；TRAE 重启后 renderer.log 出现 `User info loaded {"userId":"用户D"}`（互换凭据被服务端接受）；`project.user_id` 随行为 用户D（inspect 探针只读核验）。**注意**：目标账号实例的登录 blob 会被 TRAE 清理（陈旧吊销），LY 实例 blob 已失效报 `switch_donor_login_missing`（文案与判定均正确），切换前需目标账号实例保持有效登录；本次改用 blob 有效的用户A 验收。
 - **边界说明**：`master_switch_conflict` 人工决策分支未真机触发（单测覆盖）；种子 DB 无会话，换腿与接力台账 0 条目路径未产生真机样本（逻辑由单测覆盖，待日常使用中积累）。
 
 ### P5-2 环境页 + 账号页切号主面板（Q6/Q7/Q9）✅（2026-08-31 真机验收通过）
@@ -351,7 +351,7 @@
     | checkin-ec1590e91ce0 | 3508.1 MB | 3470.6 | 37.1 | 0.2 | ✅ |
     | checkin-ee273142ca4e | 3551.8 MB | 3468.6 | 81.4 | 0.7 | ✅ |
     | checkin-f03cd7249235 | 3531.5 MB | 3468.5 | 61.5 | 0.4 | ✅ |
-    | checkin-import-1307767855650905 | 1571.2 MB | 1490.5 | 76.2 | 3.0 | ✅ |
+    | checkin-import-<设备ID> | 1571.2 MB | 1490.5 | 76.2 | 3.0 | ✅ |
   - ModularData 内部 99.99% 为 `ai-agent`（工具链缓存）；三件套路径 `User/globalStorage/storage.json` + `User/globalStorage/state.vscdb` + 根级 `machineid`。会话数核验（P3-1 索引缓存重读）：5 个有索引账号全部 0 会话（与 P3-1、grill-20260830 两次实测一致）；无索引 2 账号中 66d8f009f598 未启动（无三件套，整目录可删），0bea870c6951 三件套在位。**全部账号实例目录均为空对话库，剥离至 User 目录零对话损失。**
   - **environments/master 退役目录 3574.4 MB**：ModularData 3485.3（97.5%）+ 缓存/日志约 87 + User 0.5；`environments/relay-ledger.json` 与 `environments.json` 档案不在 master 目录内，删除不受影响。
   - **snapshots 3.34 GB（5 个快照）调用链核查定论：孤儿**。生成链（`scan_history`/`scan_default_history`/`scan_local_inventory` → SnapshotStore → `snapshots/`）与读取链（`browse_history`/`search_history`/`read_conversation`/`assign_source` 及授权命令族）全部注册于 invoke_handler 但 **前端零调用**（Phase 5 历史页已改读主库 `get_master_history`）。同族孤儿：P3-1/P3-2 会话索引命令族（`get_account_session_index`/`get_account_session_changes`/`refresh_account_session_index`/`get_account_session_messages`）前端仅类型定义残留、组件与测试已移除。
@@ -567,7 +567,7 @@
 
 ## 后续设计议题：凭据代次稳定性（2026-09-09，核心约束已确认）
 
-本议题由 `梦梦` 与 `用户2361650421` 的 `20403 Token device not match` 故障触发。当前只记录已确认的设计边界，不提前实施未确认的状态机、批量修复或迁移。用户已确认：凭据维护需要覆盖管理工具关闭期间，并提供单账号/全部账号的手动刷新入口；手动刷新是立即换发一次；失败时保留旧凭据并按退避策略重试；后台使用当前 Windows 用户计划任务，每 6 小时唤醒短命令，按需联网后退出。
+本议题由 `账号M` 与 `用户C` 的 `20403 Token device not match` 故障触发。当前只记录已确认的设计边界，不提前实施未确认的状态机、批量修复或迁移。用户已确认：凭据维护需要覆盖管理工具关闭期间，并提供单账号/全部账号的手动刷新入口；手动刷新是立即换发一次；失败时保留旧凭据并按退避策略重试；后台使用当前 Windows 用户计划任务，每 6 小时唤醒短命令，按需联网后退出。
 
 ### P9-0 首次登录验收与一次 OAuth 约束（方案已确认，App 优先部分落地；Windows 暂缓）
 
@@ -577,7 +577,7 @@
 - 凭据发布采用“候选代次 → 完整验收 → 原子发布”边界：发布前不切换当前代次；任一步失败都保持旧当前代次不变，避免凭据文件与账号档案指向不同代次。
 - 增加不含 token/私钥正文的凭据发布日志，记录前后代次、文件校验信息和事务阶段；启动或账号操作前只做本地幂等恢复，不自动触发 OAuth、设备重铸或网络重试。
 - 对已完成登录验收的现有账号，按阈值独立维护凭据；旧 refresh 返回 `20403` 不再触发自动签到设备重铸。只有 access 已过期时才最后尝试旧 refresh；失败保留当前代次并要求用户明确重新登录。
-- 2026-09-09 真实验证：`13347311304` 与 `15638932119` 各连续两次完成同设备 AuthCode 换发，JWT 身份校验、原子写回均通过；新 pair 的 access/refresh 有新签发寿命，未进行第二次 OAuth。随后用户实机确认换发后的凭据可以完成 TRAE Work 登录。
+- 2026-09-09 真实验证：`133****1304` 与 `156****3219` 各连续两次完成同设备 AuthCode 换发，JWT 身份校验、原子写回均通过；新 pair 的 access/refresh 有新签发寿命，未进行第二次 OAuth。随后用户实机确认换发后的凭据可以完成 TRAE Work 登录。
 - 用户新增确认：增加后台凭据维护范围，以及“刷新此账号 / 刷新全部账号”手动入口；两者均复用同设备 AuthCode 换发与候选代次→验收→原子发布边界。
 - 用户确认失败策略：同设备换发失败但旧 access 仍有效时，保留旧凭据，按 1h→2h→4h→8h 指数退避，之后最多每天一次；按账号隔离并设每日上限，超限转为需处理；不隐式 OAuth、不重铸设备，手动失败不启动隐藏循环。
 - 用户确认低占用后台策略：当前用户计划任务在登录时及每 6 小时唤醒一次；健康账号只做本地检查，维护命令完成后立即退出，不做常驻进程。
@@ -611,3 +611,80 @@
 - **补强（2026-09-14）**：P5-5 主库体检与收编候选同步排除归档、软删和无会话账号；归档-only 不再触发“归入当前账号”提示，空项目仅作诊断展示且不会进入收编或触发空跑；旧主库缺少归档列时保持兼容。
 - **补强（2026-09-21）**：空项目诊断口径排除软删项目（TRAE 历史删除残留行不再被误报为「空项目」，此即“31 个空项目”提示的根因）；环境页体检区块新增「清理空项目」——单次确认（ADR-0018）+ 自动备份，复用收编编排（关实例 → 三件套备份 → 单事务删除无任何会话行的未删项目行 → 重启），孤儿行保持只报告不动。
 - **验收**：`master_handover` 13 项、`master_history` 8 项、`master_archive` 13 项、`account_session_content` 7 项 Rust 单测通过；`LibrarySessionsPanel` 22 项 Vitest、前端 `typecheck`、Tauri `cargo check -p trae-sync` 通过。
+
+## P10 多产品工作台与 Trae CN 渐进适配（研究门禁已通过，2026-09-22）
+
+### 目标与决策边界
+
+本阶段把 Trae Sync 从 Work CN 专用 UI 提升为可安全承载多个 TRAE 产品的工作台壳层。Work CN 仍是完整支持面；Trae CN 先接入产品上下文、能力驱动导航、只读数据定位、身份发现和重新授权引导。正式边界以 `docs/adr/0029-multi-product-workbench-boundary.md` 为准，事实台账见 `.scratch/research-multi-product-adaptation-20260922.md`。
+
+本阶段不把“同一账号体系”解释为“凭据可直接迁移”：不复制 access token、refresh token、native storage blob、设备密钥或 MachineID；不跨产品写数据库、WAL、storage 或官方客户端目录；不做全局会话库、统一签到入口或泛化插件平台。
+
+### 研究门禁结论
+
+- 产品根目录、数据库相对路径和 Trae CN 只读 SQLCipher 读取已确认可隔离。
+- Work 包为 `SOLO_CN`、Trae CN 包为 `TRAE_CN`，官方认证选择分别使用 SOLO/solo 与 TRAE/trae；直接凭据复用未证明，不得承诺。
+- 两套 storage blob 结构相似，但当前真实根目录登录的是不同账号；“身份可识别”和“会话可恢复”必须拆成两个状态。
+- 两套客户端确实都把授权 URL 交给 Windows 默认外部浏览器，并使用本机临时回调；这意味着浏览器网页登录会话可能复用，但不等于产品 credential 可复用。
+- GitHub 公开源码复核仍指向平台化 OAuth：`Trae`、`TraeSolo`、`TraeCn`、`TraeSoloCn` 使用不同平台上下文、认证选择和 CN/国际服务路由；未发现能证明 Work/SOLO credential 可直接注入 Trae CN 的公开证据。完整索引见 `.scratch/research-trae-cn-github-20260922.md`。
+- V1.1 默认采用“身份发现 + 引导重新授权”。只有严格隔离实验满足 ADR-0029 的全部门槛，才允许另行评估 `verified`；Trae CN 凭据维护的独立 OAuth、续期和验收边界以 ADR-0030 为准。
+
+### V1.1 顺序（不超过十步）
+
+1. **产品注册与上下文边界**：以 `ProductContext` 统一 Work/CN 的数据根、数据库定位、可执行文件和能力清单。验收：每个产品的路径和数据源由自身上下文解析，Work 现有测试全绿。
+2. **动态工作区状态**：把固定 `platform_id` 提升为 `selectedProductId`，为每个产品保存当前账号和最近页面。验收：切换产品后旧页面详情、数据库句柄和缓存不会复用，返回原产品可恢复其最近安全页面。
+3. **标题栏产品切换器**：在标题栏左侧显示 Work CN/Trae CN，切换流程固定为销毁旧上下文 → 加载新上下文 → 重载能力 → 恢复安全页面。验收：标题、数据源和页面均属于当前产品。
+4. **能力清单驱动导航**：以 `CapabilityManifest` 生成侧栏，Trae CN 只显示真实适配的账号相关入口；签到、会话、环境不显示。验收：无 `product === work_cn` 的导航分支，Trae CN 不出现签到入口。
+5. **产品内账号切换器**：账号选择只改变当前产品的 `activeIdentityId`，不改变产品上下文或其他产品账号。验收：同产品切号不读取另一产品数据库，产品切换不重置另一产品的账号选择。
+6. **账号身份层**：从现有 Work/CN 只读材料建立脱敏 `AccountIdentity`，支持同一身份关联多个产品。验收：身份关联不向前端、日志或文件写入 token/私钥；当前不匹配的根目录显示未知或需授权。
+7. **产品凭据状态**：建立 `ProductCredential`，至少支持 `identity_recognized`、`restore_testing`、`verified`、`need_authorization`、`failed`。验收：Work `verified` 与 Trae CN `need_authorization` 可并存，UI 不把身份识别写成已登录。
+8. **重新授权引导**：Trae CN 未验证自动恢复时提供“发现已有 TRAE 账号 / 继续授权”入口，沿用 App 内 OAuth 和一次 OAuth 约束。验收：不复制生产 credential，不写官方 storage，授权结果按产品单独保存。
+9. **Trae CN 只读数据适配**：接入已验证的只读数据库定位与读取，严格禁止跨产品写入和会话合并。验收：Trae CN 读取只命中自己的 data root；Work 主库读写回归通过。
+10. **隔离恢复探针与状态回执**：仅在临时 user-data-dir、临时 credential store 和非生产实例中验证 adapter restore；若门槛未全部满足保持需授权。验收：实验有明确状态、业务码和脱敏证据，生产目录无变更。
+
+### 当前落地记录（2026-09-22）
+
+- **已落地第一切片**：`ProductContext` 的产品注册边界、标题栏产品切换器、能力清单驱动导航、按产品记忆安全页面、Trae CN 账号适配页，以及只读产品身份发现命令。
+- **已落地第二切片**：Trae CN 独立 OAuth（`TRAE/trae/IDE_PC` 通道）、独立 DPAPI 凭据目录、独立账号注册表、当前账号指针、账号列表和产品内切换命令；默认打开系统浏览器以复用网页授权会话，但不复制 Work 的本地凭据。
+- **已落地第三切片**：账号页统一进入 `AccountWorkbench`；Trae CN 通过 `AccountAdapter` 提供统一账号快照、独立 OAuth 登录、取消登录和账号切换，复用 Work 的标题、工具栏、列表/卡片视图与能力裁剪。`ProductAccountPage` 仅保留为迁移测试基线，不再作为生产路由；Work 的 `AccountDetail`、签到、额度和主库切号事务保持原路径。
+- **已落地第四切片**：健康检测和登录凭据刷新进入共享账号模块；Trae CN 使用自己的 `TRAE/IDE_PC` OAuth client、凭据根和后端命令，Work 继续使用自己的成熟续期链路。两者不共享 token、设备材料或官方 storage；额度和签到仍只由 Work 管理。
+- **当前状态**：Work CN 保持完整工作区；Trae CN 现在可以在 Trae Sync 内完成独立授权、保存账号、健康检测、凭据刷新和切换当前账号。官方 Trae CN native storage 的会话写回/关闭重启恢复，以及真实生产续期成功证据仍未完成，因此不能把该状态宣称为“Work 凭据迁移成功”或“官方客户端已登录”。
+- **尚未落地**：Trae CN 只读历史读取、官方 native session restore 和隔离恢复探针。真实账号续期仍需单独做一次实测验收，失败时回退到重新授权，不扩大到额度或签到。
+- **登录复核回执**：可以复用“同一浏览器网页登录会话”来减少再次输入账号的步骤；不能把 Work 的本地 token/blob/device 材料复制到 Trae CN。当前 Work 与 Trae CN 本地保存的脱敏 `userId` 不同，因此当前机器也不是同一账号跨产品登录状态。
+- **已验证**：`pnpm build`、`pnpm typecheck`、全量 Vitest **242/242**、Playwright **38/38**、`cargo check -p trae-sync`、Tauri 核心库 **62 passed / 1 ignored** 与 infrastructure Rust 单测 **735 passed / 7 ignored** 均通过；Windows GNU 目标的交叉检查仍受本机 OpenSSL/Strawberry Perl 工具链阻塞，详见研究台账。
+
+### P10-5 远程设备管理（2026-09-23 grill 九问定案，ADR-0031）⭐
+
+- **背景**：设备重铸与多产品登录累积服务端设备占用，达上限（10 台）时登录/续期返回 20401/20408，此前显示为普通网络错误。ListDevices 已用 Trae CN 本地凭据实测可行（占用 7/10、4/10，探针报告 `.scratch/checkin-http/reports/device-list-token-probe-20260923.json`）；ClearRefreshToken 接口已从官方前端脚本确认、未验证。研究台账 `.scratch/research-trae-device-management-20260923.md`。
+- **决策**（详见 ADR-0031）：账号级共享能力两产品同时上；原生 ListDevices 主路径 + 官方授权页兜底；本机设备禁止远程退出（UI 隐藏退出按钮 + 后端 device_id 比对拒绝，双防线）；其余设备逐台单次确认退出（列明设备名/绑定产品/影响）；列表按账号全量展示 + 行内产品标签，无筛选器；退出成功后重拉列表 + 触发该账号健康检查（本机失效→need_authorization 仅作防御兜底）；协议放产品中立 infrastructure `remote_device` 模块（`checkin_http.rs` 保持签到专用）；能力清单声明 `supports_remote_devices` 接入；UI 不显示 DeviceID/业务码；remint 本次不动。
+- **实施切片**：
+  1. infrastructure `remote_device` 模块：端口 + ListDevices 实现 + DTO + 错误映射（20401/20408 → 设备额度状态）；Work CN 凭据调用可行性实测补证（只读，无副作用）。
+  2. 共享设备面板：AccountWorkbench 设备模块（能力声明接入），列表形式呈现，信息丰富度以官方授权网页为基线只增不减——顶部汇总（已用/上限，接近上限高亮）+ 每行：设备名称、设备类型（友好映射，未知值不透传内部枚举）、绑定产品标签、最近活跃时间（绝对 + 相对双形式）、本机徽章（本机行无退出按钮）、逐行退出按钮；按最近活跃倒序；官方授权页兜底入口；加载/失败/空三态（失败显示原因 + 重试 + 官方页入口）。
+  3. 退出能力：ClearRefreshToken 实现（mock/单测固化请求形状：字段、头、错误映射）+ 逐台单次确认 UI + 本机后端拒绝 + 成功后刷新链。
+  4. 真机验收：用户明确选定一台可牺牲设备，工具内单次确认执行真实退出，结果落档 `.scratch/`；不做无副作用探针试错。
+- **验收**：20401/20408 登录失败显示「设备数量已达上限」+ 管理入口；两产品面板可用且主视野无内部标识；本机行无退出按钮且后端拒绝本机目标；真机退出验收记录落档；remint 行为与 P1-4 现状完全一致、无新增自动触网；Rust 全量 + 前端 typecheck/vitest/e2e 通过。
+- **落地记录（2026-09-23，切片 1-3 代码闭环）**：
+  - **切片 1（协议模块）**：新建 `ports/src/remote_device.rs`（`RemoteDeviceManager` 端口 + Snapshot/Entry/Error，端口零凭据暴露）与 `infrastructure/src/remote_device.rs`（`RemoteDeviceHttpAdapter` 注入 seam + `ReqwestRemoteDeviceHttpAdapter` 复用 `trae_http_client()` + `RealRemoteDeviceManager`：凭据包内存解密 → x-cloudide-token 调 ListDevices/ClearRefreshToken → 业务码字符串/数字双形态解析 → 本机 device_id 比对拒绝后端防线）；12 单测全绿。
+  - **切片 2（命令与面板）**：`list_remote_devices` 命令（RealReadPreview 门控 + product_id 路由 Work=Solo/TraeCn=TraeCn + spawn_blocking + 稳定错误码透传）；前端 `AccountCapability` 加 `remoteDevices`、新建 `RemoteDevicesPanel`（默认折叠懒加载，零打开触网；汇总行 + 设备名/类型友好映射/产品标签/绝对+相对活跃时间/本机徽章/逐行退出；三态；ConfirmDialog danger 确认）、AccountCenter 门控挂载、safeUiError 词表 5 组新增；vitest 新增 11 用例。
+  - **切片 3（退出闭环）**：`clear_remote_device` 命令（同门控路由 + `remote_device_empty_target` 防御，不写本地状态）+ 退出成功后经 `onSignedOut` 联动现有健康检测（忙碌跳过不排队）+ e2e `remote-devices.spec.ts`（本机无退出按钮 → 非本机确认 → 列表刷新）。
+  - **双产品凭据实测补证**（探针报告 `.scratch/checkin-http/reports/device-list-probe-both-products-20260923.json`）：Work CN 8/8 账号 ListDevices 全部成功（占用 1~6/10）——决策 1 开放事实已实证；Trae CN 对照 7/10、4/10 与研究台账一致。只读操作，无退出动作。
+  - **全量验收**：`cargo test --workspace` 零失败、`pnpm typecheck` 通过、vitest **255/255**、e2e **39/39**。
+  - **待办（用户配合）**：切片 4 真机退出验收——用户在工具内选定一台可牺牲的非本机设备单次确认执行真实退出，结果落档 `.scratch/`；此前不做任何 ClearRefreshToken 真实调用。
+  - **审查修复（2026-09-23 双轴 code-review 后）**：修复账号切换面板滞留（含飞行中旧响应代次守卫）、补官方设备管理页兜底入口（`open_device_management_docs` 命令 + 失败态按钮）、account_label 回退改中性文案、登录失败文案引导「登录设备」面板、退出健康检查联动收敛为单账号（`handleHealthCheck(targetProfileId?)`）。vitest 258/258。
+  - **架构深化排期（2026-09-23 grill 定）**：深化主线（Binding::from 消重 → 产品账号解析器下沉 → lib.rs 按域拆分 → 命令壳收敛）推迟至切片 4 真机验收后作为独立批次启动；候选报告 `architecture-review-20260923-p105.html`（temp），候选 5/6/7 按 Phase 计划另行排期。
+  - **UI 结构调整（2026-09-23 用户拍板，ADR-0031 决策 12）**：「登录设备」面板从账号列表页独立区块迁入**账号详情视图**——Work CN 内嵌 AccountDetail；Trae CN 卡片新增点击进入轻量 `AdapterAccountDetail`（基础信息 + 登录设备 + 可选切换）；面板 profileId/accountLabel 改必传（绑定固定账号）；登录失败文案改引导「打开该账号的详情页」；退出联动：Work 详情页刷总览数据、Trae CN 详情页单账号健康检测。后端命令零改动（本就按 profile_id 查询）。vitest **266**、e2e **39** 全绿。
+  - **列表二次调整（2026-09-23 用户拍板）**：面板三段式——本机设备区块置顶强调（无退出按钮；无匹配行显示「未识别到本机对应的设备」中性空态）+「其他设备 (N)」默认折叠分组（点开才展开，组内退出流程不变）。汇总行保持。Work 只读验证通过（探针 16 账号全绿、占用无副作用、日志无错误）。vitest **267**、e2e **39** 全绿。
+  - **本机识别修复（2026-09-23，用户真机反馈「全部显示未识别」驱动）**：实测确诊服务端 `DeviceID`（14 位记录 ID）与本地凭据 `device_id`（16 位 hex 虚拟设备指纹）是**两套标识体系**，逐行相等永不命中。对照实验：空体（官方网页形态）与仅带 ClientID 时响应各行 `CurrentDevice` 全 false；请求体带 `ClientID + DeviceInfo.DeviceID`（本机凭据指纹）后服务端才标记本机行 `CurrentDevice=true`。修复：① list 请求体从空对象改为携带凭据 ClientID+DeviceID（trait 签名同步）；② is_local 优先采用服务端 `CurrentDevice` 标记（宽松真值），device_id 相等降为兜底；③ **退出防线重构**——原"目标==本地 device_id"比对在真实体系下永不触发，改为退出前先拉只读列表，目标行 is_local=true 即拒绝且不发起退出请求（原本地比对保留为第一道）。单测 14 个（新增 CurrentDevice 标记/真值形态/服务端本机拒绝 3 个）；真实探针验证 is_local 命中本机行。诊断能力沉淀在 `real_device_probe.rs`（形状摘要 + SHA-256 指纹，不输出原值）。
+  - **切片 4 真机退出验收收口（2026-09-25）✅**：用户于 09-23~09-25 期间在工具内自然完成远程退出操作——探针占用对比显示 6 个账号合计退出 **15 台设备**（66d8f009f598 8→1、0bea870c6951 8→6 等），全部生效；`app-diagnostics.log` 零 remote_device/ERROR/panic 记录；本机识别修复后探针持续命中。验收记录 `.scratch/checkin-http/reports/device-clear-acceptance-20260925.json`。**P10-5 切片 1-4 全部完成**。残余风险：ClearRefreshToken 错误响应完整形态未穷尽（成功路径已验证）、DeviceType/LastActiveAt 展示格式随真实数据逐步校准（无报障）。
+
+### 当前不做
+
+- 自动复制或转换 Work 的 access/refresh/native blob 到 Trae CN 生产目录。
+- 共享设备身份、设备密钥、MachineID 或跨产品调用设备注册/重铸。
+- 跨产品数据库、WAL/SHM、会话正文和主库记录的读取写入混用。
+- 将签到状态放到账号全局，或把 Trae CN 的签到做成“点击后失败”的入口。
+- 把未来适配抽象成完整插件市场、全局聊天数据库或所有 TRAE 产品的一次性大迁移。
+
+### P10 完成标准
+
+Work CN 的账号保存、对话主库、直连签到和账号切换行为保持现状；Work/CN 可在标题栏切换且数据边界清晰；侧栏由能力清单生成；Trae CN 只展示已适配能力；身份状态与产品凭据状态不混淆；所有未验证的跨产品登录都显示为需授权或实验状态；全量 Rust、前端类型、组件和 E2E 验证通过。

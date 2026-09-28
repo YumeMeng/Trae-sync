@@ -1,9 +1,9 @@
 // 工作台状态 DTO：与 Rust 后端 `get_workspace_state` 命令返回的结构保持一致。
 // 0.2.1 生产能力限于 RealReadPreview；真实写入、恢复和迁移开关保持关闭。
 
-/** 平台上下文：V1 仅实现 Work CN Adapter 边界。 */
+/** 平台上下文：由当前产品工作区提供；Work CN 为完整支持面，其他产品按能力清单逐步开放。 */
 export interface PlatformContextDto {
-  /** 平台标识，V1 固定为 "work_cn" */
+  /** 当前产品标识，例如 "work_cn" 或 "trae_cn"。 */
   readonly platform_id: string;
   /** 平台显示名 */
   readonly display_name: string;
