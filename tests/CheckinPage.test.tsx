@@ -8,6 +8,7 @@ import type {
   CheckinResultDto,
   ManagedAccountsViewDto,
 } from "../src/types/account_switch";
+import type { TraeCnAccountDto } from "../src/types/product";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -218,6 +219,8 @@ describe("CheckinPage", () => {
     const status = await screen.findByTestId("auto-checkin-status");
     expect(status).toHaveTextContent("今日执行中（成功 1/3）");
 
+    // 确定性等待监听注册完成（listen 为异步注册，直接触发会偶发丢失事件）。
+    await waitFor(() => expect(handlers.get("auto-checkin-finished")).toBeDefined());
     await act(async () => {
       handlers.get("auto-checkin-finished")?.({ payload: { total: 3, completed: 2, failed: 1, skipped: 0 } });
     });
@@ -419,6 +422,8 @@ describe("CheckinPage", () => {
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
+    // 确定性等待监听注册完成（listen 为异步注册，直接触发会偶发丢失事件）。
+    await waitFor(() => expect(handlers.get("checkin-progress")).toBeDefined());
     // 第一个账号完成（completed=1）：cursor 推进到第二个账号。
     await act(async () => {
       handlers.get("checkin-progress")?.({
@@ -613,5 +618,169 @@ describe("CheckinPage", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
     expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credits", expect.anything());
+  });
+});
+
+// ============================================================================
+// Trae CN 签到区块（P13-1）：单账号池 + 手动 claim，mock invoke 边界。
+// ============================================================================
+describe("CheckinPage Trae CN 签到区块", () => {
+  const cnAccount: TraeCnAccountDto = {
+    profile_id: "profile-cn-1",
+    display_name: "CN 账号甲",
+    avatar_url: "",
+    last_verified_at: "2026-09-28T00:00:00.000Z",
+    status: "active",
+    is_current: true,
+  };
+
+  const cnStatusUnchecked = {
+    enable: true,
+    checked_in: false,
+    credits: 200,
+    did_checked_in: null,
+    extra_credits: 5,
+    message: "success",
+    business_code: 0,
+  };
+
+  function cnResult(overrides: Record<string, unknown> = {}) {
+    return {
+      profile_id: "profile-cn-1",
+      outcome: "claimed",
+      detail_code: null,
+      credits: 205,
+      extra_credits: 5,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockListen.mockReset();
+    mockListen.mockResolvedValue(() => undefined);
+  });
+
+  afterEach(() => vi.clearAllMocks());
+
+  it("渲染 CN 账号行：今日状态徽章、额外积分与可点签到按钮", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "list_trae_cn_accounts") return [cnAccount];
+      if (command === "get_trae_cn_checkin_status") return cnStatusUnchecked;
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
+
+    expect(await screen.findByText("CN 账号甲")).toBeInTheDocument();
+    // 今日状态徽章：未签（服务端 enable=true 且 checked_in=false）。
+    expect(screen.getByText("未签")).toBeInTheDocument();
+    // CN 特有字段展示：额外积分非空非零时如实透出。
+    expect(screen.getByText(/额外积分 5/)).toBeInTheDocument();
+    // 状态查询逐账号直出（不落缓存）。
+    expect(mockInvoke).toHaveBeenCalledWith("get_trae_cn_checkin_status", { profileId: "profile-cn-1" });
+    expect(screen.getByTestId("checkin-cn-claim-profile-cn-1")).toBeEnabled();
+  });
+
+  it("已签账号显示已签徽章并禁用签到按钮", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "list_trae_cn_accounts") return [cnAccount];
+      if (command === "get_trae_cn_checkin_status") {
+        return { ...cnStatusUnchecked, checked_in: true };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
+
+    expect(await screen.findByText("已签")).toBeInTheDocument();
+    expect(screen.getByTestId("checkin-cn-claim-profile-cn-1")).toBeDisabled();
+  });
+
+  it("点击签到调用 run_trae_cn_checkin，成功后通知并重查该行状态", async () => {
+    let statusCalls = 0;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "list_trae_cn_accounts") return [cnAccount];
+      if (command === "get_trae_cn_checkin_status") {
+        statusCalls += 1;
+        return cnStatusUnchecked;
+      }
+      if (command === "run_trae_cn_checkin") return cnResult();
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
+    await screen.findByText("CN 账号甲");
+
+    fireEvent.click(screen.getByTestId("checkin-cn-claim-profile-cn-1"));
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("run_trae_cn_checkin", { profileId: "profile-cn-1" })
+    );
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("签到成功"));
+    // claim 后重查该行状态（结果直出，同步“今日已签”）。
+    await waitFor(() => expect(statusCalls).toBeGreaterThanOrEqual(2));
+  });
+
+  it("claim 业务拒绝透传业务码（不压平）并显示失败通知", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "list_trae_cn_accounts") return [cnAccount];
+      if (command === "get_trae_cn_checkin_status") return cnStatusUnchecked;
+      if (command === "run_trae_cn_checkin") {
+        return cnResult({ outcome: "not_eligible", detail_code: "business_9095", credits: null, extra_credits: null });
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
+    await screen.findByText("CN 账号甲");
+    fireEvent.click(screen.getByTestId("checkin-cn-claim-profile-cn-1"));
+
+    await waitFor(() => expect(notifyMock.error).toHaveBeenCalledWith("该设备今日名额已用（9095），明日再试"));
+    // 行内结果同样透出业务码人话映射。
+    await screen.findByText("该设备今日名额已用（9095），明日再试");
+  });
+
+  it("状态查询失败行内可见：业务码提取数值，未知码回退词表", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "list_trae_cn_accounts") return [cnAccount];
+      if (command === "get_trae_cn_checkin_status") {
+        throw new Error("trae_cn_checkin_business_20310");
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
+
+    // 业务码不压平：数值原样带出。
+    expect(await screen.findByText("服务端拒绝（20310）")).toBeInTheDocument();
+  });
+
+  it("网络类失败走 safeUiError 词表", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "list_trae_cn_accounts") return [cnAccount];
+      if (command === "get_trae_cn_checkin_status") {
+        throw new Error("trae_cn_checkin_network");
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
+
+    expect(await screen.findByText("网络或服务暂时不可用，请稍后重试。")).toBeInTheDocument();
+  });
+
+  it("无账号时显示空状态引导并可跳转账号页", async () => {
+    const onNavigate = vi.fn();
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "list_trae_cn_accounts") return [];
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<CheckinPage active={true} onNavigate={onNavigate} product="trae_cn" />);
+
+    expect(await screen.findByText(/还没有 Trae CN 账号/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "去账号页添加" }));
+    expect(onNavigate).toHaveBeenCalledWith("accounts");
   });
 });

@@ -1,4 +1,5 @@
 import type { ProductId } from "../platform/productRegistry";
+import type { CheckinOutcomeDto } from "./account_switch";
 
 /** 后端只读身份发现结果；不包含 userId、token 或 native storage。 */
 export interface ProductIdentityStateDto {
@@ -33,6 +34,30 @@ export interface TraeCnCredentialRefreshEntryDto {
   readonly screen_name: string;
   readonly refreshed: boolean;
   readonly error_code: string | null;
+}
+
+/**
+ * Trae CN 签到状态（P13-1；探针实测字段全集）。
+ * business_code 按红线透传不压平；did_checked_in/extra_credits 为 CN 特有
+ * 字段（语义待 P13-4 真机验收），缺席为 null。
+ */
+export interface TraeCnCheckinStatusDto {
+  readonly enable: boolean;
+  readonly checked_in: boolean;
+  readonly credits: number | null;
+  readonly did_checked_in: boolean | null;
+  readonly extra_credits: number | null;
+  readonly message: string;
+  readonly business_code: number;
+}
+
+/** Trae CN 手动签到回执；outcome 与 Work 结果行同口径（业务码在 detail_code 透传）。 */
+export interface TraeCnCheckinResultDto {
+  readonly profile_id: string;
+  readonly outcome: CheckinOutcomeDto;
+  readonly detail_code: string | null;
+  readonly credits: number | null;
+  readonly extra_credits: number | null;
 }
 
 /** 产品 OAuth 开始命令的最小返回值。 */

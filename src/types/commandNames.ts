@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（91 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（93 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -48,6 +48,7 @@ export type CommandName =
   | "get_product_identity_state"
   | "get_relay_ledger"
   | "get_storage_root_state"
+  | "get_trae_cn_checkin_status"
   | "get_trae_instance_states"
   | "get_workspace_state"
   | "import_recovery_package_command"
@@ -81,6 +82,7 @@ export type CommandName =
   | "restore_master_sessions"
   | "restore_operation"
   | "run_checkin"
+  | "run_trae_cn_checkin"
   | "set_account_archived"
   | "set_account_auto_checkin"
   | "set_account_display_name"

@@ -470,15 +470,12 @@ describe("应用工作区入口", () => {
     expect(within(overviewRegion).queryByTestId("current-account-context")).not.toBeInTheDocument();
     expect(within(overviewRegion).queryByTestId("overview-stats-master")).not.toBeInTheDocument();
 
-    // checkin = pending：探针已验证端点，实装待验收（诚实说明卡，非操作界面）。
+    // checkin = ready（P13-1 CN 签到实装）：App 级 mock 未配置 CN 账号 →
+    // 空状态引导（操作界面按账号池存在性出现），不再渲染 pending 说明卡。
     fireEvent.click(screen.getByTestId("navigation-checkin"));
     const checkinRegion = await screen.findByRole("region", { name: "签到" });
-    expect(within(checkinRegion).getByTestId("capability-pending")).toHaveTextContent(
-      "签到能力适配中",
-    );
-    expect(within(checkinRegion).getByTestId("capability-pending")).toHaveTextContent(
-      "协议端点已验证，实装待验收",
-    );
+    expect(within(checkinRegion).getByText(/还没有 Trae CN 账号/)).toBeInTheDocument();
+    expect(within(checkinRegion).queryByTestId("capability-pending")).not.toBeInTheDocument();
 
     // environment = absent：环境体系是 Work CN 产品能力，整页说明卡。
     fireEvent.click(screen.getByTestId("navigation-environment"));

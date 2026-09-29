@@ -37,7 +37,8 @@ export type CapabilityState = "ready" | "pending" | "absent";
  * 组件内不散落 productId 判断）。
  * 事实依据：Trae CN 账号适配已落地（P10）；签到协议端点已由只读探针
  * 验证存在（.scratch/checkin-http/reports/trae-cn-checkin-probe-20260928.json）
- * 但实装未做真实验收 → pending；环境体系是 Work CN 产品能力 → absent；
+ * 且 P13-1 已实装单账号手动签到（status/claim；claim 形状待 P13-4 真机
+ * 验收回写）→ ready；环境体系是 Work CN 产品能力 → absent；
  * Trae CN 数据根只读浏览由后端 library_id 参数化读路径承载 → ready。
  */
 export const PRODUCT_SECTION_STATES: Record<ProductId, Record<SectionKey, CapabilityState>> = {
@@ -52,7 +53,7 @@ export const PRODUCT_SECTION_STATES: Record<ProductId, Record<SectionKey, Capabi
   trae_cn: {
     overview: "pending",
     accounts: "ready",
-    checkin: "pending",
+    checkin: "ready",
     environment: "absent",
     "master-library": "ready",
     settings: "ready",

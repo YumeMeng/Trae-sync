@@ -498,6 +498,10 @@ export async function installMockBridge(
       },
     ];
 
+    // P13-1：Trae CN 签到可变状态（必须在 mockInvoke 外声明）——
+    // run_trae_cn_checkin 成功后翻已签，供「领取后行内翻已签」断言。
+    let traeCnCheckedIn = false;
+
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
       const scn = (window as any).__activeScenario || {};
@@ -987,6 +991,28 @@ export async function installMockBridge(
         };
       }
       if (cmd === "cancel_checkin") return true;
+      // ===== P13-1 Trae CN 签到：单账号手动 status/claim（不真触网） =====
+      if (cmd === "get_trae_cn_checkin_status") {
+        return {
+          enable: true,
+          checked_in: traeCnCheckedIn,
+          credits: 200,
+          did_checked_in: null,
+          extra_credits: 5,
+          message: "success",
+          business_code: 0,
+        };
+      }
+      if (cmd === "run_trae_cn_checkin") {
+        traeCnCheckedIn = true;
+        return {
+          profile_id: String(args?.profileId ?? ""),
+          outcome: "claimed",
+          detail_code: null,
+          credits: 205,
+          extra_credits: 5,
+        };
+      }
       if (cmd === "refresh_managed_current_account") return MANAGED_ACCOUNT_STATE;
       // ===== P11-5 主库体检整合区块（环境页）：只读报告，静态健康数据 =====
       if (cmd === "get_master_checkup") {

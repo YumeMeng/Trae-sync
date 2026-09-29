@@ -1595,6 +1595,9 @@ pub fn run() {
             // ADR-0031 决策 2：原生列表失败时的官方设备管理页兜底入口。
             remote_devices::open_device_management_docs,
             checkin_schedule::get_checkin_overview,
+            // P13-1：Trae CN 签到（单账号手动 status/claim，无批量无调度）。
+            checkin_schedule::get_trae_cn_checkin_status,
+            checkin_schedule::run_trae_cn_checkin,
             // 凭据刷新三链随凭据域迁移（P12-R3）。
             credential_handover::refresh_checkin_credits,
             credential_handover::refresh_checkin_credentials,

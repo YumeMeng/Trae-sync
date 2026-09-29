@@ -7,7 +7,7 @@
 
 use traesync_infrastructure::{
     fixture_path_error_text, CheckinCredentialError, CheckinHttpError, CredentialVaultError,
-    FixturePathError, LoginError, MasterArchiveError, WorkCnReadLocationError,
+    FixturePathError, LoginError, MasterArchiveError, TraeCnCheckinError, WorkCnReadLocationError,
 };
 
 // ============================================================================
@@ -75,6 +75,24 @@ pub(super) fn trae_cn_health_error_code(error: &CheckinHttpError) -> String {
     }
 }
 
+/// Trae CN 签到错误 → 稳定错误码（P13-1；口径对齐 trae_cn_health_error_code：
+/// 401/403 归凭据失效，业务码 `business_{code}` 原样透传不压平）。
+pub(super) fn trae_cn_checkin_error_code(error: &TraeCnCheckinError) -> String {
+    match error {
+        TraeCnCheckinError::Network => "network_error".to_string(),
+        TraeCnCheckinError::Http(401 | 403) => "credential_invalid".to_string(),
+        TraeCnCheckinError::Http(_) => "trae_cn_checkin_http_failed".to_string(),
+        TraeCnCheckinError::Business(code) => format!("business_{code}"),
+        TraeCnCheckinError::Protocol => "trae_cn_checkin_protocol".to_string(),
+        // 防御分支（命令层先校验档案与 client，正常不触达）归凭据失效；
+        // 其余凭据原因码本身就是前端词表既有形态，原样透传。
+        TraeCnCheckinError::Credential("profile_mismatch" | "client_mismatch") => {
+            "credential_invalid".to_string()
+        }
+        TraeCnCheckinError::Credential(reason) => reason.to_string(),
+    }
+}
+
 /// 归档通道错误码映射（稳定契约，前端 safeUiError 据此给文案）。
 pub(super) fn map_master_archive_error(error: MasterArchiveError) -> String {
     match error {
@@ -137,6 +155,45 @@ mod tests {
         assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Http(500)), "health_check_failed");
         assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Business(9095)), "business_9095");
         assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Protocol), "health_check_failed");
+    }
+
+    /// CN 签到域：TraeCnCheckinError 全变体 → 稳定错误码（业务码透传不压平）。
+    #[test]
+    fn trae_cn_checkin_maps_every_variant_to_stable_code() {
+        use traesync_infrastructure::TraeCnCheckinError;
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Network),
+            "network_error"
+        );
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Http(401)),
+            "credential_invalid"
+        );
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Http(403)),
+            "credential_invalid"
+        );
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Http(500)),
+            "trae_cn_checkin_http_failed"
+        );
+        // 业务码不压平：`business_{code}` 原样带出数值。
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Business(9095)),
+            "business_9095"
+        );
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Protocol),
+            "trae_cn_checkin_protocol"
+        );
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Credential("client_mismatch")),
+            "credential_invalid"
+        );
+        assert_eq!(
+            trae_cn_checkin_error_code(&TraeCnCheckinError::Credential("credential_missing")),
+            "credential_missing"
+        );
     }
 
     /// 归档通道域：MasterArchiveError 全变体 → 稳定错误码。

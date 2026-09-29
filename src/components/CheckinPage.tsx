@@ -11,6 +11,11 @@ import type {
   CheckinResultDto,
   ManagedAccountsViewDto,
 } from "../types/account_switch";
+import type {
+  TraeCnAccountDto,
+  TraeCnCheckinResultDto,
+  TraeCnCheckinStatusDto,
+} from "../types/product";
 import type { AppPage } from "./NavigationRail";
 import { CapabilitySection } from "./CapabilitySection";
 import { EmptyState } from "./EmptyState";
@@ -348,6 +353,13 @@ export function CheckinPage({ active, onNavigate, product = "work_cn" }: Checkin
     );
   }
 
+  // Trae CN 签到（P13-1）：区块 ready 后按 CN 产品账号池渲染独立签到流。
+  // 此处分支依据是产品账号池事实（CN 独立注册表/凭据根，单账号手动签到，
+  // 无批量无调度），能力三态仍由 productRegistry 单一事实源裁决。
+  if (product === "trae_cn") {
+    return <TraeCnCheckinSection onNavigate={onNavigate} />;
+  }
+
   return (
     <section className="checkin-page" role="region" aria-label="签到">
       <header className="page-header">
@@ -524,6 +536,221 @@ export function CheckinPage({ active, onNavigate, product = "work_cn" }: Checkin
       )}
     </section>
   );
+}
+
+/**
+ * Trae CN 签到区块（P13-1）：CN 账号池逐账号展示签到状态并提供手动签到。
+ * 与 Work 流的差异是产品事实：CN 为独立账号池（list_trae_cn_accounts）、
+ * 单账号手动 claim（一次一授权，仅用户点击触发）、无批量/调度/自动签到；
+ * 状态查询直连直出（本轮不落缓存）。结果文案与 Work 共用同一套映射，
+ * 业务码按红线透传（business_{code} → 服务端拒绝（code））。
+ */
+function TraeCnCheckinSection({ onNavigate }: { onNavigate: (page: AppPage) => void }) {
+  const [accounts, setAccounts] = useState<readonly TraeCnAccountDto[]>([]);
+  const [statusByProfile, setStatusByProfile] = useState<Record<string, TraeCnCheckinStatusDto | null>>({});
+  const [errorByProfile, setErrorByProfile] = useState<Record<string, string>>({});
+  const [resultByProfile, setResultByProfile] = useState<Record<string, TraeCnCheckinResultDto>>({});
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [busyProfile, setBusyProfile] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // 单账号状态查询：只读直连；行内失败可见（不静默伪装成"未查询"）。
+  const refreshStatus = useCallback(async (profileId: string) => {
+    try {
+      const status = await invoke<TraeCnCheckinStatusDto>("get_trae_cn_checkin_status", { profileId });
+      setStatusByProfile((current) => ({ ...current, [profileId]: status }));
+      setErrorByProfile((current) => {
+        if (!(profileId in current)) return current;
+        const next = { ...current };
+        delete next[profileId];
+        return next;
+      });
+    } catch (reason: unknown) {
+      setStatusByProfile((current) => ({ ...current, [profileId]: null }));
+      setErrorByProfile((current) => ({
+        ...current,
+        [profileId]: traeCnCheckinErrorMessage(reason, "签到状态查询失败，请稍后重试。"),
+      }));
+    }
+  }, []);
+
+  const loadAccounts = useCallback(() => {
+    setRefreshing(true);
+    void invoke<TraeCnAccountDto[]>("list_trae_cn_accounts")
+      .then(async (rows) => {
+        setAccounts(rows);
+        setLoadFailed(false);
+        await Promise.all(rows.map((row) => refreshStatus(row.profile_id)));
+      })
+      .catch(() => setLoadFailed(true))
+      .finally(() => setRefreshing(false));
+  }, [refreshStatus]);
+
+  useEffect(() => {
+    loadAccounts();
+  }, [loadAccounts]);
+
+  // 手动签到：单账号 claim；成功/失败都经 notify 透出并刷新该行状态。
+  const handleClaim = useCallback(async (profileId: string) => {
+    if (busyProfile) return;
+    setBusyProfile(profileId);
+    try {
+      const result = await invoke<TraeCnCheckinResultDto>("run_trae_cn_checkin", { profileId });
+      setResultByProfile((current) => ({ ...current, [profileId]: result }));
+      if (result.outcome === "claimed" || result.outcome === "already_checked_in") {
+        notify.success(checkinOutcomeLabel(result.outcome, result.detail_code));
+      } else {
+        notify.error(checkinOutcomeLabel(result.outcome, result.detail_code));
+      }
+      await refreshStatus(profileId);
+    } catch (reason: unknown) {
+      notify.error(traeCnCheckinErrorMessage(reason, "签到未完成，请稍后重试。"));
+    } finally {
+      setBusyProfile(null);
+    }
+  }, [busyProfile, refreshStatus]);
+
+  return (
+    <section className="checkin-page" role="region" aria-label="签到">
+      <header className="page-header">
+        <div className="page-header__copy">
+          <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
+        </div>
+        {accounts.length > 0 && (
+          <div className="page-header__actions">
+            <button
+              className="btn"
+              type="button"
+              onClick={loadAccounts}
+              disabled={refreshing}
+              data-testid="checkin-cn-refresh"
+              title="重新查询各账号的签到状态（联网）"
+            >
+              <RefreshCw size={15} className={refreshing ? "icon-spin" : undefined} aria-hidden="true" />刷新状态
+            </button>
+          </div>
+        )}
+      </header>
+
+      {loadFailed ? (
+        <EmptyState
+          className="checkin-page__empty"
+          description="Trae CN 账号列表暂时不可读取，请稍后重试。"
+        />
+      ) : accounts.length === 0 ? (
+        <EmptyState
+          className="checkin-page__empty-actions"
+          description="还没有 Trae CN 账号。先在「账号」页完成登录添加。"
+          action={
+            <button className="btn btn--primary" type="button" onClick={() => onNavigate("accounts")}>
+              <UserPlus size={15} aria-hidden="true" />去账号页添加
+            </button>
+          }
+        />
+      ) : (
+        <section className="checkin-page__selection" aria-labelledby="checkin-selection-heading">
+          <div className="account-center__section-heading">
+            <h3 id="checkin-selection-heading"><CalendarCheck size={16} aria-hidden="true" />签到账号</h3>
+            <span className="section-caption">{accounts.length} 个账号</span>
+          </div>
+          <ul className="checkin-flow" aria-label="Trae CN 签到账号与结果">
+            {accounts.map((account) => (
+              <TraeCnCheckinRow
+                key={account.profile_id}
+                account={account}
+                status={statusByProfile[account.profile_id] ?? null}
+                error={errorByProfile[account.profile_id] ?? null}
+                result={resultByProfile[account.profile_id] ?? null}
+                busy={busyProfile !== null}
+                spinning={busyProfile === account.profile_id}
+                onClaim={() => void handleClaim(account.profile_id)}
+              />
+            ))}
+          </ul>
+        </section>
+      )}
+    </section>
+  );
+}
+
+/** Trae CN 签到账号行：名字 + 今日状态徽章 + 额外积分 + 行内签到按钮与结果。 */
+function TraeCnCheckinRow({
+  account,
+  status,
+  error,
+  result,
+  busy,
+  spinning,
+  onClaim,
+}: {
+  account: TraeCnAccountDto;
+  status: TraeCnCheckinStatusDto | null;
+  error: string | null;
+  result: TraeCnCheckinResultDto | null;
+  busy: boolean;
+  spinning: boolean;
+  onClaim: () => void;
+}) {
+  const checkedIn = status?.checked_in === true;
+  const claimable = status?.enable === true && status.checked_in === false;
+  const outcome = result?.outcome ?? null;
+  // 结果语气：claimed/already 安静（中性）；其余琥珀（需要关注）。
+  const resultTone = outcome === "claimed" || outcome === "already_checked_in" ? "ok" : "warn";
+  const metaParts: string[] = [];
+  // CN 特有字段（语义待 P13-4 验收）：非空非零时如实展示。
+  if (status?.extra_credits != null && status.extra_credits > 0) {
+    metaParts.push(`额外积分 ${status.extra_credits}`);
+  }
+  if (account.last_verified_at) metaParts.push(`最近验证 ${formatShortDate(account.last_verified_at)}`);
+  return (
+    <li className="checkin-flow__row">
+      <span className="checkin-flow__id">
+        <span className="checkin-flow__name-row">
+          <strong>{account.display_name}</strong>
+          {status && <CheckinSlotBadge state={checkedIn ? "checked_in" : "unchecked"} />}
+        </span>
+        <span className="checkin-flow__meta">{error ?? metaParts.join(" · ")}</span>
+      </span>
+      <span className="checkin-flow__side">
+        {spinning && (
+          <span className="checkin-flow__phase checkin-flow__phase--active">
+            <Loader2 size={13} className="checkin-flow__spinner" aria-hidden="true" />签到中…
+          </span>
+        )}
+        {!spinning && result && (
+          <span className={`checkin-flow__result checkin-flow__result--${resultTone}`}>
+            {checkinOutcomeLabel(result.outcome, result.detail_code)}
+          </span>
+        )}
+        <button
+          className="btn checkin-flow__inline-btn"
+          type="button"
+          onClick={onClaim}
+          disabled={busy || !claimable}
+          title={claimable ? "领取今日签到积分" : checkedIn ? "今日已签到" : "当前不可领取"}
+          data-testid={`checkin-cn-claim-${account.profile_id}`}
+        >
+          <CalendarCheck size={13} aria-hidden="true" />签到
+        </button>
+      </span>
+    </li>
+  );
+}
+
+/**
+ * CN 签到错误 → 界面文案：业务码先提取数值原样展示（红线：不压平），
+ * 其余稳定原因码走 safeUiError 词表（对齐 environment_delete_failed_residue
+ * 的"先特判、再词表"先例）。
+ */
+function traeCnCheckinErrorMessage(error: unknown, fallback: string): string {
+  const text = typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : "";
+  const business = /trae_cn_checkin_business_(\d+)/.exec(text);
+  if (business) return `服务端拒绝（${business[1]}）`;
+  return safeUiErrorMessage(error, fallback);
 }
 
 /**

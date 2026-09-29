@@ -24,14 +24,18 @@ use traesync_application::{BatchCheckinRunner, CheckinService, CheckinTransport}
 use traesync_infrastructure::{
     AccountRecord, AccountRegistry, AutoCheckinBatchState, AutoCheckinLedger, AutoCheckinSettings,
     AutoCheckinStore, CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding,
-    CredentialMaintenanceStateStore, FixtureCheckinTransport, RealCheckinRenewalService,
-    RealCheckinTransport,
+    CredentialMaintenanceStateStore, FixtureCheckinTransport, OAuthClient,
+    RealCheckinRenewalService, RealCheckinTransport, RealTraeCnCheckinClient, TraeCnCheckinClient,
+    TraeCnCheckinError,
 };
 
 use crate::{
-    checkin_overview, error_mapping::credential_maintenance_error_code, run_blocking, AppState,
-    RuntimeMode,
+    checkin_overview, ensure_checkin_http_enabled,
+    error_mapping::{credential_maintenance_error_code, trae_cn_checkin_error_code},
+    run_blocking, AppState, RuntimeMode,
 };
+// P13-1：CN 签到命令复用凭据域的 CN 产品根路径约定。
+use crate::credential_handover::trae_cn_material_root;
 // P12-R3：system_time_to_rfc3339 随凭据域迁 credential_handover。
 use crate::credential_handover::system_time_to_rfc3339;
 
@@ -997,6 +1001,376 @@ pub(crate) fn get_checkin_overview(
 ) -> Result<Vec<checkin_overview::CheckinOverviewEntryDto>, String> {
     let material_root = checkin_material_root(&state)?;
     checkin_overview::build_overview(&material_root)
+}
+
+// ============================================================================
+// Trae CN 签到（P13-1）：单账号手动 status/claim，无批量无调度（CN 无自动签）
+// ============================================================================
+
+/// Trae CN 签到状态查询回执（checkin 域 wire 风格；业务码透传不压平）。
+/// pub(crate)：tauri 命令宏展开的包装函数签名需要暴露返回类型。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TraeCnCheckinStatusWireDto {
+    enable: bool,
+    checked_in: bool,
+    credits: Option<i64>,
+    /// CN 特有字段（探针报告顶层键；语义未验证，原样透传）。
+    did_checked_in: Option<bool>,
+    /// CN 特有字段：附加积分（未验证，原样透传）。
+    extra_credits: Option<i64>,
+    message: String,
+    business_code: i64,
+}
+
+/// Trae CN 手动签到（单账号 claim）回执；outcome/detail_code 与 Work 结果行
+/// 同口径，前端复用同一套人话映射与业务码透传规则。
+/// pub(crate)：tauri 命令宏展开的包装函数签名需要暴露返回类型。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TraeCnCheckinResultWireDto {
+    profile_id: String,
+    outcome: traesync_domain::CheckinOutcome,
+    detail_code: Option<String>,
+    credits: Option<i64>,
+    extra_credits: Option<i64>,
+}
+
+/// 单账号 profile_id 校验（CN 签到域；错误码与批量域一致）。
+fn validate_trae_cn_profile_id(profile_id: &str) -> Result<(), String> {
+    if profile_id.is_empty() || profile_id.len() > 256 {
+        return Err("checkin_profile_invalid".to_string());
+    }
+    Ok(())
+}
+
+/// CN 注册表档案 → 凭据绑定；注册表损坏/档案缺失分别收口（稳定错误码）。
+fn trae_cn_binding(
+    material_root: &Path,
+    profile_id: &str,
+) -> Result<CheckinProfileBinding, String> {
+    let record = AccountRegistry::new(material_root)
+        .find(profile_id)
+        .map_err(|_| "trae_cn_registry_invalid".to_string())?
+        .ok_or_else(|| "trae_cn_account_not_found".to_string())?;
+    Ok(CheckinProfileBinding::from(&record))
+}
+
+/// claim 错误 → (outcome, detail_code)：业务码 `business_{code}` 原样透传
+/// （红线：不压平）；401/403 与凭据类归授权不匹配，其余按传输/运行时收口。
+fn trae_cn_claim_outcome(
+    error: &TraeCnCheckinError,
+) -> (traesync_domain::CheckinOutcome, String) {
+    let detail_code = trae_cn_checkin_error_code(error);
+    let outcome = match error {
+        TraeCnCheckinError::Business(_) => traesync_domain::CheckinOutcome::NotEligible,
+        TraeCnCheckinError::Network => traesync_domain::CheckinOutcome::NetworkError,
+        TraeCnCheckinError::Http(401 | 403) | TraeCnCheckinError::Credential(_) => {
+            traesync_domain::CheckinOutcome::AuthMismatch
+        }
+        TraeCnCheckinError::Http(_) | TraeCnCheckinError::Protocol => {
+            traesync_domain::CheckinOutcome::RuntimeError
+        }
+    };
+    (outcome, detail_code)
+}
+
+/// 查询 CN 账号签到状态的内层编排（客户端可注入，供测试用 fake seam）。
+/// 不落任何缓存：手动查询直出，避免引入 credits-cache 失效复杂度（P13-1 决策）。
+fn get_trae_cn_checkin_status_inner(
+    material_root: &Path,
+    profile_id: &str,
+    build_client: impl Fn(PathBuf, CheckinProfileBinding) -> Box<dyn TraeCnCheckinClient>,
+) -> Result<TraeCnCheckinStatusWireDto, String> {
+    let binding = trae_cn_binding(material_root, profile_id)?;
+    let client = build_client(material_root.to_path_buf(), binding);
+    let status = client
+        .status(profile_id)
+        .map_err(|error| trae_cn_checkin_error_code(&error))?;
+    Ok(TraeCnCheckinStatusWireDto {
+        enable: status.enable,
+        checked_in: status.checked_in,
+        credits: status.credits,
+        did_checked_in: status.did_checked_in,
+        extra_credits: status.extra_credits,
+        message: status.message,
+        business_code: status.business_code,
+    })
+}
+
+/// CN 手动签到（claim）的内层编排（客户端可注入）。
+/// 互斥方案（P13-1）：claim 与 Work 签到/凭据维护共用同一把进程内
+/// `checkin_execution_lock`——claim 虽不写本地缓存，但会读取凭据包并与
+/// 凭据换发共享服务端交互面，共用锁以最小侵入保证同一账号操作不交错；
+/// 锁忙快速失败（checkin_already_running），与手动批量语义对等。
+fn run_trae_cn_checkin_inner(
+    material_root: &Path,
+    profile_id: &str,
+    execution_lock: &Arc<Mutex<()>>,
+    build_client: impl Fn(PathBuf, CheckinProfileBinding) -> Box<dyn TraeCnCheckinClient>,
+) -> Result<TraeCnCheckinResultWireDto, String> {
+    let binding = trae_cn_binding(material_root, profile_id)?;
+    let _guard = execution_lock
+        .try_lock()
+        .map_err(|_| "checkin_already_running".to_string())?;
+    let client = build_client(material_root.to_path_buf(), binding);
+    let claim_result = client.claim(profile_id);
+    let (outcome, detail_code) = match &claim_result {
+        Ok(_) => (traesync_domain::CheckinOutcome::Claimed, None),
+        Err(error) => {
+            let (outcome, code) = trae_cn_claim_outcome(error);
+            (outcome, Some(code))
+        }
+    };
+    let (credits, extra_credits) = claim_result
+        .map(|claim| (claim.credits, claim.extra_credits))
+        .unwrap_or((None, None));
+    Ok(TraeCnCheckinResultWireDto {
+        profile_id: profile_id.to_string(),
+        outcome,
+        detail_code,
+        credits,
+        extra_credits,
+    })
+}
+
+/// 查询 Trae CN 账号的签到状态（单账号只读直连；不落缓存，手动查询直出）。
+#[tauri::command]
+pub(crate) async fn get_trae_cn_checkin_status(
+    profile_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<TraeCnCheckinStatusWireDto, String> {
+    ensure_checkin_http_enabled(&state)?;
+    validate_trae_cn_profile_id(&profile_id)?;
+    let material_root = trae_cn_material_root(&state)?;
+    run_blocking("trae_cn_checkin_join_failed", move || {
+        get_trae_cn_checkin_status_inner(&material_root, &profile_id, |root, binding| {
+            Box::new(RealTraeCnCheckinClient::new(root, binding, OAuthClient::TraeCn))
+        })
+    })
+    .await
+}
+
+/// 对 Trae CN 账号发起一次手动签到（claim）：单账号、无批量、无调度；
+/// 一次调用 = 一次用户授权动作（前端按钮点击触发，claim 一次一授权）。
+#[tauri::command]
+pub(crate) async fn run_trae_cn_checkin(
+    profile_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<TraeCnCheckinResultWireDto, String> {
+    ensure_checkin_http_enabled(&state)?;
+    validate_trae_cn_profile_id(&profile_id)?;
+    let material_root = trae_cn_material_root(&state)?;
+    let execution_lock = Arc::clone(&state.checkin_execution_lock);
+    run_blocking("trae_cn_checkin_join_failed", move || {
+        run_trae_cn_checkin_inner(&material_root, &profile_id, &execution_lock, |root, binding| {
+            Box::new(RealTraeCnCheckinClient::new(root, binding, OAuthClient::TraeCn))
+        })
+    })
+    .await
+}
+
+/// CN 签到命令层测试：fake 客户端注入 + 注册表现场（Windows：DPAPI 凭据）。
+#[cfg(test)]
+mod trae_cn_checkin_tests {
+    use super::*;
+    use traesync_infrastructure::{generate_device_keypair, TraeCnCheckinClaim, TraeCnCheckinStatus};
+
+    /// fake CN 签到客户端：返回预置结果并记录 claim 调用（命令编排的 mock seam）。
+    struct FakeCnClient {
+        status_result: Result<TraeCnCheckinStatus, TraeCnCheckinError>,
+        claim_result: Result<TraeCnCheckinClaim, TraeCnCheckinError>,
+        claimed_profiles: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TraeCnCheckinClient for FakeCnClient {
+        fn status(
+            &self,
+            _profile_id: &str,
+        ) -> Result<TraeCnCheckinStatus, TraeCnCheckinError> {
+            self.status_result.clone()
+        }
+
+        fn claim(&self, profile_id: &str) -> Result<TraeCnCheckinClaim, TraeCnCheckinError> {
+            self.claimed_profiles
+                .lock()
+                .unwrap()
+                .push(profile_id.to_string());
+            self.claim_result.clone()
+        }
+    }
+
+    /// CN 注册表档案夹具：直接写 CN material_root（无 checkin 子目录）。
+    fn registered_cn_account(root: &Path, profile_id: &str) {
+        let (_, public_pem) = generate_device_keypair().unwrap();
+        AccountRegistry::new(root)
+            .upsert(&AccountRecord {
+                profile_id: profile_id.to_string(),
+                account_id: format!("account-{profile_id}"),
+                screen_name: "CN 测试账号".to_string(),
+                avatar_url: String::new(),
+                device_id: "1234567890123456".to_string(),
+                device_public_key: public_pem,
+                display_name: None,
+                masked_mobile: String::new(),
+                created_at_unix_seconds: 0,
+                last_verified_at_unix_seconds: 0,
+                device_created_at_unix_seconds: 0,
+                auto_checkin_enabled: false,
+                archived: false,
+            })
+            .unwrap();
+    }
+
+    fn probe_status() -> TraeCnCheckinStatus {
+        TraeCnCheckinStatus {
+            enable: true,
+            checked_in: false,
+            credits: Some(200),
+            did_checked_in: Some(false),
+            extra_credits: Some(5),
+            message: "success".to_string(),
+            business_code: 0,
+        }
+    }
+
+    fn probe_claim() -> TraeCnCheckinClaim {
+        TraeCnCheckinClaim {
+            credits: Some(205),
+            extra_credits: Some(5),
+            checked_in: Some(true),
+            message: "success".to_string(),
+            business_code: 0,
+        }
+    }
+
+    /// claim 错误 → outcome/detail_code 映射：业务码透传（红线），其余按
+    /// 传输/凭据/运行时收口，与 Work 结果行口径同族。
+    #[test]
+    fn trae_cn_claim_outcome_maps_every_error_variant() {
+        let (outcome, detail) =
+            trae_cn_claim_outcome(&TraeCnCheckinError::Business(9095));
+        assert_eq!(outcome, traesync_domain::CheckinOutcome::NotEligible);
+        assert_eq!(detail, "business_9095");
+
+        let (outcome, detail) = trae_cn_claim_outcome(&TraeCnCheckinError::Network);
+        assert_eq!(outcome, traesync_domain::CheckinOutcome::NetworkError);
+        assert_eq!(detail, "network_error");
+
+        let (outcome, detail) = trae_cn_claim_outcome(&TraeCnCheckinError::Http(401));
+        assert_eq!(outcome, traesync_domain::CheckinOutcome::AuthMismatch);
+        assert_eq!(detail, "credential_invalid");
+
+        let (outcome, detail) =
+            trae_cn_claim_outcome(&TraeCnCheckinError::Credential("credential_missing"));
+        assert_eq!(outcome, traesync_domain::CheckinOutcome::AuthMismatch);
+        assert_eq!(detail, "credential_missing");
+
+        let (outcome, detail) = trae_cn_claim_outcome(&TraeCnCheckinError::Protocol);
+        assert_eq!(outcome, traesync_domain::CheckinOutcome::RuntimeError);
+        assert_eq!(detail, "trae_cn_checkin_protocol");
+    }
+
+    #[test]
+    fn trae_cn_status_inner_reports_missing_account_without_client() {
+        let root = tempfile::tempdir().unwrap();
+        let error = get_trae_cn_checkin_status_inner(root.path(), "profile-x", |_, _| {
+            panic!("档案缺失不应构造客户端")
+        })
+        .unwrap_err();
+        assert_eq!(error, "trae_cn_account_not_found");
+    }
+
+    #[test]
+    fn trae_cn_status_inner_roundtrips_probe_fields() {
+        let root = tempfile::tempdir().unwrap();
+        registered_cn_account(root.path(), "profile-cn");
+        let dto = get_trae_cn_checkin_status_inner(root.path(), "profile-cn", |_, _| {
+            Box::new(FakeCnClient {
+                status_result: Ok(probe_status()),
+                claim_result: Ok(probe_claim()),
+                claimed_profiles: Arc::new(Mutex::new(Vec::new())),
+            }) as Box<dyn TraeCnCheckinClient>
+        })
+        .unwrap();
+        assert!(dto.enable);
+        assert!(!dto.checked_in);
+        assert_eq!(dto.credits, Some(200));
+        assert_eq!(dto.did_checked_in, Some(false));
+        assert_eq!(dto.extra_credits, Some(5));
+        assert_eq!(dto.business_code, 0);
+    }
+
+    #[test]
+    fn trae_cn_claim_inner_reports_success_and_business_transparently() {
+        let root = tempfile::tempdir().unwrap();
+        registered_cn_account(root.path(), "profile-cn");
+        let execution_lock = Arc::new(Mutex::new(()));
+        let claimed = Arc::new(Mutex::new(Vec::new()));
+
+        // 成功路径：outcome=claimed + 积分字段透传。
+        let dto = run_trae_cn_checkin_inner(
+            root.path(),
+            "profile-cn",
+            &execution_lock,
+            |_, _| {
+                Box::new(FakeCnClient {
+                    status_result: Ok(probe_status()),
+                    claim_result: Ok(probe_claim()),
+                    claimed_profiles: Arc::clone(&claimed),
+                }) as Box<dyn TraeCnCheckinClient>
+            },
+        )
+        .unwrap();
+        assert_eq!(dto.outcome, traesync_domain::CheckinOutcome::Claimed);
+        assert_eq!(dto.detail_code, None);
+        assert_eq!(dto.credits, Some(205));
+        assert_eq!(dto.extra_credits, Some(5));
+        // 客户端收到的 profile_id 与命令入参一致。
+        assert_eq!(*claimed.lock().unwrap(), vec!["profile-cn".to_string()]);
+
+        // 业务拒绝路径：outcome=not_eligible + detail_code=business_{code}（不压平）。
+        let dto = run_trae_cn_checkin_inner(
+            root.path(),
+            "profile-cn",
+            &execution_lock,
+            |_, _| {
+                Box::new(FakeCnClient {
+                    status_result: Ok(probe_status()),
+                    claim_result: Err(TraeCnCheckinError::Business(9074)),
+                    claimed_profiles: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn TraeCnCheckinClient>
+            },
+        )
+        .unwrap();
+        assert_eq!(dto.outcome, traesync_domain::CheckinOutcome::NotEligible);
+        assert_eq!(dto.detail_code.as_deref(), Some("business_9074"));
+    }
+
+    #[test]
+    fn trae_cn_claim_inner_rejects_when_execution_lock_busy() {
+        let root = tempfile::tempdir().unwrap();
+        registered_cn_account(root.path(), "profile-cn");
+        let execution_lock = Arc::new(Mutex::new(()));
+        // 预占互斥（模拟 Work 批量签到/凭据维护执行中）：CN claim 快速失败。
+        let _guard = execution_lock.try_lock().unwrap();
+        let error = run_trae_cn_checkin_inner(root.path(), "profile-cn", &execution_lock, |_, _| {
+            panic!("锁忙不应构造客户端")
+        })
+        .unwrap_err();
+        assert_eq!(error, "checkin_already_running");
+    }
+
+    #[test]
+    fn trae_cn_profile_id_validation_rejects_empty_and_oversized() {
+        assert_eq!(
+            validate_trae_cn_profile_id("").unwrap_err(),
+            "checkin_profile_invalid"
+        );
+        assert_eq!(
+            validate_trae_cn_profile_id(&"x".repeat(257)).unwrap_err(),
+            "checkin_profile_invalid"
+        );
+        assert!(validate_trae_cn_profile_id("profile-cn").is_ok());
+    }
 }
 
 /// 批量操作逐账号进度事件统一契约（P12-R2b）：三条批量链（凭据刷新

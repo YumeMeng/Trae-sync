@@ -31,6 +31,8 @@ pub mod checkin;
 pub mod checkin_credential;
 pub mod checkin_http;
 pub mod checkin_login;
+// P13-1：Trae CN 签到协议实装（status/claim，探针形状为唯一权威来源）。
+pub mod trae_cn_checkin;
 // P11-6：Trae CN 签到只读探针（ADR-0032 决策 4 门禁；status 类查询先行）。
 pub mod checkin_probe;
 pub mod content_graph;
@@ -134,6 +136,12 @@ pub use checkin_login::{
     begin_login, begin_login_for, build_login_url_for, complete_login, LoginAcceptance,
     LoginCallbackServer, LoginError, LoginHandoff, LoginProduct, LoginReceipt, LoginSession,
     CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
+};
+// P13-1：Trae CN 签到协议端口与 Real 实现（命令层经此引用）。
+pub use trae_cn_checkin::{
+    parse_claim_envelope, parse_status_envelope, status_request, claim_request,
+    RealTraeCnCheckinClient, ReqwestTraeCnCheckinHttp, TraeCnCheckinClaim, TraeCnCheckinClient,
+    TraeCnCheckinError, TraeCnCheckinHttp, TraeCnCheckinRequest, TraeCnCheckinStatus,
 };
 // P11-6：只读探针公开 API（真实探测由 #[ignore] 集成测试显式授权运行）。
 pub use checkin_probe::{

@@ -554,6 +554,28 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /remote_device_protocol/i,
     "服务端返回了无法识别的设备信息，请稍后重试或使用官方管理页。",
   ],
+  // ===== P13-1 Trae CN 签到：稳定原因码映射（业务码不在此压平——
+  // 签到区块先按 trae_cn_checkin_business_{code} 提取数值展示，再落到词表） =====
+  [
+    /trae_cn_checkin_network|trae_cn_checkin_http_/i,
+    "网络或服务暂时不可用，请稍后重试。",
+  ],
+  [
+    /trae_cn_checkin_credential_/i,
+    "登录凭据不可用，请先完成登录或刷新登录凭据。",
+  ],
+  [
+    /trae_cn_checkin_protocol/i,
+    "服务端返回了无法识别的签到信息，请稍后重试。",
+  ],
+  [
+    /trae_cn_checkin_join_failed/i,
+    "签到操作未能完成，请稍后重试。",
+  ],
+  [
+    /trae_cn_account_not_found|trae_cn_registry_invalid/i,
+    "Trae CN 账号信息不可读取，请在「账号」页确认登录状态后重试。",
+  ],
 ];
 
 function errorText(error: unknown): string {
