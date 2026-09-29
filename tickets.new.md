@@ -688,3 +688,103 @@
 ### P10 完成标准
 
 Work CN 的账号保存、对话主库、直连签到和账号切换行为保持现状；Work/CN 可在标题栏切换且数据边界清晰；侧栏由能力清单生成；Trae CN 只展示已适配能力；身份状态与产品凭据状态不混淆；所有未验证的跨产品登录都显示为需授权或实验状态；全量 Rust、前端类型、组件和 E2E 验证通过。
+
+## Phase 11：精细化与生产就绪（2026-09-28 grill 六议题 28 项定案）
+
+### 背景与决策依据
+
+2026-09-28 弹窗 grill 会话逐项定案六议题 28 项策略，全量记录 `.scratch/grill-session-20260928-production-refinement.md`（含各模块机制地图与疑点裁决）。核心方向：**Work CN 先收尾、Trae CN 适配其后**（执行顺序铁律）；差异收敛在适配层；通知体系基建先行。架构决策见 ADR-0032（能力三态，局部取代 ADR-0029 决策 4/9 与 ADR-0030 决策 5，取代标注已写入两 ADR 状态行）。
+
+纪律：每任务 TDD 红→绿；每阶段全量验收（`cargo test --workspace` + `pnpm typecheck` + `pnpm test` + e2e）；子代理实施 + 主会话逐项验收。
+
+### P11-0 决策链同步 ✅（2026-09-28 完成）
+
+- ADR-0032 新立；ADR-0029/0030 状态行加取代标注；ADR 索引更新（15 份）。
+- 本 Phase 写入 tickets.new.md；策略会话记录落 `.scratch/`。
+- CONTEXT.md 无领域语言变更（能力三态为 UI 实现，术语「能力清单」既有定义已覆盖）。
+
+### P11-1 全局通知体系（sonner + 统一 notify 适配层）
+
+- **决策**：选型 sonner（React 生态标准，样式对齐 DESIGN_TOKENS 毛玻璃）；位置**顶部居中**；成功 4s/失败 6s 自动消失、悬停暂停、堆叠上限 4、不抢焦点；建单一 notify 模块作 sonner 唯一入口；**通知类全迁**（操作结果/完成/失败/提醒，批量结果摘要含异常清单入 toast 富内容），**页面结构态保留**（加载占位/空态/整页错误+重试）；落点联动：自动签到完成提示、取消登录失败提示、批量操作完成摘要。
+- **切片**：① 引入 sonner + notify 模块 + Toaster 挂载 + 毛玻璃主题（单测：适配层 API 与内容映射）；② 通知类迁移（AccountCenter/AccountDetail/AdapterAccountDetail/CheckinPage/EnvironmentPage/MasterLibraryDetail/SettingsPanel/PluginWorkbench 页内通知横幅与结果摘要；自动签到完成跨页 toast；取消登录失败 toast）；③ 验收清理（通知类页内横幅零残留）。
+- **验收**：notify 适配层单测；迁移点 vitest 更新；`pnpm typecheck`/vitest/e2e 全绿；通知类页内横幅无残留（grep 验证）。
+
+### P11-2 签到调度策略修复
+
+- **决策**：① 自动签到撞锁被跳过的账号当日**顺延重试**（约 30 分钟后，仍走 try_lock 与 before 探测，防重复签）；② 自动签到中断（崩溃）后台账停 Running 的，下次 tick **恢复补跑**未完成账号（before 探测 + 9095 配额天然防重复）。
+- **验收**：触发判定/顺延重试/中断补跑单测（含互斥与 fail-closed 不回归用例）；`cargo test --workspace` 全绿。
+
+### P11-3 账号模块收尾
+
+- **决策**：① 清理 `ProductAccountPage.tsx` 及专属测试（迁移基线使命已完成）；② **首次登录验收**落地（ADR-0027 实现，P9-0 Work 侧）：登录完成后立即以同设备 AuthCode 滚动换发验证可持续性，验收通过才算登录完成；失败保留候选材料与证据，不自动重铸、不二次 OAuth；③ 批量健康检测/凭据刷新补**逐账号进度事件**（复用 master-switch-progress 事件模式）；④ 取消登录失败给用户可见提示（经 notify）；⑤ 「刷新」按钮悬浮提示注明纯本地不联网。
+- **验收**：删除后无引用残留；首登验收成功/失败路径单测（失败保留证据不覆盖）；进度事件前后端联调 + 组件测试；全量测试绿。
+
+### P11-4 备份能力补齐（红线）+ 设置小项
+
+- **决策**（ADR-0018 三维度落地）：① 备份位置可选——backup-retention.json 增加 backup_dir（默认现目录），设置页「更改备份位置」确认框问是否迁移已有备份，**迁移用复制、原位保留**并提示可手动清理（铁律：不自动删快照）；保留裁剪只管当前活动位置的链；备份链视图与恢复指引同步；② 备份内容可选「包含账号凭据」（账号注册表 + DPAPI 凭据包整拷至备份位置子目录，同 Windows 用户可恢复）；③ `purge_account_records` 补备份先行（与破坏性操作家族对齐）；④ `keep_policy` 展示读实际配置值。
+- **验收**：位置更改/迁移/裁剪单测（含跨位置链隔离）；凭据备份内容与恢复单测；purge 备份先行单测；全量测试绿。
+
+### P11-5 环境模块四项 + 副环境补齐
+
+- **决策**：① 环境卡补「关闭实例」按钮（运行中显示，后端优雅终止进程）；② 「主库自检」（G18）与「主库体检」（P5-5）整合为一个「主库体检」区块（登录态/可切换性作为其中一组检查项）；③ 归档草稿从前端 localStorage 迁到工具管理数据 storage_root（后端持久化命令，首次读取时迁移旧草稿）；④ 删除副环境时目录删除失败的错误信息带上残留路径；⑤ **副环境全量补齐**：体检/收编扩展到副环境（复用现成机制）+ 副库详情页（复用 LibrarySessionsPanel 的 libraryId 边界）+ 副环境统计卡。
+- **验收**：各机制单测/e2e；副环境体检与收编对副库真实生效；详情页两库切换正常；草稿迁移不丢失；全量测试绿。
+
+### P11-6 产品化界面适配（ADR-0032 落地，Work 收尾后启动）
+
+- **决策**：① 问候语取产品注册表 `displayName` 动态生成；② 导航五页全产品开放 + 区块能力三态（ready/pending/absent，判定依据能力清单与探针结论）；③ Trae CN 签到**只读探针先行**（status 类查询、不消耗配额、不发 claim），结论落档 `.scratch/`，有端点实装、无端点显示 absent；④ Trae CN 主库只读浏览（Library 抽象接入）；⑤ 各页空态组件统一（共享 EmptyState）。
+- **验收**：探针报告落档；三态渲染组件测试（每产品每区块）；Work CN 全量回归不受影响；e2e 关键路径绿。
+
+### P11 执行阶段顺序
+
+1. P11-1 通知基建 → 2. P11-2 签到调度 + P11-4 小项（6-2/6-3 部分）→ 3. P11-3 账号收尾 → 4. P11-4 备份大项 + P11-5 环境四项 → 5. P11-5 副环境补齐 → 6. P11-6 产品化对齐（含探针）。
+
+### P11 验收清单（完成后逐项核对）
+
+- [x] P11-1 sonner 集成 + notify 唯一入口 + 顶部居中毛玻璃样式（2026-09-28 切片①，274/274）
+- [x] P11-1 通知类迁移完成、页内通知横幅零残留、结构态保留（2026-09-28 切片②，vitest 272 + e2e 39；OperationResultCard 零引用已删除）
+- [x] P11-1 自动签到完成跨页提示 + 取消登录失败提示落地（2026-09-28 App 级监听 + AccountCenter warning）
+- [x] P11-2 撞锁顺延重试 + 中断恢复补跑（单测固化；1012/0 全绿，2026-09-28）
+- [x] P11-3 ProductAccountPage 清理、无引用残留（2026-09-28）
+- [x] P11-3 首次登录验收落地（成功/失败路径，证据保留；回执 acceptance 字段，2026-09-28）
+- [x] P11-3 批量健康检测/凭据刷新逐账号进度事件（含 credits-refresh-progress 补齐 Work 健康检测与额度路径）
+- [x] P11-3 刷新按钮纯本地提示（2026-09-28）
+- [x] P11-4 备份位置可选 + 复制迁移 + 裁剪管当前位置（2026-09-28：backup_dir 配置/set/migrate 命令、活动目录解析统一、单测 9+5 项；迁移含凭据子目录与 sha256 校验、幂等、部分失败清单）
+- [x] P11-4 凭据内容备份（勾选）+ 恢复可用（2026-09-28：includeCredentials 白名单整拷 credentials-{stamp}（accounts.json + profiles/renewals/refresh-rescue/retired 密文），has_credentials 展示 + 人工恢复指引；白名单防御性断言明文不入备份）
+- [x] P11-4 purge 备份先行 + keep_policy 读实际值（2026-09-28 随 P11-2 批次完成，单测 5+1 项）
+- [x] P11-5 关闭实例按钮 + 自检/体检整合 + 草稿迁 storage_root + 删除残留带路径（2026-09-28：close_environment_instance 命令（主库/副环境口径复用 taskkill /T 优雅→/T /F 兜底原语，NotRunning 幂等）；环境卡「主库体检」整合区块（登录健康四项 + 库内容分组，独立降级）；get/set_archive_draft + archive-drafts.json（原子写/256KB/损坏 fail-closed 不删文件）+ localStorage 首读迁移；environment_delete_failed_residue:{path} + safeUiError 带路径提示；单测后端 7+5、前端 291 全绿，e2e 39 项通过）
+- [x] P11-5 副环境体检/收编 + 副库详情页 + 统计卡（2026-09-28：体检/收编/统计/历史/归档删除合并全命令 library_id 参数化（缺省 master 兼容，未知 id 报 library_not_found）；副环境账号解析=注册表权威（主库保留实测优先）；副环境卡体检区块（有差异才显示）+归入当前账号+查看详情；MasterLibraryDetail 接受 library prop，副库插件 tab 诚实说明；备份链/验证面板按库路由；性能红线守住（5s 轮询无 DB 聚合）。vitest 295 + e2e 36）
+- [x] P11-6 问候语动态化 + 五页全开放 + 能力三态（2026-09-28：问候语取注册表 displayName（OverviewPage product prop）；NavigationRail 移除按产品过滤；PRODUCT_SECTION_STATES 三态映射（trae_cn：overview pending / accounts ready / checkin pending / environment absent / master-library ready / settings ready）+ CapabilitySection 组件；App.tsx 页面槽位全产品渲染，pending/absent 页零 Work CN IPC）
+- [x] P11-6 后端：Trae CN 签到探针结论落档（端点存在且可用，报告 .scratch/checkin-http/reports/trae-cn-checkin-probe-20260928.json）+ 主库只读接入（trae_cn 库读放行/写拒绝 library_read_only/体检 not_applicable，单测 7 项）（2026-09-28）
+- [x] P11-6 前端：三态渲染组件测试（每产品每区块）+ EmptyState 统一 + trae_cn 库入口（2026-09-28：MasterLibraryDetail trae_cn 只读形态（标题「Trae CN 数据根」+只读徽章，写控件/草稿机制隐藏，验证面板自然降级，插件 tab 只读说明，统计卡正常）；总览浏览入口 overview-library-cta；EmptyState 统一 account-center/checkin-page/plugin-empty/settings-backup/lib-tree/history-empty（原类名保留为测试钩子）；vitest 313 + typecheck + e2e 39 全绿）
+- [x] 全阶段：cargo test --workspace / pnpm typecheck / vitest / e2e 全绿（2026-09-29 终验收：cargo 各二进制 0 failed（主 99 + infrastructure 780 + application 58 + commands 27 + domain 50 等）、typecheck ✓、vitest **313/313**、e2e **39/39**；孤儿样式 product-account-page 全块清理）
+- [x] 最终汇报报告：变更清单 + 验收证据 + 遗留风险（2026-09-29，见会话汇报；探针报告/测试日志均在 .scratch/）
+
+## Phase 12：架构深化与审查处置（2026-09-29 协作研讨定案，待执行）
+
+### 背景与决策依据
+
+四专业子智能体研讨（Rust 架构师/前端架构师/质量治理/行业调研）+ 四轮弹窗质询定案，全录 `.scratch/collab-discussion-20260929-architecture-and-remediation.md`。输入：P11 两轴审查（0 硬违规；S1-S9/P1-P4 判断题）+ 架构扫描 7 候选（上轮 4 主线复验成立，Binding 2→18 处、解析器 2→4 组恶化；lib.rs 13,522 行/91 command）。
+
+关键决策：解析器**直接 enum**（含 into_account() 辅助方法）；门禁收敛用 helper 函数式（宏包装经行业证据否决——Rust 宏展开次序「最外层先展开」）；BatchProgressEvent serde tag 判别联合、前端 unknown-kind 丢弃兜底、同批对齐；mock 自建路由器（官方 mockIPC 与 vi.mock 底座冲突）+ **命令名 union 构建期生成**（gen-command-union.mjs + vitest golden 断言）；子组件文件化三判据（testid 契约/≥2 处/>150 行）。
+
+### R0 立即修（2026-09-29 已定案启动）
+
+- D1 提交切分 A'：5 提交拓扑序（C1 docs-adr → C2 前端全量 → C3 后端全量 → C4 杂项归档 → C5 tickets+决策文档），每提交独立可构建可验证
+- P1 RemoteDevicesPanel 退出通知迁 notify.success（单设备操作已核实）；S9 OverviewPage 缩进；S4 operation_contract 死代码删除；S6 SettingsPanel 专用类名；S7 notify.css 圆角对齐 token；S5 残留路径保留主视野 + 设置页备份位置收悬浮；S8 examples 运维工具移出 .scratch/tools/ 并剥离个人路径
+- P3 凭据备份裁剪：credentials-{stamp} 与同名主备份**同 stamp 同进同退**（以主备份链计数为准；孤儿凭据子目录不自动清，恢复指引注明）——TDD
+
+### 架构批次（R1→R3，每 Phase TDD + 全量四套件 + 子代理实施主会话验收）
+
+- **R1 热身**：② From<&AccountRecord>（infrastructure 内，不提供所有权版，登录手拼处保留 new()）→ ① 解析器下沉（infrastructure/library_account.rs，直接 enum LibraryAccountResolution + into_account()；前置 LibraryContext 迁 domain + lib.rs use 转发）∥ ⑦ mock 路由 + union 生成脚本（前端独立）
+- **R2 横切收敛**：④ 命令壳收敛（ensure_real_preview/ensure_fixture 两函数 + error_mapping.rs + run_blocking<T>，含 S1/S2）∥ ⑤ 后端批量运行器 + BatchProgressEvent（serde tag，含 S3）+ 前端 useTauriEvents（latest-ref + cancelled 代次守卫）+ useArchiveDraft hook（9 格迁移矩阵）∥ R2b/R2c 事件契约**同批对齐**
+- **R3 lib.rs 薄根化**：按耦合低→高逐域纯移动 commit；environment_library 一步分二（environment.rs + library_archive.rs）；共享 fixture 提 test_support.rs
+- Trae CN 签到实装（P2 条目，ADR-0030 门禁）：探针已证实 status 端点可用（.scratch/checkin-http/reports/trae-cn-checkin-probe-20260928.json）；实装需真机 claim 验收（用户配合，同 P10-5 切片 4 模式），签到区块届时 pending→ready（改 PRODUCT_SECTION_STATES 一处）
+- 后续待办：凭据备份凭据子目录裁剪规则随 P3 落地后观察；vitest 闪失一次（高负载下）如复现加 --pool=forks 验证
+
+### P12 验收清单
+
+- [ ] R0：五提交落地且各提交可构建；R0 修复项全部完成并有对应提交
+- [ ] R1：From 消重 18→0 处手工搬运；解析器 enum 落地调用点迁移；mock 路由 + union golden 断言
+- [ ] R2：门禁 56→0 处复制；批量运行器 + 前端 11 处 listen 收敛；useArchiveDraft 9 格矩阵单测
+- [ ] R3：lib.rs 薄根化（mod 按域），全量测试绿
+- [ ] 每阶段全量四套件验收（延续 P11 纪律）
