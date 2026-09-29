@@ -12,8 +12,13 @@ import type {
   ManagedAccountsViewDto,
 } from "../types/account_switch";
 import type { AppPage } from "./NavigationRail";
+import { CapabilitySection } from "./CapabilitySection";
+import { EmptyState } from "./EmptyState";
+import { sectionStateOf, type ProductId } from "../platform/productRegistry";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
+// 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
+import { notify } from "../platform/notify";
 import { CheckinSlotBadge, deriveCheckinSlotState } from "./StatusBadges";
 
 /** 后端逐账号进度事件（checkin-progress）载荷；outcome 与 CheckinResultDto 同口径。 */
@@ -47,6 +52,8 @@ interface CheckinPageProps {
   active: boolean;
   /** 空状态引导跳转账号页添加账号。 */
   onNavigate: (page: AppPage) => void;
+  /** 当前产品（缺省 work_cn）：区块三态取自产品注册表。 */
+  product?: ProductId;
 }
 
 /**
@@ -54,8 +61,12 @@ interface CheckinPageProps {
  * 账号档案管理在「账号」页；这里只做签到选择、批量执行与逐账号结果。
  * 执行语义遵循 grill D8/ADR-0019：串行逐账号 status→claim→status，
  * 账号间随机间隔 3-8 秒（后端保障），本页只做期望管理提示。
+ * 区块能力三态（P11-6）：非 ready 产品渲染诚实说明卡（探针已验证端点、
+ * 实装待真实验收 → pending），不发起任何读取与监听。
  */
-export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
+export function CheckinPage({ active, onNavigate, product = "work_cn" }: CheckinPageProps) {
+  // 产品事实源：区块三态来自注册表，组件内不做 productId 判断。
+  const sectionState = sectionStateOf(product, "checkin");
   const [capability, setCapability] = useState<CheckinCapabilityDto | null>(null);
   const [overview, setOverview] = useState<readonly CheckinOverviewEntryDto[]>([]);
   // fixture 模式（CI 演示）没有登录账号，沿用本地已保存账号作为签到池。
@@ -71,17 +82,14 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
   // 批量执行期间 3~8 秒错峰间隔显示"N 秒后开始"，不再是无变化的"签到中…"。
   const [interWaits, setInterWaits] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  // 自动签到：设置与今日台账状态行 + 错峰执行实时结果 + 完成横幅。
+  // 自动签到：设置与今日台账状态行 + 错峰执行实时结果（完成摘要由 App 级 notify.summary 承载）。
   const [autoStatus, setAutoStatus] = useState<AutoCheckinStatusDto | null>(null);
   const [autoResults, setAutoResults] = useState<readonly CheckinProgressEvent[]>([]);
-  const [autoBanner, setAutoBanner] = useState<AutoCheckinFinishedEvent | null>(null);
 
   const realMode = capability?.real_http_enabled === true;
 
   useEffect(() => {
-    if (!active) return;
+    if (!active || sectionState !== "ready") return;
     let cancelled = false;
     void invoke<CheckinCapabilityDto>("get_checkin_capability")
       .then((next) => { if (!cancelled) setCapability(next); })
@@ -96,7 +104,7 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
         }
       });
     return () => { cancelled = true; };
-  }, [active]);
+  }, [active, sectionState]);
 
   // 签到池数据：真实模式读取账号总览（含缓存积分/今日状态）；fixture 读取已保存账号。
   useEffect(() => {
@@ -109,7 +117,7 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
           // 读取失败必须可见：静默置空会把真实故障伪装成“还没有账号”。
           if (!cancelled) {
             setOverview([]);
-            setError(safeUiErrorMessage(reason, "账号总览读取失败。"));
+            notify.error(safeUiErrorMessage(reason, "账号总览读取失败。"));
           }
         });
     } else if (capability.transport === "fixture") {
@@ -152,7 +160,7 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
 
   // 监听后端逐账号进度事件：串行批次（3-8 秒/账号）期间实时上屏，不再黑盒等待。
   useEffect(() => {
-    if (!active) return;
+    if (!active || sectionState !== "ready") return;
     let unlisten: (() => void) | null = null;
     let cancelled = false;
     void listen<CheckinProgressEvent>("checkin-progress", (event) => {
@@ -170,11 +178,11 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
       cancelled = true;
       unlisten?.();
     };
-  }, [active]);
+  }, [active, sectionState]);
 
   // 监听阶段事件（checkin-phase）：账号间错峰等待，行内显示"N 秒后开始"。
   useEffect(() => {
-    if (!active) return;
+    if (!active || sectionState !== "ready") return;
     let unlisten: (() => void) | null = null;
     let cancelled = false;
     void listen<CheckinPhaseEvent>("checkin-phase", (event) => {
@@ -190,11 +198,11 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
       cancelled = true;
       unlisten?.();
     };
-  }, [active]);
+  }, [active, sectionState]);
 
   // 自动签到：读取今日台账 + 监听错峰执行进度与完成事件（与手动通道分离）。
   useEffect(() => {
-    if (!active) return;
+    if (!active || sectionState !== "ready") return;
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
     const addUnlisten = (promise: Promise<() => void>) => {
@@ -217,9 +225,10 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
         ? { ...current, ledger: { ...current.ledger, completed: payload.completed, running: true } }
         : current);
     }));
+    // 完成事件只做本页数据回填（台账翻完成态 + 刷新总览）；跨页完成摘要
+    // 由 App 级监听经 notify.summary 发布（P11-1 切片②），不再渲染页内横幅。
     addUnlisten(listen<AutoCheckinFinishedEvent>("auto-checkin-finished", (event) => {
       const payload = event.payload;
-      setAutoBanner(payload);
       setAutoStatus((current) => current
         ? { ...current, ledger: { date: current.ledger?.date ?? "", running: false, total: payload.total, completed: payload.completed, failed: payload.failed, skipped: payload.skipped } }
         : current);
@@ -234,15 +243,13 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
       cancelled = true;
       unlisteners.forEach((fn) => fn());
     };
-  }, [active, realMode]);
+  }, [active, sectionState, realMode]);
 
   // U-3 通用执行入口：一键全签 / 一键补签 / 签到所选 / 行内单签 共用同一批次通道。
   // ids 顺序即执行顺序（后端串行），同时存入 runIds 供进度条推演当前行。
   const handleRunIds = useCallback(async (ids: readonly string[]) => {
     if (!capability?.enabled || ids.length === 0 || busy) return;
     setBusy(true);
-    setError(null);
-    setMessage(null);
     setSummary(null);
     setLiveResults([]);
     setLiveProgress(null);
@@ -251,14 +258,16 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
     try {
       const next = await invoke<CheckinBatchSummaryDto>("run_checkin", { profileIds: [...ids] });
       setSummary(next);
-      setMessage(next.failed === 0 ? "签到流程已完成。" : "部分签到未完成，请查看逐账号结果。");
+      // 批次结果走全局通知：全成功按成功档，部分失败按警告档（异常原因仍在逐行结果里）。
+      if (next.failed === 0) notify.success("签到流程已完成。");
+      else notify.warning("部分签到未完成，请查看逐账号结果。");
       // 签到会更新积分缓存（后端写回）；刷新总览让“今日已签/积分”同步。
       if (realMode) {
         const entries = await invoke<CheckinOverviewEntryDto[]>("get_checkin_overview").catch(() => null);
         if (entries) setOverview(entries);
       }
     } catch (reason: unknown) {
-      setError(safeUiErrorMessage(reason, "签到未完成，请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, "签到未完成，请稍后重试。"));
     } finally {
       setBusy(false);
       setRunIds([]);
@@ -306,6 +315,26 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
   const progressCompleted = liveProgress?.completed ?? 0;
   const cursorId = busy && runIds.length > 0 ? runIds[Math.min(progressCompleted, runIds.length - 1)] : null;
 
+  // 区块能力三态（P11-6，ADR-0032 决策 2/4）：非 ready 产品渲染诚实说明卡。
+  // Trae CN 签到：只读探针已验证 status 端点存在，claim 实装未做真实验收 → pending。
+  if (sectionState !== "ready") {
+    return (
+      <section className="checkin-page" role="region" aria-label="签到">
+        <header className="page-header">
+          <div className="page-header__copy">
+            <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
+          </div>
+        </header>
+        <CapabilitySection
+          state={sectionState}
+          product={product}
+          title="签到能力适配中"
+          note="协议端点已验证，实装待验收。"
+        />
+      </section>
+    );
+  }
+
   if (!active) {
     return (
       <section className="checkin-page" role="region" aria-label="签到">
@@ -314,7 +343,7 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
             <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
           </div>
         </header>
-        <p className="checkin-page__empty" role="status">正在读取签到信息…</p>
+        <EmptyState role="status" className="checkin-page__empty" description="正在读取签到信息…" />
       </section>
     );
   }
@@ -342,15 +371,6 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
         )}
       </header>
 
-      {error && <p className="workbench__error" role="alert">{error}</p>}
-      {message && <p className="checkin-page__message" role="status">{message}</p>}
-      {autoBanner && (
-        <p className="checkin-page__message" role="status" data-testid="auto-checkin-banner">
-          今日自动签到完成：成功 {autoBanner.completed}/{autoBanner.total}
-          {autoBanner.failed > 0 ? `，失败 ${autoBanner.failed}` : ""}
-          {autoBanner.skipped > 0 ? `，跳过 ${autoBanner.skipped}` : ""}。
-        </p>
-      )}
       {autoStatus && (
         <p className="checkin-page__meta" role="status" data-testid="auto-checkin-status">
           自动签到：{autoStatus.enabled ? `每日 ${autoStatus.daily_time_hhmm} 触发` : "已关闭"}
@@ -492,12 +512,15 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
           )}
         </section>
       ) : (
-        <div className="checkin-page__empty-actions">
-          <p className="checkin-page__empty">还没有可签到的账号。先在「账号」页通过浏览器登录添加账号。</p>
-          <button className="btn btn--primary" type="button" onClick={() => onNavigate("accounts")}>
-            <UserPlus size={15} aria-hidden="true" />去账号页添加
-          </button>
-        </div>
+        <EmptyState
+          className="checkin-page__empty-actions"
+          description="还没有可签到的账号。先在「账号」页通过浏览器登录添加账号。"
+          action={
+            <button className="btn btn--primary" type="button" onClick={() => onNavigate("accounts")}>
+              <UserPlus size={15} aria-hidden="true" />去账号页添加
+            </button>
+          }
+        />
       )}
     </section>
   );

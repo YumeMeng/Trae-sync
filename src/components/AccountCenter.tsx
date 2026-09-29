@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ArrowDownAZ, ArrowLeftRight, HeartPulse, LayoutGrid, List, RefreshCw, ShieldCheck, UserPlus, UserRound } from "lucide-react";
 import type {
   CheckinCapabilityDto,
@@ -16,6 +17,8 @@ import type {
 import type { EnvironmentStateDto } from "../types/environment";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { displayMobile, effectiveDisplayName } from "../utils/accountDisplay";
+// 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
+import { notify, type NotifyIssue } from "../platform/notify";
 import { AccountDetail } from "./AccountDetail";
 import { AdapterAccountDetail } from "./AdapterAccountDetail";
 import {
@@ -25,9 +28,9 @@ import {
   deriveLoginSlotState,
   type LoginSlotState,
 } from "./StatusBadges";
-import { OperationResultCard, type OperationResultIssue } from "./OperationResultCard";
 import { MasterSwitchDialog, type MasterSwitchTarget } from "./MasterSwitchDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { EmptyState } from "./EmptyState";
 import type {
   AccountAction,
   AccountActionResult,
@@ -41,6 +44,66 @@ interface AccountCenterProps {
   active: boolean;
   /** Trae CN 等产品通过适配器接入同一账号工作台；Work 保持默认事务实现。 */
   adapter?: AccountAdapter | null;
+}
+
+/** 批量凭据刷新逐账号进度事件（credential-refresh-progress）载荷；非敏感白名单。 */
+interface CredentialRefreshProgressEvent {
+  profile_id: string;
+  screen_name: string;
+  /** 已处理账号数（含失败，1 起）。 */
+  completed: number;
+  total: number;
+  refreshed: boolean;
+  error_code: string | null;
+}
+
+/** 批量健康检测逐账号进度事件（health-check-progress）载荷；非敏感白名单。 */
+interface HealthCheckProgressEvent {
+  profile_id: string;
+  screen_name: string;
+  /** 已检测账号数（含失败，1 起）。 */
+  completed: number;
+  total: number;
+  healthy: boolean;
+  error_code: string | null;
+}
+
+/** 积分/额度刷新逐账号进度事件（credits-refresh-progress）载荷；与 CreditsRefreshEntryDto 同源。 */
+interface CreditsRefreshProgressEvent {
+  profile_id: string;
+  screen_name: string;
+  /** 已刷新账号数（含失败，1 起）。 */
+  completed: number;
+  total: number;
+  ok: boolean;
+  credits: number | null;
+  checked_in: boolean | null;
+  usage_remaining_credits: number | null;
+  error_code: string | null;
+}
+
+/** 批量操作进度文案的最小展示状态：第 i/N 个账号名。 */
+interface BatchProgress {
+  completed: number;
+  total: number;
+  name: string;
+}
+
+/** 首登验收失败原因码 → 括号内的一句人话；未覆盖码回退凭据错误码词表。 */
+const ACCEPTANCE_REASON_SHORT: ReadonlyArray<readonly [RegExp, string]> = [
+  [/credential_refresh_failed/i, "换发新登录凭据未通过"],
+  [/credential_missing|credential_unavailable|credential_invalid/i, "登录凭据保存后不可用"],
+  [/binding_mismatch|auth_mismatch/i, "登录凭据与账号绑定不一致"],
+  [/manual_recovery_required/i, "登录凭据需要人工恢复"],
+];
+
+/** 验收失败原因不外露原文：短词表优先，兜底走 safeUiErrorMessage 的人话映射。 */
+function acceptanceReasonText(errorCode: string | null | undefined): string {
+  const text = errorCode ?? "";
+  for (const [pattern, message] of ACCEPTANCE_REASON_SHORT) {
+    if (pattern.test(text)) return message;
+  }
+  return errorCode ? safeUiErrorMessage(errorCode, "原因未知").replace(/。$/, "") : "原因未知";
 }
 
 // 登录浏览器方式：isolated=隔离实例（默认，与本机登录态互不影响）；
@@ -73,15 +136,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const [view, setView] = useState<ManagedAccountsViewDto | null>(null);
   const [adapterSnapshot, setAdapterSnapshot] = useState<AccountSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
   const [checkinCapability, setCheckinCapability] = useState<CheckinCapabilityDto | null>(null);
-  // G9 结果卡：健康检测 / 刷新额度完成后的结构化回执（首行结论 + 异常清单）。
-  const [resultCard, setResultCard] = useState<{
-    title: string;
-    okCount: number;
-    issues: readonly OperationResultIssue[];
-  } | null>(null);
   // 账号总览（真实模式）：档案 + 积分缓存 + 令牌到期，驱动卡片与详情视图。
   const [overview, setOverview] = useState<readonly CheckinOverviewEntryDto[]>([]);
   const [loginBusy, setLoginBusy] = useState(false);
@@ -93,6 +148,14 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const [credentialRefreshBusy, setCredentialRefreshBusy] = useState(false);
   // 一键健康检测进行中（本地检测 + 网络探测，按钮禁用 + 进度提示）。
   const [healthBusy, setHealthBusy] = useState(false);
+  // 批量操作逐账号进度（P11-3）：事件实时驱动「正在处理 i/N：账号名」文案；
+  // 操作开始时清零，命令返回走既有结果摘要后随 busy 一起清除。
+  const [credentialProgress, setCredentialProgress] = useState<BatchProgress | null>(null);
+  const [healthProgress, setHealthProgress] = useState<BatchProgress | null>(null);
+  // 额度刷新逐账号进度：refresh_checkin_credits 同时服务「刷新额度」与
+  // 「健康检测网络步骤」，同一事件源且两流程按钮互斥不并发，单状态即可；
+  // 开始时清零防止上一批账号名串显到新流程。
+  const [creditsProgress, setCreditsProgress] = useState<BatchProgress | null>(null);
   // G15 纯本地刷新进行中（毫秒级本地读取，仅驱动按钮图标旋转）。
   const [localRefreshBusy, setLocalRefreshBusy] = useState(false);
   // 选中的账号：非空时进入独立详情视图。
@@ -140,7 +203,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     let cancelled = false;
     setLoading(true);
     void load().catch((reason: unknown) => {
-      if (!cancelled) setError(safeUiErrorMessage(reason, "账号信息暂时不可读取，请稍后重试。"));
+      if (!cancelled) notify.error(safeUiErrorMessage(reason, "账号信息暂时不可读取，请稍后重试。"));
     }).finally(() => {
       if (!cancelled) setLoading(false);
     });
@@ -181,7 +244,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         // 读取失败必须可见：静默置空会把真实故障伪装成“还没有账号”。
         if (!cancelled) {
           setOverview([]);
-          setError(safeUiErrorMessage(reason, "账号总览读取失败。"));
+          notify.error(safeUiErrorMessage(reason, "账号总览读取失败。"));
         }
       });
     return () => { cancelled = true; };
@@ -211,6 +274,36 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
       .catch(() => undefined); // 读取失败保持现状徽章（未登录），不阻塞页面。
     return () => { cancelled = true; };
   }, [active, adapter, checkinCapability?.real_http_enabled, overviewProfileKey]);
+
+  // 批量操作逐账号进度事件（P11-3）：挂载期订阅、卸载清理。页面以 hidden
+  // 切换仍保持挂载，事件在页面隐藏期间也会到达并更新状态，重新显示即为最新
+  // 进度；结果摘要由命令返回后的既有 notify.summary 路径发布，这里只管进度文案。
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+    const addUnlisten = (promise: Promise<() => void>) => {
+      void promise.then((fn) => {
+        if (cancelled) fn();
+        else unlisteners.push(fn);
+      }).catch(() => undefined);
+    };
+    addUnlisten(listen<CredentialRefreshProgressEvent>("credential-refresh-progress", (event) => {
+      const payload = event.payload;
+      setCredentialProgress({ completed: payload.completed, total: payload.total, name: payload.screen_name });
+    }));
+    addUnlisten(listen<HealthCheckProgressEvent>("health-check-progress", (event) => {
+      const payload = event.payload;
+      setHealthProgress({ completed: payload.completed, total: payload.total, name: payload.screen_name });
+    }));
+    addUnlisten(listen<CreditsRefreshProgressEvent>("credits-refresh-progress", (event) => {
+      const payload = event.payload;
+      setCreditsProgress({ completed: payload.completed, total: payload.total, name: payload.screen_name });
+    }));
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((fn) => fn());
+    };
+  }, []);
 
   // P5-2 环境档案：主库当前登录账号驱动「使用中」标记与切换按钮分布。
   // fixture 模式后端返回空档案（无当前账号），全部账号展示切换入口。
@@ -249,7 +342,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
       : Promise.all([refreshOverview(), loadEnvironment()]).then(() => undefined);
     void refresh
       .catch((reason: unknown) => {
-        if (adapter) setError(safeUiErrorMessage(reason, `${adapter.productName} 账号信息刷新失败。`));
+        if (adapter) notify.error(safeUiErrorMessage(reason, `${adapter.productName} 账号信息刷新失败。`));
       })
       .finally(() => setLocalRefreshBusy(false));
   }, [adapter, localRefreshBusy, refreshAdapterSnapshot, refreshOverview, loadEnvironment]);
@@ -317,19 +410,33 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const handleLogin = useCallback(async (useSystemBrowser: boolean) => {
     if (loginBusy) return;
     setLoginBusy(true);
-    setError(null);
-    setMessage(null);
     try {
       if (adapter) {
         const receipt = await adapter.login();
         await refreshAdapterSnapshot();
-        setMessage(`账号“${receipt.displayName}”登录成功，已保存到${adapter.productName}。`);
+        notify.success(`账号“${receipt.displayName}”登录成功，已保存到${adapter.productName}。`);
+        // P11-3 首登验收：failed = 账号已保存但同设备换发验收未通过；如实
+        // 警告、不自动重试也不发起第二次授权，passed 由成功提示覆盖不重复打扰。
+        if (receipt.acceptance === "failed") {
+          notify.warning(
+            `账号“${receipt.displayName}”已保存，但可持续性验收未通过（${acceptanceReasonText(receipt.acceptanceErrorCode)}）。`,
+            "可稍后在账号详情手动刷新凭据或重新登录。",
+          );
+        }
         return;
       }
       await invoke<CheckinLoginBeginDto>("begin_checkin_login", { useSystemBrowser });
       const receipt = await invoke<CheckinLoginReceiptDto>("complete_checkin_login");
       const entries = await refreshOverview();
-      setMessage(`账号“${receipt.screen_name}”登录成功，已可用于签到。`);
+      notify.success(`账号“${receipt.screen_name}”登录成功，已可用于签到。`);
+      // P11-3 首登验收：failed = 凭据已入库但同设备换发验收未通过；如实警告，
+      // 不自动重试、不发起第二次授权，passed 由成功提示覆盖不重复打扰。
+      if (receipt.acceptance === "failed") {
+        notify.warning(
+          `账号“${receipt.screen_name}”已保存，但可持续性验收未通过（${acceptanceReasonText(receipt.acceptance_error_code)}）。`,
+          "可稍后在账号详情手动刷新凭据或重新登录。",
+        );
+      }
       // G11：登录成功即引导补录完整手机号（可跳过）；脱敏号取自刷新后的
       // 总览条目（登录时已写入注册表）。已补录过的账号重复登录不再打扰。
       const fresh = entries?.find((entry) => entry.profile_id === receipt.profile_id) ?? null;
@@ -343,9 +450,9 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     } catch (reason: unknown) {
       // 取消不是错误：以中性提示收尾（浏览器被关闭同样走此路径）。
       if (typeof reason === "string" && reason === "login_cancelled") {
-        setMessage("登录已取消；若浏览器已关闭或未完成授权，可重新发起登录。");
+        notify.info("登录已取消；若浏览器已关闭或未完成授权，可重新发起登录。");
       } else {
-        setError(safeUiErrorMessage(reason, "登录未完成，请重新发起登录。"));
+        notify.error(safeUiErrorMessage(reason, "登录未完成，请重新发起登录。"));
       }
     } finally {
       setLoginBusy(false);
@@ -388,14 +495,14 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         await invoke("set_account_mobile", { profileId: request.profileId, mobile: request.mobile });
         await refreshOverview();
         // 列表场景回写成功反馈；详情页场景由数据刷新呈现新号码。
-        setMessage("手机号已保存，账号列表与详情页都会显示完整号码。");
+        notify.success("手机号已保存，账号列表与详情页都会显示完整号码。");
         // 补录弹层发起的：保存成功后与原流程一致，一并关闭。
         if (request.closePrompt) setMobilePrompt(null);
       } catch (reason: unknown) {
-        // 失败：补录弹层场景回弹层内提示；详情页场景回页面错误条。
+        // 失败：补录弹层场景回弹层内提示；详情页场景走全局通知。
         const text = safeUiErrorMessage(reason, "手机号保存未完成，请稍后重试。");
         if (request.closePrompt) setMobilePromptError(text);
-        else setError(text);
+        else notify.error(text);
       } finally {
         if (request.closePrompt) setMobilePromptBusy(false);
       }
@@ -416,7 +523,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         if (saved) {
           setMobilePrompt(null);
           setMobilePromptValue("");
-          setMessage("手机号已补全，账号列表与详情页都会显示完整号码。");
+          notify.success("手机号已补全，账号列表与详情页都会显示完整号码。");
         }
       } catch (reason: unknown) {
         setMobilePromptError(safeUiErrorMessage(reason, "手机号保存失败，请稍后重试。"));
@@ -427,89 +534,79 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   }, [mobilePrompt, mobilePromptBusy, mobilePromptValue, saveMobileBackfill]);
 
   // 取消进行中的登录（P7-4）：置位后端取消标记，等待中的 complete 会以
-  // login_cancelled 收尾。取消请求本身失败不打断等待（仍有超时兜底）。
+  // login_cancelled 收尾。取消请求失败时警告提示（成功取消不需要打扰；
+  // 等待仍有 complete 的超时与浏览器退出检测兜底，不会悬挂）。
   const handleCancelLogin = useCallback(async () => {
     try {
       await (adapter ? adapter.cancelLogin() : invoke("cancel_checkin_login"));
     } catch {
-      /* 取消失败不额外提示：complete 的超时与浏览器退出检测仍会收尾 */
+      notify.warning("取消登录未成功，登录等待将继续；完成或超时后会自动收尾。");
     }
   }, [adapter]);
 
   const handleAdapterSwitch = useCallback(async (accountId: string) => {
     if (!adapter || adapterSwitchingId) return;
     setAdapterSwitchingId(accountId);
-    setError(null);
-    setMessage(null);
     try {
       await adapter.switchAccount(accountId);
       await refreshAdapterSnapshot();
-      setMessage(`${adapter.productName} 当前账号已切换。`);
+      notify.success(`${adapter.productName} 当前账号已切换。`);
     } catch (reason: unknown) {
-      setError(safeUiErrorMessage(reason, `${adapter.productName} 账号切换未完成。`));
+      notify.error(safeUiErrorMessage(reason, `${adapter.productName} 账号切换未完成。`));
     } finally {
       setAdapterSwitchingId(null);
     }
   }, [adapter, adapterSwitchingId, refreshAdapterSnapshot]);
 
-  // 适配器动作复用 Work 的结果卡与忙碌状态；具体协议只留在产品适配器内。
+  // 适配器动作复用批量摘要通知与忙碌状态；具体协议只留在产品适配器内。
   // ADR-0031 决策 6：targetAccountId 非空时健康检测只针对该账号（远程退出联动）。
   const runAdapterAction = useCallback(async (action: AccountAction, targetAccountId?: string) => {
     if (!adapter) return;
     const isHealth = action === "health";
     if (isHealth ? healthBusy : credentialRefreshBusy) return;
-    if (isHealth) setHealthBusy(true);
-    else setCredentialRefreshBusy(true);
-    setError(null);
-    setMessage(null);
-    setResultCard(null);
+    // 操作开始清掉上一批残留进度，避免新批次串显旧账号名。
+    if (isHealth) { setHealthProgress(null); setHealthBusy(true); }
+    else { setCredentialProgress(null); setCredentialRefreshBusy(true); }
     try {
       const result: AccountActionResult = await adapter.runAction(action, targetAccountId);
       await refreshAdapterSnapshot();
-      const issues: OperationResultIssue[] = result.issues.map((issue) => ({
-        key: issue.id,
-        name: issue.displayName || "该账号",
+      const issues: NotifyIssue[] = result.issues.map((issue) => ({
+        displayName: issue.displayName || "该账号",
         reason: safeUiErrorMessage(issue.errorCode, "网络或服务暂时不可用，请稍后重试。"),
       }));
-      setResultCard({
-        title: isHealth ? "健康检测" : "凭据刷新",
-        okCount: result.okCount,
-        issues,
-      });
+      notify.summary(isHealth ? "健康检测完成" : "凭据刷新完成", issues, result.okCount);
     } catch (reason: unknown) {
-      setError(safeUiErrorMessage(reason, isHealth ? "健康检测未完成，请稍后重试。" : "凭据刷新未完成，请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, isHealth ? "健康检测未完成，请稍后重试。" : "凭据刷新未完成，请稍后重试。"));
     } finally {
-      if (isHealth) setHealthBusy(false);
-      else setCredentialRefreshBusy(false);
+      if (isHealth) { setHealthBusy(false); setHealthProgress(null); }
+      else { setCredentialRefreshBusy(false); setCredentialProgress(null); }
     }
   }, [adapter, credentialRefreshBusy, healthBusy, refreshAdapterSnapshot]);
 
   // 批量刷新额度：逐账号只读查询（后端串行、无间隔实时完成），刷新全部卡片。
   const handleRefreshAllCredits = useCallback(() => {
     if (creditsBusy || overview.length === 0) return;
+    setCreditsProgress(null);
     setCreditsBusy(true);
-    setError(null);
-    setMessage(null);
-    setResultCard(null);
     void (async () => {
       try {
         const profileIds = overview.map((entry) => entry.profile_id);
         const results = await invoke<CreditsRefreshEntryDto[]>("refresh_checkin_credits", { profileIds });
         await refreshOverview();
         const nameOf = new Map(overview.map((entry) => [entry.profile_id, effectiveDisplayName(entry)]));
-        // G9 结果卡：异常账号列名 + 一句人话原因；正常账号不占空间。
+        // 批量摘要通知：异常账号列名 + 一句人话原因；正常账号只计入成功数。
         const issues = results
           .filter((item) => item.error_code !== null)
           .map((item) => ({
-            key: item.profile_id,
-            name: nameOf.get(item.profile_id) ?? item.screen_name,
+            displayName: nameOf.get(item.profile_id) ?? item.screen_name,
             reason: safeUiErrorMessage(item.error_code, "网络或服务暂时不可用，请稍后重试。"),
           }));
-        setResultCard({ title: "额度刷新", okCount: results.length - issues.length, issues });
+        notify.summary("额度刷新完成", issues, results.length - issues.length);
       } catch (reason: unknown) {
-        setError(safeUiErrorMessage(reason, "额度刷新未完成，请稍后重试。"));
+        notify.error(safeUiErrorMessage(reason, "额度刷新未完成，请稍后重试。"));
       } finally {
         setCreditsBusy(false);
+        setCreditsProgress(null);
       }
     })();
   }, [creditsBusy, overview, refreshOverview]);
@@ -534,10 +631,8 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
       return;
     }
     if (credentialRefreshBusy || overview.length === 0) return;
+    setCredentialProgress(null);
     setCredentialRefreshBusy(true);
-    setError(null);
-    setMessage(null);
-    setResultCard(null);
     void (async () => {
       try {
         const profileIds = overview.map((entry) => entry.profile_id);
@@ -547,15 +642,10 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         const issues = results
           .filter((item) => !item.refreshed)
           .map((item) => ({
-            key: item.profile_id,
-            name: (nameOf.get(item.profile_id) ?? item.screen_name) || "该账号",
+            displayName: (nameOf.get(item.profile_id) ?? item.screen_name) || "该账号",
             reason: safeUiErrorMessage(item.error_code, "登录凭据刷新未完成，请稍后重试。"),
           }));
-        setResultCard({
-          title: "凭据刷新",
-          okCount: results.filter((item) => item.refreshed).length,
-          issues,
-        });
+        notify.summary("凭据刷新完成", issues, results.filter((item) => item.refreshed).length);
         // 换发结果已完成身份校验；本地徽章无需再次发起逐账号网络探测。
         setLoginStates((previous) => {
           const next = { ...previous };
@@ -572,9 +662,10 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
           return next;
         });
       } catch (reason: unknown) {
-        setError(safeUiErrorMessage(reason, "凭据刷新未完成，请稍后重试。"));
+        notify.error(safeUiErrorMessage(reason, "凭据刷新未完成，请稍后重试。"));
       } finally {
         setCredentialRefreshBusy(false);
+        setCredentialProgress(null);
       }
     })();
   }, [adapter, credentialRefreshBusy, overview, refreshOverview, runAdapterAction]);
@@ -595,10 +686,9 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
       ? overview.filter((entry) => entry.profile_id === targetProfileId)
       : overview;
     if (healthBusy || targets.length === 0) return;
+    setHealthProgress(null);
+    setCreditsProgress(null);
     setHealthBusy(true);
-    setError(null);
-    setMessage(null);
-    setResultCard(null);
     void (async () => {
       try {
         const profileIds = targets.map((entry) => entry.profile_id);
@@ -612,11 +702,14 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         // 网络探测：逐账号只读查询，error_code 非空即签到会话异常。
         const results = await invoke<CreditsRefreshEntryDto[]>("refresh_checkin_credits", { profileIds });
         await refreshOverview();
-        setResultCard({ title: "健康检测", ...buildHealthResult(states, results, targets) });
+        const health = buildHealthResult(states, results, targets);
+        notify.summary("健康检测完成", health.issues, health.okCount);
       } catch (reason: unknown) {
-        setError(safeUiErrorMessage(reason, "健康检测未完成，请稍后重试。"));
+        notify.error(safeUiErrorMessage(reason, "健康检测未完成，请稍后重试。"));
       } finally {
         setHealthBusy(false);
+        setHealthProgress(null);
+        setCreditsProgress(null);
       }
     })();
   }, [adapter, adapterSnapshot?.accounts.length, healthBusy, overview, refreshOverview, runAdapterAction]);
@@ -728,7 +821,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
             <h1 data-page-title="accounts" tabIndex={-1}>账号</h1>
           </div>
         </header>
-        <p className="account-center__empty" role="status">正在读取账号信息…</p>
+        <EmptyState role="status" className="account-center__empty" description="正在读取账号信息…" />
       </section>
     );
   }
@@ -794,6 +887,9 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const hasCredentialRefreshCapability = realCheckinMode
     || adapter?.capabilities.includes("refreshCredential") === true;
 
+  // 健康检测进度展示源：CN 路径事件优先，Work 网络步骤事件兜底（见渲染区注释）。
+  const healthProgressShown = healthProgress ?? creditsProgress;
+
   return (
     <section className="account-center" role="region" aria-label={adapter ? `${adapter.productName} 账号` : "账号"}>
       <header className="page-header">
@@ -816,7 +912,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
                 onClick={handleLocalRefresh}
                 disabled={localRefreshBusy || credentialRefreshBusy}
                 data-testid="account-refresh-local"
-                title={adapter ? "重读当前产品保存的账号信息" : "重读本机缓存的账号信息（不联网）；需要探测真实状态请用健康检测"}
+                title="刷新本地数据，不联网检测"
               >
                 <RefreshCw size={15} className={localRefreshBusy ? "icon-spin" : undefined} aria-hidden="true" />刷新
               </button>
@@ -864,16 +960,6 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         </div>
       </header>
 
-      {error && <p className="workbench__error" role="alert">{error}</p>}
-      {message && <p className="account-center__message" role="status">{message}</p>}
-      {/* G9 结果卡：健康检测 / 刷新额度共用形态（首行结论 + 异常清单）。 */}
-      {resultCard && (
-        <OperationResultCard
-          title={resultCard.title}
-          okCount={resultCard.okCount}
-          issues={resultCard.issues}
-        />
-      )}
       {loginBusy && (
         <div className="account-center__login-waiting" role="status">
           <p className="account-center__meta">
@@ -894,12 +980,25 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
           </button>
         </div>
       )}
-      {creditsBusy && <p className="account-center__meta" role="status">正在查询最新额度…</p>}
-      {credentialRefreshBusy && <p className="account-center__meta" role="status">
-        {adapter ? `正在刷新 ${adapter.productName} 登录凭据，不会打开新的 OAuth 登录…` : "正在刷新登录凭据，不会打开新的 OAuth 登录…"}
+      {creditsBusy && <p className="account-center__meta" role="status">
+        {creditsProgress
+          ? `正在处理 ${creditsProgress.completed}/${creditsProgress.total}：${creditsProgress.name}`
+          : "正在查询最新额度…"}
       </p>}
+      {/* P11-3：批量凭据刷新收到逐账号进度事件时升级为「正在处理 i/N：账号名」；
+          未收到事件（首批账号尚在处理）时保留原说明文案。 */}
+      {credentialRefreshBusy && <p className="account-center__meta" role="status">
+        {credentialProgress
+          ? `正在处理 ${credentialProgress.completed}/${credentialProgress.total}：${credentialProgress.name}`
+          : adapter ? `正在刷新 ${adapter.productName} 登录凭据，不会打开新的 OAuth 登录…` : "正在刷新登录凭据，不会打开新的 OAuth 登录…"}
+      </p>}
+      {/* 健康检测进度：health-check-progress 由 CN 适配路径推送；Work 的网络
+          步骤（refresh_checkin_credits）复用 credits-refresh-progress——先看
+          CN 事件、再看网络步骤事件，均未到达（本地检测阶段）保留原回退文案。 */}
       {healthBusy && <p className="account-center__meta" role="status">
-        {adapter ? `正在检测 ${adapter.productName} 账号健康度…` : "正在检测账号健康度（登录存档 + 签到会话探测）…"}
+        {healthProgressShown
+          ? `正在处理 ${healthProgressShown.completed}/${healthProgressShown.total}：${healthProgressShown.name}`
+          : adapter ? `正在检测 ${adapter.productName} 账号健康度…` : "正在检测账号健康度（登录存档 + 签到会话探测）…"}
       </p>}
 
       {/* 我的账号：页面主体。真实模式双视图（U-2：列表宽行默认 / 卡片网格切换，
@@ -999,12 +1098,15 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
                 ))}
               </ul>
             ) : (
-              <div className="account-center__empty-actions">
-                <p className="account-center__empty">尚未保存账号。点击右上角“添加账号”通过浏览器登录。</p>
-                <button className="btn btn--primary" type="button" onClick={() => void handleLogin(true)} disabled={loginBusy}>
-                  <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
-                </button>
-              </div>
+              <EmptyState
+                className="account-center__empty-actions"
+                description="尚未保存账号。点击右上角“添加账号”通过浏览器登录。"
+                action={
+                  <button className="btn btn--primary" type="button" onClick={() => void handleLogin(true)} disabled={loginBusy}>
+                    <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
+                  </button>
+                }
+              />
             )}
           </>
         ) : realCheckinMode ? (
@@ -1030,15 +1132,18 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
               </ul>
             ) : (
               // G14 过滤空态：有账号但当前过滤无匹配，与「还没有账号」区分。
-              <p className="account-center__empty">没有需要处理的账号。</p>
+              <EmptyState className="account-center__empty" description="没有需要处理的账号。" />
             )
           ) : (
-            <div className="account-center__empty-actions">
-              <p className="account-center__empty">还没有账号。通过浏览器登录添加第一个账号，登录成功后即可签到。</p>
-              <button className="btn btn--primary" type="button" onClick={() => void handleLogin(loginBrowserMode === "system")} disabled={loginBusy}>
-                <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
-              </button>
-            </div>
+            <EmptyState
+              className="account-center__empty-actions"
+              description="还没有账号。通过浏览器登录添加第一个账号，登录成功后即可签到。"
+              action={
+                <button className="btn btn--primary" type="button" onClick={() => void handleLogin(loginBrowserMode === "system")} disabled={loginBusy}>
+                  <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
+                </button>
+              }
+            />
           )
         ) : savedAccounts.length > 0 ? (
           <ul className={accountView === "list" ? "account-list" : "account-card-grid"}>
@@ -1064,7 +1169,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
             ))}
           </ul>
         ) : (
-          <p className="account-center__empty">尚未保存账号。点击右上角“添加账号”通过浏览器登录。</p>
+          <EmptyState className="account-center__empty" description="尚未保存账号。点击右上角“添加账号”通过浏览器登录。" />
         )}
       </section>
 
@@ -1457,12 +1562,13 @@ const LOGIN_SLOT_REASONS: Record<LoginSlotState, string | null> = {
  * 异常口径与徽章同源（G10 状态机）：登录槽非正常态 或 签到会话探测失败；
  * 登录问题优先展示（会话异常多为同一根因——凭据坏了探测必然失败）。
  * states 为 null（本地检测读取失败）时只依据会话探测结果，不臆测登录态。
+ * 结果经 notify.summary 发布（批量摘要通知：成功数 + 异常清单）。
  */
 function buildHealthResult(
   states: readonly TraeInstanceStateDto[] | null,
   results: readonly CreditsRefreshEntryDto[],
   overview: readonly CheckinOverviewEntryDto[],
-): { okCount: number; issues: OperationResultIssue[] } {
+): { okCount: number; issues: NotifyIssue[] } {
   const nameOf = new Map(overview.map((entry) => [entry.profile_id, effectiveDisplayName(entry)]));
   const stateOf = new Map((states ?? []).map((state) => [state.profile_id, state]));
   const probeOf = new Map(results.map((result) => [result.profile_id, result]));
@@ -1472,7 +1578,7 @@ function buildHealthResult(
       .filter((item) => CREDENTIAL_RELOGIN_ERROR_CODES.has(item.error_code ?? ""))
       .map((item) => item.profile_id),
   );
-  const issues: OperationResultIssue[] = [];
+  const issues: NotifyIssue[] = [];
   for (const entry of overview) {
     const state = stateOf.get(entry.profile_id);
     const effective = effectiveCredentialState(
@@ -1485,15 +1591,14 @@ function buildHealthResult(
       ? LOGIN_SLOT_REASONS[deriveLoginSlotState({ login_state: effective, relogin_only: reloginOnly })]
       : null;
     if (loginReason !== null) {
-      issues.push({ key: entry.profile_id, name: nameOf.get(entry.profile_id) ?? entry.screen_name, reason: loginReason });
+      issues.push({ displayName: nameOf.get(entry.profile_id) ?? entry.screen_name, reason: loginReason });
       continue;
     }
     // 登录正常才单独报会话异常（登录失效的探测失败是同一根因，不重复列）。
     const probe = probeOf.get(entry.profile_id);
     if (probe && probe.error_code !== null) {
       issues.push({
-        key: entry.profile_id,
-        name: nameOf.get(entry.profile_id) ?? entry.screen_name,
+        displayName: nameOf.get(entry.profile_id) ?? entry.screen_name,
         reason: safeUiErrorMessage(probe.error_code, "网络或服务暂时不可用，请稍后重试。"),
       });
     }

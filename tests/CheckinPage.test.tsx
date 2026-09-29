@@ -15,7 +15,25 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 
+// P11-1 切片②：批次结果等一次性提示已迁到 notify 适配层；断言 notify 调用。
+vi.mock("../src/platform/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/platform/notify")>();
+  return {
+    ...actual,
+    notify: {
+      success: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: vi.fn(),
+    },
+  };
+});
+
+import { notify } from "../src/platform/notify";
+
 const mockInvoke = vi.mocked(invoke);
+const notifyMock = vi.mocked(notify);
 
 const realCapability = {
   enabled: true,
@@ -204,9 +222,9 @@ describe("CheckinPage", () => {
       handlers.get("auto-checkin-finished")?.({ payload: { total: 3, completed: 2, failed: 1, skipped: 0 } });
     });
 
-    // 完成横幅出现，且台账从执行中翻到已完成（running 消失）。
-    const banner = screen.getByTestId("auto-checkin-banner");
-    expect(banner).toHaveTextContent("今日自动签到完成：成功 2/3，失败 1");
+    // 完成事件回填台账（running 消失）；跨页完成摘要由 App 级 notify.summary 承担，
+    // 签到页自身不再渲染横幅（P11-1 切片②）。
+    expect(screen.queryByTestId("auto-checkin-banner")).not.toBeInTheDocument();
     expect(status).toHaveTextContent("今日已完成（成功 2/3，失败 1）");
     expect(status).not.toHaveTextContent("今日执行中");
   });
@@ -369,7 +387,9 @@ describe("CheckinPage", () => {
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
-    expect(await screen.findByText("部分签到未完成，请查看逐账号结果。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.warning).toHaveBeenCalledWith("部分签到未完成，请查看逐账号结果。");
+    });
     expect(screen.getByText("设备刚创建，请等待约 5 分钟后重试")).toBeInTheDocument();
   });
 
@@ -418,7 +438,9 @@ describe("CheckinPage", () => {
     await act(async () => {
       resolveRun(summary([result("profile-login-1"), result("profile-login-2")]));
     });
-    expect(await screen.findByText("签到流程已完成。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("签到流程已完成。");
+    });
     expect(screen.queryByTestId("checkin-inter-wait")).not.toBeInTheDocument();
   });
 
@@ -446,7 +468,9 @@ describe("CheckinPage", () => {
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
-    expect(await screen.findByText("签到流程已完成。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("签到流程已完成。");
+    });
     // U-3 单列表演进式：结果直接落在行内（无独立结果列表）。
     // 已签到账号显示「今日已签到」；新领取账号展示成功。
     const flowList = screen.getByRole("list", { name: "签到账号与结果" });
@@ -483,7 +507,9 @@ describe("CheckinPage", () => {
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
-    expect(await screen.findByText("部分签到未完成，请查看逐账号结果。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.warning).toHaveBeenCalledWith("部分签到未完成，请查看逐账号结果。");
+    });
     // ADR-0019：业务码原样透出，不压平为通用失败（U-3 起结果只在行内出现一次）。
     expect(screen.getAllByText(/设备信息未获服务端信任（9074）/)).toHaveLength(1);
   });
@@ -497,7 +523,9 @@ describe("CheckinPage", () => {
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("本机登录存储不可用，请检查磁盘后重试。");
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith("本机登录存储不可用，请检查磁盘后重试。");
+    });
   });
 
   it("没有可签到账号时显示空状态引导并可跳转账号页", async () => {

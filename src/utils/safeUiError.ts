@@ -221,6 +221,27 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /master_backup_failed/i,
     "主库数据备份未完成，原数据未受影响；请稍后重试。",
   ],
+  // ===== P11-4 备份位置可选 + 凭据内容备份 =====
+  [
+    /backup_dir_invalid/i,
+    "备份目录不可用：请输入一个本机可访问的完整目录路径。",
+  ],
+  [
+    /backup_dir_unavailable/i,
+    "备份目录无法创建，请检查磁盘与权限后重试。",
+  ],
+  [
+    /backup_dir_conflicts_checkin/i,
+    "备份目录不能放在账号签到材料目录内，请换一个位置。",
+  ],
+  [
+    /master_backup_credentials_failed|master_backup_credentials_exists/i,
+    "账号凭据备份未完成，主数据备份不受影响；请稍后重试。",
+  ],
+  [
+    /master_backup_migrate_failed|master_backup_migrate_join_failed/i,
+    "备份迁移未完成，原位置备份保持不变；请稍后重试。",
+  ],
   [
     /backup_retention_invalid/i,
     "备份清理设置读取失败（配置文件可能损坏），已停止自动清理；请保留数据目录后反馈。",
@@ -447,6 +468,23 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /environment_delete_failed/i,
     "环境删除未完成，请稍后重试。",
   ],
+  // ===== P11-5 环境实例关闭 + 归档草稿存储 =====
+  [
+    /environment_close_failed/i,
+    "TRAE 实例未能关闭，请稍后重试，或在 TRAE 窗口内直接退出。",
+  ],
+  [
+    /archive_draft_store_invalid/i,
+    "归档草稿存储不可读（文件可能损坏），草稿已暂存在本机浏览器存储，未丢失。",
+  ],
+  [
+    /archive_draft_store_unavailable/i,
+    "归档草稿存储暂不可用，草稿已暂存在本机浏览器存储，未丢失。",
+  ],
+  [
+    /archive_draft_join_failed/i,
+    "归档草稿暂存未完成，请稍后重试。",
+  ],
   [
     /environment_login_busy/i,
     "该环境正在生成回复，请等它完成后再切换账号。",
@@ -532,9 +570,19 @@ function errorText(error: unknown): string {
   return "";
 }
 
-/** 将后端异常映射为不会暴露路径、密钥或认证正文的界面提示。 */
+/**
+ * 将后端异常映射为不会暴露路径、密钥或认证正文的界面提示。
+ * 例外（P11-5）：副环境删除残留目录的错误码自带完整路径
+ * （environment_delete_failed_residue:{path}）——路径就是用户手动清理的
+ * 目标，必须原样带出；须先于固定词表判定，否则 delete_failed 规则会
+ * 截胡并丢掉路径。
+ */
 export function safeUiErrorMessage(error: unknown, fallback: string): string {
   const text = errorText(error);
+  const residueMatch = /environment_delete_failed_residue:(.+)/i.exec(text);
+  if (residueMatch) {
+    return `环境已移除，但目录删除失败，请手动清理：${residueMatch[1].trim()}`;
+  }
   for (const [pattern, message] of KNOWN_ERROR_MESSAGES) {
     if (pattern.test(text)) return message;
   }

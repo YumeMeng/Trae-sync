@@ -1,46 +1,39 @@
 import { CalendarCheck, Layers, Settings2, UserRound } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Home } from "lucide-react";
-import type { ProductCapability } from "../platform/productRegistry";
+import type { SectionKey } from "../platform/productRegistry";
 
-// master-library 为主库详情页（P5-8a-2）：不在导航栏（从环境页主库卡进入，
-// 页内「返回」回环境页），故 navigationItems 不含它。
-export type AppPage =
-  | "overview"
-  | "accounts"
-  | "checkin"
-  | "environment"
-  | "master-library"
-  | "settings";
+// master-library 为主库详情页（P5-8a-2）：不在导航栏（Work CN 从环境页主库卡
+// 进入，Trae CN 从总览浏览入口进入），故 navigationItems 不含它。
+export type AppPage = SectionKey;
 
 interface NavigationRailProps {
   activePage: AppPage;
   onPageChange: (page: AppPage) => void;
-  capabilities: readonly ProductCapability[];
 }
 
 // 导航只负责切换页面；状态徽章统一收敛到标题栏，不再重复展示能力状态。
+// ADR-0032 决策 1：五页对所有产品开放（页面本体一致，区块按能力三态呈现），
+// 不再按产品过滤导航项；未适配区块以诚实说明卡承载。
 const navigationItems: Array<{
   page: AppPage;
   label: string;
   icon: LucideIcon;
-  capability: ProductCapability;
 }> = [
-  { page: "overview", label: "总览", icon: Home, capability: "overview" },
-  { page: "accounts", label: "账号", icon: UserRound, capability: "accounts" },
-  { page: "checkin", label: "签到", icon: CalendarCheck, capability: "checkin" },
-  { page: "environment", label: "环境", icon: Layers, capability: "environment" },
-  { page: "settings", label: "设置", icon: Settings2, capability: "settings" },
+  { page: "overview", label: "总览", icon: Home },
+  { page: "accounts", label: "账号", icon: UserRound },
+  { page: "checkin", label: "签到", icon: CalendarCheck },
+  { page: "environment", label: "环境", icon: Layers },
+  { page: "settings", label: "设置", icon: Settings2 },
 ];
 
 // 持久导航只切换产品工作区，不承载任何数据写入动作。
 // 52px 图标栏：文字不占栏内空间，hover 由 CSS 玻璃 tooltip（data-label）呈现。
-export function NavigationRail({ activePage, onPageChange, capabilities }: NavigationRailProps) {
-  const visibleItems = navigationItems.filter((item) => capabilities.includes(item.capability));
+export function NavigationRail({ activePage, onPageChange }: NavigationRailProps) {
   return (
     <aside className="navigation-rail" aria-label="主导航">
       <nav className="navigation-rail__nav">
-        {visibleItems.map((item) => {
+        {navigationItems.map((item) => {
           const active = activePage === item.page;
           return (
             <button

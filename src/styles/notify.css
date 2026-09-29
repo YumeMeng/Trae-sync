@@ -1,0 +1,122 @@
+/* 全局通知层（P11-1 切片①）：sonner Toaster 的毛玻璃主题。
+   发通知必须经 src/platform/notify.ts（sonner 唯一入口）；
+   类名统一 sonner- 前缀避免冲突，语义 token 只引用 tokens.css。
+
+   层序：z=40 高于内容(1)/热区条(5)/标题栏(10)/tooltip(30)，
+   低于模态遮罩(55+)；sonner 默认 z-index 999999999，必须压回。
+   顶部偏移由 App.tsx 的 Toaster offset prop 提供（标题栏 38px + 10px 间隙），
+   toast 面板整体落在标题栏下方，不遮挡拖拽区。
+
+   注意：sonner 在运行时向 <head> 注入默认样式（晚于本静态样式表，
+   同权重会压过本文件），故以下覆盖选择器一律用「属性 + 类」复合提权。 */
+
+/* —— 容器：压回层序，字体回到全局栈 —— */
+ol[data-sonner-toaster] {
+  z-index: 40;
+  font-family: inherit;
+}
+
+/* —— 面板：白玻璃（sonner 默认面板规则权重 0,2,0，此处 0,3,0 必胜） —— */
+[data-sonner-toast][data-styled="true"].sonner-toast {
+  padding: 11px 16px;
+  gap: 10px;
+  border: 1px solid var(--line-hair);
+  border-radius: 8px;
+  background: var(--glass-strong);
+  backdrop-filter: var(--glass-blur-strong);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  box-shadow: var(--shadow-float);
+  color: var(--text-1);
+  font-size: 13px;
+}
+
+/* 语义描边：颜色即状态（成功绿/失败红/警告琥珀/信息靛蓝），底色保持白玻璃。 */
+[data-sonner-toast][data-styled="true"].sonner-toast--success {
+  border-color: var(--ok-line);
+}
+
+[data-sonner-toast][data-styled="true"].sonner-toast--error {
+  border-color: var(--danger-line);
+}
+
+[data-sonner-toast][data-styled="true"].sonner-toast--warning {
+  border-color: var(--warn-line);
+}
+
+[data-sonner-toast][data-styled="true"].sonner-toast--info {
+  border-color: var(--accent-border);
+}
+
+/* —— 文字：标题/描述（覆盖 sonner 硬编码 #3f3f3f 等） —— */
+[data-sonner-toast][data-styled="true"].sonner-toast [data-title] {
+  color: var(--text-1);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+[data-sonner-toast][data-styled="true"].sonner-toast [data-description] {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.55;
+}
+
+/* —— 图标：lucide 语义色（svg 描边继承 currentColor） —— */
+.sonner-toast--success [data-icon] {
+  color: var(--ok);
+}
+
+.sonner-toast--error [data-icon] {
+  color: var(--danger);
+}
+
+.sonner-toast--warning [data-icon] {
+  color: var(--warn-dot);
+}
+
+.sonner-toast--info [data-icon] {
+  color: var(--accent);
+}
+
+/* —— 关闭按钮：玻璃系小圆钮（覆盖 sonner 灰阶默认） —— */
+[data-sonner-toast][data-styled="true"].sonner-toast [data-close-button] {
+  border: 1px solid var(--line-control);
+  background: var(--glass-solid);
+  color: var(--text-2);
+}
+
+[data-sonner-toast][data-styled="true"].sonner-toast:hover [data-close-button]:hover {
+  border-color: var(--line-hair);
+  background: var(--fill-strong);
+  color: var(--text-1);
+}
+
+/* —— 摘要富内容（notify.summary 的描述节点） —— */
+.sonner-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sonner-summary__ok {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.sonner-summary__issues {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sonner-summary__issue {
+  /* 名称与原因逐行展示，超长省略避免清单撑爆面板 */
+  overflow: hidden;
+  color: var(--text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

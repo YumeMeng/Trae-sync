@@ -26,6 +26,11 @@ function detail(page: Page): Locator {
   return page.getByRole("region", { name: "主库详情" });
 }
 
+// 全局通知 toast（sonner，P11-1 切片②）：通知类提示的统一断言目标。
+function notifyToast(page: Page, text: string | RegExp): Locator {
+  return page.locator("[data-sonner-toast]").filter({ hasText: text });
+}
+
 // 安装 mock bridge → 环境页 → 主库卡「详情」进入主库详情页（真实 UI 路径）。
 // 默认 tab 即对话列表；树是否渲染由各测试自行等待（引导态场景无树）。
 async function setup(page: Page, scenario: MockScenario = {}) {
@@ -232,10 +237,10 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     // 归档所选只先进入草稿，不立即写库或重启。
     await panel.getByTestId("batch-archive").click();
-    await expect(panel.getByTestId("action-notice")).toContainText("已加入待归档设置");
+    await expect(notifyToast(page, "已加入待归档设置")).toBeVisible();
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 2 个");
     await panel.getByTestId("archive-draft-apply").click();
-    await expect(panel.getByTestId("action-notice")).toContainText("已应用归档设置：归档 2 个");
+    await expect(notifyToast(page, "已应用归档设置：归档 2 个")).toBeVisible();
     // 应用后 p1 移空后行消失；未涉及的 p2 仍在；入口计数 3（s3 + 新归档 2）。
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
     await expect(panel.getByTestId("library-session-s1")).toHaveCount(0);
@@ -259,7 +264,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 2 个");
     await panel.getByTestId("archive-draft-apply").click();
-    await expect(panel.getByTestId("action-notice")).toContainText("已应用归档设置：归档 2 个");
+    await expect(notifyToast(page, "已应用归档设置：归档 2 个")).toBeVisible();
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
     await expect(panel.getByTestId("library-archive-entry")).toContainText("3");
   });
@@ -276,7 +281,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await expect(dialog).toContainText("删除 2 个会话");
     await expect(dialog).toContainText("共 17 条消息");
     await panel.getByTestId("delete-confirm-confirm").click();
-    await expect(panel.getByTestId("action-notice")).toContainText("已删除 2 个会话。");
+    await expect(notifyToast(page, "已删除 2 个会话。")).toBeVisible();
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
   });
 
@@ -292,7 +297,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 1 个");
     await panel.getByTestId("archive-draft-apply").click();
-    await expect(panel.getByTestId("action-notice")).toContainText("已应用归档设置：归档 1 个");
+    await expect(notifyToast(page, "已应用归档设置：归档 1 个")).toBeVisible();
     await expect(panel.getByTestId("library-session-s1")).toHaveCount(0);
     await expect(panel.getByTestId("library-archive-entry")).toContainText("2");
     await panel.getByTestId("library-archive-entry").click();
@@ -331,10 +336,8 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await panel.getByTestId("merge-target-p2").check();
     await panel.getByTestId("merge-confirm-confirm").click();
 
-    // 回执只用数量与动作结果表述（界面表达纪律）。
-    await expect(panel.getByTestId("action-notice")).toContainText(
-      "已把 2 个会话并入「项目贝塔」，清理 1 个空分组。",
-    );
+    // 回执只用数量与动作结果表述（界面表达纪律），走全局通知。
+    await expect(notifyToast(page, "已把 2 个会话并入「项目贝塔」，清理 1 个空分组。")).toBeVisible();
     // 合并后树内 p1 移空被清理；「未关联文件夹」组不受影响。
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
     const p2 = panel.getByTestId("library-project-p2");
@@ -371,9 +374,7 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await panel.getByTestId("batch-restore").click();
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("恢复 1 个");
     await panel.getByTestId("archive-draft-apply").click();
-    await expect(panel.getByTestId("action-notice")).toContainText(
-      "已应用归档设置：归档 0 个、恢复 1 个",
-    );
+    await expect(notifyToast(page, "已应用归档设置：归档 0 个、恢复 1 个")).toBeVisible();
     await expect(panel.getByTestId("library-archive-empty")).toContainText("没有已归档的会话");
 
     // 返回主列表：s3 归位 p2 分组。
@@ -508,9 +509,9 @@ test.describe("账号档案", () => {
 
     await accountCenter.getByTestId("account-refresh-credentials").click();
     await accountCenter.getByTestId("account-refresh-credentials-confirm-confirm").click();
-    await expect(accountCenter.getByTestId("operation-result-card")).toContainText(
-      "凭据刷新完成：2 个账号正常。",
-    );
+    // 批量结果走全局通知（sonner toast：标题 + 成功数）。
+    await expect(notifyToast(page, "凭据刷新完成")).toBeVisible();
+    await expect(notifyToast(page, "成功 2 项")).toBeVisible();
 
     const calls = await page.evaluate(() => (window as any).__mockCommandCalls as string[]);
     expect(calls).toContain("refresh_checkin_credentials");
@@ -529,7 +530,8 @@ test.describe("账号档案", () => {
     // 刷新凭据有二次确认弹层，确认后继续。
     await detailPage.getByTestId("account-detail-refresh-credentials").click();
     await detailPage.getByTestId("account-detail-credentials-confirm-confirm").click();
-    await expect(detailPage.getByRole("status")).toContainText("登录凭据已更新，无需重新登录。");
+    // 成功回执走全局通知（P11-1 切片②）。
+    await expect(notifyToast(page, "登录凭据已更新，无需重新登录。")).toBeVisible();
 
     const calls = await page.evaluate(() => (window as any).__mockCommandCalls as string[]);
     expect(calls.filter((call) => call === "refresh_checkin_credentials")).toHaveLength(1);

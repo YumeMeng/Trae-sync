@@ -32,36 +32,10 @@
   line-height: 1.55;
 }
 
-.checkin-page__message {
-  margin: 0;
-  padding: 10px 12px;
-  /* 正常态消息条：中性玻璃（绿色清剿） */
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  color: var(--text-2);
-  font-size: 13px;
-  line-height: 1.45;
-}
+/* 签到页消息条已由 notify 全局通知承载（P11-1 切片②），样式随迁清理。 */
 
-.checkin-page__empty {
-  margin-top: 5px;
-  color: var(--text-2);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.checkin-page__empty-actions {
-  display: grid;
-  gap: 12px;
-  justify-items: start;
-  padding: 16px;
-  border: 1px dashed var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--fill-soft);
-}
+/* 签到页空态已由共享 EmptyState 组件承载（P11-6 任务 4）：
+   checkin-page__empty / __empty-actions 仅保留测试钩子，不再承载样式。 */
 
 /* ============================================================
    U-3 签到页重设计（DESIGN_TOKENS 契约）：

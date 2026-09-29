@@ -19,6 +19,8 @@ import type {
 } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
+// 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
+import { notify } from "../platform/notify";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { RemoteDevicesPanel } from "./RemoteDevicesPanel";
 
@@ -51,8 +53,6 @@ type ConfirmableAction = "credentials" | "reset-device" | "remove";
  */
 export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSaveMobile, onBack }: AccountDetailProps) {
   const [busy, setBusy] = useState<DetailAction>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
   // 待确认操作：非空即弹出统一确认弹层（ConfirmDialog）。
   const [pendingAction, setPendingAction] = useState<ConfirmableAction | null>(null);
   // U-1 备注名草稿：进入详情时以档案值为准；外部数据刷新时同步重置。
@@ -66,14 +66,14 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
     setMobileDraft(entry.mobile_full ?? "");
   }, [entry.mobile_full, entry.profile_id]);
 
+  // 详情页操作统一骨架：busy 锁 + 成功回执与失败原因均走全局通知
+  // （一次性结果，离开页面后仍可见；页面不再保留常驻 message/error 段落）。
   const runAction = useCallback(async (action: Exclude<DetailAction, null>, task: () => Promise<void>) => {
     setBusy(action);
-    setError(null);
-    setMessage(null);
     try {
       await task();
     } catch (reason: unknown) {
-      setError(safeUiErrorMessage(reason, "操作未完成，请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, "操作未完成，请稍后重试。"));
     } finally {
       setBusy(null);
     }
@@ -87,7 +87,7 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
       displayName: aliasDraft.trim() || null,
     });
     await onDataChanged();
-    setMessage(aliasDraft.trim() ? "备注名已保存。" : "备注名已清除，恢复服务端名称。");
+    notify.success(aliasDraft.trim() ? "备注名已保存。" : "备注名已清除，恢复服务端名称。");
   }), [aliasDraft, entry.profile_id, onDataChanged, runAction]);
 
   // G11 保存手机号：非空 = 补录全号（父组件做查重提示）；空 = 清除（回退脱敏号）。
@@ -95,7 +95,7 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
   const handleSaveMobile = useCallback(() => void runAction("mobile", async () => {
     const saved = await onSaveMobile(mobileDraft.trim());
     if (saved) {
-      setMessage(mobileDraft.trim() ? "手机号已保存。" : "已清除补录的手机号，恢复显示脱敏号。");
+      notify.success(mobileDraft.trim() ? "手机号已保存。" : "已清除补录的手机号，恢复显示脱敏号。");
     }
   }), [mobileDraft, onSaveMobile, runAction]);
 
@@ -112,7 +112,7 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
     const usage = result?.usage_remaining_credits !== null && result?.usage_remaining_credits !== undefined
       ? formatCreditsValue(result.usage_remaining_credits)
       : "未知";
-    setMessage(`额度已更新：模型积分 ${usage}（今日${result?.checked_in ? "已签" : "未签"}）。`);
+    notify.success(`额度已更新：模型积分 ${usage}（今日${result?.checked_in ? "已签" : "未签"}）。`);
   }), [entry.profile_id, onDataChanged, runAction]);
 
   // 手动刷新登录凭据：只执行同设备换发，成功后写回本机加密凭据与 TRAE 登录 blob。
@@ -183,13 +183,13 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
           throw new Error(result?.error_code ?? "credential_refresh_failed");
         }
         await onDataChanged();
-        setMessage("登录凭据已更新，无需重新登录。");
+        notify.success("登录凭据已更新，无需重新登录。");
       });
     } else if (action === "reset-device") {
       void runAction("reset-device", async () => {
         await invoke("reset_checkin_device", { profileId: entry.profile_id });
         await onDataChanged();
-        setMessage("签到设备已重置，下次签到将使用新设备。");
+        notify.success("签到设备已重置，下次签到将使用新设备。");
       });
     } else {
       void runAction("remove", async () => {
@@ -209,9 +209,9 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
     if (first?.outcome === "claimed") {
       // status.credits 为静态池值，不反映签到奖励（实证恒 200）；
       // 成功的权威信号是 claimed + checked_in 翻转，不展示增量。
-      setMessage("签到成功，奖励已发放。");
+      notify.success("签到成功，奖励已发放。");
     } else if (first?.outcome === "already_checked_in") {
-      setMessage("今日已签到，无需重复领取。");
+      notify.info("今日已签到，无需重复领取。");
     } else if (first?.detail_code) {
       // 原始业务码抛出，由 safeUiErrorMessage 映射文案
       // （ADR-0019：业务码不得压平）。
@@ -224,7 +224,7 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
   const handleRelogin = useCallback(() => {
     void runAction("relogin", async () => {
       await onRelogin();
-      setMessage("重新登录完成，登录凭据已更新。");
+      notify.success("重新登录完成，登录凭据已更新。");
     });
   }, [onRelogin, runAction]);
 
@@ -238,9 +238,6 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
           <h1 data-page-title="accounts" tabIndex={-1}>{effectiveDisplayName(entry)}</h1>
         </div>
       </header>
-
-      {error && <p className="workbench__error" role="alert">{error}</p>}
-      {message && <p className="account-detail__message" role="status">{message}</p>}
 
       {/* 基础信息：备注名（行内编辑）、手机号、额度、今日状态、时间与设备 */}
       <section className="account-detail__section" aria-labelledby="account-detail-basic">
@@ -393,7 +390,7 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
                 enabled: !entry.auto_checkin_enabled,
               });
               await onDataChanged();
-              setMessage(!entry.auto_checkin_enabled ? "已加入每日自动签到。" : "已退出每日自动签到。");
+              notify.success(!entry.auto_checkin_enabled ? "已加入每日自动签到。" : "已退出每日自动签到。");
             })}
           />
           <span className="account-center__profile-copy">

@@ -1,4 +1,4 @@
-﻿import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { PluginWorkbench } from "../src/components/PluginWorkbench";
@@ -9,7 +9,25 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+// P11-1 切片②：安装/移除结果等一次性提示已迁到 notify；断言 notify 调用。
+vi.mock("../src/platform/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/platform/notify")>();
+  return {
+    ...actual,
+    notify: {
+      success: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: vi.fn(),
+    },
+  };
+});
+
+import { notify } from "../src/platform/notify";
+
 const mockInvoke = vi.mocked(invoke);
+const notifyMock = vi.mocked(notify);
 
 function tabState(overrides: Partial<PluginTabStateDto> = {}): PluginTabStateDto {
   return {
@@ -266,6 +284,9 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
       }));
     });
     await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("已安装 插件二。");
+    });
+    await waitFor(() => {
       expect(screen.getByTestId("plugin-market-installed-uuid-p2")).toBeVisible();
     });
   });
@@ -308,11 +329,13 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
         recordId: "rec-1",
       });
     });
-    // 卸载后行消失 + 回执列明账号数。
+    // 卸载后行消失 + 批量摘要通知列明成功账号数。
     await waitFor(() => {
       expect(screen.queryByTestId("plugin-row-rec-1")).not.toBeInTheDocument();
     });
-    expect(screen.getByTestId("plugin-notice")).toHaveTextContent("已从 2 个账号移除 插件一");
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith("已移除 插件一", [], 2);
+    });
   });
 
   it("卸载回执透出部分失败（fail-soft：列明失败账号）", async () => {
@@ -331,8 +354,10 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
     fireEvent.click(screen.getByTestId("plugin-uninstall-confirm-confirm"));
 
     await waitFor(() => {
-      expect(screen.getByTestId("plugin-notice")).toHaveTextContent(
-        "已从 1 个账号移除 插件一；账号乙 移除失败",
+      expect(notifyMock.summary).toHaveBeenCalledWith(
+        "已移除 插件一",
+        [{ displayName: "账号乙", reason: "移除失败，可稍后重试。" }],
+        1,
       );
     });
   });
@@ -359,8 +384,11 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
     });
     render(<PluginWorkbench active />);
 
-    const alert = await screen.findByTestId("plugin-error");
-    expect(alert).toHaveTextContent("主库当前没有已登录账号");
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith(
+        "主库当前没有已登录账号，无法读取插件状态；请先在环境页确认账号。",
+      );
+    });
   });
 
   it("市场目录读取失败不阻断已装列表（分类列留空，fail-soft）", async () => {

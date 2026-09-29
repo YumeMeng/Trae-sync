@@ -10,7 +10,25 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 
+// P11-1 切片②：操作结果类提示已迁到 notify 适配层；断言 notify 调用而非页内文本。
+vi.mock("../src/platform/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/platform/notify")>();
+  return {
+    ...actual,
+    notify: {
+      success: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: vi.fn(),
+    },
+  };
+});
+
+import { notify } from "../src/platform/notify";
+
 const mockInvoke = vi.mocked(invoke);
+const notifyMock = vi.mocked(notify);
 
 function envState(overrides: Partial<EnvironmentStateDto> = {}): EnvironmentStateDto {
   return {
@@ -135,7 +153,7 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     expect(mockInvoke).not.toHaveBeenCalledWith("get_master_library_stats");
   });
 
-  it("G18：自检展示四级结果，可把缓存纠正为实测账号", async () => {
+  it("P11-5：主库体检整合区块自动渲染登录健康四项，可纠正缓存", async () => {
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_environment_state") return envState();
       if (command === "get_master_self_check") {
@@ -157,17 +175,44 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     });
     render(<EnvironmentPage active />);
 
-    fireEvent.click(await screen.findByTestId("env-master-self-check"));
-    const report = await screen.findByTestId("env-self-check");
-    expect(report).toHaveTextContent("可自愈");
+    // 自检报告随体检自动读取（原独立「自检」按钮已移除）。
+    const report = await screen.findByTestId("env-checkup");
+    expect(report).toHaveTextContent("主库体检");
+    expect(report).toHaveTextContent("登录健康：可自愈");
     expect(report).toHaveTextContent("读校验");
     expect(report).toHaveTextContent("一致性");
     expect(report).toHaveTextContent("可切换");
     expect(report).toHaveTextContent("深度检查");
+    // 纠正入口仍可用：纠正后整组重读（含自检报告）。
     fireEvent.click(screen.getByTestId("env-self-check-repair"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("repair_master_current_account");
     });
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.filter(([command]) => command === "get_master_self_check").length,
+      ).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it("P11-5：独立「自检」入口已移除，报告读取失败时登录健康分组降级", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "get_master_checkup") {
+        return { status: "ready", current_account_name: "账号甲", accounts: [], orphan_project_count: 0, orphan_session_count: 0 };
+      }
+      // 自检读取失败（reject）→ 降级为 null，不阻塞库内容分组。
+      if (command === "get_master_self_check") throw new Error("trae_real_mode_required");
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    await screen.findByTestId("env-checkup");
+    expect(screen.queryByTestId("env-master-self-check")).not.toBeInTheDocument();
+    expect(screen.getByTestId("env-checkup-login")).toHaveTextContent("登录健康暂时无法读取。");
+    // 库内容分组不受登录健康失败影响。
+    expect(screen.getByTestId("env-checkup-content")).toHaveTextContent(
+      "暂未发现滞留记录，账号记录分布正常。",
+    );
   });
 
   it("P5-4：主库统计读取失败时统计格整体不渲染（可插拔降级）", async () => {
@@ -202,7 +247,7 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     };
   }
 
-  it("P5-5：体检发现滞留账号时渲染体检区块（数量表述 + 账号名主信息）", async () => {
+  it("P11-5：体检库内容分组——滞留账号诊断行 + 收编入口（数量表述 + 账号名主信息）", async () => {
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_environment_state") return envState();
       if (command === "get_master_checkup") return checkupReport();
@@ -223,8 +268,8 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     expect(screen.getByTestId("env-incorporate-entry")).toBeInTheDocument();
   });
 
-  it("P5-5：体检无滞留或读取失败时区块静默不渲染", async () => {
-    // 场景 1：分布里只有当前账号（无滞留）。
+  it("P11-5：库内容无滞留时显示正常态提示，读取失败且无自检报告时区块静默", async () => {
+    // 场景 1：分布里只有当前账号（无滞留）→ 库内容分组显示正常态。
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_environment_state") return envState();
       if (command === "get_master_checkup") {
@@ -233,11 +278,13 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       return undefined;
     });
     const { unmount } = render(<EnvironmentPage active />);
-    await screen.findByTestId("env-master-card");
-    expect(screen.queryByTestId("env-checkup")).not.toBeInTheDocument();
+    await screen.findByTestId("env-checkup-content-ok");
+    expect(screen.getByTestId("env-checkup-content-ok")).toHaveTextContent(
+      "暂未发现滞留记录，账号记录分布正常。",
+    );
     unmount();
 
-    // 场景 2：体检读取失败（reject）→ 静默降级，环境页本体不受影响。
+    // 场景 2：体检读取失败（reject）且无自检报告 → 区块整体静默，环境页不受影响。
     mockInvoke.mockImplementation(async (command: string) => {
       if (command === "get_environment_state") return envState();
       if (command === "get_master_checkup") throw new Error("trae_real_mode_required");
@@ -322,14 +369,17 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       expect(mockInvoke).toHaveBeenCalledWith("cleanup_master_empty_projects");
     });
 
-    // 成功后弹层关闭、展示结果消息（数量表述）并刷新体检。
-    expect(await screen.findByRole("status")).toHaveTextContent("已删除 2 个空项目记录（已自动备份）。");
+    // 成功后弹层关闭、结果消息走 notify（数量表述）并刷新体检。
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("已删除 2 个空项目记录（已自动备份）。");
+    });
     expect(screen.queryByTestId("env-cleanup-empty-projects-dialog")).not.toBeInTheDocument();
     await waitFor(() => {
       expect(checkupCalls).toBeGreaterThanOrEqual(2);
     });
+    // P11-5：整合区块常驻，清理后库内容分组翻为正常态提示。
     await waitFor(() => {
-      expect(screen.queryByTestId("env-checkup")).not.toBeInTheDocument();
+      expect(screen.getByTestId("env-checkup-content-ok")).toBeInTheDocument();
     });
   });
 
@@ -351,10 +401,10 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     await screen.findByTestId("env-checkup");
     fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-entry"));
     fireEvent.click(await screen.findByTestId("env-cleanup-empty-projects-dialog-confirm"));
-    // 失败提示：错误码映射后的用户文案（无底层码泄露）。
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("主库正在生成回复，清理需等它完成；稍后重试即可。");
-    expect(alert).not.toHaveTextContent("cleanup_master_busy");
+    // 失败提示：错误码映射后的用户文案（无底层码泄露），走 notify.error。
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith("主库正在生成回复，清理需等它完成；稍后重试即可。");
+    });
     // 弹层已关闭，体检区块保留（数据未变，可重试）。
     expect(screen.queryByTestId("env-cleanup-empty-projects-dialog")).not.toBeInTheDocument();
     expect(screen.getByTestId("env-checkup")).toBeInTheDocument();
@@ -408,10 +458,12 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     fireEvent.click(await screen.findByTestId("env-cleanup-empty-projects-dialog-confirm"));
 
     // 成功回执 + 重启失败：据实提示已删除与补救入口，不出现"清理未完成"。
-    expect(await screen.findByRole("status")).toHaveTextContent(
-      "已删除 1 个空项目记录（已自动备份）；主库 TRAE 未能自动启动，可从环境页重新打开。",
-    );
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已删除 1 个空项目记录（已自动备份）；主库 TRAE 未能自动启动，可从环境页重新打开。",
+      );
+    });
+    expect(notifyMock.error).not.toHaveBeenCalled();
   });
 
   it("P5-5：一键收编全流程（确认规模 → 进度事件 → 完成回执 → 刷新体检）", async () => {
@@ -447,22 +499,23 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     fireEvent.click(screen.getByTestId("incorporate-cancel"));
     expect(screen.queryByTestId("incorporate-dialog")).not.toBeInTheDocument();
 
-    // 重新进入并确认：注册进度监听 → invoke 收编。
+    // 重新进入并确认：注册进度监听 → invoke 收编（主库不带 libraryId）。
     fireEvent.click(screen.getByTestId("env-incorporate-entry"));
     fireEvent.click(await screen.findByTestId("incorporate-confirm"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("incorporate_master_records");
+      expect(mockInvoke).toHaveBeenCalledWith("incorporate_master_records", undefined);
     });
     await waitFor(() => {
       expect(mockListen).toHaveBeenCalledWith("master-incorporate-progress", expect.any(Function));
     });
 
     // 推进进度事件到「归入记录」阶段：对应步骤高亮为 run。
+    // P11-5 收官：进度载荷带 env_id，弹层只推进自己目标的事件。
     const progressHandler = mockListen.mock.calls.find(
       (call) => call[0] === "master-incorporate-progress",
-    )?.[1] as (event: { payload: { stage: string } }) => void;
+    )?.[1] as (event: { payload: { stage: string; env_id: string } }) => void;
     await act(async () => {
-      progressHandler({ payload: { stage: "incorporating" } });
+      progressHandler({ payload: { stage: "incorporating", env_id: "master" } });
     });
     expect(screen.getByTestId("incorporate-dialog")).toHaveTextContent("归入记录");
 
@@ -484,14 +537,15 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       );
     });
 
-    // 完成后刷新体检（get_master_checkup 至少 2 次）→ 体检区块消失。
+    // 完成后刷新体检（get_master_checkup 至少 2 次）→ 滞留诊断清零。
     await waitFor(() => {
       expect(mockInvoke.mock.calls.filter(([command]) => command === "get_master_checkup").length).toBeGreaterThanOrEqual(2);
     });
     fireEvent.click(screen.getByTestId("incorporate-done"));
     expect(screen.queryByTestId("incorporate-dialog")).not.toBeInTheDocument();
+    // P11-5：整合区块常驻，收编后库内容分组翻为正常态提示。
     await waitFor(() => {
-      expect(screen.queryByTestId("env-checkup")).not.toBeInTheDocument();
+      expect(screen.getByTestId("env-checkup-content-ok")).toBeInTheDocument();
     });
   });
 
@@ -585,6 +639,85 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     expect(screen.getByTestId("env-launch-env-x1")).toHaveTextContent("启动");
     // 空态提示不渲染（已有辅助环境）。
     expect(screen.queryByTestId("env-placeholder")).not.toBeInTheDocument();
+  });
+
+  it("P11-5 收官：副环境体检区块有差异才显示，归入按钮按库发起收编", async () => {
+    const secondaryCheckup = {
+      status: "ready",
+      current_account_name: "账号乙",
+      accounts: [
+        { user_id: "user-b", account_name: "账号乙", registered: true, current: true, project_count: 1, session_count: 2, empty_project_count: 0 },
+        { user_id: "user-c", account_name: "未登记账号", registered: false, current: false, project_count: 2, session_count: 3, empty_project_count: 1 },
+      ],
+      orphan_project_count: 1,
+      orphan_session_count: 0,
+    };
+    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "list_environments") return [envListItem(), secondaryEnv()];
+      if (command === "get_master_checkup") {
+        // 带副环境 libraryId 的体检 → 副环境报告；缺省 → 主库报告。
+        return (args as { libraryId?: string } | undefined)?.libraryId === "env-x1"
+          ? secondaryCheckup
+          : checkupReport();
+      }
+      if (command === "incorporate_master_records") return {
+        merged_accounts: 1,
+        transferred_projects: 2,
+        removed_mirror_rows: 0,
+        switched_sessions: 3,
+        backup_path: "C:\\bak\\switch-bak-42",
+        relay_ledger_written: true,
+        relaunch_outcome: "launched",
+      };
+      return undefined;
+    });
+    const onOpenLibraryDetail = vi.fn();
+    render(<EnvironmentPage active onOpenLibraryDetail={onOpenLibraryDetail} />);
+    // 体检区块（有差异）：登录健康只显示注册表账号（不出自检四项）。
+    const checkup = await screen.findByTestId("env-checkup-env-x1");
+    expect(checkup).toHaveTextContent("测试环境体检");
+    expect(screen.getByTestId("env-checkup-login-env-x1")).toHaveTextContent("当前登录：账号乙");
+    expect(checkup).toHaveTextContent("有 1 个账号的 3 个会话在此环境中");
+    // 归入按钮在副环境卡上。
+    fireEvent.click(screen.getByTestId(`env-incorporate-env-x1`));
+    const dialog = await screen.findByTestId("incorporate-dialog");
+    expect(dialog).toHaveTextContent("「测试环境」会自动关闭并重启");
+    // 确认后按库发起收编（libraryId = env_id）。
+    fireEvent.click(screen.getByTestId("incorporate-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("incorporate_master_records", { libraryId: "env-x1" });
+    });
+    // 查看详情入口携带环境引用。
+    fireEvent.click(screen.getByTestId("env-detail-env-x1"));
+    expect(onOpenLibraryDetail).toHaveBeenCalledWith({ id: "env-x1", displayName: "测试环境" });
+  });
+
+  it("P11-5 收官：副环境体检无差异时不显示体检区块", async () => {
+    const cleanSecondaryCheckup = {
+      status: "ready",
+      current_account_name: "账号乙",
+      accounts: [
+        { user_id: "user-b", account_name: "账号乙", registered: true, current: true, project_count: 1, session_count: 2, empty_project_count: 0 },
+      ],
+      orphan_project_count: 0,
+      orphan_session_count: 0,
+    };
+    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "list_environments") return [envListItem(), secondaryEnv()];
+      if (command === "get_master_checkup") {
+        return (args as { libraryId?: string } | undefined)?.libraryId === "env-x1"
+          ? cleanSecondaryCheckup
+          : checkupReport();
+      }
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    await screen.findByTestId("env-card-env-x1");
+    // 无差异：副环境卡无体检区块（主库体检区块照常显示）。
+    expect(screen.queryByTestId("env-checkup-env-x1")).not.toBeInTheDocument();
+    expect(screen.getByTestId("env-checkup")).toBeInTheDocument();
   });
 
   it("P6-4：创建环境全流程（输入名称 → 确认 → invoke create_environment）", async () => {
@@ -797,5 +930,110 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       return node;
     });
     expect(dialog).not.toHaveTextContent("environment_delete_running");
+  });
+
+  // ===== P11-5 关闭环境实例 =====
+
+  it("P11-5：主库运行中显示关闭按钮，确认弹层后调用关闭命令并刷新状态", async () => {
+    let closeCalls = 0;
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") {
+        // 关闭成功后重读：运行态翻转为停止（5 秒轮询之外的主动校准）。
+        return envState({ running: closeCalls > 0 ? false : true });
+      }
+      if (command === "close_environment_instance") {
+        closeCalls += 1;
+        return { outcome: "closed" };
+      }
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    // 运行中 → 关闭按钮出现（与启动/聚焦同区）。
+    fireEvent.click(await screen.findByTestId("env-master-close"));
+    // 确认弹层：说明将关闭该环境的 TRAE 实例。
+    const dialog = await screen.findByTestId("env-close-dialog");
+    expect(dialog).toHaveTextContent("将关闭「主库」正在运行的 TRAE 实例。");
+    fireEvent.click(screen.getByTestId("env-close-dialog-cancel"));
+    expect(screen.queryByTestId("env-close-dialog")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("close_environment_instance", expect.anything());
+
+    // 确认 → 关闭命令 + 按 outcome 反馈 + 刷新。
+    fireEvent.click(await screen.findByTestId("env-master-close"));
+    fireEvent.click(await screen.findByTestId("env-close-dialog-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("close_environment_instance", { envId: "master" });
+    });
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("已关闭「主库」的 TRAE 实例。");
+    });
+    // 关闭后运行态刷新为停止：按钮随运行态隐藏。
+    await waitFor(() => {
+      expect(screen.queryByTestId("env-master-close")).not.toBeInTheDocument();
+    });
+  });
+
+  it("P11-5：副环境关闭按钮仅运行中显示，强制结束与未运行回执各自反馈", async () => {
+    // 场景 1：未运行 → 关闭按钮不出现。
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: false })];
+      return undefined;
+    });
+    const first = render(<EnvironmentPage active />);
+    await screen.findByTestId("env-card-env-x1");
+    expect(screen.queryByTestId("env-close-env-x1")).not.toBeInTheDocument();
+    first.unmount();
+
+    // 场景 2：运行中 → 确认后强制结束回执（force_closed）反馈。
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: true })];
+      if (command === "close_environment_instance") return { outcome: "force_closed" };
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    fireEvent.click(await screen.findByTestId("env-close-env-x1"));
+    const dialog = await screen.findByTestId("env-close-dialog");
+    expect(dialog).toHaveTextContent("将关闭「测试环境」正在运行的 TRAE 实例。");
+    fireEvent.click(screen.getByTestId("env-close-dialog-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("close_environment_instance", { envId: "env-x1" });
+    });
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("「测试环境」未能自动退出，已强制结束进程。");
+    });
+  });
+
+  it("P11-5：关闭时环境已自行退出按幂等提示，不报错", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: true })];
+      if (command === "close_environment_instance") return { outcome: "not_running" };
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    fireEvent.click(await screen.findByTestId("env-close-env-x1"));
+    fireEvent.click(await screen.findByTestId("env-close-dialog-confirm"));
+    await waitFor(() => {
+      expect(notifyMock.info).toHaveBeenCalledWith("「测试环境」当前没有运行中的实例。");
+    });
+    expect(notifyMock.error).not.toHaveBeenCalled();
+  });
+
+  it("P11-5：关闭失败走错误码映射（notify.error）", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_environment_state") return envState();
+      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: true })];
+      if (command === "close_environment_instance") throw new Error("environment_close_failed");
+      return undefined;
+    });
+    render(<EnvironmentPage active />);
+    fireEvent.click(await screen.findByTestId("env-close-env-x1"));
+    fireEvent.click(await screen.findByTestId("env-close-dialog-confirm"));
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith(
+        "TRAE 实例未能关闭，请稍后重试，或在 TRAE 窗口内直接退出。",
+      );
+    });
   });
 });

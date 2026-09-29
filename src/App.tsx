@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { WorkspaceStateDto } from "./types/workspace";
 import { TitleBar } from "./components/TitleBar";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -9,14 +10,17 @@ import { EnvironmentPage } from "./components/EnvironmentPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
+import type { LibraryRef } from "./components/LibrarySessionsPanel";
 import {
   PRODUCT_DEFINITIONS,
+  detailLibraryRefFor,
   productDefinitionOf,
   workspaceStateForProduct,
   type ProductCapability,
   type ProductId,
 } from "./platform/productRegistry";
 import { accountAdapterFor } from "./platform/accountAdapter";
+import { notify, Toaster } from "./platform/notify";
 import { safeUiErrorMessage } from "./utils/safeUiError";
 
 // stagger 重放守卫（T9，2026-08-27）：这些列表的进场动画只播首批。
@@ -25,8 +29,16 @@ import { safeUiErrorMessage } from "./utils/safeUiError";
 const STAGGER_LISTS = ["account-list", "account-card-grid", "checkin-flow"];
 const playedStaggerLists = new Set<string>();
 
-// 应用根组件：导航工作区由当前产品能力清单生成；
-// Work CN 保留完整工作区，Trae CN 首阶段只显示账号适配页。
+/** 自动签到批次完成事件（auto-checkin-finished）载荷（与后端 DTO 同口径）。 */
+interface AutoCheckinFinishedEvent {
+  total: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+}
+
+// 应用根组件：导航工作区五页对所有产品开放（ADR-0032）；
+// 各页内容按产品注册表能力三态呈现，Work CN 与 Trae CN 页面本体一致。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -43,20 +55,41 @@ export default function App() {
   // 工作台刷新按请求代次收口，避免撤销授权后的旧响应覆盖新状态。
   const workspaceRefreshGenerationRef = useRef(0);
   const mountedRef = useRef(true);
+  // P11-5 收官：库详情页当前展示的库实例（null = 主库；副环境 = 环境页
+  //「查看详情」入口注入 env_id 与环境名）。与 activePage "master-library"
+  // 同一页面槽位承载主库/副库两种详情（导航模式与主库详情一致）。
+  const [libraryDetail, setLibraryDetail] = useState<LibraryRef | null>(null);
 
   const selectedProduct = productDefinitionOf(selectedProductId);
   const accountAdapter = useMemo(
     () => accountAdapterFor(selectedProductId),
     [selectedProductId],
   );
+  // 主库详情页的库实例（ADR-0032 决策 5）：Trae CN 固定只读数据根；
+  // Work CN 沿用环境页入口注入（缺省主库）。
+  const detailLibrary = detailLibraryRefFor(selectedProductId, libraryDetail);
   const selectedState = state
     ? workspaceStateForProduct(state, selectedProduct)
     : null;
 
   const handlePageChange = useCallback((page: AppPage) => {
+    // 离开库详情页即重置库实例引用，避免下次进入主库详情残留副库上下文。
+    if (page !== "master-library") setLibraryDetail(null);
     setActivePage(page);
     setProductPages((current) => ({ ...current, [selectedProductId]: page }));
   }, [selectedProductId]);
+
+  /** 主库详情入口（主库卡「详情」）：清空副库引用后进入。 */
+  const handleOpenMasterDetail = useCallback(() => {
+    setLibraryDetail(null);
+    handlePageChange("master-library");
+  }, [handlePageChange]);
+
+  /** 副库详情入口（副环境卡「查看详情」）：携带环境引用进入同一详情页。 */
+  const handleOpenLibraryDetail = useCallback((library: LibraryRef) => {
+    setLibraryDetail(library);
+    handlePageChange("master-library");
+  }, [handlePageChange]);
 
   const handleProductChange = useCallback((productId: ProductId) => {
     const product = productDefinitionOf(productId);
@@ -95,6 +128,29 @@ export default function App() {
       workspaceRefreshGenerationRef.current += 1;
     };
   }, [refreshWorkspaceState]);
+
+  useEffect(() => {
+    // 自动签到跨页完成摘要（P11-1 切片②）：此前只有签到页监听该事件，
+    // 用户离开签到页就看不到批次结果。App 级监听保证任意页面都能收到。
+    // finished 载荷只有计数（无逐账号名单），失败/跳过计数收进标题，
+    // notify.summary 的"成功 N 项"承载完成数；逐账号明细仍由签到页展示。
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void listen<AutoCheckinFinishedEvent>("auto-checkin-finished", (event) => {
+      const { completed, failed, skipped } = event.payload;
+      const suffix = failed > 0
+        ? `（失败 ${failed}${skipped > 0 ? `，跳过 ${skipped}` : ""}）`
+        : skipped > 0 ? `（跳过 ${skipped}）` : "";
+      notify.summary(`今日自动签到完成${suffix}`, [], completed);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    }).catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     // 导航切换后把焦点送到当前页面标题，避免键盘用户停留在旧页面的导航按钮上。
@@ -188,18 +244,15 @@ export default function App() {
         onProductChange={handleProductChange}
       />
       <div className="app-body">
-        <NavigationRail
-          activePage={activePage}
-          onPageChange={handlePageChange}
-          capabilities={selectedProduct.capabilities}
-        />
+        <NavigationRail activePage={activePage} onPageChange={handlePageChange} />
         <main id="main-content" className="app-main" ref={mainRef}>
-          {selectedState && selectedProductId === "work_cn" && (
+          {selectedState && (
             <div className="app-page" hidden={activePage !== "overview"}>
               <OverviewPage
                 state={selectedState}
                 active={activePage === "overview"}
                 onNavigate={handlePageChange}
+                product={selectedProductId}
               />
             </div>
           )}
@@ -209,27 +262,43 @@ export default function App() {
               adapter={accountAdapter}
             />
           </div>
-          {selectedProductId === "work_cn" && (
-            <>
-              <div className="app-page" hidden={activePage !== "checkin"}>
-                <CheckinPage active={activePage === "checkin"} onNavigate={handlePageChange} />
-              </div>
-              <div className="app-page" hidden={activePage !== "environment"}>
-                <EnvironmentPage
-                  active={activePage === "environment"}
-                  onOpenMasterDetail={() => handlePageChange("master-library")}
-                />
-              </div>
-              <div className="app-page" hidden={activePage !== "master-library"}>
-                <MasterLibraryDetail active={activePage === "master-library"} onNavigate={handlePageChange} />
-              </div>
-              <div className="app-page" hidden={activePage !== "settings"}>
-                <SettingsPanel active={activePage === "settings"} />
-              </div>
-            </>
-          )}
+          <div className="app-page" hidden={activePage !== "checkin"}>
+            <CheckinPage
+              active={activePage === "checkin"}
+              onNavigate={handlePageChange}
+              product={selectedProductId}
+            />
+          </div>
+          <div className="app-page" hidden={activePage !== "environment"}>
+            <EnvironmentPage
+              active={activePage === "environment"}
+              onOpenMasterDetail={handleOpenMasterDetail}
+              onOpenLibraryDetail={handleOpenLibraryDetail}
+              product={selectedProductId}
+            />
+          </div>
+          <div className="app-page" hidden={activePage !== "master-library"}>
+            <MasterLibraryDetail
+              active={activePage === "master-library"}
+              onNavigate={handlePageChange}
+              library={detailLibrary}
+            />
+          </div>
+          <div className="app-page" hidden={activePage !== "settings"}>
+            <SettingsPanel active={activePage === "settings"} />
+          </div>
         </main>
       </div>
+      {/* 全局通知层（P11-1 切片①）：唯一渲染点。发通知须经 platform/notify。
+          顶部下移 48px（标题栏 38px + 10px 间隙），toast 不遮挡标题栏拖拽区；
+          悬停暂停为 sonner 2.x 内建默认（pauseOnHover prop 已随 2.0 移除）；
+          不抢焦点（sonner 默认 aria-live polite）。 */}
+      <Toaster
+        position="top-center"
+        visibleToasts={4}
+        closeButton
+        offset={{ top: 48, bottom: 48 }}
+      />
       {/* 窗口边缘拖动热区：四周 5px 透明条（配合标题栏）让整圈边缘都能拖动/双击最大化窗口。
           顶部无需单独热区（标题栏整行已是拖拽区）；元素本身命中才触发 drag-region，
           z=5 低于弹层，模态遮罩打开时热区自然被覆盖。 */}

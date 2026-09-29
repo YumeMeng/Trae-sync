@@ -27,14 +27,8 @@
   }
 }
 
-/* “我的账号”空状态引导区：文案 + 添加账号主按钮 */
-.account-center__empty-actions {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 10px;
-  margin-top: 5px;
-}
+/* 「我的账号」空状态引导已由共享 EmptyState 组件承载（P11-6 任务 4）：
+   account-center__empty / __empty-actions 仅保留测试钩子，不再承载样式。 */
 
 /* 账号档案是设置页中的独立工作区，不再嵌套第二个页面面板。 */
 .account-center {
@@ -300,57 +294,7 @@
   line-height: 1.45;
 }
 
-/* G9 健康检测/刷新额度结果卡：首行结论 + 异常账号清单（正常账号不占空间）。 */
-.result-card {
-  display: grid;
-  gap: 8px;
-  padding: 12px 14px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-}
-
-.result-card__headline {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--text-2);
-}
-
-.result-card__issues {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-/* 异常行：名字 + 一句原因；琥珀左缘提示"需关注"，与徽章四色语义一致。 */
-.result-card__issue {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 8px;
-  border-left: 2px solid var(--warn, #b45309);
-  border-radius: 4px;
-  background: var(--glass-dense);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.result-card__issue-name {
-  flex: 0 0 auto;
-  font-weight: 600;
-  color: var(--text-1);
-}
-
-.result-card__issue-reason {
-  flex: 1 1 auto;
-  min-width: 0;
-  color: var(--text-2);
-}
+/* G9 结果卡已由 notify.summary 全局通知承载（P11-1 切片②），页内样式随迁清理。 */
 
 .account-center__handoff,
 .account-center__key-status,
@@ -529,8 +473,7 @@
   font-size: 14px;
 }
 
-.account-center__boundary p,
-.account-center__empty {
+.account-center__boundary p {
   margin-top: 5px;
   color: var(--text-2);
   font-size: 13px;
@@ -1067,17 +1010,7 @@
   gap: 16px;
 }
 
-.account-detail__message {
-  margin: 0;
-  padding: 10px 12px;
-  /* 正常态消息条：中性玻璃（绿色清剿） */
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  color: var(--text-2);
-}
+/* 账号详情消息条已由 notify 全局通知承载（P11-1 切片②），样式随迁清理。 */
 
 .account-detail__section {
   padding: 16px;

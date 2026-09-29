@@ -11,8 +11,36 @@ import type {
 } from "../src/types/account_switch";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P11-3：批量操作进度事件监听 mock（jsdom 无 Tauri IPC，需可注入事件载荷）。
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+
+// P11-1 切片②：操作结果类提示已迁到 notify 适配层；断言 notify 调用而非页内文本。
+vi.mock("../src/platform/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/platform/notify")>();
+  return {
+    ...actual,
+    notify: {
+      success: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: vi.fn(),
+    },
+  };
+});
+
+import { listen } from "@tauri-apps/api/event";
+import { notify } from "../src/platform/notify";
 
 const mockInvoke = vi.mocked(invoke);
+const notifyMock = vi.mocked(notify);
+
+/** 取出组件挂载时注册的进度事件 handler，测试中手动推送事件载荷。 */
+function progressHandlerOf(eventName: string): (event: { payload: unknown }) => void {
+  const call = vi.mocked(listen).mock.calls.find(([name]) => name === eventName);
+  if (!call) throw new Error(`事件未订阅: ${eventName}`);
+  return call[1] as (event: { payload: unknown }) => void;
+}
 const checkedAt = "2025-07-01T00:00:00.000Z";
 
 const currentProfile: AccountProfileDto = {
@@ -142,6 +170,8 @@ describe("AccountCenter", () => {
     // U-2 视图/排序偏好存 localStorage：测试间必须清零，防止偏好泄漏串扰断言。
     window.localStorage.clear();
     mockInvoke.mockReset();
+    // P11-3：进度事件订阅默认 resolve 空清理函数（卸载时调用）。
+    vi.mocked(listen).mockResolvedValue(() => undefined);
     mockInvoke.mockImplementation(async (command) => {
       if (command === "get_managed_account_state") return state();
       throw new Error(`unexpected command: ${String(command)}`);
@@ -278,7 +308,9 @@ describe("AccountCenter", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credits", { profileIds: ["profile-login-1"] });
     });
-    expect(await screen.findByText(/额度已更新：模型积分 236\.5（今日已签）/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("额度已更新：模型积分 236.5（今日已签）。");
+    });
   });
 
   it("详情页刷新登录凭据只调用凭据命令，不触发额度查询或签到", async () => {
@@ -317,7 +349,9 @@ describe("AccountCenter", () => {
     expect(refreshed).toBe(true);
     expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credits", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
-    expect(await screen.findByText("登录凭据已更新，无需重新登录。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("登录凭据已更新，无需重新登录。");
+    });
   });
 
   it("账号列表刷新全部凭据按账号展示成功与失败，不触发额度查询", async () => {
@@ -354,11 +388,240 @@ describe("AccountCenter", () => {
         profileIds: [entryA.profile_id, entryB.profile_id],
       });
     });
-    expect(await screen.findByText("凭据刷新完成：1 个账号正常，1 个需要处理。")).toBeInTheDocument();
-    expect(screen.getByText("凭据失败账号", { selector: ".result-card__issue-name" })).toBeInTheDocument();
-    expect(screen.getByText("登录凭据已过期或不可用，无法自动续期；请重新登录该账号以更新凭据。")).toBeInTheDocument();
+    // 批量结果走 notify.summary：成功数 + 异常账号清单（名称 + 一句人话原因）。
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith(
+        "凭据刷新完成",
+        [
+          {
+            displayName: "凭据失败账号",
+            reason: "登录凭据已过期或不可用，无法自动续期；请重新登录该账号以更新凭据。",
+          },
+        ],
+        1,
+      );
+    });
     expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credits", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
+  });
+
+  it("批量刷新凭据期间逐账号进度上屏，收齐后走既有结果摘要（P11-3）", async () => {
+    const entryA = overviewEntry("profile-credential-all-a", "凭据成功账号");
+    const entryB = overviewEntry("profile-credential-all-b", "凭据失败账号");
+    // noop 初始化规避 TS 对闭包赋值的窄化；命令挂起期间由事件先上屏。
+    let resolveRefresh: (entries: unknown) => void = () => undefined;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [entryA, entryB];
+      if (command === "get_trae_instance_states") {
+        return [entryA, entryB].map((entry) => ({
+          profile_id: entry.profile_id,
+          login_state: "logged_in",
+          archive_available: false,
+        }));
+      }
+      if (command === "refresh_checkin_credentials") {
+        // 挂起命令：让进度事件先于结果到达（与后端串行批次一致）。
+        return new Promise((resolve) => { resolveRefresh = resolve; });
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+    await screen.findByText("凭据成功账号");
+    fireEvent.click(screen.getByTestId("account-refresh-credentials"));
+    fireEvent.click(screen.getByTestId("account-refresh-credentials-confirm-confirm"));
+
+    // 逐账号进度事件实时上屏：「正在处理 i/N：账号名」。
+    act(() => {
+      progressHandlerOf("credential-refresh-progress")({
+        payload: { profile_id: entryA.profile_id, screen_name: "凭据成功账号", completed: 1, total: 2, refreshed: true, error_code: null },
+      });
+    });
+    expect(screen.getByText("正在处理 1/2：凭据成功账号")).toBeInTheDocument();
+
+    act(() => {
+      progressHandlerOf("credential-refresh-progress")({
+        payload: { profile_id: entryB.profile_id, screen_name: "凭据失败账号", completed: 2, total: 2, refreshed: false, error_code: "credential_refresh_failed" },
+      });
+    });
+    expect(screen.getByText("正在处理 2/2：凭据失败账号")).toBeInTheDocument();
+
+    // 命令返回：结果走既有 notify.summary，进度文案随 busy 收尾清除。
+    resolveRefresh?.([
+      { profile_id: entryA.profile_id, screen_name: "凭据成功账号", refreshed: true, error_code: null },
+      { profile_id: entryB.profile_id, screen_name: "凭据失败账号", refreshed: false, error_code: "credential_refresh_failed" },
+    ]);
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith(
+        "凭据刷新完成",
+        [expect.objectContaining({ displayName: "凭据失败账号" })],
+        1,
+      );
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/正在处理 \d\/\d/)).not.toBeInTheDocument();
+    });
+  });
+
+  it("批量健康检测期间逐账号进度上屏，完成后走既有结果摘要（P11-3）", async () => {
+    const entryA = overviewEntry("profile-health-p-a", "检测账号甲");
+    const entryB = overviewEntry("profile-health-p-b", "检测账号乙");
+    // noop 初始化规避 TS 对闭包赋值的窄化；探测挂起期间由事件先上屏。
+    let resolveProbe: (entries: unknown) => void = () => undefined;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [entryA, entryB];
+      if (command === "get_trae_instance_states") {
+        return [entryA, entryB].map((entry) => ({
+          profile_id: entry.profile_id,
+          login_state: "logged_in",
+          archive_available: false,
+        }));
+      }
+      if (command === "refresh_checkin_credits") {
+        // 网络探测挂起：进度事件先于批次结果到达。
+        return new Promise((resolve) => { resolveProbe = resolve; });
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+    await screen.findByText("检测账号甲");
+    fireEvent.click(screen.getByTestId("account-health-check"));
+
+    act(() => {
+      progressHandlerOf("health-check-progress")({
+        payload: { profile_id: entryA.profile_id, screen_name: "检测账号甲", completed: 1, total: 2, healthy: true, error_code: null },
+      });
+    });
+    expect(screen.getByText("正在处理 1/2：检测账号甲")).toBeInTheDocument();
+
+    // 本地深度检测（第一步）完成后网络探测才发出；等命令挂起再放行结果。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credits", {
+        profileIds: [entryA.profile_id, entryB.profile_id],
+      });
+    });
+    resolveProbe?.([
+      { profile_id: entryA.profile_id, screen_name: "检测账号甲", credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
+      { profile_id: entryB.profile_id, screen_name: "检测账号乙", credits: null, checked_in: null, usage_remaining_credits: null, error_code: "credential_expired" },
+    ]);
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith("健康检测完成", expect.anything(), expect.anything());
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/正在处理 \d\/\d/)).not.toBeInTheDocument();
+    });
+  });
+
+  it("批量刷新额度期间逐账号进度上屏，完成后走既有结果摘要（P11-3）", async () => {
+    const entryA = overviewEntry("profile-credits-p-a", "额度账号甲");
+    const entryB = overviewEntry("profile-credits-p-b", "额度账号乙");
+    // noop 初始化规避 TS 对闭包赋值的窄化；命令挂起期间由事件先上屏。
+    let resolveCredits: (entries: unknown) => void = () => undefined;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [entryA, entryB];
+      if (command === "get_trae_instance_states") {
+        return [entryA, entryB].map((entry) => ({
+          profile_id: entry.profile_id,
+          login_state: "logged_in",
+          archive_available: false,
+        }));
+      }
+      if (command === "refresh_checkin_credits") {
+        // 挂起命令：让进度事件先于结果到达（与后端串行批次一致）。
+        return new Promise((resolve) => { resolveCredits = resolve; });
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+    await screen.findByText("额度账号甲");
+    fireEvent.click(screen.getByTestId("account-refresh-credits"));
+
+    // 逐账号进度事件实时上屏：「正在处理 i/N：账号名」（未收到事件前显示原回退文案）。
+    expect(screen.getByText("正在查询最新额度…")).toBeInTheDocument();
+    act(() => {
+      progressHandlerOf("credits-refresh-progress")({
+        payload: { profile_id: entryA.profile_id, screen_name: "额度账号甲", completed: 1, total: 2, ok: true, credits: 1250, checked_in: true, usage_remaining_credits: 100, error_code: null },
+      });
+    });
+    expect(screen.getByText("正在处理 1/2：额度账号甲")).toBeInTheDocument();
+
+    // 命令返回：结果走既有 notify.summary，进度文案随 busy 收尾清除。
+    resolveCredits([
+      { profile_id: entryA.profile_id, screen_name: "额度账号甲", credits: 1250, checked_in: true, usage_remaining_credits: 100, error_code: null },
+      { profile_id: entryB.profile_id, screen_name: "额度账号乙", credits: null, checked_in: null, usage_remaining_credits: null, error_code: "credential_refresh_failed" },
+    ]);
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith(
+        "额度刷新完成",
+        [expect.objectContaining({ displayName: "额度账号乙" })],
+        1,
+      );
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/正在处理 \d\/\d/)).not.toBeInTheDocument();
+    });
+  });
+
+  it("Work 健康检测网络步骤由 credits-refresh-progress 驱动进度文案（P11-3）", async () => {
+    const entryA = overviewEntry("profile-hc-cred-a", "探测账号甲");
+    const entryB = overviewEntry("profile-hc-cred-b", "探测账号乙");
+    // noop 初始化规避 TS 对闭包赋值的窄化；探测挂起期间由事件先上屏。
+    let resolveProbe: (entries: unknown) => void = () => undefined;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [entryA, entryB];
+      if (command === "get_trae_instance_states") {
+        return [entryA, entryB].map((entry) => ({
+          profile_id: entry.profile_id,
+          login_state: "logged_in",
+          archive_available: false,
+        }));
+      }
+      if (command === "refresh_checkin_credits") {
+        return new Promise((resolve) => { resolveProbe = resolve; });
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+    await screen.findByText("探测账号甲");
+    fireEvent.click(screen.getByTestId("account-health-check"));
+
+    // 网络步骤已发出但事件未到（本地检测阶段/首批账号处理中）：回退文案在场。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credits", {
+        profileIds: [entryA.profile_id, entryB.profile_id],
+      });
+    });
+    expect(screen.getByText("正在检测账号健康度（登录存档 + 签到会话探测）…")).toBeInTheDocument();
+
+    // 网络步骤逐账号事件到达：进度文案驱动（与本地检测并存，由事件接管）。
+    act(() => {
+      progressHandlerOf("credits-refresh-progress")({
+        payload: { profile_id: entryA.profile_id, screen_name: "探测账号甲", completed: 1, total: 2, ok: true, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
+      });
+    });
+    expect(screen.getByText("正在处理 1/2：探测账号甲")).toBeInTheDocument();
+
+    resolveProbe?.([
+      { profile_id: entryA.profile_id, screen_name: "探测账号甲", credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
+      { profile_id: entryB.profile_id, screen_name: "探测账号乙", credits: null, checked_in: null, usage_remaining_credits: null, error_code: "credential_expired" },
+    ]);
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith("健康检测完成", expect.anything(), expect.anything());
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/正在处理 \d\/\d/)).not.toBeInTheDocument();
+    });
   });
 
   it("详情页立即签到执行单账号批次，成功后显示奖励已发放", async () => {
@@ -386,7 +649,9 @@ describe("AccountCenter", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("run_checkin", { profileIds: ["profile-login-1"] });
     });
-    expect(await screen.findByText(/签到成功，奖励已发放/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("签到成功，奖励已发放。");
+    });
   });
 
   it("缓存确认今日已签时详情页签到按钮禁用，不重复发起", async () => {
@@ -430,7 +695,9 @@ describe("AccountCenter", () => {
         enabled: false,
       });
     });
-    expect(await screen.findByText("已退出每日自动签到。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("已退出每日自动签到。");
+    });
     expect(await screen.findByText("不参与每日自动签到")).toBeInTheDocument();
   });
 
@@ -497,7 +764,9 @@ describe("AccountCenter", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("reset_checkin_device", { profileId: "profile-login-1" });
     });
-    expect(await screen.findByText(/签到设备已重置/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("签到设备已重置，下次签到将使用新设备。");
+    });
   });
 
   it("详情页重置签到设备：取消确认时不改绑", async () => {
@@ -540,10 +809,10 @@ describe("AccountCenter", () => {
         profileIds: ["profile-login-1", "profile-login-2"],
       });
     });
-    // G9 结果卡：全部正常时只显示结论行（正常账号不占空间）。
-    const card = await screen.findByTestId("operation-result-card");
-    expect(card).toHaveTextContent("额度刷新完成：2 个账号正常。");
-    expect(screen.queryByText("登录账号甲", { selector: ".result-card__issue-name" })).not.toBeInTheDocument();
+    // 批量结果走 notify.summary：全部正常时异常清单为空。
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith("额度刷新完成", [], 2);
+    });
   });
 
   it("真实模式可通过浏览器登录添加账号并刷新卡片", async () => {
@@ -578,7 +847,9 @@ describe("AccountCenter", () => {
       expect(mockInvoke).toHaveBeenCalledWith("begin_checkin_login", { useSystemBrowser: false })
     );
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("complete_checkin_login"));
-    expect(await screen.findByText(/账号“登录账号乙”登录成功/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("账号“登录账号乙”登录成功，已可用于签到。");
+    });
     // 登录后总览刷新，新账号进入「我的账号」卡片。
     expect(await screen.findByTestId("account-card-profile-login-2")).toBeInTheDocument();
     // G11 登录成功会弹补录层：收尾关闭，避免影响后续断言。
@@ -587,6 +858,77 @@ describe("AccountCenter", () => {
     await waitFor(() =>
       expect(screen.queryByTestId("mobile-backfill-dialog")).not.toBeInTheDocument()
     );
+  });
+
+  it("P11-3 首登验收未通过：账号已保存但额外弹验收警告（Work 路径）", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_managed_account_state") return state();
+      if (command === "get_checkin_capability") return realCapability;
+      if (command === "get_checkin_overview") return [];
+      if (command === "begin_checkin_login") return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+      if (command === "complete_checkin_login") {
+        return {
+          profile_id: "profile-accept-1",
+          account_id: "account-profile-accept-1",
+          screen_name: "验收账号",
+          avatar_url: "",
+          acceptance: "failed",
+          acceptance_error_code: "credential_refresh_failed",
+        };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} />);
+    fireEvent.click(await screen.findByTestId("account-add-primary"));
+
+    // 成功提示照发（凭据已入库），验收失败额外警告：原因码映射为人话，不外露原文。
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("账号“验收账号”登录成功，已可用于签到。");
+    });
+    await waitFor(() => {
+      expect(notifyMock.warning).toHaveBeenCalledWith(
+        "账号“验收账号”已保存，但可持续性验收未通过（换发新登录凭据未通过）。",
+        "可稍后在账号详情手动刷新凭据或重新登录。",
+      );
+    });
+  });
+
+  it("P11-3 CN 适配器登录：验收未通过同样弹警告并透传原因", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_product_identity_state") return [];
+      if (command === "list_trae_cn_accounts") {
+        return [{
+          profile_id: "cn-accept",
+          display_name: "CN 验收账号",
+          avatar_url: "",
+          last_verified_at: null,
+          status: "active",
+          is_current: true,
+        }];
+      }
+      if (command === "begin_trae_cn_login") return { login_url: "https://example.test/login" };
+      if (command === "complete_trae_cn_login") {
+        return {
+          profile_id: "cn-accept",
+          screen_name: "CN 验收账号",
+          avatar_url: "",
+          acceptance: "failed",
+          acceptance_error_code: "credential_refresh_failed",
+        };
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+    fireEvent.click(await screen.findByTestId("account-add-primary"));
+
+    await waitFor(() => {
+      expect(notifyMock.warning).toHaveBeenCalledWith(
+        "账号“CN 验收账号”已保存，但可持续性验收未通过（换发新登录凭据未通过）。",
+        "可稍后在账号详情手动刷新凭据或重新登录。",
+      );
+    });
   });
 
   it("G11 登录成功后弹手机号补录层：展示脱敏号供比对，跳过不发起保存", async () => {
@@ -749,7 +1091,9 @@ describe("AccountCenter", () => {
     await waitFor(() =>
       expect(screen.queryByTestId("mobile-backfill-dialog")).not.toBeInTheDocument()
     );
-    expect(await screen.findByText(/手机号已补全/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("手机号已补全，账号列表与详情页都会显示完整号码。");
+    });
   });
 
   it("G11 补录校验失败：脱敏号不匹配时弹层就地展示映射文案，不关闭", async () => {
@@ -827,7 +1171,9 @@ describe("AccountCenter", () => {
         mobile: "13812340000",
       })
     );
-    expect(await screen.findByText("手机号已保存。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("手机号已保存。");
+    });
 
     // 返回列表：补录后的全号替代脱敏号展示。
     fireEvent.click(screen.getByTestId("account-detail-back"));
@@ -1022,13 +1368,19 @@ describe("AccountCenter", () => {
     await screen.findByText("刷新成功账号");
     fireEvent.click(screen.getByTestId("account-refresh-credits"));
 
-    // G9 结果卡：首行结论 + 异常账号列名与一句人话原因（正常账号不占空间）。
-    expect(await screen.findByText("额度刷新完成：1 个账号正常，1 个需要处理。")).toBeInTheDocument();
-    expect(screen.getByText("刷新失败账号", { selector: ".result-card__issue-name" })).toBeInTheDocument();
-    expect(
-      screen.getByText("登录凭据已过期或不可用，无法自动续期；请重新登录该账号以更新凭据。"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("刷新成功账号", { selector: ".result-card__issue-name" })).not.toBeInTheDocument();
+    // 批量结果走 notify.summary：异常账号列名与一句人话原因，成功账号不进清单。
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith(
+        "额度刷新完成",
+        [
+          {
+            displayName: "刷新失败账号",
+            reason: "登录凭据已过期或不可用，无法自动续期；请重新登录该账号以更新凭据。",
+          },
+        ],
+        1,
+      );
+    });
     // 总览带回持久化标记：卡片显示“刷新失败”，徽章融合为需重登。
     expect(await screen.findByText("刷新失败")).toBeInTheDocument();
     expect(await screen.findByText("需重登")).toBeInTheDocument();
@@ -1100,10 +1452,14 @@ describe("AccountCenter", () => {
 
     // 检测后：乙的徽章立即翻转为已过期（本地深度检测即时刷新）。
     expect(await screen.findByText("已过期")).toBeInTheDocument();
-    // G9 结果卡：首行结论 + 乙列为需处理（登录原因优先于会话探测异常）。
-    expect(await screen.findByText("健康检测完成：1 个账号正常，1 个需要处理。")).toBeInTheDocument();
-    expect(screen.getByText("失效账号乙", { selector: ".result-card__issue-name" })).toBeInTheDocument();
-    expect(screen.getByText("登录态已过期，等待自动恢复")).toBeInTheDocument();
+    // 批量摘要：乙列为需处理（登录原因优先于会话探测异常）。
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith(
+        "健康检测完成",
+        [{ displayName: "失效账号乙", reason: "登录态已过期，等待自动恢复" }],
+        1,
+      );
+    });
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credits", { profileIds: [entryA.profile_id, entryB.profile_id] }));
   });
 
@@ -1127,8 +1483,10 @@ describe("AccountCenter", () => {
     await screen.findByText("未登录账号");
     fireEvent.click(screen.getByTestId("account-health-check"));
 
-    // uninitialized = 未登录（灰·中性）：不算需处理，结果卡只报正常。
-    expect(await screen.findByText("健康检测完成：1 个账号正常。")).toBeInTheDocument();
+    // uninitialized = 未登录（灰·中性）：不算需处理，摘要只报正常。
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith("健康检测完成", [], 1);
+    });
   });
 
   it("真实模式未登录任何账号时显示空状态引导且无签到入口", async () => {
@@ -1156,7 +1514,7 @@ describe("AccountCenter", () => {
     fireEvent.click(await screen.findByTestId("account-add-primary"));
 
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("浏览器登录回调无效，请重新发起登录。");
+      expect(notifyMock.error).toHaveBeenCalledWith("浏览器登录回调无效，请重新发起登录。");
     });
     // 登录失败后按钮恢复可用，可重新发起
     expect(screen.getByTestId("account-add-primary")).toBeEnabled();
@@ -1192,9 +1550,11 @@ describe("AccountCenter", () => {
 
     fireEvent.click(screen.getByTestId("account-cancel-login"));
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("cancel_checkin_login"));
-    // 取消走中性提示（role=status），不进错误通道（role=alert）。
-    expect(await screen.findByText(/登录已取消/)).toBeInTheDocument();
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // 取消走中性通知（notify.info），不进错误通道（notify.error）。
+    await waitFor(() => {
+      expect(notifyMock.info).toHaveBeenCalledWith("登录已取消；若浏览器已关闭或未完成授权，可重新发起登录。");
+    });
+    expect(notifyMock.error).not.toHaveBeenCalled();
     // 按钮解锁，可重新发起登录。
     await waitFor(() => expect(screen.getByTestId("account-add-primary")).toBeEnabled());
     expect(screen.getByTestId("account-add-primary")).toHaveTextContent("添加账号");
@@ -1210,7 +1570,7 @@ describe("AccountCenter", () => {
 
     render(<AccountCenter active={true} />);
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("账号注册表不可读取，请重启应用后重试；若持续出现请保留数据目录后反馈。");
+      expect(notifyMock.error).toHaveBeenCalledWith("账号注册表不可读取，请重启应用后重试；若持续出现请保留数据目录后反馈。");
     });
   });
 

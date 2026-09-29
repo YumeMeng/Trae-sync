@@ -6,18 +6,7 @@
   gap: 16px;
 }
 
-.environment-page__message {
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  color: var(--text-2);
-  font-size: 13px;
-  line-height: 1.45;
-}
+/* 环境页消息条已由 notify 全局通知承载（P11-1 切片②），样式随迁清理。 */
 
 .environment-page__body {
   display: grid;
@@ -133,7 +122,7 @@
   border-top: 1px solid var(--line-hair);
 }
 
-/* ===== P5-5 主库体检区块（有滞留记录才渲染）===== */
+/* ===== P5-5 主库体检区块（P11-5 起整合登录健康 + 库内容两组）===== */
 
 .env-checkup {
   margin-top: 14px;
@@ -155,6 +144,26 @@
 .env-checkup__head svg {
   flex: none;
   color: var(--accent);
+}
+
+/* P11-5 整合区块分组：登录健康 / 库内容（各自独立降级提示）。 */
+.env-checkup__group {
+  margin-top: 10px;
+}
+
+.env-checkup__group-title {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* 体检区块内的诊断摘要行（原警告文案，整合后归入库内容分组）。 */
+.env-checkup__notice {
+  margin-top: 8px;
+  display: grid;
+  gap: 2px;
+  color: var(--text-1);
+  font-size: 12px;
 }
 
 /* 滞留账号行：账号名（主信息）+ 规模（副信息）。 */

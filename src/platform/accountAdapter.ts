@@ -66,7 +66,13 @@ export interface AccountAdapter {
   readonly productName: string;
   readonly capabilities: readonly AccountCapability[];
   loadSnapshot(): Promise<AccountSnapshot>;
-  login(): Promise<{ readonly displayName: string }>;
+  login(): Promise<{
+    readonly displayName: string;
+    /** 首登可持续性验收结果（ADR-0027）：failed = 账号已保存但同设备换发未通过。 */
+    readonly acceptance: "passed" | "failed";
+    /** 验收失败的稳定错误码；通过时为 null。 */
+    readonly acceptanceErrorCode: string | null;
+  }>;
   cancelLogin(): Promise<void>;
   switchAccount(accountId: string): Promise<void>;
   /**
@@ -145,7 +151,11 @@ export function createTraeCnAccountAdapter(
       // 复用的是浏览器网页登录会话，不是 Work CN 的本地凭据或 native storage。
       await invoke<ProductLoginBeginDto>("begin_trae_cn_login", { useSystemBrowser: true });
       const receipt = await invoke<TraeCnLoginReceiptDto>("complete_trae_cn_login");
-      return { displayName: receipt.screen_name || "Trae CN 账号" };
+      return {
+        displayName: receipt.screen_name || "Trae CN 账号",
+        acceptance: receipt.acceptance,
+        acceptanceErrorCode: receipt.acceptance_error_code ?? null,
+      };
     },
     async cancelLogin() {
       await invoke("cancel_trae_cn_login");

@@ -89,6 +89,16 @@ export interface MasterArchiveApplyResultDto {
   readonly relaunch_outcome: string;
 }
 
+/**
+ * P11-5 库归档草稿（get_archive_draft 返回 / set_archive_draft 参数）。
+ * 草稿持久化在工具管理数据（storage_root/archive-drafts.json，每库一键），
+ * 字段与 Rust 侧 ArchiveDraftDto（serde 命名）一致。
+ */
+export interface ArchiveDraftDto {
+  readonly archive_session_ids: readonly string[];
+  readonly restore_session_ids: readonly string[];
+}
+
 /** get_relay_ledger 逐条记录（前端按 session_id / from_session_id 链回轨迹）。 */
 export interface RelayLedgerEntryDto {
   /** 新腿 session_id（换腿后身份）。 */

@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import type { AppPage } from "./NavigationRail";
 import type {
+  ArchiveDraftDto,
   MasterHistoryDto,
   MasterArchiveApplyResultDto,
   MasterMergeResultDto,
@@ -31,7 +32,10 @@ import type {
 } from "../types/history";
 import type { SessionMessageDto } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+// 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
+import { notify } from "../platform/notify";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { EmptyState } from "./EmptyState";
 
 // ============================================================================
 // 库对话面板（G21 两栏式 + G22 统一选择模式，ADR-0025 Library 抽象）
@@ -64,6 +68,11 @@ interface LibrarySessionsPanelProps {
   embedded?: boolean;
   /** 库实例（缺省主库；副库落地时同一组件零改动复用）。 */
   library?: LibraryRef;
+  /**
+   * 只读库形态（P11-6，ADR-0032 决策 5）：归档/删除/合并等写操作控件
+   * 与草稿机制整体隐藏（不是禁用）；读路径与归档内容浏览保留。
+   */
+  readOnly?: boolean;
 }
 
 /** 一段接力轨迹：某账号持有该会话的时间段与其间新增消息数。 */
@@ -93,12 +102,18 @@ const UNLINKED_GROUP_ID = "__unlinked__";
 /** 消息流分页大小（后端按时间倒序取页后反转为升序）。 */
 const CHAT_WINDOW_LIMIT = 2000;
 
-/** 归档草稿存储键前缀；按库隔离，应用重启后仍可继续调整。 */
+/** 归档草稿存储键前缀；按库隔离（P11-5 起仅作迁移源，草稿正本在工具管理数据）。 */
 const ARCHIVE_DRAFT_STORAGE_PREFIX = "trae-sync:archive-draft:";
 
 interface ArchiveDraft {
   readonly archiveSessionIds: readonly string[];
   readonly restoreSessionIds: readonly string[];
+}
+
+/** 需要就地恢复的异常收尾（P11-1 切片②）：带一句原因与重试动作。 */
+interface ArchiveRecovery {
+  readonly kind: "relaunch" | "refresh";
+  readonly message: string;
 }
 
 const EMPTY_ARCHIVE_DRAFT: ArchiveDraft = {
@@ -110,8 +125,36 @@ function archiveDraftStorageKey(libraryId: string): string {
   return `${ARCHIVE_DRAFT_STORAGE_PREFIX}${encodeURIComponent(libraryId)}`;
 }
 
-/** 读取本地草稿；坏数据按空草稿处理，不能阻断历史列表。 */
-function readArchiveDraft(libraryId: string): ArchiveDraft {
+/** 草稿是否有未提交内容（空草稿在后端表现为删除该库键）。 */
+function draftHasChanges(draft: ArchiveDraft): boolean {
+  return draft.archiveSessionIds.length > 0 || draft.restoreSessionIds.length > 0;
+}
+
+/**
+ * 前端草稿状态 → 后端命令参数。请求方向 Tauri 自动做 camelCase→snake_case
+ * 参数转换（与 apply_master_archive_changes 同惯例），因此传 camelCase；
+ * 响应方向是 serde 序列化，保持 snake_case（见 dtoToDraft）。
+ */
+function draftToDto(draft: ArchiveDraft): {
+  archiveSessionIds: string[];
+  restoreSessionIds: string[];
+} {
+  return {
+    archiveSessionIds: [...draft.archiveSessionIds],
+    restoreSessionIds: [...draft.restoreSessionIds],
+  };
+}
+
+/** 后端草稿返回 → 前端草稿状态。 */
+function dtoToDraft(dto: ArchiveDraftDto): ArchiveDraft {
+  return {
+    archiveSessionIds: [...dto.archive_session_ids],
+    restoreSessionIds: [...dto.restore_session_ids],
+  };
+}
+
+/** 读取 localStorage 旧草稿（P11-5 迁移源）；坏数据按空草稿处理，不阻断列表。 */
+function readLegacyDraft(libraryId: string): ArchiveDraft {
   try {
     const raw = window.localStorage.getItem(archiveDraftStorageKey(libraryId));
     if (!raw) return EMPTY_ARCHIVE_DRAFT;
@@ -137,6 +180,7 @@ export function LibrarySessionsPanel({
   onNavigate,
   embedded = false,
   library = { id: "master" },
+  readOnly = false,
 }: LibrarySessionsPanelProps) {
   // 库显示名（文案随库实例变化，ADR-0025；缺省主库）。
   const libName = library.displayName?.trim() || "主库";
@@ -162,17 +206,17 @@ export function LibrarySessionsPanel({
   const [selectedSessionIds, setSelectedSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [selectedProjectIds, setSelectedProjectIds] = useState<ReadonlySet<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
-  const [batchError, setBatchError] = useState<string | null>(null);
-  // 归档/恢复先落在本地草稿，用户点击应用时才一次性写入主库。
-  const [archiveDraft, setArchiveDraft] = useState<ArchiveDraft>(() =>
-    readArchiveDraft(library.id),
-  );
-  // 本地草稿写入失败时保留当前状态，但明确告知用户重启后可能无法恢复。
+  // 归档/恢复先落在草稿（P11-5 起持久化到工具管理数据），用户点击应用时
+  // 才一次性写入主库；初始为空，待库草稿从后端读入。
+  const [archiveDraft, setArchiveDraft] = useState<ArchiveDraft>(EMPTY_ARCHIVE_DRAFT);
+  // 草稿持久化全部失败（后端 + localStorage 回退都不可用）时的显式提示。
   const [archiveDraftStorageError, setArchiveDraftStorageError] = useState<string | null>(null);
-  // 操作回执（归档/恢复/删除/合并完成后的一句话提示，行内展示）。
-  const [actionNotice, setActionNotice] = useState<string | null>(null);
-  // 数据库已更新但实例启动或列表刷新失败时，保留对应的恢复入口。
-  const [archiveRecovery, setArchiveRecovery] = useState<"relaunch" | "refresh" | null>(null);
+  // 已完成后端草稿加载的库 id：加载未完成前禁止写回，防止空/旧草稿
+  // 覆盖其他库或上一会话的持久化内容（跨库写保护）。
+  const draftLoadedForRef = useRef<string | null>(null);
+  // 数据库已更新但实例启动或列表刷新失败时，保留带重试按钮的就地恢复入口
+  // （正常完成的回执走全局通知，不再保留页内横幅）。
+  const [archiveRecovery, setArchiveRecovery] = useState<ArchiveRecovery | null>(null);
   // 删除二次确认（ADR-0018：列明规模，单次确认）。
   const [deleteConfirm, setDeleteConfirm] = useState<readonly MasterSessionEntryDto[] | null>(null);
   // 合并确认弹层（两步：选保留目标 → 确认页）。
@@ -183,29 +227,108 @@ export function LibrarySessionsPanel({
   const currentUserIdRef = useRef<string | null>(null);
   const pollCancelled = useRef(false);
 
-  const archiveDraftHasChanges =
-    archiveDraft.archiveSessionIds.length > 0 || archiveDraft.restoreSessionIds.length > 0;
+  const archiveDraftHasChanges = draftHasChanges(archiveDraft);
 
-  // 切换库实例时切换对应草稿；草稿不因组件卸载或应用重启丢失。
-  useEffect(() => {
-    setArchiveDraft(readArchiveDraft(library.id));
-  }, [library.id]);
+  // ===== P11-5 归档草稿持久化（localStorage 迁入工具管理数据）=====
 
+  // 切换库实例时切换对应草稿：读后端（storage_root/archive-drafts.json，
+  // 损坏 fail-closed 返回空草稿）；后端为空且 localStorage 有旧草稿时迁移
+  // （写入成功才清除旧键，失败保留旧键并提示，本会话仍可用旧草稿）。
+  // 页面不可见时不发起 IPC，active 后补读。只读库不参与草稿机制（P11-6）。
   useEffect(() => {
-    try {
-      const key = archiveDraftStorageKey(library.id);
-      if (!archiveDraftHasChanges) window.localStorage.removeItem(key);
-      else window.localStorage.setItem(key, JSON.stringify(archiveDraft));
-      setArchiveDraftStorageError(null);
-    } catch {
-      // 本地存储不可用时仍允许本次会话继续操作，但必须显式提示持久化风险。
-      setArchiveDraftStorageError(
-        archiveDraftHasChanges
-          ? "归档设置暂存失败，关闭应用可能丢失未提交草稿。请先恢复本地存储后再离开。"
-          : "未能清理本地归档草稿，重启后可能再次出现。",
-      );
-    }
-  }, [archiveDraft, archiveDraftHasChanges, library.id]);
+    if (!active || readOnly) return;
+    const libraryId = library.id;
+    let cancelled = false;
+    // 加载未完成前先复位：草稿清空 + 关闭写回（ref 校验）。
+    draftLoadedForRef.current = null;
+    setArchiveDraft(EMPTY_ARCHIVE_DRAFT);
+    setArchiveDraftStorageError(null);
+    void (async () => {
+      let draft: ArchiveDraft = EMPTY_ARCHIVE_DRAFT;
+      try {
+        draft = dtoToDraft(await invoke<ArchiveDraftDto>("get_archive_draft", { libraryId }));
+      } catch {
+        // 命令不可用按空草稿处理；后续写入失败仍会回退 localStorage。
+      }
+      if (cancelled) return;
+      if (draftHasChanges(draft)) {
+        draftLoadedForRef.current = libraryId;
+        setArchiveDraft(draft);
+        return;
+      }
+      // 后端无草稿：尝试一次性迁移 localStorage 旧草稿（老版本升级路径）。
+      const legacy = readLegacyDraft(libraryId);
+      if (draftHasChanges(legacy)) {
+        try {
+          await invoke("set_archive_draft", { libraryId, ...draftToDto(legacy) });
+          try {
+            window.localStorage.removeItem(archiveDraftStorageKey(libraryId));
+          } catch {
+            // 清旧键失败无碍：正本已写入后端，localStorage 仅为迁移源。
+          }
+          if (!cancelled) setArchiveDraft(legacy);
+        } catch {
+          // 迁移失败：草稿保留在 localStorage，本会话照常使用，显式提示。
+          if (!cancelled) {
+            setArchiveDraft(legacy);
+            notify.warning("归档草稿迁移到新存储失败，本次暂由本机浏览器存储保存，未丢失。");
+          }
+        }
+      }
+      if (!cancelled) draftLoadedForRef.current = libraryId;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [active, readOnly, library.id]);
+
+  // 草稿变化时写回工具管理数据；后端写入失败回退 localStorage 并显式提示
+  // （不静默丢草稿）。仅对「已完成后端加载」的库生效，防止跨库误写。
+  // 只读库不写草稿（P11-6）。
+  useEffect(() => {
+    if (readOnly || draftLoadedForRef.current !== library.id) return;
+    const libraryId = library.id;
+    let cancelled = false;
+    void (async () => {
+      try {
+        await invoke("set_archive_draft", { libraryId, ...draftToDto(archiveDraft) });
+        // 后端写入成功：localStorage 至多是迁移残留，统一清理。
+        try {
+          window.localStorage.removeItem(archiveDraftStorageKey(libraryId));
+        } catch {
+          // 清理失败无碍正本；不提示。
+        }
+        if (!cancelled) setArchiveDraftStorageError(null);
+      } catch {
+        // 回退 localStorage：空草稿清旧键，有内容则暂存。
+        try {
+          const key = archiveDraftStorageKey(libraryId);
+          if (!archiveDraftHasChanges) window.localStorage.removeItem(key);
+          else window.localStorage.setItem(key, JSON.stringify(archiveDraft));
+          if (!cancelled) {
+            setArchiveDraftStorageError(null);
+            notify.warning(
+              archiveDraftHasChanges
+                ? "归档草稿暂存到工具数据失败，已改存本机浏览器存储，重启应用后仍可恢复。"
+                : "归档草稿清理未能写入工具数据，重启应用后可能再次出现该草稿。",
+            );
+          }
+        } catch {
+          // 双重失败才升级为页内横幅：当前状态保留，但不能静默。
+          if (!cancelled) {
+            setArchiveDraftStorageError(
+              archiveDraftHasChanges
+                ? "归档设置暂存失败，关闭应用可能丢失未提交草稿。请先恢复本地存储后再离开。"
+                : "未能清理本地归档草稿，重启后可能再次出现。",
+            );
+          }
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [archiveDraft, archiveDraftHasChanges, readOnly, library.id]);
 
   const load = useCallback(
     async (force: boolean) => {
@@ -586,21 +709,20 @@ export function LibrarySessionsPanel({
 
   // ===== G22 统一选择模式与批量操作 =====
 
-  /** 统一批量执行骨架：忙态锁 + 成功后强制刷新 + 回执/失败走行内提示。 */
+  /** 统一批量执行骨架：忙态锁 + 成功后强制刷新 + 成功回执/失败原因走全局通知。 */
   const runBatch = useCallback(
-    async (action: () => Promise<unknown>, onDone: () => void, receipt: string | null) => {
+    async (action: () => Promise<unknown>, onDone: () => void, successMessage: string | null) => {
       setBatchBusy(true);
-      setBatchError(null);
       setArchiveRecovery(null);
       try {
         await action();
         onDone();
-        // 回执为空时保留 action 内按后端结果生成的提示（合并流）。
-        if (receipt) setActionNotice(receipt);
+        // 成功回执为空时由 action 内按后端结果发布通知（合并流）。
+        if (successMessage) notify.success(successMessage);
         // 归档/恢复/删除/合并都直接改库文件，强制重读让两栏立即反映新状态。
         await load(true);
       } catch (reason: unknown) {
-        setBatchError(safeUiErrorMessage(reason, "操作未完成，请稍后重试。"));
+        notify.error(safeUiErrorMessage(reason, "操作未完成，请稍后重试。"));
       } finally {
         setBatchBusy(false);
       }
@@ -609,7 +731,6 @@ export function LibrarySessionsPanel({
   );
 
   const enterSelectMode = useCallback(() => {
-    setActionNotice(null);
     setSelectMode(true);
     setSelectedSessionIds(new Set());
     setSelectedProjectIds(new Set());
@@ -749,9 +870,9 @@ export function LibrarySessionsPanel({
           restoreSessionIds: [...restoreIds],
         };
       });
-      setBatchError(null);
       setArchiveRecovery(null);
-      setActionNotice(
+      // 草稿暂存是中间态提醒（用户还要继续操作），走中性通知。
+      notify.info(
         mode === "archive"
           ? `已加入待归档设置，共 ${sessionIds.length} 个会话。完成选择后点击“应用归档设置”。`
           : `已加入待恢复设置，共 ${sessionIds.length} 个会话。完成选择后点击“应用归档设置”。`,
@@ -784,7 +905,6 @@ export function LibrarySessionsPanel({
   const applyArchiveDraft = useCallback(async () => {
     if (!archiveDraftHasChanges || batchBusy) return;
     setBatchBusy(true);
-    setBatchError(null);
     setArchiveRecovery(null);
     try {
       const result = await invoke<MasterArchiveApplyResultDto>("apply_master_archive_changes", {
@@ -803,18 +923,24 @@ export function LibrarySessionsPanel({
         // 数据库已提交，刷新失败不能把已经完成的批次误报为“未提交”。
         refreshFailed = true;
       }
-      const resultNotice =
-        result.relaunch_outcome === "failed"
-          ? `主库已更新（归档 ${archivedCount} 个、恢复 ${restoredCount} 个），实例尚未启动，请重试启动。`
-          : `已应用归档设置：归档 ${archivedCount} 个、恢复 ${restoredCount} 个会话。`;
-      setArchiveRecovery(
-        result.relaunch_outcome === "failed" ? "relaunch" : refreshFailed ? "refresh" : null,
-      );
-      setActionNotice(
-        refreshFailed ? `${resultNotice} 历史列表刷新失败，请手动刷新。` : resultNotice,
-      );
+      const resultNotice = result.relaunch_outcome === "failed"
+        ? `主库已更新（归档 ${archivedCount} 个、恢复 ${restoredCount} 个），实例尚未启动，请重试启动。`
+        : `已应用归档设置：归档 ${archivedCount} 个、恢复 ${restoredCount} 个会话。`;
+      if (result.relaunch_outcome === "failed") {
+        // 实例未启动需要就地重试：保留带按钮的页内提示条。
+        setArchiveRecovery({ kind: "relaunch", message: resultNotice });
+      } else if (refreshFailed) {
+        // 列表刷新失败需要就地重试：保留带按钮的页内提示条。
+        setArchiveRecovery({
+          kind: "refresh",
+          message: `${resultNotice} 历史列表刷新失败，请手动刷新。`,
+        });
+      } else {
+        // 正常完成：结果走全局通知（离开页面后仍可见）。
+        notify.success(resultNotice);
+      }
     } catch (reason: unknown) {
-      setBatchError(safeUiErrorMessage(reason, "归档设置未提交，草稿仍保留。"));
+      notify.error(safeUiErrorMessage(reason, "归档设置未提交，草稿仍保留。"));
     } finally {
       setBatchBusy(false);
     }
@@ -824,22 +950,21 @@ export function LibrarySessionsPanel({
   const retryArchiveRecovery = useCallback(async () => {
     if (!archiveRecovery || batchBusy) return;
     const recovery = archiveRecovery;
-    let failureStage = recovery;
+    let failureStage: ArchiveRecovery["kind"] = recovery.kind;
     setBatchBusy(true);
-    setBatchError(null);
     try {
-      if (recovery === "relaunch") await invoke("launch_master_library");
+      if (recovery.kind === "relaunch") await invoke("launch_master_library");
       try {
         await load(true);
       } catch (reason: unknown) {
         failureStage = "refresh";
-        setArchiveRecovery("refresh");
+        setArchiveRecovery({ kind: "refresh", message: "历史列表刷新失败，请手动刷新。" });
         throw reason;
       }
       setArchiveRecovery(null);
-      setActionNotice(recovery === "relaunch" ? "主库实例已重新启动，历史列表已刷新。" : "历史列表已刷新。");
+      notify.success(recovery.kind === "relaunch" ? "主库实例已重新启动，历史列表已刷新。" : "历史列表已刷新。");
     } catch (reason: unknown) {
-      setBatchError(
+      notify.error(
         safeUiErrorMessage(
           reason,
           failureStage === "relaunch" ? "实例仍未启动，请稍后重试。" : "历史列表刷新失败，请稍后重试。",
@@ -854,8 +979,7 @@ export function LibrarySessionsPanel({
   const discardArchiveDraft = useCallback(() => {
     if (batchBusy) return;
     setArchiveDraft(EMPTY_ARCHIVE_DRAFT);
-    setBatchError(null);
-    setActionNotice("已放弃未提交的归档设置，主库没有变化。");
+    notify.info("已放弃未提交的归档设置，主库没有变化。");
   }, [batchBusy]);
 
   /** 删除所选（先弹确认，确认后走后端先备份再删除）。 */
@@ -905,12 +1029,12 @@ export function LibrarySessionsPanel({
             libraryId: library.id,
           });
           // 回执只用数量与动作结果表述（界面表达纪律）。
-          setActionNotice(
+          notify.success(
             `已把 ${result.moved_sessions} 个会话并入「${targetName}」，清理 ${result.removed_projects} 个空分组。`,
           );
         },
         () => exitSelectMode(),
-        null, // 回执在 action 内按后端结果生成，此处不覆盖。
+        null, // 回执在 action 内按后端结果发布，此处不重复。
       );
     },
     [mergeConfirm, runBatch, library.id, exitSelectMode],
@@ -919,13 +1043,11 @@ export function LibrarySessionsPanel({
   // ===== 视图切换（正常 ↔ 归档）：切换时清空选择，避免跨视图残留勾选。 =====
 
   const enterArchiveView = useCallback(() => {
-    setActionNotice(null);
     setArchiveView(true);
     exitSelectMode();
   }, [exitSelectMode]);
 
   const exitArchiveView = useCallback(() => {
-    setActionNotice(null);
     setArchiveView(false);
     exitSelectMode();
   }, [exitSelectMode]);
@@ -1021,7 +1143,7 @@ export function LibrarySessionsPanel({
                 session={session}
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
-                showQuickArchive={!selectMode}
+                showQuickArchive={!selectMode && !readOnly}
                 onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
@@ -1091,7 +1213,7 @@ export function LibrarySessionsPanel({
                 session={session}
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
-                showQuickArchive={!selectMode}
+                showQuickArchive={!selectMode && !readOnly}
                 onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
@@ -1106,74 +1228,105 @@ export function LibrarySessionsPanel({
   const body = () => {
     if (loadError) {
       return (
-        <div className="history-empty" data-testid="history-error">
-          <p>{loadError}</p>
-          <button
-            className="btn"
-            type="button"
-            onClick={() => void load(true).catch(() => undefined)}
-          >
-            <RefreshCw size={15} aria-hidden="true" />重试
-          </button>
-        </div>
+        <EmptyState
+          panel
+          className="history-empty"
+          testId="history-error"
+          description={loadError}
+          action={
+            <button
+              className="btn"
+              type="button"
+              onClick={() => void load(true).catch(() => undefined)}
+            >
+              <RefreshCw size={15} aria-hidden="true" />重试
+            </button>
+          }
+        />
       );
     }
     if (!history) {
       return (
-        <div className="history-empty" data-testid="history-loading">
-          正在读取库记录…
-        </div>
+        <EmptyState
+          panel
+          className="history-empty"
+          testId="history-loading"
+          description="正在读取库记录…"
+        />
       );
     }
     if (history.status === "no_master_data") {
       return (
-        <div className="history-empty" data-testid="history-guide">
-          <Layers size={26} strokeWidth={1.6} aria-hidden="true" />
-          <p>{libName}还没有对话数据。</p>
-          <p className="history-empty__hint">到环境页启动{libName}并在 TRAE 内登录一次，对话记录会自动出现在这里。</p>
-          {onNavigate && (
-            <button
-              className="btn btn--primary"
-              type="button"
-              onClick={() => onNavigate("environment")}
-              data-testid="history-guide-launch"
-            >
-              去环境页启动
-            </button>
-          )}
-        </div>
+        <EmptyState
+          panel
+          className="history-empty"
+          testId="history-guide"
+          icon={<Layers size={26} strokeWidth={1.6} />}
+          title={`${libName}还没有对话数据。`}
+          // 只读库（P11-6）：不出环境页引导——Trae CN 无环境能力，不能把
+          // 用户引向一个 absent 页面；数据将在 Trae CN 使用后自然出现。
+          description={
+            readOnly
+              ? undefined
+              : `到环境页启动${libName}并在 TRAE 内登录一次，对话记录会自动出现在这里。`
+          }
+          action={
+            !readOnly && onNavigate ? (
+              <button
+                className="btn btn--primary"
+                type="button"
+                onClick={() => onNavigate("environment")}
+                data-testid="history-guide-launch"
+              >
+                去环境页启动
+              </button>
+            ) : undefined
+          }
+        />
       );
     }
     if (history.status === "no_current_account") {
       return (
-        <div className="history-empty" data-testid="history-guide">
-          <Layers size={26} strokeWidth={1.6} aria-hidden="true" />
-          <p>{libName}尚未登记登录账号。</p>
-          <p className="history-empty__hint">在环境页确认{libName}已登录账号；切换账号后记录仍会保留。</p>
-          {onNavigate && (
-            <button
-              className="btn btn--primary"
-              type="button"
-              onClick={() => onNavigate("environment")}
-            >
-              去环境页查看
-            </button>
-          )}
-        </div>
+        <EmptyState
+          panel
+          className="history-empty"
+          testId="history-guide"
+          icon={<Layers size={26} strokeWidth={1.6} />}
+          title={`${libName}尚未登记登录账号。`}
+          description={
+            readOnly ? undefined : `在环境页确认${libName}已登录账号；切换账号后记录仍会保留。`
+          }
+          action={
+            !readOnly && onNavigate ? (
+              <button
+                className="btn btn--primary"
+                type="button"
+                onClick={() => onNavigate("environment")}
+              >
+                去环境页查看
+              </button>
+            ) : undefined
+          }
+        />
       );
     }
     if (history.status === "read_failed") {
       return (
-        <div className="history-empty" data-testid="history-error">
-          <p>{libName}记录暂时无法读取，请稍后重试。</p>
-          <button
-            className="btn"
-            type="button"
-            onClick={() => void load(true).catch(() => undefined)}
-          >
-            <RefreshCw size={15} aria-hidden="true" />重试
-          </button>
-        </div>
+        <EmptyState
+          panel
+          className="history-empty"
+          testId="history-error"
+          description={`${libName}记录暂时无法读取，请稍后重试。`}
+          action={
+            <button
+              className="btn"
+              type="button"
+              onClick={() => void load(true).catch(() => undefined)}
+            >
+              <RefreshCw size={15} aria-hidden="true" />重试
+            </button>
+          }
+        />
       );
     }
 
@@ -1205,33 +1358,23 @@ export function LibrarySessionsPanel({
               />
             </div>
           )}
-          {batchError && (
-            <div className="lib-notice lib-notice--error" data-testid="batch-error" role="alert">
-              {batchError}
-            </div>
-          )}
-          {actionNotice && (
-            <div
-              className={`lib-notice${archiveRecovery ? " lib-notice--action" : ""}`}
-              data-testid="action-notice"
-              role="status"
-            >
-              <span className="lib-notice__message">{actionNotice}</span>
-              {archiveRecovery && (
-                <button
-                  className="btn btn--quiet"
-                  type="button"
-                  onClick={() => void retryArchiveRecovery()}
-                  disabled={batchBusy}
-                  data-testid="archive-recovery-retry"
-                >
-                  {batchBusy
-                    ? "处理中…"
-                    : archiveRecovery === "relaunch"
-                      ? "重试启动"
-                      : "刷新历史列表"}
-                </button>
-              )}
+          {archiveRecovery && (
+            // 需要就地恢复的异常收尾（实例未启动/列表刷新失败）：带重试按钮的页内提示条。
+            <div className="lib-notice lib-notice--action" data-testid="action-notice" role="status">
+              <span className="lib-notice__message">{archiveRecovery.message}</span>
+              <button
+                className="btn btn--quiet"
+                type="button"
+                onClick={() => void retryArchiveRecovery()}
+                disabled={batchBusy}
+                data-testid="archive-recovery-retry"
+              >
+                {batchBusy
+                  ? "处理中…"
+                  : archiveRecovery.kind === "relaunch"
+                    ? "重试启动"
+                    : "刷新历史列表"}
+              </button>
             </div>
           )}
           {archiveDraftStorageError && (
@@ -1336,19 +1479,22 @@ export function LibrarySessionsPanel({
                     : []),
                 ]}
             {!archiveView && keyword && treeSessions.length === 0 && (
-              <div className="lib-tree__empty">没有匹配的会话</div>
+              <EmptyState className="lib-tree__empty" description="没有匹配的会话" />
             )}
             {!archiveView && !keyword && liveSessions.length === 0 && (
-              <div className="lib-tree__empty">还没有对话记录</div>
+              <EmptyState className="lib-tree__empty" description="还没有对话记录" />
             )}
             {archiveView && archivedSessions.length === 0 && (
-              <div className="lib-tree__empty" data-testid="library-archive-empty">
-                没有已归档的会话
-              </div>
+              <EmptyState
+                className="lib-tree__empty"
+                testId="library-archive-empty"
+                description="没有已归档的会话"
+              />
             )}
           </div>
 
-          {/* 底部固定区：已归档入口（有归档内容才显示）+ 选择/取消 */}
+          {/* 底部固定区：已归档入口（有归档内容才显示）+ 选择/取消。
+              只读库（P11-6）无批量写操作，选择入口整体隐藏。 */}
           <div className="lib-foot">
             {!archiveView && archivedSessions.length > 0 && (
               <button
@@ -1362,22 +1508,24 @@ export function LibrarySessionsPanel({
                 <span className="lib-archive-entry__count">{archivedSessions.length}</span>
               </button>
             )}
-            <button
-              className="btn btn--quiet lib-select-btn"
-              type="button"
-              onClick={selectMode ? exitSelectMode : enterSelectMode}
-              data-testid="library-select-mode"
-            >
-              {selectMode ? (
-                <>
-                  <X size={15} aria-hidden="true" />取消
-                </>
-              ) : (
-                <>
-                  <ListChecks size={15} aria-hidden="true" />选择
-                </>
-              )}
-            </button>
+            {!readOnly && (
+              <button
+                className="btn btn--quiet lib-select-btn"
+                type="button"
+                onClick={selectMode ? exitSelectMode : enterSelectMode}
+                data-testid="library-select-mode"
+              >
+                {selectMode ? (
+                  <>
+                    <X size={15} aria-hidden="true" />取消
+                  </>
+                ) : (
+                  <>
+                    <ListChecks size={15} aria-hidden="true" />选择
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </aside>
 

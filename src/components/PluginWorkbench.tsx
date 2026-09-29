@@ -8,7 +8,10 @@ import type {
   PluginUninstallEverywhereDto,
 } from "../types/plugins";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+// 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
+import { notify, type NotifyIssue } from "../platform/notify";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { EmptyState } from "./EmptyState";
 
 // ============================================================================
 // G23 插件 tab 工作台（ADR-0023 清单 + ADR-0026 实时同步）：表格化
@@ -78,12 +81,12 @@ function PluginRow({
 
 export function PluginWorkbench({ active }: PluginWorkbenchProps) {
   const [state, setState] = useState<PluginTabStateDto | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [segment, setSegment] = useState<PluginSegment>("installed");
   // 市场目录：已装段分类关联与市场段浏览共用（G23 顶部分类 chips 数据源），
   // tab 激活即拉取（只读），失败不阻断已装列表（分类列留空）。
   const [market, setMarket] = useState<MarketPluginItem[] | null>(null);
+  // 市场目录读取失败原因：market 为空时作为空态文案展示（结构性占位，保留页内）。
   const [marketError, setMarketError] = useState<string | null>(null);
   // 分类筛选（null = 全部）；segment 切换时重置。
   const [category, setCategory] = useState<string | null>(null);
@@ -93,7 +96,6 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
   const [pendingUninstall, setPendingUninstall] = useState<InstalledPluginDto | null>(null);
   // 装/卸进行中的条目键，防止重复点击。
   const [busyKey, setBusyKey] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
   const loadState = useCallback(async () => {
@@ -102,10 +104,9 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
       const next = await invoke<PluginTabStateDto>("get_plugin_tab_state");
       if (!mountedRef.current) return;
       setState(next);
-      setError(null);
     } catch (reason: unknown) {
       if (!mountedRef.current) return;
-      setError(safeUiErrorMessage(reason, "插件状态暂时不可读取，请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, "插件状态暂时不可读取，请稍后重试。"));
     } finally {
       if (mountedRef.current) setLoading(false);
     }
@@ -140,7 +141,6 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
   /** 安装市场插件（ADR-0026 决策 1：零确认，即时改云端 + 更新清单）。 */
   const install = useCallback(async (plugin: MarketPluginItem) => {
     setBusyKey(plugin.plugin_id);
-    setNotice(null);
     try {
       await invoke("install_plugin", {
         pluginId: plugin.plugin_id,
@@ -149,11 +149,11 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
         registry: plugin.registry,
       });
       if (!mountedRef.current) return;
-      setNotice(`已安装 ${plugin.display_name || plugin.name}。`);
+      notify.success(`已安装 ${plugin.display_name || plugin.name}。`);
       await loadState();
     } catch (reason: unknown) {
       if (!mountedRef.current) return;
-      setError(safeUiErrorMessage(reason, "安装未完成，请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, "安装未完成，请稍后重试。"));
     } finally {
       if (mountedRef.current) setBusyKey(null);
     }
@@ -168,7 +168,6 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
     const target = pendingUninstall;
     setPendingUninstall(null);
     setBusyKey(target.record_id);
-    setNotice(null);
     const pluginTitle = target.display_name || target.name;
     try {
       const receipt = await invoke<PluginUninstallEverywhereDto>(
@@ -180,15 +179,16 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
       const failedNames = receipt.accounts
         .filter((item) => item.failed)
         .map((item) => item.display_name);
-      setNotice(
-        failedNames.length > 0
-          ? `已从 ${removedCount} 个账号移除 ${pluginTitle}；${failedNames.join("、")} 移除失败，可稍后重试。`
-          : `已从 ${removedCount} 个账号移除 ${pluginTitle}。`,
-      );
+      // 跨账号批量移除结果走批量摘要通知：成功数 + 逐账号异常清单（可稍后重试）。
+      const issues: NotifyIssue[] = failedNames.map((name) => ({
+        displayName: name,
+        reason: "移除失败，可稍后重试。",
+      }));
+      notify.summary(`已移除 ${pluginTitle}`, issues, removedCount);
       await loadState();
     } catch (reason: unknown) {
       if (!mountedRef.current) return;
-      setError(safeUiErrorMessage(reason, "移除未完成，请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, "移除未完成，请稍后重试。"));
     } finally {
       if (mountedRef.current) setBusyKey(null);
     }
@@ -371,7 +371,6 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
           className="btn btn--quiet"
           type="button"
           onClick={() => {
-            setNotice(null);
             void loadState();
             void loadMarket();
           }}
@@ -406,34 +405,29 @@ export function PluginWorkbench({ active }: PluginWorkbenchProps) {
         </div>
       )}
 
-      {error && (
-        <p className="workbench__error" role="alert" data-testid="plugin-error">
-          {error}
-        </p>
-      )}
-      {notice && (
-        <p className="plugin-workbench__notice" data-testid="plugin-notice">{notice}</p>
-      )}
-
       <div className="plugin-list" data-testid={segment === "installed" ? "plugin-installed-list" : "plugin-market-list"}>
         {loading && state === null && segment === "installed" && (
-          <p className="plugin-empty">正在读取已装插件…</p>
+          <EmptyState className="plugin-empty" description="正在读取已装插件…" />
         )}
         {segment === "market" && market === null && (
-          <p className="plugin-empty">{marketError ?? "正在读取插件市场…"}</p>
+          <EmptyState className="plugin-empty" description={marketError ?? "正在读取插件市场…"} />
         )}
         {segment === "market" && market !== null && marketError && (
           <p className="workbench__error" role="alert">{marketError}</p>
         )}
         {isEmpty && segment === "installed" && (
-          <p className="plugin-empty" data-testid="plugin-installed-empty">
-            当前账号还没有已装插件；可到插件市场浏览安装。
-          </p>
+          <EmptyState
+            className="plugin-empty"
+            testId="plugin-installed-empty"
+            description="当前账号还没有已装插件；可到插件市场浏览安装。"
+          />
         )}
         {isEmpty && segment === "market" && (
-          <p className="plugin-empty" data-testid="plugin-market-empty">
-            没有符合条件的插件，可调整分类或搜索词。
-          </p>
+          <EmptyState
+            className="plugin-empty"
+            testId="plugin-market-empty"
+            description="没有符合条件的插件，可调整分类或搜索词。"
+          />
         )}
         {rows.map((row) => (
           <PluginRow

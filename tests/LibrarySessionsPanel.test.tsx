@@ -1,4 +1,4 @@
-﻿import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { LibrarySessionsPanel } from "../src/components/LibrarySessionsPanel";
@@ -9,7 +9,26 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+// P11-1 切片②：批量操作回执/失败原因已迁到 notify；断言 notify 调用。
+// 带「重试启动/刷新历史列表」按钮的就地恢复条（archive-recovery）仍在页内，保留 DOM 断言。
+vi.mock("../src/platform/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/platform/notify")>();
+  return {
+    ...actual,
+    notify: {
+      success: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: vi.fn(),
+    },
+  };
+});
+
+import { notify } from "../src/platform/notify";
+
 const mockInvoke = vi.mocked(invoke);
+const notifyMock = vi.mocked(notify);
 
 const NOW = Date.now() / 1000;
 const DAY = 24 * 3600;
@@ -213,6 +232,11 @@ function setupHistory(history: MasterHistoryDto) {
       const typedArgs = args as { sessionId: string; offset?: number };
       return sessionMessages(typedArgs.sessionId, typedArgs.offset);
     }
+    // P11-5：草稿正本在工具管理数据；默认空草稿（读取/写入都成功）。
+    if (command === "get_archive_draft") {
+      return { archive_session_ids: [], restore_session_ids: [] };
+    }
+    if (command === "set_archive_draft") return true;
     return undefined;
   });
 }
@@ -472,6 +496,8 @@ type MutableSession = {
 function setupMutableHistory(options: {
   relaunchOutcomes?: readonly ("launched" | "failed")[];
   refreshFailures?: number;
+  /** P11-5：提供时模拟工具管理数据中的草稿持久化（libraryId → 草稿）。 */
+  drafts?: Map<string, { archive_session_ids: string[]; restore_session_ids: string[] }>;
 } = {}) {
   const dto = historyDto();
   const sessions = dto.sessions.map((session) => ({ ...session })) as MutableSession[];
@@ -493,6 +519,30 @@ function setupMutableHistory(options: {
       return sessionMessages((args as { sessionId: string }).sessionId);
     }
     if (command === "launch_master_library") return { outcome: "launched", login_state: "logged_in" };
+    // P11-5：草稿正本在工具管理数据；默认空草稿（读取/写入都成功），
+    // 传入 drafts Map 时模拟真实持久化。
+    if (command === "get_archive_draft") {
+      const libraryId = (args as { libraryId: string }).libraryId;
+      return options.drafts?.get(libraryId) ?? { archive_session_ids: [], restore_session_ids: [] };
+    }
+    if (command === "set_archive_draft") {
+      const payload = args as {
+        libraryId: string;
+        archiveSessionIds: string[];
+        restoreSessionIds: string[];
+      };
+      if (options.drafts) {
+        if (payload.archiveSessionIds.length === 0 && payload.restoreSessionIds.length === 0) {
+          options.drafts.delete(payload.libraryId);
+        } else {
+          options.drafts.set(payload.libraryId, {
+            archive_session_ids: [...payload.archiveSessionIds],
+            restore_session_ids: [...payload.restoreSessionIds],
+          });
+        }
+      }
+      return true;
+    }
     if (command === "apply_master_archive_changes") {
       const { archiveSessionIds, restoreSessionIds } = args as {
         archiveSessionIds: string[];
@@ -596,12 +646,16 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
       });
     });
 
-    // 刷新后：退出选择模式、行内回执、入口计数 3（s3 原有 + 新归档 2）
+    // 刷新后：退出选择模式、成功回执走 notify、入口计数 3（s3 原有 + 新归档 2）
     await waitFor(() => {
       expect(screen.getByTestId("library-archive-entry")).toHaveTextContent("3");
     });
     expect(screen.queryByTestId("library-action-bar")).not.toBeInTheDocument();
-    expect(screen.getByTestId("action-notice")).toHaveTextContent("已应用归档设置：归档 2 个、恢复 0 个会话。");
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("已应用归档设置：归档 2 个、恢复 0 个会话。");
+    });
+    // 无恢复需求时不保留页内提示条。
+    expect(screen.queryByTestId("action-notice")).not.toBeInTheDocument();
     expect(screen.queryByTestId("library-session-s1")).not.toBeInTheDocument();
   });
 
@@ -623,8 +677,10 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("launch_master_library");
-      expect(screen.getByTestId("action-notice")).toHaveTextContent("实例已重新启动");
+      expect(notifyMock.success).toHaveBeenCalledWith("主库实例已重新启动，历史列表已刷新。");
     });
+    // 恢复完成后页内提示条消失。
+    expect(screen.queryByTestId("action-notice")).not.toBeInTheDocument();
     expect(screen.queryByTestId("archive-recovery-retry")).not.toBeInTheDocument();
   });
 
@@ -650,8 +706,9 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
         previousCurrentUserId: null,
         libraryId: "master",
       });
-      expect(screen.getByTestId("action-notice")).toHaveTextContent("历史列表已刷新");
+      expect(notifyMock.success).toHaveBeenCalledWith("历史列表已刷新。");
     });
+    expect(screen.queryByTestId("action-notice")).not.toBeInTheDocument();
     expect(screen.queryByTestId("archive-recovery-retry")).not.toBeInTheDocument();
   });
 
@@ -763,26 +820,37 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
         libraryId: "master",
       });
     });
-    // 不进选择模式；回执 + 树内即时消失
+    // 不进选择模式；成功回执走 notify + 树内即时消失
     expect(screen.queryByTestId("library-action-bar")).not.toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getByTestId("action-notice")).toHaveTextContent("已应用归档设置：归档 1 个、恢复 0 个会话。");
+      expect(notifyMock.success).toHaveBeenCalledWith("已应用归档设置：归档 1 个、恢复 0 个会话。");
     });
     expect(screen.queryByTestId("library-session-s2")).not.toBeInTheDocument();
   });
 
-  it("归档草稿在组件重载后仍保留，用户可放弃而不写入数据库", async () => {
-    setupMutableHistory();
+  it("归档草稿在后端持久化，组件重载后仍保留，用户可放弃而不写入数据库", async () => {
+    // P11-5：草稿正本存工具管理数据（get/set_archive_draft），用内存 map 模拟。
+    const drafts = new Map<string, { archive_session_ids: string[]; restore_session_ids: string[] }>();
+    setupMutableHistory({ drafts });
     const firstRender = render(<LibrarySessionsPanel active />);
     await expandProject("p1");
 
     fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
     expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
+    // 草稿变化写入后端命令（不再写 localStorage）。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_archive_draft", {
+        libraryId: "master",
+        archiveSessionIds: ["s2"],
+        restoreSessionIds: [],
+      });
+    });
     expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
 
+    // 重载：后端返回已存草稿（模拟重启后读取工具管理数据）。
     firstRender.unmount();
     mockInvoke.mockClear();
-    setupMutableHistory();
+    setupMutableHistory({ drafts });
     render(<LibrarySessionsPanel active />);
 
     await waitFor(() => {
@@ -790,29 +858,98 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     });
     expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
 
+    // 放弃设置：清空草稿（后端删除该库键），不写数据库。
     fireEvent.click(screen.getByTestId("archive-draft-discard"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_archive_draft", {
+        libraryId: "master",
+        archiveSessionIds: [],
+        restoreSessionIds: [],
+      });
+    });
     expect(screen.queryByTestId("archive-draft-bar")).not.toBeInTheDocument();
     await expandProject("p1");
     expect(screen.getByTestId("library-session-s2")).toBeInTheDocument();
   });
 
-  it("本地草稿保存失败时显示可见提示", async () => {
+  it("localStorage 旧草稿在首次读取时迁移到后端，成功后清除旧键", async () => {
     setupMutableHistory();
+    // 预置老版本遗留草稿（localStorage 迁移源）。
+    window.localStorage.setItem(
+      "trae-sync:archive-draft:master",
+      JSON.stringify({ archiveSessionIds: ["s2"], restoreSessionIds: [] }),
+    );
+    render(<LibrarySessionsPanel active />);
+
+    // 迁移：草稿状态来自 localStorage，并写入后端命令。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_archive_draft", {
+        libraryId: "master",
+        archiveSessionIds: ["s2"],
+        restoreSessionIds: [],
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
+    });
+    // 迁移成功后清除 localStorage 旧键（避免下次重复迁移）。
+    expect(window.localStorage.getItem("trae-sync:archive-draft:master")).toBeNull();
+  });
+
+  it("后端草稿写入失败时回退 localStorage 并显式告警，双失败显示页内错误", async () => {
+    setupMutableHistory();
+    // 场景 1：后端写入失败、localStorage 回退成功 → notify.warning，草稿不丢。
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_master_history") return historyDto();
+      if (command === "get_relay_ledger") return ledgerEntries();
+      if (command === "get_archive_draft") {
+        return { archive_session_ids: [], restore_session_ids: [] };
+      }
+      if (command === "set_archive_draft") throw new Error("archive_draft_store_unavailable");
+      return undefined;
+    });
+    const first = render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+    fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    expect(await screen.findByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
+    await waitFor(() => {
+      expect(notifyMock.warning).toHaveBeenCalledWith(
+        "归档草稿暂存到工具数据失败，已改存本机浏览器存储，重启应用后仍可恢复。",
+      );
+    });
+    // 回退路径确实写入了 localStorage。
+    expect(window.localStorage.getItem("trae-sync:archive-draft:master")).toContain("s2");
+    first.unmount();
+
+    // 场景 2：后端与 localStorage 双失败 → 页内横幅（不能静默丢草稿）。
+    // 清掉场景 1 回退写入的草稿，从干净状态开始。
+    window.localStorage.clear();
     const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("storage_quota");
     });
-
     try {
       render(<LibrarySessionsPanel active />);
       await expandProject("p1");
       fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
-
       expect(await screen.findByTestId("archive-draft-storage-error")).toHaveTextContent(
         "暂存失败",
       );
     } finally {
       setItem.mockRestore();
     }
+  });
+
+  it("后端草稿读取失败（命令不可用）按空草稿处理，不阻断历史列表", async () => {
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_master_history") return historyDto();
+      if (command === "get_relay_ledger") return ledgerEntries();
+      if (command === "get_archive_draft") throw new Error("archive_draft_join_failed");
+      return undefined;
+    });
+    render(<LibrarySessionsPanel active />);
+    // 列表正常渲染，无草稿条。
+    expect(await screen.findByTestId("library-project-p1")).toBeInTheDocument();
+    expect(screen.queryByTestId("archive-draft-bar")).not.toBeInTheDocument();
   });
 
   it("删除确认列明规模：取消不删除、确认后调用真实删除", async () => {
@@ -845,8 +982,8 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     });
     await waitFor(() => {
       expect(screen.queryByTestId("library-action-bar")).not.toBeInTheDocument();
+      expect(notifyMock.success).toHaveBeenCalledWith("已删除 1 个会话。");
     });
-    expect(screen.getByTestId("action-notice")).toHaveTextContent("已删除 1 个会话。");
   });
 
   it("归档视图：模式→项目层级展示 + 恢复所选归位主树", async () => {
@@ -1041,13 +1178,13 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
       });
     });
 
-    // 刷新后：退出选择模式、回执以数量表述、p1 无会话不再显示、p2 收拢全部
+    // 刷新后：退出选择模式、合并回执走 notify（数量表述）、p1 无会话不再显示、p2 收拢全部
     await waitFor(() => {
       expect(screen.queryByTestId("library-action-bar")).not.toBeInTheDocument();
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已把 2 个会话并入「项目二」，清理 1 个空分组。",
+      );
     });
-    expect(screen.getByTestId("action-notice")).toHaveTextContent(
-      "已把 2 个会话并入「项目二」，清理 1 个空分组。",
-    );
     expect(screen.queryByTestId("library-project-p1")).not.toBeInTheDocument();
     expect(screen.getByTestId("library-project-p2")).toHaveTextContent("4");
   });
@@ -1074,11 +1211,48 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("batch-merge"));
     fireEvent.click(await screen.findByTestId("merge-confirm-confirm"));
 
-    // 错误以自然语言提示（master_merge_running 的映射文案）
+    // 错误以自然语言通知（master_merge_running 的映射文案）
     await waitFor(() => {
-      expect(screen.getByTestId("batch-error")).toHaveTextContent("主库正在运行");
+      expect(notifyMock.error).toHaveBeenCalledWith(expect.stringContaining("主库正在运行"));
     });
     // 树维持原状（会话未被移动）
     expect(screen.getByTestId("library-project-p1")).toHaveTextContent("2");
+  });
+});
+
+// ============================================================================
+// P11-6（ADR-0032 决策 5）：只读库形态（trae_cn 数据根）。
+// 写操作控件隐藏（不是禁用）；草稿机制整体不参与；引导去环境页的 CTA 不出现
+//（Trae CN 环境能力 absent，不能把用户引向一个 absent 页面）。
+// ============================================================================
+
+describe("LibrarySessionsPanel readOnly（Trae CN 只读浏览）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+  });
+
+  it("写控件隐藏：选择按钮与快捷归档不出；草稿命令不发起；归档内容仍可浏览", async () => {
+    setupHistory(historyDto());
+    render(<LibrarySessionsPanel active readOnly />);
+
+    await screen.findByTestId("library-project-p1");
+    // 读路径正常，写机制（归档草稿）整体不参与。
+    expect(mockInvoke).not.toHaveBeenCalledWith("get_archive_draft", expect.anything());
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    await expandProject("p1");
+    expect(screen.queryByTestId("library-quick-archive-s1")).not.toBeInTheDocument();
+    // 已归档内容是数据根的一部分，浏览入口保留。
+    expect(screen.getByTestId("library-archive-entry")).toBeInTheDocument();
+  });
+
+  it("空态引导：不出「去环境页」按钮，只保留诚实说明", async () => {
+    setupHistory(
+      historyDto({ status: "no_master_data", current_user_id: null, projects: [], sessions: [] }),
+    );
+    render(<LibrarySessionsPanel active readOnly />);
+    const guide = await screen.findByTestId("history-guide");
+    expect(guide).toHaveTextContent("还没有对话数据");
+    expect(screen.queryByTestId("history-guide-launch")).not.toBeInTheDocument();
   });
 });

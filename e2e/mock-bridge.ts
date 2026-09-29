@@ -988,6 +988,68 @@ export async function installMockBridge(
       }
       if (cmd === "cancel_checkin") return true;
       if (cmd === "refresh_managed_current_account") return MANAGED_ACCOUNT_STATE;
+      // ===== P11-5 主库体检整合区块（环境页）：只读报告，静态健康数据 =====
+      if (cmd === "get_master_checkup") {
+        const current = ACCOUNTS.find((entry) => entry.profile_id === envCurrentProfileId);
+        return {
+          status: "ready",
+          current_account_name: current?.screen_name ?? null,
+          accounts: current
+            ? [
+                {
+                  user_id: current.account_id,
+                  account_name: current.screen_name,
+                  registered: true,
+                  current: true,
+                  project_count: 3,
+                  session_count: 5,
+                  empty_project_count: 0,
+                },
+              ]
+            : [],
+          orphan_project_count: 0,
+          orphan_session_count: 0,
+        };
+      }
+      if (cmd === "get_master_self_check") {
+        return {
+          level: "healthy",
+          checks: [
+            { key: "read", status: "passed", summary: "登录数据可读取" },
+            { key: "consistency", status: "passed", summary: "工具记录与实际登录一致" },
+            { key: "switchability", status: "passed", summary: "主库已关闭，可进行切换" },
+            { key: "deep", status: "passed", summary: "接力记录可读取" },
+          ],
+          current_account_name: null,
+          observed_account_name: null,
+          can_repair: false,
+        };
+      }
+      // ===== P11-5 库归档草稿（工具管理数据 mock：页面级内存 map，每库一键）=====
+      if (cmd === "get_archive_draft") {
+        const drafts: Map<string, unknown> =
+          (window as any).__archiveDrafts ?? new Map();
+        return (
+          drafts.get(args?.libraryId) ?? { archive_session_ids: [], restore_session_ids: [] }
+        );
+      }
+      if (cmd === "set_archive_draft") {
+        const drafts: Map<string, unknown> =
+          (window as any).__archiveDrafts ?? new Map();
+        (window as any).__archiveDrafts = drafts;
+        // 空草稿 = 两个意图列表都为空（与后端 ArchiveDraftRecord::is_empty 同义）。
+        const hasArchive = Array.isArray(args?.archiveSessionIds) && args.archiveSessionIds.length > 0;
+        const hasRestore = Array.isArray(args?.restoreSessionIds) && args.restoreSessionIds.length > 0;
+        if (!hasArchive && !hasRestore) {
+          drafts.delete(args?.libraryId);
+        } else {
+          drafts.set(args?.libraryId, {
+            archive_session_ids: hasArchive ? [...args.archiveSessionIds] : [],
+            restore_session_ids: hasRestore ? [...args.restoreSessionIds] : [],
+          });
+        }
+        return true;
+      }
       // Tauri event 插件 command 只返回句柄，不产生真实事件；页面会继续用轮询兜底。
       if (cmd === "plugin:event|listen") return 0;
       if (cmd === "plugin:event|unlisten") return null;

@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CalendarClock, DatabaseBackup } from "lucide-react";
+import { CalendarClock, DatabaseBackup, FolderSymlink } from "lucide-react";
 import type { AutoCheckinStatusDto } from "../types/account_switch";
-import type { BackupRetentionDto, MasterBackupChainDto } from "../types/masterLibrary";
+import type {
+  BackupMigrationDto,
+  BackupRetentionDto,
+  MasterBackupChainDto,
+} from "../types/masterLibrary";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+// 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
+import { notify } from "../platform/notify";
+import { EmptyState } from "./EmptyState";
 
 interface SettingsPanelProps {
   /** 页面可见时才读取设置，避免后台 IPC。 */
@@ -12,8 +19,6 @@ interface SettingsPanelProps {
 
 // 设置页：自动签到偏好 + 主库备份。
 export function SettingsPanel({ active }: SettingsPanelProps) {
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
   // 自动签到设置（ADR-0019 决策 5 / 2026-08-23 grill）：总开关 + 每日时间点 + 今日台账。
   const [autoStatus, setAutoStatus] = useState<AutoCheckinStatusDto | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
@@ -21,6 +26,13 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
   // 读取失败（fixture 模式等）静默降级为 null，分区整体不渲染（可插拔语义）。
   const [backupChain, setBackupChain] = useState<MasterBackupChainDto | null>(null);
   const [backupBusy, setBackupBusy] = useState(false);
+  // P11-4② 备份内容可选「包含账号凭据」：默认不勾，避免无意识扩散凭据文件。
+  const [includeCredentials, setIncludeCredentials] = useState(false);
+  // P11-4① 更改备份位置弹层：目录输入 + 是否同时迁移现有备份（默认勾选）。
+  const [locationDialogOpen, setLocationDialogOpen] = useState(false);
+  const [locationInput, setLocationInput] = useState("");
+  const [migrateExisting, setMigrateExisting] = useState(true);
+  const [locationBusy, setLocationBusy] = useState(false);
   // P5-9 备份保留设置：自动清理开关 + 保留份数（与备份链同分区展示）。
   const [retention, setRetention] = useState<BackupRetentionDto | null>(null);
   const [retentionBusy, setRetentionBusy] = useState(false);
@@ -54,33 +66,79 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
   }, [active, loadBackupChain]);
 
   // 手动备份：主库三件套复制为 .switch-bak-{时间戳}（create_new 永不覆盖）。
+  // 勾选凭据时后端把签到凭据白名单整拷到 credentials-{同时间戳}/ 子目录。
   // 成功后重读备份链；失败提示稳定原因（如主库运行中），原数据不受影响。
   const handleCreateBackup = useCallback(() => {
     if (backupBusy) return;
     setBackupBusy(true);
-    setError(null);
-    setMessage(null);
-    void invoke<string>("create_master_backup")
+    void invoke<string>("create_master_backup", { includeCredentials })
       .then(() => loadBackupChain())
-      .then(() => setMessage("主库数据备份已创建，原数据未受影响。"))
-      .catch((reason: unknown) => setError(safeUiErrorMessage(reason, "主库数据备份未完成。")))
+      .then(() =>
+        notify.success(
+          includeCredentials
+            ? "主库数据备份已创建（含账号凭据子目录），原数据未受影响。"
+            : "主库数据备份已创建，原数据未受影响。",
+        ),
+      )
+      .catch((reason: unknown) => notify.error(safeUiErrorMessage(reason, "主库数据备份未完成。")))
       .finally(() => setBackupBusy(false));
-  }, [backupBusy, loadBackupChain]);
+  }, [backupBusy, includeCredentials, loadBackupChain]);
+
+  // P11-4① 提交备份位置变更：先迁移（此刻活动目录仍是旧位置）再切换；
+  // 迁移出现失败清单时中止切换（已复制的保留，可排查后重试，迁移幂等）。
+  const handleSaveBackupLocation = useCallback(() => {
+    if (locationBusy) return;
+    const targetDir = locationInput.trim();
+    if (targetDir === "") return;
+    setLocationBusy(true);
+    const run: Promise<BackupMigrationDto | null> = migrateExisting
+      ? invoke<BackupMigrationDto>("migrate_master_backups", { targetDir })
+      : Promise.resolve(null);
+    void run
+      .then((migration) => {
+        if (migration && migration.failures.length > 0) {
+          // 部分失败：不切换位置，返回清单（notify.summary 带异常逐行）。
+          notify.summary(
+            "部分备份未能复制到新位置，备份位置未变更",
+            migration.failures.map((failure) => ({
+              displayName: failure.file_name,
+              reason: failure.reason,
+            })),
+            migration.migrated_files,
+          );
+          return;
+        }
+        return invoke("set_backup_dir", { backupDir: targetDir }).then(() => {
+          notify.success(
+            migration
+              ? `备份位置已更新，${migration.migrated_files} 个文件已复制到新位置（原位置备份保留，可自行清理）。`
+              : "备份位置已更新，之后的备份将写入新目录。",
+          );
+        });
+      })
+      .then(() => {
+        setLocationDialogOpen(false);
+        setLocationInput("");
+        return loadBackupChain();
+      })
+      .catch((reason: unknown) =>
+        notify.error(safeUiErrorMessage(reason, "备份位置变更未完成，当前设置保持不变。")),
+      )
+      .finally(() => setLocationBusy(false));
+  }, [locationBusy, locationInput, migrateExisting, loadBackupChain]);
 
   // P5-9 保存备份保留设置：开关与保留份数一起提交（后端范围校验 1-50）。
   const handleSaveRetention = useCallback((enabled: boolean, keep: number) => {
     if (retentionBusy) return;
     setRetentionBusy(true);
-    setError(null);
-    setMessage(null);
     void invoke("set_backup_retention", { enabled, keep })
       .then(() => {
         setRetention({ enabled, keep });
-        setMessage(enabled
+        notify.success(enabled
           ? `备份自动清理已开启，超出 ${keep} 份的旧备份会在新备份生成后自动删除。`
           : "备份自动清理已关闭，旧备份不会再被自动删除。");
       })
-      .catch((reason: unknown) => setError(safeUiErrorMessage(reason, "备份清理设置保存失败。")))
+      .catch((reason: unknown) => notify.error(safeUiErrorMessage(reason, "备份清理设置保存失败。")))
       .finally(() => setRetentionBusy(false));
   }, [retentionBusy]);
 
@@ -88,15 +146,13 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
   const handleSaveAutoCheckin = useCallback((enabled: boolean, dailyTime: string) => {
     if (autoBusy) return;
     setAutoBusy(true);
-    setError(null);
-    setMessage(null);
     void invoke("set_auto_checkin_settings", { enabled, dailyTimeHhmm: dailyTime })
       .then(() => invoke<AutoCheckinStatusDto>("get_auto_checkin_settings"))
       .then((next) => {
         setAutoStatus(next);
-        setMessage(enabled ? `自动签到已开启，每日 ${dailyTime} 后自动执行。` : "自动签到已关闭。");
+        notify.success(enabled ? `自动签到已开启，每日 ${dailyTime} 后自动执行。` : "自动签到已关闭。");
       })
-      .catch((reason: unknown) => setError(safeUiErrorMessage(reason, "自动签到设置保存失败。")))
+      .catch((reason: unknown) => notify.error(safeUiErrorMessage(reason, "自动签到设置保存失败。")))
       .finally(() => setAutoBusy(false));
   }, [autoBusy]);
 
@@ -157,9 +213,6 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       ) : (
         <p className="account-center__meta">正在读取自动签到设置…</p>
       )}
-
-      {error && <p className="workbench__error" role="alert">{error}</p>}
-      {message && <p className="settings-panel__key-message" role="status">{message}</p>}
 
       {/* P5-4 主库数据备份（ADR-0018）：备份链展示 + 手动创建 + 人工恢复指引。
           P5-9 备份保留：超出保留数的旧备份自动清理（可关闭）；恢复仍是人工操作，界面只给定位与步骤。 */}
@@ -227,33 +280,130 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
                     >
                       {entry.has_wal ? "含附属件" : "完整快照"}
                     </span>
+                    {entry.has_credentials && (
+                      <span className="settings-backup__kind" title="这份备份同时保存了账号凭据（加密密文），恢复时把凭据子目录一并复制回签到材料目录">
+                        含凭据
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>
             ) : (
-              <p className="settings-backup__empty">尚无备份；切换账号时会自动生成，也可以现在手动创建一份。</p>
+              <EmptyState
+                className="settings-backup__empty"
+                description="尚无备份；切换账号时会自动生成，也可以现在手动创建一份。"
+              />
             )}
-            <button
-              className="btn btn--quiet"
-              type="button"
-              onClick={handleCreateBackup}
-              disabled={backupBusy}
-              data-testid="master-backup-create"
-            >
-              <DatabaseBackup size={15} aria-hidden="true" />
-              {backupBusy ? "备份中…" : "立即备份"}
-            </button>
+            {/* P11-4② 备份内容可选：凭据文件属敏感材料，默认不勾避免无意识扩散。 */}
+            <label className="account-center__profile-select" data-testid="backup-include-credentials-toggle" title="把账号凭据（加密密文）与账号清单一并备份到备份目录下的凭据子目录；仅同一 Windows 用户可恢复。">
+              <input
+                type="checkbox"
+                checked={includeCredentials}
+                disabled={backupBusy}
+                onChange={(event) => setIncludeCredentials(event.target.checked)}
+              />
+              <span className="account-center__profile-copy">
+                <strong>包含账号凭据</strong>
+                <span>备份签到账号的加密凭据与清单（默认不勾）</span>
+              </span>
+            </label>
+            <div className="settings-backup__actions">
+              <button
+                className="btn btn--quiet"
+                type="button"
+                onClick={handleCreateBackup}
+                disabled={backupBusy}
+                data-testid="master-backup-create"
+              >
+                <DatabaseBackup size={15} aria-hidden="true" />
+                {backupBusy ? "备份中…" : "立即备份"}
+              </button>
+              <button
+                className="btn btn--quiet"
+                type="button"
+                onClick={() => {
+                  setLocationInput("");
+                  setMigrateExisting(true);
+                  setLocationDialogOpen(true);
+                }}
+                disabled={locationBusy}
+                data-testid="backup-location-change"
+              >
+                <FolderSymlink size={15} aria-hidden="true" />
+                更改备份位置
+              </button>
+            </div>
+            {/* P11-4① 当前备份位置常驻展示；恢复指引与展示同源（活动备份目录）。 */}
+            <p className="account-center__meta" data-testid="backup-location-current">
+              当前备份位置：<code>{backupChain.backup_dir}</code>
+            </p>
             <details className="settings-panel__fold settings-backup__location" data-testid="master-backup-location-details">
-              <summary>查看备份位置与恢复步骤</summary>
+              <summary>查看恢复步骤</summary>
               <p className="settings-backup__hint" data-testid="master-backup-restore-hint">
-                备份保存在 <code>{backupChain.backup_dir}</code> 目录（.switch-bak- 前缀）。
+                备份保存在上方所示目录（.switch-bak- 前缀）。
                 {retention?.enabled
                   ? `超出保留份数的旧备份会自动清理（当前保留 ${retention.keep} 份）。`
                   : "未开启自动清理时，备份不会被自动删除。"}
                 人工恢复：先关闭 TRAE，再把所选备份内的文件复制回该目录覆盖原位，然后重新启动。
+                {backupChain.backups.some((entry) => entry.has_credentials)
+                  ? "带「含凭据」的备份在凭据子目录（credentials- 前缀）中保存了账号加密凭据：恢复账号时把该子目录的内容复制回签到材料目录（checkin）即可。"
+                  : ""}
               </p>
             </details>
           </div>
+          {/* P11-4① 更改备份位置弹层：目录输入 + 迁移勾选（迁移是复制、原位保留）。 */}
+          {locationDialogOpen && (
+            <div className="switch-veil" role="presentation">
+              <div className="switch-dialog" role="dialog" aria-modal="true" aria-label="更改备份位置" data-testid="backup-location-dialog">
+                <div className="switch-dialog__title">更改备份位置</div>
+                <p className="settings-backup__hint">
+                  新备份将写入新目录；已有备份默认复制过去（原位置保留，可自行清理）。
+                </p>
+                <input
+                  className="mobile-prompt__input"
+                  type="text"
+                  value={locationInput}
+                  placeholder="输入新备份目录的完整路径，如 D:\\TraeBackups"
+                  disabled={locationBusy}
+                  data-testid="backup-location-input"
+                  aria-label="新备份目录"
+                  onChange={(event) => setLocationInput(event.target.value)}
+                />
+                <label className="account-center__profile-select" data-testid="backup-location-migrate-toggle">
+                  <input
+                    type="checkbox"
+                    checked={migrateExisting}
+                    disabled={locationBusy}
+                    onChange={(event) => setMigrateExisting(event.target.checked)}
+                  />
+                  <span className="account-center__profile-copy">
+                    <strong>同时迁移现有备份</strong>
+                    <span>复制到新位置并逐文件校验，原位置保留</span>
+                  </span>
+                </label>
+                <div className="switch-dialog__actions">
+                  <button
+                    className="btn btn--quiet"
+                    type="button"
+                    onClick={() => setLocationDialogOpen(false)}
+                    disabled={locationBusy}
+                    data-testid="backup-location-dialog-cancel"
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="btn btn--primary"
+                    type="button"
+                    onClick={handleSaveBackupLocation}
+                    disabled={locationBusy || locationInput.trim() === ""}
+                    data-testid="backup-location-dialog-confirm"
+                  >
+                    {locationBusy ? "保存中…" : "保存"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </>
       )}
     </section>

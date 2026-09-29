@@ -2,10 +2,29 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { SettingsPanel } from "../src/components/SettingsPanel";
+import type { MasterBackupEntryDto } from "../src/types/masterLibrary";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
+// P11-1 切片②：操作结果类提示已迁到 notify 适配层；断言 notify 调用而非页内文本。
+vi.mock("../src/platform/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/platform/notify")>();
+  return {
+    ...actual,
+    notify: {
+      success: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: vi.fn(),
+    },
+  };
+});
+
+import { notify } from "../src/platform/notify";
+
 const mockInvoke = vi.mocked(invoke);
+const notifyMock = vi.mocked(notify);
 
 describe("设置面板", () => {
   beforeEach(() => {
@@ -99,7 +118,9 @@ describe("设置面板", () => {
         dailyTimeHhmm: "10:00",
       });
     });
-    expect(await screen.findByText("自动签到已关闭。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("自动签到已关闭。");
+    });
     // 关闭后时间控件禁用。
     expect(screen.getByTestId("auto-checkin-time-input")).toBeDisabled();
   });
@@ -145,14 +166,14 @@ describe("设置面板", () => {
   });
 
   it("P5-4：点击立即备份提交命令并重读备份链", async () => {
-    const backups: Array<{ stamp_unix_seconds: number; total_bytes: number; has_wal: boolean }> = [];
+    const backups: MasterBackupEntryDto[] = [];
     mockInvoke.mockImplementation(async (command) => {
       if (command === "get_master_backup_chain") {
         // 每次返回新对象（后端语义）：mock 持有同一引用会让 React 状态不变、徽章不刷新。
         return { backups: [...backups], backup_dir: "D:\\bak", keep_policy: 5 };
       }
       if (command === "create_master_backup") {
-        backups.push({ stamp_unix_seconds: 1756000000, total_bytes: 1024 * 1024, has_wal: false });
+        backups.push({ stamp_unix_seconds: 1756000000, total_bytes: 1024 * 1024, has_wal: false, has_credentials: false });
         return "D:\\bak\\.switch-bak-1756000000";
       }
       throw new Error(`unexpected command: ${String(command)}`);
@@ -164,11 +185,132 @@ describe("设置面板", () => {
 
     fireEvent.click(screen.getByTestId("master-backup-create"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("create_master_backup");
+      // P11-4②：凭据勾选默认关闭，随命令提交（后端按 false 不建凭据子目录）。
+      expect(mockInvoke).toHaveBeenCalledWith("create_master_backup", { includeCredentials: false });
     });
-    expect(await screen.findByText("主库数据备份已创建，原数据未受影响。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("主库数据备份已创建，原数据未受影响。");
+    });
     // 备份后备份链重读：徽章更新为 1 份。
     expect(await screen.findByText("现有 1 份")).toBeInTheDocument();
+  });
+
+  it("P11-4②：勾选包含账号凭据后提交 includeCredentials 并提示含凭据", async () => {
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_master_backup_chain") {
+        return {
+          backups: [{ stamp_unix_seconds: 1756000000, total_bytes: 1024, has_wal: false, has_credentials: true }],
+          backup_dir: "D:\\bak",
+          keep_policy: 5,
+        };
+      }
+      if (command === "create_master_backup") {
+        return "D:\\bak\\.switch-bak-1756000000";
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+
+    fireEvent.click(screen.getByTestId("backup-include-credentials-toggle").querySelector("input")!);
+    fireEvent.click(screen.getByTestId("master-backup-create"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("create_master_backup", { includeCredentials: true });
+    });
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("主库数据备份已创建（含账号凭据子目录），原数据未受影响。");
+    });
+  });
+
+  it("P11-4①：更改备份位置默认先迁移再切换并重读备份链", async () => {
+    const calls: string[] = [];
+    mockInvoke.mockImplementation(async (command) => {
+      calls.push(command);
+      if (command === "get_master_backup_chain") {
+        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
+      }
+      if (command === "migrate_master_backups") {
+        return { migrated_files: 3, failures: [] };
+      }
+      if (command === "set_backup_dir") return undefined;
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), {
+      target: { value: "E:\\TraeBackups" },
+    });
+    // 迁移勾选默认勾选。
+    expect(screen.getByTestId("backup-location-migrate-toggle").querySelector("input")).toBeChecked();
+    fireEvent.click(screen.getByTestId("backup-location-dialog-confirm"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("migrate_master_backups", { targetDir: "E:\\TraeBackups" });
+      expect(mockInvoke).toHaveBeenCalledWith("set_backup_dir", { backupDir: "E:\\TraeBackups" });
+    });
+    // 顺序约束：迁移在切换之前（此刻活动目录仍是旧位置才能枚举到待迁备份）。
+    expect(calls.indexOf("migrate_master_backups")).toBeLessThan(calls.indexOf("set_backup_dir"));
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "备份位置已更新，3 个文件已复制到新位置（原位置备份保留，可自行清理）。",
+      );
+    });
+  });
+
+  it("P11-4①：取消迁移时只切换位置；迁移部分失败中止切换并返回清单", async () => {
+    let failMigration = false;
+    mockInvoke.mockImplementation(async (command) => {
+      if (command === "get_master_backup_chain") {
+        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
+      }
+      if (command === "migrate_master_backups") {
+        if (failMigration) {
+          return { migrated_files: 1, failures: [{ file_name: "database.db.switch-bak-1000", reason: "目标已存在同名文件且内容不一致，未覆盖" }] };
+        }
+        return { migrated_files: 2, failures: [] };
+      }
+      if (command === "set_backup_dir") return undefined;
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+
+    render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+
+    // 取消迁移：不调 migrate，直接 set。
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), {
+      target: { value: "E:\\TraeBackups" },
+    });
+    fireEvent.click(screen.getByTestId("backup-location-migrate-toggle").querySelector("input")!);
+    fireEvent.click(screen.getByTestId("backup-location-dialog-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_backup_dir", { backupDir: "E:\\TraeBackups" });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("migrate_master_backups", expect.anything());
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("备份位置已更新，之后的备份将写入新目录。");
+    });
+
+    // 部分失败：中止切换（不调 set），notify.summary 带失败清单。
+    // 重新打开弹层时迁移勾选被重置为默认勾选，直接确认即可走迁移路径。
+    failMigration = true;
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), {
+      target: { value: "F:\\TraeBackups" },
+    });
+    fireEvent.click(screen.getByTestId("backup-location-dialog-confirm"));
+    await waitFor(() => {
+      expect(notifyMock.summary).toHaveBeenCalledWith(
+        "部分备份未能复制到新位置，备份位置未变更",
+        [expect.objectContaining({ displayName: "database.db.switch-bak-1000" })],
+        1,
+      );
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("set_backup_dir", { backupDir: "F:\\TraeBackups" });
   });
 
   it("P5-4：主库运行中创建备份被拒并给出稳定提示", async () => {
@@ -186,7 +328,9 @@ describe("设置面板", () => {
     await screen.findByTestId("master-backup-section");
 
     fireEvent.click(screen.getByTestId("master-backup-create"));
-    expect(await screen.findByRole("alert")).toHaveTextContent(/主库正在运行/);
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith(expect.stringMatching(/主库正在运行/));
+    });
   });
 
   it("P5-9：备份分区展示保留设置并随开关保存", async () => {
@@ -213,7 +357,9 @@ describe("设置面板", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("set_backup_retention", { enabled: false, keep: 5 });
     });
-    expect(await screen.findByText(/备份自动清理已关闭/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith("备份自动清理已关闭，旧备份不会再被自动删除。");
+    });
     // 关闭后保留份数输入禁用。
     expect(screen.getByTestId("backup-retention-keep-input")).toBeDisabled();
     expect(settings).toBeInTheDocument();
@@ -243,7 +389,11 @@ describe("设置面板", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("set_backup_retention", { enabled: true, keep: 12 });
     });
-    expect(await screen.findByText(/保留 12 份/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "备份自动清理已开启，超出 12 份的旧备份会在新备份生成后自动删除。",
+      );
+    });
 
     // 越界值（51）不提交，避免后端拒绝后设置与界面不一致。
     const before = calls.length;

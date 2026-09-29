@@ -6,6 +6,7 @@ import type {
   LedgerVerificationDto,
   MasterVerificationDto,
 } from "../types/masterLibrary";
+import type { LibraryRef } from "./LibrarySessionsPanel";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 
 // ============================================================================
@@ -14,6 +15,7 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 //   移出，由 P8-5 主库自检（G18）承载；backupOnly 时不渲染。
 // 区块二 备份对比（可切换链上任一备份点为基准，会话级差异）——库信息 tab
 //   常驻区块。进 tab 自动执行 + 刷新按钮（P5-5 体检同模式）。
+// P11-5 收官：library 指定库实例（缺省主库；副库读自身台账与备份链）。
 // ============================================================================
 
 interface MasterVerificationPanelProps {
@@ -21,9 +23,15 @@ interface MasterVerificationPanelProps {
   active: boolean;
   /** G20：仅渲染备份对比区块（库信息 tab 用）；false 渲染全部区块。 */
   backupOnly?: boolean;
+  /** 库实例引用（ADR-0025，缺省主库）。 */
+  library?: LibraryRef;
 }
 
-export function MasterVerificationPanel({ active, backupOnly = false }: MasterVerificationPanelProps) {
+export function MasterVerificationPanel({
+  active,
+  backupOnly = false,
+  library,
+}: MasterVerificationPanelProps) {
   const [report, setReport] = useState<MasterVerificationDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -43,6 +51,7 @@ export function MasterVerificationPanel({ active, backupOnly = false }: MasterVe
     try {
       const next = await invoke<MasterVerificationDto>("get_master_verification", {
         backupStamp: stamp,
+        ...(library ? { libraryId: library.id } : {}),
       });
       if (!mountedRef.current) return;
       setReport(next);
@@ -55,7 +64,7 @@ export function MasterVerificationPanel({ active, backupOnly = false }: MasterVe
     } finally {
       if (mountedRef.current) setLoading(false);
     }
-  }, []);
+  }, [library]);
 
   useEffect(() => {
     if (!active) return;

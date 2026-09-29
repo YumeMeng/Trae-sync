@@ -11,7 +11,25 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+// P11-1 切片②：读取失败原因已迁到 notify；断言 notify.error 调用。
+vi.mock("../src/platform/notify", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/platform/notify")>();
+  return {
+    ...actual,
+    notify: {
+      success: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: vi.fn(),
+    },
+  };
+});
+
+import { notify } from "../src/platform/notify";
+
 const mockInvoke = vi.mocked(invoke);
+const notifyMock = vi.mocked(notify);
 
 const NOW = Math.floor(Date.now() / 1000);
 
@@ -250,7 +268,217 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
       return undefined;
     });
     render(<MasterLibraryDetail active onNavigate={() => undefined} />);
-    const alert = await screen.findByRole("alert");
-    expect(alert).toBeInTheDocument();
+    // 读取失败原因走 notify.error（P11-1 切片②），不再渲染页内错误条。
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalled();
+    });
+  });
+
+  it("P11-5 收官：副库详情页——标题用环境名，统计/备份链/历史按 libraryId 解析", async () => {
+    const secondaryListItem = {
+      env_id: "env-x1",
+      name: "测试环境",
+      is_master: false,
+      current_profile_id: "profile-b",
+      current_account_name: "账号乙",
+      data_dir: "D:\\store\\environments\\env-x1",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 1750000100,
+      size_bytes: 2097152,
+    };
+    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (command === "list_environments") return [secondaryListItem];
+      if (command === "get_master_library_stats") {
+        // 副库必须显式带 libraryId（缺省主库兼容口径不被误用）。
+        if (libraryId !== "env-x1") throw new Error("missing libraryId");
+        return {
+          status: "ready",
+          current_user_id: "user-b",
+          project_count: 2,
+          session_count: 5,
+          message_count: 40,
+          participating_account_count: 1,
+          last_active_unix_seconds: NOW - 60,
+          size_bytes: 1024 * 1024,
+        };
+      }
+      if (command === "get_master_backup_chain") {
+        if (libraryId !== "env-x1") throw new Error("missing libraryId");
+        return { backups: [], backup_dir: "D:\\store\\environments\\env-x1\\ModularData\\ai-agent", keep_policy: 5 };
+      }
+      if (command === "get_master_history") {
+        if (libraryId !== "env-x1") throw new Error("missing libraryId");
+        return historyDto();
+      }
+      if (command === "get_relay_ledger") return [];
+      if (command === "get_master_verification") {
+        if (libraryId !== "env-x1") throw new Error("missing libraryId");
+        return {
+          ledger: { status: "ready", checked_count: 0, relayed_away_count: 0, issues: [] },
+          backup: { status: "no_backups", backup_stamp: null, backup_stamps: [], common_count: 0, relayed_away_count: 0, added_count: 0, missing: [] },
+        };
+      }
+      return undefined;
+    });
+    render(
+      <MasterLibraryDetail
+        active
+        onNavigate={() => undefined}
+        library={{ id: "env-x1", displayName: "测试环境" }}
+      />,
+    );
+
+    // 标题/面包屑 = 环境名（不再是「主库」）。
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("测试环境");
+    // 副环境档案：当前账号与数据目录来自 list_environments 行。
+    fireEvent.click(screen.getByTestId("master-tab-info"));
+    const info = await screen.findByTestId("master-detail-info");
+    expect(screen.getByTestId("master-info-account")).toHaveTextContent("账号乙");
+    expect(screen.getByTestId("master-info-path")).toHaveTextContent("environments\\env-x1");
+    expect(screen.getByTestId("master-info-size")).toHaveTextContent("1.0 MB");
+    // 统计口径与主库一致（计数区同款结构）。
+    await waitFor(() => {
+      expect(screen.getByTestId("master-detail-counts")).toHaveTextContent("2");
+    });
+    expect(info).toBeInTheDocument();
+  });
+
+  it("P11-5 收官：副库插件 tab 显示说明（副环境不参与插件管理），不挂工作台", async () => {
+    const secondaryListItem = {
+      env_id: "env-x1",
+      name: "测试环境",
+      is_master: false,
+      current_profile_id: null,
+      current_account_name: null,
+      data_dir: "D:\\store\\environments\\env-x1",
+      running: false,
+      login_state: "uninitialized",
+      created_at_unix_seconds: 1750000100,
+      size_bytes: 0,
+    };
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "list_environments") return [secondaryListItem];
+      if (command === "get_master_library_stats") {
+        return { status: "no_master_data", current_user_id: null, project_count: 0, session_count: 0, message_count: 0, participating_account_count: 0, last_active_unix_seconds: null, size_bytes: 0 };
+      }
+      if (command === "get_master_backup_chain") {
+        return { backups: [], backup_dir: "D:\\store", keep_policy: 5 };
+      }
+      if (command === "get_master_history") return historyDto({ status: "no_master_data", current_user_id: null, projects: [], sessions: [] });
+      return undefined;
+    });
+    render(
+      <MasterLibraryDetail
+        active
+        onNavigate={() => undefined}
+        library={{ id: "env-x1", displayName: "测试环境" }}
+      />,
+    );
+    fireEvent.click(await screen.findByTestId("master-tab-plugins"));
+    // 诚实 UI：显示说明而非插件工作台。
+    expect(screen.getByTestId("master-plugins-secondary-note")).toHaveTextContent("副环境不参与插件管理");
+    expect(screen.queryByTestId("plugin-workbench")).not.toBeInTheDocument();
+  });
+
+  // ==========================================================================
+  // P11-6（ADR-0032 决策 5）：Trae CN 只读数据根详情。
+  // 后端契约：trae_cn 库读放行（历史/消息/统计），写命令报 library_read_only，
+  // 体检 not_applicable——前端以只读浏览形态呈现，写控件隐藏（不是禁用）。
+  // ==========================================================================
+
+  /** trae_cn 只读库的完整数据 mock（读命令带 libraryId=trae_cn；无环境档案查询）。 */
+  function setupTraeCnDetail() {
+    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (command === "get_master_library_stats") {
+        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+        return {
+          status: "ready",
+          current_user_id: "u-t1",
+          project_count: 1,
+          session_count: 2,
+          message_count: 5,
+          participating_account_count: 1,
+          last_active_unix_seconds: NOW - 60,
+          size_bytes: 1024 * 1024,
+        };
+      }
+      if (command === "get_master_backup_chain") {
+        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+        return { backups: [], backup_dir: "C:\\trae-cn\\bak", keep_policy: 5 };
+      }
+      if (command === "get_master_history") {
+        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+        return historyDto({
+          current_user_id: "u-t1",
+          projects: [{ project_id: "p-t1", name: "Trae 项目", absolute_path: null }],
+          sessions: [
+            {
+              session_id: "s-t1",
+              project_id: "p-t1",
+              title: "Trae 会话",
+              message_count: 5,
+              updated_at_unix_seconds: NOW - 60,
+              deleted: false,
+              hidden_status: null,
+              work_mode: null,
+            },
+          ],
+        });
+      }
+      if (command === "get_relay_ledger") return [];
+      if (command === "get_master_verification") {
+        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+        // 只读库自然降级：无台账无备份（面板只渲染备份对比区块）。
+        return {
+          ledger: { status: "no_ledger", checked_count: 0, relayed_away_count: 0, issues: [] },
+          backup: { status: "no_backups", backup_stamp: null, backup_stamps: [], common_count: 0, relayed_away_count: 0, added_count: 0, missing: [] },
+        };
+      }
+      return undefined;
+    });
+  }
+
+  it("P11-6：trae_cn 只读详情——标题取注册表口径，写控件隐藏，历史列表挂载", async () => {
+    setupTraeCnDetail();
+    render(<MasterLibraryDetail active onNavigate={() => undefined} library={{ id: "trae_cn" }} />);
+
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Trae CN 数据根");
+    // 只读边界：批量操作入口（选择按钮）与悬浮快捷归档隐藏。
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("library-quick-archive-s-t1")).not.toBeInTheDocument();
+    // 历史列表正常挂载（读路径放行）。
+    fireEvent.click(await screen.findByTestId("library-project-p-t1"));
+    await screen.findByTestId("library-session-s-t1");
+    // 只读库不做环境档案查询（工具不管理 Trae CN 登录态）。
+    expect(mockInvoke).not.toHaveBeenCalledWith("get_environment_state", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("list_environments", expect.anything());
+  });
+
+  it("P11-6：trae_cn 库信息 tab——统计卡正常，验证面板自然降级，账号显示为未跟踪", async () => {
+    setupTraeCnDetail();
+    render(<MasterLibraryDetail active onNavigate={() => undefined} library={{ id: "trae_cn" }} />);
+
+    fireEvent.click(screen.getByTestId("master-tab-info"));
+    await screen.findByTestId("master-detail-info");
+    // 统计卡正常渲染（stats 已放行）。
+    await waitFor(() => {
+      expect(screen.getByTestId("master-detail-counts")).toHaveTextContent("2");
+    });
+    // 工具不管理 Trae CN 登录态：当前账号不冒充「未登录」，显示中性占位。
+    expect(screen.getByTestId("master-info-account")).toHaveTextContent("—");
+    // 验证面板自然降级（备份对比区块在场，无备份为诚实空态）。
+    expect(await screen.findByTestId("verification-backup-block")).toBeInTheDocument();
+    expect(screen.getByTestId("verification-backup-badge")).toHaveTextContent("暂无备份");
+  });
+
+  it("P11-6：trae_cn 插件 tab 显示只读浏览说明，不挂插件工作台", async () => {
+    setupTraeCnDetail();
+    render(<MasterLibraryDetail active onNavigate={() => undefined} library={{ id: "trae_cn" }} />);
+    fireEvent.click(await screen.findByTestId("master-tab-plugins"));
+    expect(screen.getByTestId("master-plugins-readonly-note")).toHaveTextContent("Trae CN 为只读浏览");
+    expect(screen.queryByTestId("plugin-workbench")).not.toBeInTheDocument();
   });
 });

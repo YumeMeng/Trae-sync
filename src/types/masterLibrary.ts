@@ -52,6 +52,8 @@ export interface MasterBackupEntryDto {
   readonly total_bytes: number;
   /** 是否带 wal 附属件。 */
   readonly has_wal: boolean;
+  /** 是否带凭据备份子目录（credentials-{stamp}，P11-4②）。 */
+  readonly has_credentials: boolean;
 }
 
 /** 主库备份链（设置页备份分区数据源）。 */
@@ -72,6 +74,23 @@ export interface BackupRetentionDto {
   readonly enabled: boolean;
   /** 保留最近 N 份（含刚生成的最新备份；范围 1-50）。 */
   readonly keep: number;
+}
+
+/**
+ * P11-4① 备份迁移回执（migrate_master_backups 返回）。
+ * 字段与 src-tauri/src/lib.rs 的 BackupMigrationDto（serde 命名）一致。
+ */
+export interface BackupMigrationDto {
+  /** 本次确认落位新目录的文件数（含幂等已存在项）。 */
+  readonly migrated_files: number;
+  /** 失败清单（出现即中止位置切换，由用户排查后重试）。 */
+  readonly failures: readonly BackupMigrationFailureDto[];
+}
+
+/** 迁移失败单条记录（file_name 为备份目录内相对名）。 */
+export interface BackupMigrationFailureDto {
+  readonly file_name: string;
+  readonly reason: string;
 }
 
 /**
@@ -157,8 +176,8 @@ export interface MasterCheckupAccountDto {
 
 /** 主库体检报告（环境页体检区块数据源，只读）。 */
 export interface MasterCheckupDto {
-  /** ready / no_current_account / no_master_data / read_failed。 */
-  readonly status: "ready" | "no_current_account" | "no_master_data" | "read_failed";
+  /** ready / no_current_account / no_master_data / read_failed / not_applicable（P11-6：Trae CN 只读库不适用体检）。 */
+  readonly status: "ready" | "no_current_account" | "no_master_data" | "read_failed" | "not_applicable";
   /** 当前账号账号名（回执与引导文案用）；未登记为 null。 */
   readonly current_account_name: string | null;
   /** 可交接范围内的账号分布（按正常会话数降序）。 */
@@ -196,6 +215,9 @@ export interface MasterIncorporateProgressEvent {
     | "incorporating"
     | "restarting"
     | "done";
+  /** 库实例归属（P11-5 收官：主库 "master" / 副环境 env_id）；
+   *  多库收编并行时，弹层只推进自己目标的事件。 */
+  readonly env_id: string;
 }
 
 /** P5-5 清理空项目回执（cleanup_master_empty_projects 返回）。 */

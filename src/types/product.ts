@@ -45,6 +45,10 @@ export interface TraeCnLoginReceiptDto {
   readonly profile_id: string;
   readonly screen_name: string;
   readonly avatar_url: string;
+  /** 首次登录可持续性验收结果（ADR-0027）：与 Work 回执同一套语义。 */
+  readonly acceptance: "passed" | "failed";
+  /** 验收失败的稳定错误码；通过时后端省略该字段。 */
+  readonly acceptance_error_code?: string;
 }
 
 /**

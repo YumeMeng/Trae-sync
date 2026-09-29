@@ -5,12 +5,14 @@ import {
   CheckCircle2,
   Combine,
   Database,
+  HeartPulse,
   Layers,
   LogIn,
   MonitorPlay,
   Pencil,
   Plus,
   RefreshCw,
+  Square,
   Trash2,
   TriangleAlert,
 } from "lucide-react";
@@ -27,7 +29,11 @@ import type {
 } from "../types/masterLibrary";
 import type { AccountProfileDto, ManagedAccountsViewDto } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+// 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
+import { notify } from "../platform/notify";
 import { InstanceSlotBadge } from "./StatusBadges";
+import { CapabilitySection } from "./CapabilitySection";
+import { sectionStateOf, type ProductId } from "../platform/productRegistry";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 interface EnvironmentPageProps {
@@ -35,24 +41,42 @@ interface EnvironmentPageProps {
   active: boolean;
   /** 打开主库详情页（P5-8a-2：主库卡入口）。 */
   onOpenMasterDetail?: () => void;
+  /** 打开副库详情页（P11-5 收官：副环境卡「查看详情」入口，携带环境引用）。 */
+  onOpenLibraryDetail?: (library: { id: string; displayName: string }) => void;
+  /** 当前产品（缺省 work_cn）：区块三态取自产品注册表。 */
+  product?: ProductId;
 }
 
 /**
  * 环境页 V2（P5-2 + P6-4，ADR-0024）：
  * 主库环境卡（默认环境，置顶不可删）+ 辅助环境列表（创建/登录账号/
- * 启动/重命名/删除）。主库卡只承载生命周期、体检与自检入口。
+ * 启动/关闭/重命名/删除）。主库卡承载生命周期与整合后的「主库体检」
+ * 区块（P11-5：登录健康 + 库内容两组）。
+ * P11-5 收官：副环境卡挂体检区块（有差异才显示；登录健康分组只显示
+ * 注册表账号与待登录态）+「归入当前账号」+「查看详情」入口；收编弹层
+ * 复用同一结构，进度事件按 env_id 过滤。
  */
-export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageProps) {
+export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetail, product = "work_cn" }: EnvironmentPageProps) {
+  // 产品事实源：区块三态来自注册表，组件内不做 productId 判断。
+  const sectionState = sectionStateOf(product, "environment");
   const [state, setState] = useState<EnvironmentStateDto | null>(null);
-  // P5-5 主库体检：同读同刷；失败静默降级为 null（体检区块不渲染）。
+  // P5-5 主库体检：同读同刷；失败静默降级为 null（库内容分组显示降级提示）。
   const [checkup, setCheckup] = useState<MasterCheckupDto | null>(null);
-  // P8-5 G18：手动触发的四项主库自检报告。
+  // P11-5 收官 副环境体检：按 env_id 存报告（仅手动刷新/进页时读取，
+  // 5 秒轮询不触发——性能红线：轮询不新增数据库聚合调用）。
+  const [secondaryCheckups, setSecondaryCheckups] = useState<
+    Record<string, MasterCheckupDto | null>
+  >({});
+  // P8-5 G18 主库自检报告（P11-5 并入「主库体检」区块的登录健康分组；
+  // active 时随体检自动读取，不再依赖手动触发）。
   const [selfCheck, setSelfCheck] = useState<MasterSelfCheckDto | null>(null);
-  const [selfChecking, setSelfChecking] = useState(false);
+  const [repairing, setRepairing] = useState(false);
   // P6-4 环境列表（含主库置顶项；null = 首次未读）。
   const [envList, setEnvList] = useState<EnvironmentListItemDto[] | null>(null);
   // 收编弹层：null = 关闭；确认 → 运行（四阶段进度）→ 完成回执 / 失败提示。
-  const [incorporating, setIncorporating] = useState<IncorporatePhase | null>(null);
+  // P11-5 收官：带目标库引用（主库/副环境共用弹层与编排），进度事件按
+  // env_id 过滤，多库并行收编时只推进自己目标的事件。
+  const [incorporating, setIncorporating] = useState<IncorporateSession | null>(null);
   // 清理空项目：弹层开关 + 执行中（后端编排：关实例 → 备份 → 删除 → 重启）。
   const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
   const [cleaningUp, setCleaningUp] = useState(false);
@@ -61,8 +85,11 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
   const [renameDialog, setRenameDialog] = useState<NameDialogState | null>(null);
   const [loginDialogEnv, setLoginDialogEnv] = useState<EnvironmentListItemDto | null>(null);
   const [deleteDialogEnv, setDeleteDialogEnv] = useState<EnvironmentListItemDto | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
+  // P11-5 关闭实例：确认弹层目标（主库用固定名）+ 执行中环境。
+  const [closeDialogEnv, setCloseDialogEnv] = useState<{ envId: string; name: string } | null>(
+    null,
+  );
+  const [closingEnvId, setClosingEnvId] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
   const [launchingEnvId, setLaunchingEnvId] = useState<string | null>(null);
   const pollCancelled = useRef(false);
@@ -83,58 +110,62 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
   const load = useCallback(async () => {
     const next = await invoke<EnvironmentStateDto>("get_environment_state");
     setState(next);
-    // 体检与环境列表同读同刷；主库统计由详情页负责，避免环境卡重复读取。
-    const [checkupReport, list] = await Promise.all([
+    // P11-5 体检整合：体检与环境列表同读同刷，自检报告（登录健康）一并
+    // 自动读取；两组各自失败降级为 null，互不阻塞。主库统计仍归详情页。
+    const [checkupReport, selfCheckReport, list] = await Promise.all([
       invoke<MasterCheckupDto>("get_master_checkup").catch(() => null),
+      invoke<MasterSelfCheckDto>("get_master_self_check").catch(() => null),
       // 手动刷新带体积（主库三件套 + 副环境整目录口径）。
       invoke<EnvironmentListItemDto[]>("list_environments", { includeSize: true }).catch(
         () => null,
       ),
     ]);
     setCheckup(checkupReport);
+    setSelfCheck(selfCheckReport);
     if (list) setEnvList((previous) => mergeListSizes(previous, list));
+    // P11-5 收官：副环境体检随列表并行拉取（每环境只读聚合；与主库体检
+    // 同时机——进页/手动刷新/动作后，5 秒轮询不进入本函数）。
+    if (list) {
+      const secondaries = list.filter((item) => !item.is_master);
+      const reports = await Promise.all(
+        secondaries.map(async (item) => [
+          item.env_id,
+          await invoke<MasterCheckupDto>("get_master_checkup", {
+            libraryId: item.env_id,
+          }).catch(() => null),
+        ] as const),
+      );
+      setSecondaryCheckups(Object.fromEntries(reports));
+    }
   }, [mergeListSizes]);
 
-  /** G18：只读自检，报告失败也不改变主库数据。 */
-  const handleSelfCheck = useCallback(async () => {
-    setSelfChecking(true);
-    setError(null);
-    try {
-      const report = await invoke<MasterSelfCheckDto>("get_master_self_check");
-      setSelfCheck(report);
-    } catch (reason: unknown) {
-      setError(safeUiErrorMessage(reason, "主库自检未完成，请稍后重试。"));
-    } finally {
-      setSelfChecking(false);
-    }
-  }, []);
-
-  /** G18：只在用户明确点击后纠正工具缓存，随后重新读取报告。 */
+  /** G18：只在用户明确点击后纠正工具缓存，随后整组重读（含登录健康报告）。 */
   const handleRepair = useCallback(async () => {
-    setError(null);
+    setRepairing(true);
     try {
       await invoke("repair_master_current_account");
       await load();
-      await handleSelfCheck();
-      setMessage("已按实际登录账号纠正主库记录。");
+      notify.success("已按实际登录账号纠正主库记录。");
     } catch (reason: unknown) {
-      setError(safeUiErrorMessage(reason, "主库记录未能纠正，请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, "主库记录未能纠正，请稍后重试。"));
+    } finally {
+      setRepairing(false);
     }
-  }, [handleSelfCheck, load]);
+  }, [load]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active || sectionState !== "ready") return;
     let cancelled = false;
     void load().catch((reason: unknown) => {
-      if (!cancelled) setError(safeUiErrorMessage(reason, "环境状态暂时不可读取，请稍后重试。"));
+      if (!cancelled) notify.error(safeUiErrorMessage(reason, "环境状态暂时不可读取，请稍后重试。"));
     });
     return () => { cancelled = true; };
-  }, [active, load]);
+  }, [active, sectionState, load]);
 
   // 运行态轮询（与账号页实例徽章同模式）：主库可能被用户在 TRAE 内直接关闭/启动，
   // 页面停留期间每 5 秒校准一次；隐藏即停止。轮询不带体积（沿用最近一次的值）。
   useEffect(() => {
-    if (!active) return;
+    if (!active || sectionState !== "ready") return;
     pollCancelled.current = false;
     const poll = async () => {
       if (pollCancelled.current) return;
@@ -153,19 +184,17 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
       pollCancelled.current = true;
       window.clearInterval(timer);
     };
-  }, [active, mergeListSizes]);
+  }, [active, sectionState, mergeListSizes]);
 
-  /** 统一的动作后反馈：成功消息 + 列表校准；失败走页面级错误条。 */
+  /** 统一的动作后反馈：成功消息走全局通知；失败原因走全局错误通知。 */
   const runEnvAction = useCallback(
     async (action: () => Promise<void>, successMessage: string) => {
-      setError(null);
-      setMessage(null);
       try {
         await action();
         await load();
-        setMessage(successMessage);
+        notify.success(successMessage);
       } catch (reason: unknown) {
-        setError(safeUiErrorMessage(reason, "环境操作未能完成，请稍后重试。"));
+        notify.error(safeUiErrorMessage(reason, "环境操作未能完成，请稍后重试。"));
       }
     },
     [load],
@@ -198,54 +227,89 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
     [launchingEnvId, runEnvAction],
   );
 
+  // P11-5：关闭环境实例（主库/副环境通用）。成功消息按关闭回执定制：
+  // 优雅关闭 / 强制兜底 / 本就未运行（幂等，info 提示）各自不同表述；
+  // 完成后立即刷新一次运行态（5 秒轮询会继续校准）。
+  const handleCloseEnv = useCallback(
+    async (target: { envId: string; name: string }) => {
+      if (closingEnvId) return;
+      setClosingEnvId(target.envId);
+      try {
+        const receipt = await invoke<{ outcome: string }>("close_environment_instance", {
+          envId: target.envId,
+        });
+        await load();
+        if (receipt.outcome === "not_running") {
+          notify.info(`「${target.name}」当前没有运行中的实例。`);
+        } else if (receipt.outcome === "force_closed") {
+          notify.success(`「${target.name}」未能自动退出，已强制结束进程。`);
+        } else {
+          notify.success(`已关闭「${target.name}」的 TRAE 实例。`);
+        }
+      } catch (reason: unknown) {
+        notify.error(safeUiErrorMessage(reason, "环境操作未能完成，请稍后重试。"));
+      } finally {
+        setClosingEnvId(null);
+      }
+    },
+    [closingEnvId, load],
+  );
+
   const currentName = state?.current_account_name ?? null;
   const secondaryEnvs = envList === null ? null : envList.filter((env) => !env.is_master);
 
   // ===== P5-5 体检区块数据派生 + 一键收编 =====
 
-  // 滞留账号（非当前且存在正常会话的分布行）——收编目标；无滞留时区块整体不渲染。
-  const staleAccounts =
-    checkup?.status === "ready"
-      ? checkup.accounts.filter((account) => !account.current && account.session_count > 0)
-      : [];
-  // 空项目只作诊断展示，不进入收编规模；归档-only 项目不算空项目。
-  const emptyShellAccounts =
-    checkup?.status === "ready"
-      ? checkup.accounts.filter((account) => !account.current && account.empty_project_count > 0)
-      : [];
-  const staleSessionTotal = staleAccounts.reduce((sum, a) => sum + a.session_count, 0);
-  const staleProjectTotal = staleAccounts.reduce((sum, a) => sum + a.project_count, 0);
-  // 清理与提示行都按全库口径统计空项目（含当前账号名下的残留行），
-  // 与后端删除范围一致；诊断列表只列非当前账号的分布行。
-  const emptyProjectTotal =
-    checkup?.status === "ready"
-      ? checkup.accounts.reduce((sum, a) => sum + a.empty_project_count, 0)
-      : 0;
+  // 主库体检派生（滞留账号 / 空项目诊断 / 收编目标规模）。
+  const masterView = deriveCheckupView(checkup);
+  const staleAccounts = masterView.staleAccounts;
+  const emptyShellAccounts = masterView.emptyShellAccounts;
+  const staleSessionTotal = masterView.staleSessionTotal;
+  const staleProjectTotal = masterView.staleProjectTotal;
+  const emptyProjectTotal = masterView.emptyProjectTotal;
   // 只要全库存在空项目（哪怕全在当前账号名下），体检区块与清理入口就要出现。
-  const hasCheckupNotice = staleAccounts.length > 0 || emptyProjectTotal > 0;
+  const hasCheckupNotice = masterView.hasNotice;
+  // 登录数据损坏（G18 读校验失败且摘要提示损坏）：需要显式引导重新登录。
+  const readCheck = selfCheck?.checks.find((check) => check.key === "read");
+  const loginCorrupted = readCheck?.status === "failed" && readCheck.summary.includes("损坏");
 
   /** 确认收编 → 后端四步编排（关实例 → 备份 → 归属改写 → 重启）。 */
-  const startIncorporate = useCallback(async () => {
-    setIncorporating({ kind: "running", stage: "closing" });
+  const startIncorporate = useCallback(async (target: IncorporateTarget) => {
+    setIncorporating({ target, phase: { kind: "running", stage: "closing" } });
     let unlisten: (() => void) | null = null;
     try {
       // 进度事件（done 只推满进度条；回执以 invoke 返回为准）。
+      // P11-5 收官：载荷带 env_id，弹层只推进自己目标的事件。
       unlisten = await listen<MasterIncorporateProgressEvent>(
         "master-incorporate-progress",
         (event) => {
+          if (event.payload.env_id !== target.envId) return;
           setIncorporating((current) =>
-            current?.kind === "running" ? { kind: "running", stage: event.payload.stage } : current,
+            current?.target.envId === target.envId && current.phase.kind === "running"
+              ? { target, phase: { kind: "running", stage: event.payload.stage } }
+              : current,
           );
         },
       );
-      const receipt = await invoke<MasterIncorporateResultDto>("incorporate_master_records");
-      setIncorporating({ kind: "done", receipt });
+      const receipt = await invoke<MasterIncorporateResultDto>(
+        "incorporate_master_records",
+        target.isMaster ? undefined : { libraryId: target.envId },
+      );
+      setIncorporating({ target, phase: { kind: "done", receipt } });
       // 收编完成即刷新体检与统计（滞留行清零，区块自然消失）。
       await load();
     } catch (reason: unknown) {
       setIncorporating({
-        kind: "failed",
-        message: safeUiErrorMessage(reason, "归入未完成，主库数据保持操作前状态；请稍后重试。"),
+        target,
+        phase: {
+          kind: "failed",
+          message: safeUiErrorMessage(
+            reason,
+            target.isMaster
+              ? "归入未完成，主库数据保持操作前状态；请稍后重试。"
+              : "归入未完成，环境数据保持操作前状态；请稍后重试。",
+          ),
+        },
       });
     } finally {
       unlisten?.();
@@ -254,35 +318,52 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
 
   /** 收编弹层关闭（运行中不允许——后端事务已开）。 */
   const closeIncorporate = useCallback(() => {
-    setIncorporating((current) => (current?.kind === "running" ? current : null));
+    setIncorporating((current) => (current?.phase.kind === "running" ? current : null));
   }, []);
 
   /** 确认清理空项目 → 后端编排（关实例 → 备份 → 删除 → 重启）。 */
   const handleCleanupEmptyProjects = useCallback(async () => {
     if (cleaningUp) return;
     setCleaningUp(true);
-    setError(null);
     try {
       const receipt = await invoke<MasterEmptyProjectCleanupDto>("cleanup_master_empty_projects");
       setCleanupDialogOpen(false);
       // 清理完成即刷新体检（空项目清零，诊断行自然消失）。
       await load();
       // 重启失败不回滚删除：删除已提交且已备份，据实提示而非"清理未完成"。
-      setMessage(
-        receipt.deleted_projects > 0
-          ? receipt.relaunch_outcome === "failed"
+      if (receipt.deleted_projects > 0) {
+        notify.success(
+          receipt.relaunch_outcome === "failed"
             ? `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）；主库 TRAE 未能自动启动，可从环境页重新打开。`
-            : `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）。`
-          : "没有可清理的空项目记录。",
-      );
+            : `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）。`,
+        );
+      } else {
+        notify.info("没有可清理的空项目记录。");
+      }
     } catch (reason: unknown) {
-      // 失败关闭弹层，错误走页面级错误条（ConfirmDialog 无内嵌错误插槽）。
+      // 失败关闭弹层，错误走全局通知（ConfirmDialog 无内嵌错误插槽）。
       setCleanupDialogOpen(false);
-      setError(safeUiErrorMessage(reason, "清理未完成，主库数据保持操作前状态；请稍后重试。"));
+      notify.error(safeUiErrorMessage(reason, "清理未完成，主库数据保持操作前状态；请稍后重试。"));
     } finally {
       setCleaningUp(false);
     }
   }, [cleaningUp, load]);
+
+  // 区块能力三态（P11-6，ADR-0032 决策 2）：非 ready 产品整页说明卡。
+  // 环境体系是 Work CN 产品能力（多环境与实例管理依赖其数据根布局）；
+  // Trae CN 的数据浏览入口不放在这里，由主库详情页承载只读数据根。
+  if (sectionState !== "ready") {
+    return (
+      <section className="environment-page" role="region" aria-label="环境">
+        <header className="page-header">
+          <div className="page-header__copy">
+            <h1 data-page-title="environment" tabIndex={-1}>环境</h1>
+          </div>
+        </header>
+        <CapabilitySection state={sectionState} product={product} />
+      </section>
+    );
+  }
 
   return (
     <section className="environment-page" role="region" aria-label="环境">
@@ -302,9 +383,6 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
           </button>
         </div>
       </header>
-
-      {error && <p className="workbench__error" role="alert">{error}</p>}
-      {message && <p className="environment-page__message" role="status">{message}</p>}
 
       <div className="environment-page__body">
         {/* 主库：默认环境（不可删除/不可修改类型） */}
@@ -337,83 +415,161 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
               : "主库尚未登录账号：首次启动后请在 TRAE 窗口内登录一次，此后切换账号全自动完成。"}
           </p>
 
-          {/* P5-5 主库体检：有滞留记录才出现（无差异静默，不打扰）。
-              账号行用账号名表述；user_id 收进悬浮提示（界面表达纪律）。 */}
-          {checkup?.status === "ready" && hasCheckupNotice && (
+          {/* P11-5 主库体检整合区块（原 G18 自检 + P5-5 体检两个入口合并）：
+              登录健康分组（读校验/一致性/可切换/深度四项）+ 库内容分组
+              （滞留/空项目/孤儿行诊断与动作）。active 时自动读取，两组
+              各自失败降级为提示，互不阻塞；两组都不可读时区块整体静默。 */}
+          {(selfCheck || checkup) && (
             <div className="env-checkup" data-testid="env-checkup">
               <div className="env-checkup__head">
-                <TriangleAlert size={16} aria-hidden="true" />
-                <div>
-                  {staleAccounts.length > 0 && (
-                    <div>
-                      有 {staleAccounts.length} 个账号的 {staleSessionTotal} 个会话在主库中，未随当前账号展示
-                    </div>
-                  )}
-                  {emptyProjectTotal > 0 && (
-                    <div>另有 {emptyProjectTotal} 个空项目记录未进入归入范围</div>
-                  )}
-                </div>
+                <HeartPulse size={16} aria-hidden="true" />
+                <div>主库体检</div>
               </div>
-              {staleAccounts.length > 0 && <ul className="env-checkup__list">
-                {staleAccounts.map((account) => (
-                  <li key={account.user_id} title={`账号标识：${account.user_id}`}>
-                    <span className="env-checkup__name">
-                      {account.account_name ?? "未登记账号"}
-                    </span>
-                    <span className="env-checkup__meta">
-                      {account.session_count} 个会话 · {account.project_count} 个项目
-                    </span>
-                  </li>
-                ))}
-              </ul>}
-              {emptyShellAccounts.length > 0 && (
-                <ul className="env-checkup__list" data-testid="env-empty-shell-list">
-                  {emptyShellAccounts.map((account) => (
-                    <li key={`empty-${account.user_id}`} title={`账号标识：${account.user_id}`}>
-                      <span className="env-checkup__name">
-                        {account.account_name ?? "未登记账号"}
-                      </span>
-                      <span className="env-checkup__meta">
-                        {account.empty_project_count} 个空项目
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {/* 空项目一键清理（破坏性，弹层单次确认后执行）。
-                  删除范围为全库空项目，执行前自动备份。 */}
-              {emptyProjectTotal > 0 && (
-                <button
-                  className="btn env-checkup__action"
-                  type="button"
-                  onClick={() => setCleanupDialogOpen(true)}
-                  data-testid="env-cleanup-empty-projects-entry"
-                >
-                  <Trash2 size={15} aria-hidden="true" />清理空项目
-                </button>
-              )}
-              {checkup.orphan_project_count > 0 && (
-                <p className="env-checkup__note">
-                  另有 {checkup.orphan_project_count} 条无归属记录不会被归入。
-                </p>
-              )}
-              {staleAccounts.length > 0 && <button
-                className="btn btn--primary env-checkup__action"
-                type="button"
-                onClick={() => setIncorporating({ kind: "confirm" })}
-                data-testid="env-incorporate-entry"
-              >
-                <Combine size={15} aria-hidden="true" />一键归入当前账号
-              </button>}
-            </div>
-          )}
 
-          {selfCheck && (
-            <MasterSelfCheckReport
-              report={selfCheck}
-              onRepair={() => void handleRepair()}
-              repairing={selfChecking}
-            />
+              {/* 登录健康分组：现 G18 自检四项（user_id 等技术细节不进主视野）。 */}
+              <div className="env-checkup__group" data-testid="env-checkup-login">
+                <div className="env-checkup__group-title">
+                  登录健康{selfCheck ? `：${selfCheckLevelLabel(selfCheck.level)}` : ""}
+                </div>
+                {selfCheck ? (
+                  <>
+                    {selfCheck.current_account_name !== selfCheck.observed_account_name &&
+                      selfCheck.observed_account_name !== null && (
+                        <p className="env-self-check__note">
+                          实际登录：{selfCheck.observed_account_name}；工具记录：
+                          {selfCheck.current_account_name ?? "暂无"}
+                        </p>
+                      )}
+                    {loginCorrupted && (
+                      <p className="env-self-check__note">登录数据已损坏，需重新登录。</p>
+                    )}
+                    <ul className="env-self-check__list">
+                      {selfCheck.checks.map((check) => (
+                        <li
+                          key={check.key}
+                          className={`env-self-check__item env-self-check__item--${check.status}`}
+                        >
+                          <span className="env-self-check__item-name">{selfCheckKeyLabel(check.key)}</span>
+                          <span className="env-self-check__item-status">{selfCheckStatusLabel(check.status)}</span>
+                          <span className="env-self-check__item-summary">{check.summary}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    <details className="env-self-check__details" data-testid="env-self-check-deep">
+                      <summary>查看深度检查说明</summary>
+                      <p>
+                        {selfCheck.checks.find((check) => check.key === "deep")?.summary ??
+                          "暂无深度检查结果。"}
+                      </p>
+                      <p>需要核对具体记录时，请在主库详情的库信息中展开备份对比。</p>
+                    </details>
+                    {selfCheck.can_repair && (
+                      <button
+                        className="btn btn--primary env-self-check__repair"
+                        type="button"
+                        onClick={() => void handleRepair()}
+                        disabled={repairing}
+                        data-testid="env-self-check-repair"
+                      >
+                        {repairing ? "纠正中…" : "纠正为实际登录账号"}
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <p className="env-checkup__note">登录健康暂时无法读取。</p>
+                )}
+              </div>
+
+              {/* 库内容分组：现 P5-5 体检主体（滞留/空项目诊断 + 收编/清理动作）。 */}
+              <div className="env-checkup__group" data-testid="env-checkup-content">
+                <div className="env-checkup__group-title">库内容</div>
+                {checkup?.status === "ready" ? (
+                  hasCheckupNotice ? (
+                    <>
+                      <div className="env-checkup__notice">
+                        {staleAccounts.length > 0 && (
+                          <div>
+                            有 {staleAccounts.length} 个账号的 {staleSessionTotal} 个会话在主库中，未随当前账号展示
+                          </div>
+                        )}
+                        {emptyProjectTotal > 0 && (
+                          <div>另有 {emptyProjectTotal} 个空项目记录未进入归入范围</div>
+                        )}
+                      </div>
+                      {staleAccounts.length > 0 && <ul className="env-checkup__list">
+                        {staleAccounts.map((account) => (
+                          <li key={account.user_id} title={`账号标识：${account.user_id}`}>
+                            <span className="env-checkup__name">
+                              {account.account_name ?? "未登记账号"}
+                            </span>
+                            <span className="env-checkup__meta">
+                              {account.session_count} 个会话 · {account.project_count} 个项目
+                            </span>
+                          </li>
+                        ))}
+                      </ul>}
+                      {emptyShellAccounts.length > 0 && (
+                        <ul className="env-checkup__list" data-testid="env-empty-shell-list">
+                          {emptyShellAccounts.map((account) => (
+                            <li key={`empty-${account.user_id}`} title={`账号标识：${account.user_id}`}>
+                              <span className="env-checkup__name">
+                                {account.account_name ?? "未登记账号"}
+                              </span>
+                              <span className="env-checkup__meta">
+                                {account.empty_project_count} 个空项目
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {/* 空项目一键清理（破坏性，弹层单次确认后执行）。
+                          删除范围为全库空项目，执行前自动备份。 */}
+                      {emptyProjectTotal > 0 && (
+                        <button
+                          className="btn env-checkup__action"
+                          type="button"
+                          onClick={() => setCleanupDialogOpen(true)}
+                          data-testid="env-cleanup-empty-projects-entry"
+                        >
+                          <Trash2 size={15} aria-hidden="true" />清理空项目
+                        </button>
+                      )}
+                      {checkup.orphan_project_count > 0 && (
+                        <p className="env-checkup__note">
+                          另有 {checkup.orphan_project_count} 条无归属记录不会被归入。
+                        </p>
+                      )}
+                      {staleAccounts.length > 0 && <button
+                        className="btn btn--primary env-checkup__action"
+                        type="button"
+                        onClick={() =>
+                          setIncorporating({
+                            target: {
+                              envId: "master",
+                              envName: "主库",
+                              accountName: currentName,
+                              isMaster: true,
+                            },
+                            phase: { kind: "confirm" },
+                          })
+                        }
+                        data-testid="env-incorporate-entry"
+                      >
+                        <Combine size={15} aria-hidden="true" />一键归入当前账号
+                      </button>}
+                    </>
+                  ) : (
+                    <p className="env-checkup__note" data-testid="env-checkup-content-ok">
+                      暂未发现滞留记录，账号记录分布正常。
+                    </p>
+                  )
+                ) : (
+                  <p className="env-checkup__note">
+                    {checkup ? checkupStatusNote(checkup.status) : "库内容暂时无法读取。"}
+                  </p>
+                )}
+              </div>
+            </div>
           )}
 
           <div className="env-card__foot">
@@ -435,16 +591,19 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
               >
                 <Database size={15} aria-hidden="true" />详情
               </button>
-              <button
-                className="btn"
-                type="button"
-                onClick={() => void handleSelfCheck()}
-                disabled={selfChecking}
-                data-testid="env-master-self-check"
-                title="检查主库登录数据、账号记录和切换条件"
-              >
-                <CheckCircle2 size={15} aria-hidden="true" />{selfChecking ? "自检中…" : "自检"}
-              </button>
+              {/* P11-5：关闭实例（仅运行中显示；确认弹层防误触）。 */}
+              {state?.running === true && (
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => setCloseDialogEnv({ envId: "master", name: "主库" })}
+                  disabled={closingEnvId !== null}
+                  data-testid="env-master-close"
+                  title="关闭主库 TRAE 实例"
+                >
+                  <Square size={15} aria-hidden="true" />关闭
+                </button>
+              )}
               <button
                 className="btn btn--primary"
                 type="button"
@@ -491,20 +650,31 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
                 <SecondaryEnvCard
                   key={env.env_id}
                   env={env}
+                  // P11-5 收官：副环境体检报告（有差异才渲染区块）。
+                  checkup={secondaryCheckups[env.env_id] ?? null}
                   launching={launchingEnvId === env.env_id}
+                  closing={closingEnvId === env.env_id}
                   onLaunch={() => void handleLaunchEnv(env)}
-                  onLogin={() => {
-                    setError(null);
-                    setLoginDialogEnv(env);
-                  }}
-                  onRename={() => {
-                    setError(null);
-                    setRenameDialog({ env, name: env.name, error: null, busy: false });
-                  }}
-                  onDelete={() => {
-                    setError(null);
-                    setDeleteDialogEnv(env);
-                  }}
+                  onClose={() => setCloseDialogEnv({ envId: env.env_id, name: env.name })}
+                  onLogin={() => setLoginDialogEnv(env)}
+                  onRename={() => setRenameDialog({ env, name: env.name, error: null, busy: false })}
+                  onDelete={() => setDeleteDialogEnv(env)}
+                  onOpenDetail={
+                    onOpenLibraryDetail
+                      ? () => onOpenLibraryDetail({ id: env.env_id, displayName: env.name })
+                      : undefined
+                  }
+                  onIncorporate={(targetAccountName) =>
+                    setIncorporating({
+                      target: {
+                        envId: env.env_id,
+                        envName: env.name,
+                        accountName: targetAccountName,
+                        isMaster: false,
+                      },
+                      phase: { kind: "confirm" },
+                    })
+                  }
                 />
               ))}
             </div>
@@ -512,16 +682,32 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
         </div>
       </div>
 
-      {/* P5-5 收编弹层：确认 → 四阶段进度 → 完成回执 / 失败提示 */}
+      {/* P5-5 收编弹层（P11-5 收官：主库/副环境共用）：确认 → 四阶段进度 → 完成回执 / 失败提示 */}
       {incorporating && (
         <IncorporateDialog
-          phase={incorporating}
-          currentName={currentName}
-          staleAccounts={staleAccounts}
-          staleSessionTotal={staleSessionTotal}
-          staleProjectTotal={staleProjectTotal}
-          orphanProjectCount={checkup?.orphan_project_count ?? 0}
-          onConfirm={() => void startIncorporate()}
+          target={incorporating.target}
+          phase={incorporating.phase}
+          staleAccounts={
+            incorporating.target.isMaster
+              ? staleAccounts
+              : deriveCheckupView(secondaryCheckups[incorporating.target.envId] ?? null).staleAccounts
+          }
+          staleSessionTotal={
+            incorporating.target.isMaster
+              ? staleSessionTotal
+              : deriveCheckupView(secondaryCheckups[incorporating.target.envId] ?? null).staleSessionTotal
+          }
+          staleProjectTotal={
+            incorporating.target.isMaster
+              ? staleProjectTotal
+              : deriveCheckupView(secondaryCheckups[incorporating.target.envId] ?? null).staleProjectTotal
+          }
+          orphanProjectCount={
+            incorporating.target.isMaster
+              ? checkup?.orphan_project_count ?? 0
+              : secondaryCheckups[incorporating.target.envId]?.orphan_project_count ?? 0
+          }
+          onConfirm={() => void startIncorporate(incorporating.target)}
           onClose={closeIncorporate}
         />
       )}
@@ -558,7 +744,7 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
           onSubmit={async (name) => {
             await invoke("create_environment", { name });
             await load();
-            setMessage(`已创建环境「${name.trim()}」。`);
+            notify.success(`已创建环境「${name.trim()}」。`);
           }}
         />
       )}
@@ -574,7 +760,7 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
             if (!env) return;
             await invoke("rename_environment", { envId: env.env_id, name });
             await load();
-            setMessage(`已重命名为「${name.trim()}」。`);
+            notify.success(`已重命名为「${name.trim()}」。`);
           }}
         />
       )}
@@ -599,70 +785,55 @@ export function EnvironmentPage({ active, onOpenMasterDetail }: EnvironmentPageP
           onDone={async () => {
             setDeleteDialogEnv(null);
             await load();
-            setMessage(`已删除环境「${deleteDialogEnv.name}」。`);
+            notify.success(`已删除环境「${deleteDialogEnv.name}」。`);
           }}
+        />
+      )}
+
+      {/* P11-5 关闭实例确认弹层（主库/副环境通用）：确认后调用关闭命令。 */}
+      {closeDialogEnv && (
+        <ConfirmDialog
+          title={`关闭「${closeDialogEnv.name}」`}
+          lines={[
+            `将关闭「${closeDialogEnv.name}」正在运行的 TRAE 实例。`,
+            "实例内未保存的内容可能丢失，请确认已保存所需工作。",
+          ]}
+          confirmLabel="关闭实例"
+          confirmIcon={<Square size={15} aria-hidden="true" />}
+          busyLabel="正在关闭…"
+          busy={closingEnvId !== null}
+          onCancel={() => setCloseDialogEnv(null)}
+          onConfirm={() => {
+            const target = closeDialogEnv;
+            setCloseDialogEnv(null);
+            void handleCloseEnv(target);
+          }}
+          testId="env-close-dialog"
         />
       )}
     </section>
   );
 }
 
-/** G18 自检报告：主视野只显示四项结论，深度说明保持默认折叠。 */
-function MasterSelfCheckReport({
-  report,
-  onRepair,
-  repairing,
-}: {
-  report: MasterSelfCheckDto;
-  onRepair: () => void;
-  repairing: boolean;
-}) {
-  const readCheck = report.checks.find((check) => check.key === "read");
-  const namesDiffer =
-    report.current_account_name !== report.observed_account_name &&
-    report.observed_account_name !== null;
-  return (
-    <div className={`env-self-check env-self-check--${report.level}`} data-testid="env-self-check">
-      <div className="env-self-check__head">
-        <div>
-          <strong>主库自检：{selfCheckLevelLabel(report.level)}</strong>
-          {namesDiffer && (
-            <p className="env-self-check__note">
-              实际登录：{report.observed_account_name}；工具记录：{report.current_account_name ?? "暂无"}
-            </p>
-          )}
-          {readCheck?.status === "failed" && readCheck.summary.includes("损坏") && (
-            <p className="env-self-check__note">登录数据已损坏，需重新登录。</p>
-          )}
-        </div>
-      </div>
-      <ul className="env-self-check__list">
-        {report.checks.map((check) => (
-          <li key={check.key} className={`env-self-check__item env-self-check__item--${check.status}`}>
-            <span className="env-self-check__item-name">{selfCheckKeyLabel(check.key)}</span>
-            <span className="env-self-check__item-status">{selfCheckStatusLabel(check.status)}</span>
-            <span className="env-self-check__item-summary">{check.summary}</span>
-          </li>
-        ))}
-      </ul>
-      <details className="env-self-check__details" data-testid="env-self-check-deep">
-        <summary>查看深度检查说明</summary>
-        <p>{report.checks.find((check) => check.key === "deep")?.summary ?? "暂无深度检查结果。"}</p>
-        <p>需要核对具体记录时，请在主库详情的库信息中展开备份对比。</p>
-      </details>
-      {report.can_repair && (
-        <button
-          className="btn btn--primary env-self-check__repair"
-          type="button"
-          onClick={onRepair}
-          disabled={repairing}
-          data-testid="env-self-check-repair"
-        >
-          {repairing ? "纠正中…" : "纠正为实际登录账号"}
-        </button>
-      )}
-    </div>
-  );
+/**
+ * P11-5 主库体检整合面板的库内容状态说明（checkup 非 ready 时的降级文案；
+ * 按状态给用户能直接理解的原因，不用底层码）。
+ * P11-6：not_applicable = 只读库（Trae CN 数据根）不适用体检——按 absent
+ * 语义说明而非「读取失败」（后端 master_checkup_not_applicable 同口径）。
+ */
+function checkupStatusNote(status: MasterCheckupDto["status"]): string {
+  switch (status) {
+    case "no_current_account":
+      return "尚未确认主库当前登录账号，无法统计库内容。";
+    case "no_master_data":
+      return "主库尚未产生对话数据。";
+    case "read_failed":
+      return "库内容暂时无法读取。";
+    case "not_applicable":
+      return "该产品无此能力：只读浏览的库不适用体检。";
+    default:
+      return "库内容暂时无法读取。";
+  }
 }
 
 function selfCheckLevelLabel(level: MasterSelfCheckDto["level"]): string {
@@ -702,22 +873,48 @@ function selfCheckStatusLabel(status: MasterSelfCheckDto["checks"][number]["stat
   }
 }
 
-/** P6-4 辅助环境卡：名称 + 当前账号 + 运行态 + 体积 + 四项操作。 */
+/**
+ * P6-4 辅助环境卡：名称 + 当前账号 + 运行态 + 体积 + 操作组。
+ * P11-5 收官：挂副环境体检区块（有差异才显示，复用 env-checkup 结构；
+ * 登录健康分组只显示注册表账号与待登录态，不出自检四项——副环境登录
+ * 由工具托管，无实测语义）+「归入当前账号」+「查看详情」入口。
+ */
 function SecondaryEnvCard({
   env,
+  checkup,
   launching,
+  closing,
   onLaunch,
+  onClose,
   onLogin,
   onRename,
   onDelete,
+  onOpenDetail,
+  onIncorporate,
 }: {
   env: EnvironmentListItemDto;
+  /** 副环境体检报告（进页/手动刷新时读取；无差异时不渲染区块）。 */
+  checkup: MasterCheckupDto | null;
   launching: boolean;
+  /** P11-5：该环境的关闭动作执行中（按钮禁用与文案切换）。 */
+  closing: boolean;
   onLaunch: () => void;
+  onClose: () => void;
   onLogin: () => void;
   onRename: () => void;
   onDelete: () => void;
+  /** P11-5 收官：打开副库详情页（详情按钮）。 */
+  onOpenDetail?: () => void;
+  /** P11-5 收官：发起归入（参数 = 注册表当前账号显示名，弹层文案用）。 */
+  onIncorporate: (targetAccountName: string | null) => void;
 }) {
+  const view = deriveCheckupView(checkup);
+  // 有差异才显示体检区块（与主库口径一致：滞留/空项目/孤儿行任一存在；
+  // 体检读取失败或无差异时静默——卡片本身已有登录入口与运行态）。
+  const showCheckup =
+    checkup?.status === "ready" &&
+    (view.hasNotice || checkup.orphan_project_count > 0);
+
   return (
     <div className="env-card" data-testid={`env-card-${env.env_id}`}>
       <div className="env-card__head">
@@ -744,6 +941,72 @@ function SecondaryEnvCard({
         )}
       </div>
 
+      {/* P11-5 收官 副环境体检区块：有差异才显示；结构与主库体检同构。 */}
+      {showCheckup && (
+        <div className="env-checkup" data-testid={`env-checkup-${env.env_id}`}>
+          <div className="env-checkup__head">
+            <HeartPulse size={16} aria-hidden="true" />
+            <div>{env.name}体检</div>
+          </div>
+
+          {/* 登录健康分组：副环境无实测语义，只显示注册表账号与待登录态。 */}
+          <div className="env-checkup__group" data-testid={`env-checkup-login-${env.env_id}`}>
+            <div className="env-checkup__group-title">登录健康</div>
+            <p className="env-checkup__note">
+              {env.current_account_name
+                ? `当前登录：${env.current_account_name}。`
+                : "尚未登录账号，请先登录后再使用该环境。"}
+            </p>
+          </div>
+
+          {/* 库内容分组：滞留/空项目诊断 + 归入动作（语义与主库一致）。 */}
+          <div className="env-checkup__group" data-testid={`env-checkup-content-${env.env_id}`}>
+            <div className="env-checkup__group-title">库内容</div>
+            {view.staleAccounts.length > 0 && (
+              <div className="env-checkup__notice">
+                <div>
+                  有 {view.staleAccounts.length} 个账号的 {view.staleSessionTotal} 个会话在此环境中，未随当前账号展示
+                </div>
+              </div>
+            )}
+            {view.emptyProjectTotal > 0 && (
+              <div className="env-checkup__notice">
+                <div>另有 {view.emptyProjectTotal} 个空项目记录未进入归入范围</div>
+              </div>
+            )}
+            {view.staleAccounts.length > 0 && (
+              <ul className="env-checkup__list">
+                {view.staleAccounts.map((account) => (
+                  <li key={account.user_id} title={`账号标识：${account.user_id}`}>
+                    <span className="env-checkup__name">
+                      {account.account_name ?? "未登记账号"}
+                    </span>
+                    <span className="env-checkup__meta">
+                      {account.session_count} 个会话 · {account.project_count} 个项目
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {checkup.orphan_project_count > 0 && (
+              <p className="env-checkup__note">
+                另有 {checkup.orphan_project_count} 条无归属记录不会被归入。
+              </p>
+            )}
+            {view.staleAccounts.length > 0 && (
+              <button
+                className="btn btn--primary env-checkup__action"
+                type="button"
+                onClick={() => onIncorporate(env.current_account_name ?? null)}
+                data-testid={`env-incorporate-${env.env_id}`}
+              >
+                <Combine size={15} aria-hidden="true" />归入当前账号
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="env-card__foot">
         {/* 体积与目录路径收进次信息；路径完整值进悬浮提示（界面表达纪律）。 */}
         <span
@@ -754,6 +1017,17 @@ function SecondaryEnvCard({
           {env.size_bytes !== undefined ? `${formatBytes(env.size_bytes)} · 数据目录` : "数据目录"}
         </span>
         <div className="env-card__foot-actions">
+          {onOpenDetail && (
+            <button
+              className="btn"
+              type="button"
+              onClick={onOpenDetail}
+              data-testid={`env-detail-${env.env_id}`}
+              title={`查看「${env.name}」详情（对话记录、统计与备份）`}
+            >
+              <Database size={15} aria-hidden="true" />查看详情
+            </button>
+          )}
           <button
             className="btn"
             type="button"
@@ -781,6 +1055,20 @@ function SecondaryEnvCard({
           >
             <Trash2 size={15} aria-hidden="true" />删除
           </button>
+          {/* P11-5：关闭实例（仅运行中显示，与启动/聚焦同区）。 */}
+          {env.running && (
+            <button
+              className="btn"
+              type="button"
+              onClick={onClose}
+              disabled={closing}
+              data-testid={`env-close-${env.env_id}`}
+              title="关闭该环境的 TRAE 实例"
+            >
+              <Square size={15} aria-hidden="true" />
+              {closing ? "关闭中…" : "关闭"}
+            </button>
+          )}
           <button
             className="btn btn--primary"
             type="button"
@@ -1157,21 +1445,68 @@ type IncorporatePhase =
   | { kind: "done"; receipt: MasterIncorporateResultDto }
   | { kind: "failed"; message: string };
 
-/** 收编四阶段进度（与后端 master-incorporate-progress 事件一一对应）。 */
-const INCORPORATE_STAGES: readonly { stage: string; label: string }[] = [
-  { stage: "closing", label: "关闭主库" },
-  { stage: "backing_up", label: "创建备份" },
-  { stage: "incorporating", label: "归入记录" },
-  { stage: "restarting", label: "重启主库" },
-];
+/**
+ * P11-5 收官 收编目标库：主库/副环境共用弹层与编排。
+ * isMaster 决定进度文案（关闭/重启主库 vs 关闭/重启环境）与 invoke 参数。
+ */
+interface IncorporateTarget {
+  /** 库实例 id：主库 "master"，副环境为 env_id。 */
+  envId: string;
+  /** 库显示名（进度文案与弹层说明）。 */
+  envName: string;
+  /** 归入目标账号显示名（弹层头像；null = 暂不可读，降级「当前账号」）。 */
+  accountName: string | null;
+  isMaster: boolean;
+}
+
+/** 一次收编会话：目标库 + 当前阶段。 */
+interface IncorporateSession {
+  target: IncorporateTarget;
+  phase: IncorporatePhase;
+}
 
 /**
- * P5-5 一键收编弹层：确认（列明规模与备份提示，ADR-0018 单次确认）→
- * 四阶段进度（复用切号弹层步骤条样式）→ 完成回执（数量表述）。
+ * 体检报告派生（P11-5 收官抽出）：滞留账号 / 空项目诊断 / 收编目标规模。
+ * 主库卡与副环境卡共用同一口径（原主库卡内联逻辑上移）。
+ */
+function deriveCheckupView(report: MasterCheckupDto | null) {
+  const ready = report?.status === "ready";
+  const accounts = ready ? report.accounts : [];
+  // 滞留账号（非当前且存在正常会话的分布行）——收编目标。
+  const staleAccounts = accounts.filter((account) => !account.current && account.session_count > 0);
+  // 空项目只作诊断展示，不进入收编规模；归档-only 项目不算空项目。
+  const emptyShellAccounts = accounts.filter(
+    (account) => !account.current && account.empty_project_count > 0,
+  );
+  const staleSessionTotal = staleAccounts.reduce((sum, a) => sum + a.session_count, 0);
+  const staleProjectTotal = staleAccounts.reduce((sum, a) => sum + a.project_count, 0);
+  // 清理与提示行都按全库口径统计空项目（含当前账号名下的残留行）。
+  const emptyProjectTotal = accounts.reduce((sum, a) => sum + a.empty_project_count, 0);
+  const hasNotice = staleAccounts.length > 0 || emptyProjectTotal > 0;
+  return { staleAccounts, emptyShellAccounts, staleSessionTotal, staleProjectTotal, emptyProjectTotal, hasNotice };
+}
+
+/**
+ * 收编四阶段进度文案（与后端 master-incorporate-progress 事件一一对应）。
+ * 主库沿用「主库」表述；副环境按环境名表述（界面表达纪律：对用户
+ * 描述的对象是什么就叫什么）。
+ */
+function incorporateStageLabels(isMaster: boolean, envName: string) {
+  return [
+    { stage: "closing", label: isMaster ? "关闭主库" : `关闭「${envName}」` },
+    { stage: "backing_up", label: "创建备份" },
+    { stage: "incorporating", label: "归入记录" },
+    { stage: "restarting", label: isMaster ? "重启主库" : `重启「${envName}」` },
+  ];
+}
+
+/**
+ * P5-5 一键收编弹层（P11-5 收官：主库/副环境共用）：确认（列明规模与
+ * 备份提示，ADR-0018 单次确认）→ 四阶段进度 → 完成回执（数量表述）。
  */
 function IncorporateDialog({
+  target,
   phase,
-  currentName,
   staleAccounts,
   staleSessionTotal,
   staleProjectTotal,
@@ -1179,8 +1514,8 @@ function IncorporateDialog({
   onConfirm,
   onClose,
 }: {
+  target: IncorporateTarget;
   phase: IncorporatePhase;
-  currentName: string | null;
   staleAccounts: { user_id: string; account_name: string | null }[];
   staleSessionTotal: number;
   staleProjectTotal: number;
@@ -1188,16 +1523,17 @@ function IncorporateDialog({
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const stages = incorporateStageLabels(target.isMaster, target.envName);
   const allDone = phase.kind === "done" || (phase.kind === "running" && phase.stage === "done");
   const stageIndex = allDone
-    ? INCORPORATE_STAGES.length
+    ? stages.length
     : phase.kind === "running"
-      ? Math.max(0, INCORPORATE_STAGES.findIndex((item) => item.stage === phase.stage))
+      ? Math.max(0, stages.findIndex((item) => item.stage === phase.stage))
       : 0;
   const progressPercent = allDone
     ? 100
-    : Math.round(((stageIndex + 1) / INCORPORATE_STAGES.length) * 100);
-  const targetName = currentName ?? "当前账号";
+    : Math.round(((stageIndex + 1) / stages.length) * 100);
+  const targetName = target.accountName ?? "当前账号";
 
   return (
     <div className="switch-veil" role="presentation" onClick={(event) => {
@@ -1216,7 +1552,9 @@ function IncorporateDialog({
           <span className="switch-dialog__avatar" aria-hidden="true">{targetName.slice(0, 1)}</span>
           <div>
             <div className="switch-dialog__target-name" data-testid="incorporate-target">{targetName}</div>
-            <div className="switch-dialog__target-meta">滞留记录全部归入 · 自动完成转移</div>
+            <div className="switch-dialog__target-meta">
+              {target.isMaster ? "主库" : target.envName} · 滞留记录全部归入 · 自动完成转移
+            </div>
           </div>
         </div>
 
@@ -1228,7 +1566,7 @@ function IncorporateDialog({
                 <strong>将归入 {staleAccounts.length} 个账号的记录</strong>
                 <p>
                   共 {staleSessionTotal} 个会话、{staleProjectTotal} 个项目将归入{targetName}；
-                  主库会自动关闭并重启，归入前会创建数据备份。
+                  {target.isMaster ? "主库" : `「${target.envName}」`}会自动关闭并重启，归入前会创建数据备份。
                   {orphanProjectCount > 0 ? `另有 ${orphanProjectCount} 条无归属记录不会被归入。` : ""}
                 </p>
               </div>
@@ -1276,7 +1614,7 @@ function IncorporateDialog({
               <div className="switch-dialog__bar-fill" style={{ width: `${progressPercent}%` }} />
             </div>
             <ol className="switch-dialog__steps">
-              {INCORPORATE_STAGES.map((item, index) => {
+              {stages.map((item, index) => {
                 const state = phase.kind === "done" || index < stageIndex ? "done"
                   : phase.kind === "running" && index === stageIndex ? "run" : "idle";
                 return (

@@ -76,6 +76,29 @@ describe("读取授权失效错误映射", () => {
     );
   });
 
+  // ===== P11-5 环境实例关闭 + 删除残留路径 + 归档草稿存储 =====
+
+  it.each([
+    ["environment_close_failed", "TRAE 实例未能关闭，请稍后重试，或在 TRAE 窗口内直接退出。"],
+    [
+      "archive_draft_store_invalid",
+      "归档草稿存储不可读（文件可能损坏），草稿已暂存在本机浏览器存储，未丢失。",
+    ],
+    [
+      "archive_draft_store_unavailable",
+      "归档草稿存储暂不可用，草稿已暂存在本机浏览器存储，未丢失。",
+    ],
+  ])("%s 使用稳定提示", (code, message) => {
+    expect(safeUiErrorMessage(code, "fallback")).toBe(message);
+  });
+
+  it("删除副环境的残留目录错误带出完整路径供手动清理", () => {
+    const error = "environment_delete_failed_residue:D:\\store\\environments\\env-1-a";
+    expect(safeUiErrorMessage(error, "fallback")).toBe(
+      "环境已移除，但目录删除失败，请手动清理：D:\\store\\environments\\env-1-a",
+    );
+  });
+
   it.each([
     ["master_archive_busy", "主库正在生成回复，归档设置需等它完成；稍后重试即可。"],
     ["master_archive_close_failed", "主库实例未能关闭，归档设置尚未写入；请关闭 TRAE 后重试。"],

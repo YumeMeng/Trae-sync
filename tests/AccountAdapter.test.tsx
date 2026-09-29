@@ -47,6 +47,7 @@ describe("账号适配器与共享工作台", () => {
         profile_id: "cn-new",
         screen_name: "CN 新账号",
         avatar_url: "",
+        acceptance: "passed",
       };
       if (command === "cancel_trae_cn_login") return undefined;
       if (command === "switch_trae_cn_account") return [];
@@ -94,7 +95,11 @@ describe("账号适配器与共享工作台", () => {
   it("把 CN 登录流程保持在适配器内", async () => {
     const adapter = createTraeCnAccountAdapter();
 
-    await expect(adapter.login()).resolves.toEqual({ displayName: "CN 新账号" });
+    await expect(adapter.login()).resolves.toEqual({
+      displayName: "CN 新账号",
+      acceptance: "passed",
+      acceptanceErrorCode: null,
+    });
     await adapter.cancelLogin();
 
     expect(mockInvoke).toHaveBeenCalledWith("begin_trae_cn_login", { useSystemBrowser: true });

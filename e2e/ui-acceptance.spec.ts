@@ -19,6 +19,11 @@ async function gotoMasterDetail(page: Page) {
   await expect(page.getByRole("region", { name: "主库详情" })).toBeVisible();
 }
 
+// 全局通知 toast（sonner，P11-1 切片②）：通知类提示的统一断言目标。
+function notifyToast(page: Page, text: string | RegExp) {
+  return page.locator("[data-sonner-toast]").filter({ hasText: text });
+}
+
 // 进页即读主库（默认对话列表 tab）；等左栏项目树渲染完成。
 async function waitForLibraryLoaded(page: Page) {
   await expect(page.getByTestId("library-tree")).toBeVisible();
@@ -199,7 +204,7 @@ test.describe("桌面尺寸与滚动验收", () => {
     }
   });
 
-  test("P10 产品切换器按能力切换工作区，不复用 Work CN 账号页", async ({ page }) => {
+  test("P10/P11-6 产品切换器切换工作区：五页全开放、区块按能力三态呈现", async ({ page }) => {
     await installMockBridge(page);
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
@@ -210,15 +215,30 @@ test.describe("桌面尺寸与滚动验收", () => {
 
     await expect(page.getByRole("region", { name: "Trae CN 账号" })).toBeVisible();
     await expect(page.getByTestId("product-credential-status")).toHaveText("需要授权");
-    await expect(page.getByTestId("navigation-checkin")).toHaveCount(0);
+    // P11-6（ADR-0032）：导航五页全产品开放；账号 region 不复用 Work CN 工作台。
+    await expect(page.getByTestId("navigation-checkin")).toBeVisible();
     await expect(page.getByRole("region", { name: "账号", exact: true })).toHaveCount(0);
     // 产品凭据边界由共享账号工作台展示；不能把浏览器会话复用误报成凭据迁移。
     await expect(page.getByText("尚未确认与 Work CN 的 TRAE 身份关系。")).toBeVisible();
     await expect(page.getByRole("heading", { name: "我的账号", level: 3 })).toBeVisible();
 
+    // 签到页开放但为 pending 说明卡（探针已验证端点、实装待验收，不出操作界面）。
+    // 总览页也有 pending 卡（页面槽位常驻 DOM），在签到 region 内定位。
+    await page.getByTestId("navigation-checkin").click();
+    const checkinRegion = page.getByRole("region", { name: "签到" });
+    await expect(checkinRegion.getByTestId("capability-pending")).toBeVisible();
+    await expect(checkinRegion.getByTestId("capability-pending")).toContainText("签到能力适配中");
+
+    // 环境页为 absent 说明卡（环境体系是 Work CN 产品能力）。
+    await page.getByTestId("navigation-environment").click();
+    await expect(
+      page.getByRole("region", { name: "环境" }).getByTestId("capability-absent"),
+    ).toBeVisible();
+
     await productSwitcher.selectOption("work_cn");
     await expect(page.getByTestId("navigation-checkin")).toBeVisible();
     await expect(page.getByTestId("current-account-context")).toBeVisible();
+    await expect(page.getByTestId("capability-pending")).toHaveCount(0);
   });
 });
 
@@ -391,7 +411,8 @@ test.describe("P5-4 总览联动与设置页备份分区验收", () => {
 
     await page.getByTestId("master-backup-create").click();
     await expect(page.getByText("现有 3 份")).toBeVisible();
-    await expect(page.getByText("主库数据备份已创建")).toBeVisible();
+    // 备份完成提示走全局通知（sonner toast）。
+    await expect(notifyToast(page, "主库数据备份已创建")).toBeVisible();
   });
 });
 
@@ -461,17 +482,18 @@ test.describe("P5-8b 插件 tab 验收（ADR-0026 同步策略）", () => {
     await expect(page.getByTestId("plugin-market-row-plug-uuid-5")).toContainText("代码图谱");
     await expect(page.getByTestId("plugin-market-installed-plug-uuid-1")).toBeVisible();
 
-    // 安装零确认（ADR-0026 决策 1）：点击即装，无确认弹层，回执提示。
+    // 安装零确认（ADR-0026 决策 1）：点击即装，无确认弹层，回执走全局通知。
     await page.getByTestId("plugin-install-plug-uuid-5").click();
     await expect(page.getByTestId("plugin-market-installed-plug-uuid-5")).toBeVisible();
-    await expect(page.getByTestId("plugin-notice")).toContainText("已安装 代码图谱");
+    await expect(notifyToast(page, "已安装 代码图谱")).toBeVisible();
 
-    // 卸载：单次确认（列明影响面 N 账号）→ 确认后行消失 + 回执。
+    // 卸载：单次确认（列明影响面 N 账号）→ 确认后行消失 + 批量摘要通知。
     await page.getByTestId("plugin-segment-installed").click();
     await page.getByTestId("plugin-uninstall-plug-rec-1").click();
     await expect(page.getByTestId("plugin-uninstall-confirm")).toContainText("将同时从 2 个账号移除");
     await page.getByTestId("plugin-uninstall-confirm-confirm").click();
     await expect(page.getByTestId("plugin-row-plug-rec-1")).toHaveCount(0);
-    await expect(page.getByTestId("plugin-notice")).toContainText("已从 2 个账号移除 飞书协作");
+    await expect(notifyToast(page, "已移除 飞书协作")).toBeVisible();
+    await expect(notifyToast(page, "成功 2 项")).toBeVisible();
   });
 });

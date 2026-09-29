@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, LogOut, MonitorSmartphone, RefreshCw } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { EmptyState } from "./EmptyState";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import type { RemoteDeviceEntry, RemoteDeviceSnapshot } from "../types/product";
 
@@ -425,7 +426,7 @@ export function RemoteDevicesPanel({
                 </>
               ) : (
                 // 防御态：协议保证成功响应至少含本机一行，理论不出现。
-                <p className="account-center__empty">暂无设备记录。</p>
+                <EmptyState className="account-center__empty" description="暂无设备记录。" />
               )}
             </>
           )}

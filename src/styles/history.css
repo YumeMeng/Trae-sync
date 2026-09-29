@@ -16,34 +16,12 @@
   flex: none;
 }
 
-/* —— 空态/引导/错误（库未启动、读取失败等居中卡） —— */
+/* 空态/引导/错误已由共享 EmptyState 组件承载（P11-6 任务 4），
+   样式收敛到 base.css 的 .empty-state 家族；.history-empty 仅为测试钩子，
+   这里只保留 flex 容器内的撑满布局职责。 */
 .history-empty {
   flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 40px 20px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-panel);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  box-shadow: var(--glass-shadow);
-  color: var(--text-2);
-  font-size: 13.5px;
-  text-align: center;
-}
-
-.history-empty svg {
-  color: var(--text-3);
-}
-
-.history-empty__hint {
-  margin: 0;
-  color: var(--text-3);
-  font-size: 12px;
+  min-height: 0;
 }
 
 /* ============================================================
@@ -142,12 +120,8 @@
   min-width: 0;
 }
 
-.lib-notice--error {
-  border-color: var(--danger-line);
-  background: var(--danger-soft);
-  color: var(--danger);
-}
-
+/* 失败提示条已由 notify.error 全局通知承载（P11-1 切片②），样式随迁清理；
+   草稿本地暂存失败的持久警告仍保留 --warning 变体。 */
 .lib-notice--warning {
   border-color: var(--accent-border);
   background: var(--accent-soft);
@@ -324,10 +298,8 @@
 }
 
 .lib-tree__empty {
-  padding: 40px 16px;
-  text-align: center;
-  color: var(--text-3);
-  font-size: 12.5px;
+  /* P11-6：结构样式收敛到 .empty-state（base.css），类名保留为测试钩子。 */
+  flex: none;
 }
 
 /* —— 归档视图：模式 → 项目 → 会话（低饱和灰显，G21） —— */

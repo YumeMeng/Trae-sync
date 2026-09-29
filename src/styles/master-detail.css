@@ -254,16 +254,7 @@
   outline: none;
 }
 
-/* 操作回执（安装/移除成功提示）：轻量非阻断 */
-.plugin-workbench__notice {
-  flex: none;
-  padding: 8px 12px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--accent-soft);
-  color: var(--text-1);
-  font-size: 12.5px;
-}
+/* 插件操作回执已由 notify 全局通知承载（P11-1 切片②），样式随迁清理。 */
 
 /* 分类筛选 chips（G23：复用市场 category_name） */
 .plugin-chips {
@@ -305,11 +296,10 @@
   gap: 4px;
 }
 
+/* 插件列表空态已由共享 EmptyState 组件承载（P11-6 任务 4），
+   .plugin-empty 仅保留测试钩子；flex: none 防止空态被滚动容器拉伸。 */
 .plugin-empty {
-  padding: 30px 12px;
-  color: var(--text-3);
-  font-size: 13px;
-  text-align: center;
+  flex: none;
 }
 
 /* 行骨架（已装/市场共用）：图标 | 名称+元信息 | 分类 | 标签+操作 */

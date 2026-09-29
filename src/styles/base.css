@@ -304,6 +304,67 @@ body {
   padding: 20px;
 }
 
+/* ============================================================
+   统一空态（P11-6 任务 4）：EmptyState 组件的实现层。
+   基础形态 = 轻量居中空态行；panel 修饰 = 玻璃卡（区块级说明卡，
+   三态渲染与历史引导用），样式取自 DESIGN_TOKENS 玻璃面契约。
+   ============================================================ */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 26px 16px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.empty-state--panel {
+  padding: 36px 24px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--radius-panel);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  font-size: 13.5px;
+}
+
+.empty-state__icon {
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+}
+
+/* 靛蓝点缀：说明卡图标用品牌强调色（pending/absent 同色系，不引入新色相）。 */
+.capability-section .empty-state__icon,
+.empty-state--panel .empty-state__icon {
+  color: var(--accent);
+}
+
+.empty-state__title {
+  margin: 0;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.empty-state__desc {
+  margin: 0;
+  max-width: 46em;
+  line-height: 1.55;
+}
+
+.empty-state__action {
+  margin-top: 6px;
+}
+
+/* 区块能力三态说明卡的外层槽位（数据属性挂载点，自身不承载视觉）。 */
+.capability-section {
+  min-width: 0;
+}
+
 .app-page {
   min-height: 100%;
 }
