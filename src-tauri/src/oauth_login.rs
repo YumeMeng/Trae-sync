@@ -13,9 +13,9 @@ use traesync_infrastructure::{
     LoginProduct, LoginSession, ProductAccountStateStore, CALLBACK_TIMEOUT_SECONDS,
 };
 
-use crate::{
-    checkin_material_root, ensure_login_real_mode, run_blocking, trae_cn_material_root, AppState,
-};
+use crate::{checkin_material_root, ensure_login_real_mode, run_blocking, AppState};
+// P12-R3：Trae CN 材料根随凭据域迁 credential_handover。
+use crate::credential_handover::trae_cn_material_root;
 use crate::error_mapping::login_command_error;
 
 /// 登录开始结果；login_url 同时返回给前端展示（浏览器唤起失败时用户可手动复制）。
@@ -557,7 +557,8 @@ mod oauth_profile_cleanup_tests {
 #[cfg(test)]
 mod login_command_tests {
     use super::*;
-    use crate::list_checkin_accounts_inner;
+    // P12-R3：账号列表原语随凭据域迁 credential_handover。
+    use crate::credential_handover::list_checkin_accounts_inner;
     use crate::test_support::make_real_mode_state;
     use crate::RuntimeMode;
 

@@ -13,8 +13,10 @@ use traesync_infrastructure::{CheckinProfileBinding, RealRemoteDeviceManager};
 
 use crate::{
     checkin_material_root, ensure_login_real_mode, resolve_remote_device_account, run_blocking,
-    trae_cn_material_root, AppState,
+    AppState,
 };
+// P12-R3：Trae CN 材料根随凭据域迁 credential_handover。
+use crate::credential_handover::trae_cn_material_root;
 #[cfg(windows)]
 use crate::oauth_login::open_login_url_in_browser;
 

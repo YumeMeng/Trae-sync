@@ -29,9 +29,11 @@ use traesync_infrastructure::{
 };
 
 use crate::{
-    checkin_overview, error_mapping::credential_maintenance_error_code, run_blocking,
-    system_time_to_rfc3339, AppState, RuntimeMode,
+    checkin_overview, error_mapping::credential_maintenance_error_code, run_blocking, AppState,
+    RuntimeMode,
 };
+// P12-R3：system_time_to_rfc3339 随凭据域迁 credential_handover。
+use crate::credential_handover::system_time_to_rfc3339;
 
 /// 签到能力白名单 DTO；真实 HTTP 未启用时明确显示，不伪装成线上签到。
 /// pub(crate)：tauri 命令宏展开的包装函数签名需要暴露返回类型。

@@ -533,7 +533,7 @@ fn local_today_string() -> String {
 fn unix_seconds_to_rfc3339(seconds: u64) -> Option<String> {
     let time =
         std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds))?;
-    // 与 lib.rs 的 system_time_to_rfc3339 保持同一格式（UTC 毫秒）。
+    // 与 credential_handover 的 system_time_to_rfc3339 保持同一格式（UTC 毫秒）。
     let datetime = chrono::DateTime::<chrono::Utc>::from(time);
     Some(datetime.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
