@@ -779,6 +779,7 @@ Work CN 的账号保存、对话主库、直连签到和账号切换行为保持
 - **R2 横切收敛**：④ 命令壳收敛（ensure_real_preview/ensure_fixture 两函数 + error_mapping.rs + run_blocking<T>，含 S1/S2）∥ ⑤ 后端批量运行器 + BatchProgressEvent（serde tag，含 S3）+ 前端 useTauriEvents（latest-ref + cancelled 代次守卫）+ useArchiveDraft hook（9 格迁移矩阵）∥ R2b/R2c 事件契约**同批对齐**
 - **R3 lib.rs 薄根化**：按耦合低→高逐域纯移动 commit；environment_library 一步分二（environment.rs + library_archive.rs）；共享 fixture 提 test_support.rs
 - Trae CN 签到实装（P2 条目，ADR-0030 门禁）：探针已证实 status 端点可用（.scratch/checkin-http/reports/trae-cn-checkin-probe-20260928.json）；实装需真机 claim 验收（用户配合，同 P10-5 切片 4 模式），签到区块届时 pending→ready（改 PRODUCT_SECTION_STATES 一处）
+- **CN 能力真实性审计结论（2026-09-29 复核）**：① CN 健康检测**真机验收通过**（2/2 账号 HTTP 200/auth 一致/昵称指纹一致，报告 trae-cn-health-probe-1790684645.json；09-28 对照组 401/20310 系其自身请求形状错误，非 CN 凭据问题——「可用性存疑」旧表述作废）；② CN 库只读浏览真机实测通过（17 项目/39 会话/328 消息，探针 trae_cn_library_read_probe.rs 沉淀）；③ 09-28 晚 CN 目录 3 份切号备份已澄清=用户授权的三次 master_handover_manual 真实交接（备份先行+记录归并，participating_account_count=1 即预期结果），无越权写库；④ CN 真实续期长期有效性仍按 ADR-0030 待独立验收；⑤ 参考 master_handover_manual 实现评估「CN 记录归并」是否产品化为收编类功能（用户确认该工具可完成任务）
 - 后续待办：凭据备份凭据子目录裁剪规则随 P3 落地后观察；vitest 闪失一次（高负载下）如复现加 --pool=forks 验证
 
 ### P12 验收清单
