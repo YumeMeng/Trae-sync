@@ -4456,7 +4456,7 @@ async fn check_trae_cn_account_health(
 fn check_trae_cn_account_health_inner(
     material_root: &Path,
     selected: &[String],
-    progress: &dyn Fn(HealthCheckProgressEvent),
+    progress: &dyn Fn(BatchProgressEvent),
 ) -> Result<Vec<TraeCnHealthEntryDto>, String> {
     let registry = AccountRegistry::new(material_root);
     let records = registry
@@ -4465,26 +4465,26 @@ fn check_trae_cn_account_health_inner(
     let store = CheckinCredentialStore::new(material_root);
     let client = trae_http_client();
     let now = unix_now_seconds();
-    let total = selected.len();
-    let mut results = Vec::with_capacity(selected.len());
 
-    for (index, profile_id) in selected.iter().enumerate() {
-        let Some(record) = records.iter().find(|record| &record.profile_id == profile_id) else {
-            results.push(TraeCnHealthEntryDto {
-                profile_id: profile_id.clone(),
-                screen_name: String::new(),
-                healthy: false,
-                error_code: Some("credential_missing".to_string()),
-            });
-            progress(HealthCheckProgressEvent {
-                profile_id: profile_id.clone(),
-                screen_name: String::new(),
-                completed: index + 1,
-                total,
-                healthy: false,
-                error_code: Some("credential_missing".to_string()),
-            });
-            continue;
+    run_serial_batch(selected, &records, progress, |profile_id, record, completed, total| {
+        let Some(record) = record else {
+            // 缺失档案：不触网即失败，进度事件与回执同步带 credential_missing。
+            return Ok((
+                TraeCnHealthEntryDto {
+                    profile_id: profile_id.to_string(),
+                    screen_name: String::new(),
+                    healthy: false,
+                    error_code: Some("credential_missing".to_string()),
+                },
+                BatchProgressEvent::HealthCheck {
+                    profile_id: profile_id.to_string(),
+                    screen_name: String::new(),
+                    completed,
+                    total,
+                    healthy: false,
+                    error_code: Some("credential_missing".to_string()),
+                },
+            ));
         };
         let binding = CheckinProfileBinding::from(record);
         let result = store
@@ -4516,40 +4516,41 @@ fn check_trae_cn_account_health_inner(
                 registry
                     .upsert(&verified)
                     .map_err(|_| "trae_cn_registry_invalid".to_string())?;
-                results.push(TraeCnHealthEntryDto {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    healthy: true,
-                    error_code: None,
-                });
-                progress(HealthCheckProgressEvent {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    completed: index + 1,
-                    total,
-                    healthy: true,
-                    error_code: None,
-                });
+                Ok((
+                    TraeCnHealthEntryDto {
+                        profile_id: profile_id.to_string(),
+                        screen_name: record.screen_name.clone(),
+                        healthy: true,
+                        error_code: None,
+                    },
+                    BatchProgressEvent::HealthCheck {
+                        profile_id: profile_id.to_string(),
+                        screen_name: record.screen_name.clone(),
+                        completed,
+                        total,
+                        healthy: true,
+                        error_code: None,
+                    },
+                ))
             }
-            Err(error_code) => {
-                results.push(TraeCnHealthEntryDto {
-                    profile_id: profile_id.clone(),
+            Err(error_code) => Ok((
+                TraeCnHealthEntryDto {
+                    profile_id: profile_id.to_string(),
                     screen_name: record.screen_name.clone(),
                     healthy: false,
                     error_code: Some(error_code.clone()),
-                });
-                progress(HealthCheckProgressEvent {
-                    profile_id: profile_id.clone(),
+                },
+                BatchProgressEvent::HealthCheck {
+                    profile_id: profile_id.to_string(),
                     screen_name: record.screen_name.clone(),
-                    completed: index + 1,
+                    completed,
                     total,
                     healthy: false,
                     error_code: Some(error_code),
-                });
-            }
+                },
+            )),
         }
-    }
-    Ok(results)
+    })
 }
 
 // ===== ADR-0031 账号级远程设备管理（P10-5 切片 2）：设备列表只读命令 =====
@@ -4848,60 +4849,95 @@ struct CredentialRefreshEntryDto {
     error_code: Option<String>,
 }
 
-/// 凭据刷新逐账号进度事件（`credential-refresh-progress`）：批量手动刷新
-/// 每完成一个账号推送一次，前端可展示「第 i/N 个账号」的实时进度；
+/// 批量操作逐账号进度事件统一契约（P12-R2b）：三条批量链（凭据刷新
+/// `credential-refresh-progress`、健康检测 `health-check-progress`、
+/// 积分/额度刷新 `credits-refresh-progress`）共用单一判别枚举，事件名保持
+/// 不变；serde `tag = "kind"` 区分链路，kind 字面值与前端
+/// `src/types/batchProgress.ts` 的 BatchProgressKind 逐一相等。
 /// 载荷为非敏感白名单，不含 token 或任何凭据材料。
 #[derive(Debug, Clone, Serialize)]
-struct CredentialRefreshProgressEvent {
-    profile_id: String,
-    screen_name: String,
-    /// 已处理账号数（含失败，1 起）。
-    completed: usize,
-    /// 批次账号总数。
-    total: usize,
-    /// 该账号本次换发是否成功。
-    refreshed: bool,
-    /// 失败原因码；成功为 None。
-    error_code: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BatchProgressEvent {
+    /// 凭据刷新链：批量手动刷新每完成一个账号推送一次。
+    CredentialRefresh {
+        profile_id: String,
+        screen_name: String,
+        /// 已处理账号数（含失败，1 起）。
+        completed: usize,
+        /// 批次账号总数。
+        total: usize,
+        /// 该账号本次换发是否成功。
+        refreshed: bool,
+        /// 失败原因码；成功为 None（序列化保留 null）。
+        error_code: Option<String>,
+    },
+    /// 健康检测链：批量健康检测每完成一个账号推送一次。
+    HealthCheck {
+        profile_id: String,
+        screen_name: String,
+        /// 已检测账号数（含失败，1 起）。
+        completed: usize,
+        /// 批次账号总数。
+        total: usize,
+        /// 该账号健康检测是否通过。
+        healthy: bool,
+        /// 失败原因码；成功为 None（序列化保留 null）。
+        error_code: Option<String>,
+    },
+    /// 积分/额度刷新链：只读刷新每完成一个账号推送一次，结果字段与
+    /// `CreditsRefreshEntryDto` 同源，均为非敏感展示值。
+    CreditsRefresh {
+        profile_id: String,
+        screen_name: String,
+        /// 已刷新账号数（含失败，1 起）。
+        completed: usize,
+        /// 批次账号总数。
+        total: usize,
+        /// 该账号本次刷新是否成功。
+        ok: bool,
+        /// 最新积分；失败或未取到为 None。
+        credits: Option<i64>,
+        /// 最新「今日已签」状态；失败为 None。
+        checked_in: Option<bool>,
+        /// 额度剩余；失败或未取到为 None。
+        usage_remaining_credits: Option<f64>,
+        /// 失败原因码；成功为 None（序列化保留 null）。
+        error_code: Option<String>,
+    },
 }
 
-/// 健康检测逐账号进度事件（`health-check-progress`）：批量健康检测每完成
-/// 一个账号推送一次；载荷为非敏感白名单，不含凭据材料。
-#[derive(Debug, Clone, Serialize)]
-struct HealthCheckProgressEvent {
-    profile_id: String,
-    screen_name: String,
-    /// 已检测账号数（含失败，1 起）。
-    completed: usize,
-    /// 批次账号总数。
-    total: usize,
-    /// 该账号健康检测是否通过。
-    healthy: bool,
-    /// 失败原因码；成功为 None。
-    error_code: Option<String>,
-}
-
-/// 积分/额度刷新逐账号进度事件（`credits-refresh-progress`）：只读刷新
-/// 每完成一个账号推送一次；结果字段与 `CreditsRefreshEntryDto` 同源，
-/// 均为非敏感展示值，不含 token 或任何凭据材料。
-#[derive(Debug, Clone, Serialize)]
-struct CreditsRefreshProgressEvent {
-    profile_id: String,
-    screen_name: String,
-    /// 已刷新账号数（含失败，1 起）。
-    completed: usize,
-    /// 批次账号总数。
-    total: usize,
-    /// 该账号本次刷新是否成功。
-    ok: bool,
-    /// 最新积分；失败或未取到为 None。
-    credits: Option<i64>,
-    /// 最新「今日已签」状态；失败为 None。
-    checked_in: Option<bool>,
-    /// 额度剩余；失败或未取到为 None。
-    usage_remaining_credits: Option<f64>,
-    /// 失败原因码；成功为 None。
-    error_code: Option<String>,
+/// 泛型批量运行器（P12-R2b）：三条批量链共享的「串行循环 + 逐账号进度事件
+/// 发射」骨架。内建语义（CONTEXT.md 既有约束，行为不变量）：
+/// - 串行逐账号执行，账号间不并发；
+/// - 单账号失败不阻断批次（失败由链闭包编码进回执与事件的 error_code）；
+/// - completed（含失败，1 起）逐账号递增，total 为批次账号总数；
+/// - 档案缺失/失败账号也各发一次进度事件。
+///
+/// 档案查找由运行器统一执行；链闭包接收（profile_id、档案（缺失为 None）、
+/// completed、total），返回（链内回执、该账号进度事件）。闭包返回 Err 表示
+/// 整批中止的存储故障（如凭据包写回失败），直接向上传播且该账号不发事件，
+/// 与既有 `?` 提前返回语义一致。
+fn run_serial_batch<E, F>(
+    selected: &[String],
+    records: &[AccountRecord],
+    mut on_progress: impl FnMut(BatchProgressEvent),
+    mut step: F,
+) -> Result<Vec<E>, String>
+where
+    F: FnMut(&str, Option<&AccountRecord>, usize, usize) -> Result<(E, BatchProgressEvent), String>,
+{
+    let total = selected.len();
+    let mut entries = Vec::with_capacity(selected.len());
+    for (index, profile_id) in selected.iter().enumerate() {
+        let completed = index + 1;
+        let record = records
+            .iter()
+            .find(|record| &record.profile_id == profile_id);
+        let (entry, event) = step(profile_id, record, completed, total)?;
+        on_progress(event);
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 /// 只读刷新积分：逐账号调 status + ide_user_ent_usage（不 claim、不消耗签到资格），
@@ -4941,7 +4977,7 @@ fn refresh_checkin_credits_inner(
     material_root: &std::path::Path,
     selected: &[String],
     runtime_mode: RuntimeMode,
-    progress: &dyn Fn(CreditsRefreshProgressEvent),
+    progress: &dyn Fn(BatchProgressEvent),
 ) -> Result<Vec<CreditsRefreshEntryDto>, String> {
     let registry = AccountRegistry::new(material_root);
     let records = registry
@@ -4953,140 +4989,151 @@ fn refresh_checkin_credits_inner(
         return Err("manual_recovery_required".to_string());
     }
 
-    let mut entries = Vec::new();
     let mut snapshots: Vec<(String, traesync_domain::CheckinStatusSnapshot)> = Vec::new();
     let mut usages: Vec<(String, traesync_domain::EntitlementUsageSnapshot)> = Vec::new();
     // 失败账号原因码：写入积分缓存持久化（卡片“刷新失败”标记，成功后清除）。
     let mut failures: Vec<(String, String)> = Vec::new();
-    let total = selected.len();
-    for (index, profile_id) in selected.iter().enumerate() {
-        let Some(record) = records.iter().find(|r| &r.profile_id == profile_id) else {
-            entries.push(CreditsRefreshEntryDto {
-                profile_id: profile_id.clone(),
-                screen_name: String::new(),
-                credits: None,
-                checked_in: None,
-                usage_remaining_credits: None,
-                error_code: Some("credential_missing".to_string()),
-            });
-            progress(CreditsRefreshProgressEvent {
-                profile_id: profile_id.clone(),
-                screen_name: String::new(),
-                completed: index + 1,
-                total,
-                ok: false,
-                credits: None,
-                checked_in: None,
-                usage_remaining_credits: None,
-                error_code: Some("credential_missing".to_string()),
-            });
-            continue;
-        };
-        let binding = CheckinProfileBinding::from(record);
-        // 手机号补采用克隆：binding 随后 move 进 transport 的绑定表。
-        let backfill_binding = binding.clone();
-        let refresh_result = match runtime_mode {
-            RuntimeMode::Fixture => Ok(()),
-            RuntimeMode::RealReadPreview => {
-                let renewal = RealCheckinRenewalService::new(&store);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or(0);
-                renewal.renew_if_needed(&binding, now).map(|_| ())
-            }
-        };
-        let transport: Box<dyn CheckinTransport> = match runtime_mode {
-            RuntimeMode::Fixture => Box::new(FixtureCheckinTransport::for_profiles(
-                std::slice::from_ref(profile_id),
-            )),
-            RuntimeMode::RealReadPreview => {
-                let mut bindings = std::collections::BTreeMap::new();
-                bindings.insert(record.profile_id.clone(), binding);
-                Box::new(RealCheckinTransport::new(&store, bindings))
-            }
-        };
-        let status = match refresh_result {
-            Err(_) => Err("credential_refresh_failed".to_string()),
-            Ok(()) => transport
-                .status(profile_id)
-                .map_err(|error| checkin_transport_error_code(&error)),
-        };
-        match status {
-            Ok(snapshot) => {
-                snapshots.push((profile_id.clone(), snapshot.clone()));
-                // U-1 脱敏手机号无感补采：仅真实模式且档案缺失时调用一次
-                // GetUserInfo（只读接口，失败静默，下次刷新再试）。
-                // 健康检测复用本命令路径，存量账号由此补全。
-                if record.masked_mobile.is_empty()
-                    && matches!(runtime_mode, RuntimeMode::RealReadPreview)
-                {
-                    if let Ok(bundle) = store.load(&backfill_binding) {
-                        let client = trae_http_client();
-                        if let Ok(user_info) = get_user_info(&client, &bundle.access_token) {
-                            if !user_info.masked_mobile.is_empty() {
-                                let _ = registry
-                                    .backfill_masked_mobile(profile_id, &user_info.masked_mobile);
+
+    let entries = run_serial_batch(
+        selected,
+        &records,
+        progress,
+        |profile_id, record, completed, total| {
+            let Some(record) = record else {
+                return Ok((
+                    CreditsRefreshEntryDto {
+                        profile_id: profile_id.to_string(),
+                        screen_name: String::new(),
+                        credits: None,
+                        checked_in: None,
+                        usage_remaining_credits: None,
+                        error_code: Some("credential_missing".to_string()),
+                    },
+                    BatchProgressEvent::CreditsRefresh {
+                        profile_id: profile_id.to_string(),
+                        screen_name: String::new(),
+                        completed,
+                        total,
+                        ok: false,
+                        credits: None,
+                        checked_in: None,
+                        usage_remaining_credits: None,
+                        error_code: Some("credential_missing".to_string()),
+                    },
+                ));
+            };
+            let binding = CheckinProfileBinding::from(record);
+            // 手机号补采用克隆：binding 随后 move 进 transport 的绑定表。
+            let backfill_binding = binding.clone();
+            let refresh_result = match runtime_mode {
+                RuntimeMode::Fixture => Ok(()),
+                RuntimeMode::RealReadPreview => {
+                    let renewal = RealCheckinRenewalService::new(&store);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(0);
+                    renewal.renew_if_needed(&binding, now).map(|_| ())
+                }
+            };
+            let transport: Box<dyn CheckinTransport> = match runtime_mode {
+                // for_profiles 接收 &[String]：闭包内 profile_id 已是 &str，补拥有值。
+                RuntimeMode::Fixture => Box::new(FixtureCheckinTransport::for_profiles(&[
+                    profile_id.to_string(),
+                ])),
+                RuntimeMode::RealReadPreview => {
+                    let mut bindings = std::collections::BTreeMap::new();
+                    bindings.insert(record.profile_id.clone(), binding);
+                    Box::new(RealCheckinTransport::new(&store, bindings))
+                }
+            };
+            let status = match refresh_result {
+                Err(_) => Err("credential_refresh_failed".to_string()),
+                Ok(()) => transport
+                    .status(profile_id)
+                    .map_err(|error| checkin_transport_error_code(&error)),
+            };
+            match status {
+                Ok(snapshot) => {
+                    snapshots.push((profile_id.to_string(), snapshot.clone()));
+                    // U-1 脱敏手机号无感补采：仅真实模式且档案缺失时调用一次
+                    // GetUserInfo（只读接口，失败静默，下次刷新再试）。
+                    // 健康检测复用本命令路径，存量账号由此补全。
+                    if record.masked_mobile.is_empty()
+                        && matches!(runtime_mode, RuntimeMode::RealReadPreview)
+                    {
+                        if let Ok(bundle) = store.load(&backfill_binding) {
+                            let client = trae_http_client();
+                            if let Ok(user_info) = get_user_info(&client, &bundle.access_token) {
+                                if !user_info.masked_mobile.is_empty() {
+                                    let _ = registry
+                                        .backfill_masked_mobile(profile_id, &user_info.masked_mobile);
+                                }
                             }
                         }
                     }
+                    // status 成功后追加真实额度查询：独立失败处理，额度失败不拖垮积分回执。
+                    let usage = transport
+                        .entitlement_usage(profile_id)
+                        .map_err(|error| checkin_transport_error_code(&error));
+                    let usage_remaining_credits = match usage {
+                        Ok(usage_snapshot) => {
+                            let remaining = usage_snapshot.remaining_credits;
+                            usages.push((profile_id.to_string(), usage_snapshot));
+                            Some(remaining)
+                        }
+                        Err(_) => None,
+                    };
+                    Ok((
+                        CreditsRefreshEntryDto {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            credits: snapshot.credits,
+                            checked_in: Some(snapshot.checked_in),
+                            usage_remaining_credits,
+                            error_code: None,
+                        },
+                        BatchProgressEvent::CreditsRefresh {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            completed,
+                            total,
+                            ok: true,
+                            credits: snapshot.credits,
+                            checked_in: Some(snapshot.checked_in),
+                            usage_remaining_credits,
+                            error_code: None,
+                        },
+                    ))
                 }
-                // status 成功后追加真实额度查询：独立失败处理，额度失败不拖垮积分回执。
-                let usage = transport
-                    .entitlement_usage(profile_id)
-                    .map_err(|error| checkin_transport_error_code(&error));
-                let usage_remaining_credits = match usage {
-                    Ok(usage_snapshot) => {
-                        let remaining = usage_snapshot.remaining_credits;
-                        usages.push((profile_id.clone(), usage_snapshot));
-                        Some(remaining)
-                    }
-                    Err(_) => None,
-                };
-                entries.push(CreditsRefreshEntryDto {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    credits: snapshot.credits,
-                    checked_in: Some(snapshot.checked_in),
-                    usage_remaining_credits,
-                    error_code: None,
-                });
-                progress(CreditsRefreshProgressEvent {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    completed: index + 1,
-                    total,
-                    ok: true,
-                    credits: snapshot.credits,
-                    checked_in: Some(snapshot.checked_in),
-                    usage_remaining_credits,
-                    error_code: None,
-                });
+                Err(error_code) => {
+                    failures.push((profile_id.to_string(), error_code.clone()));
+                    Ok((
+                        CreditsRefreshEntryDto {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            credits: None,
+                            checked_in: None,
+                            usage_remaining_credits: None,
+                            error_code: Some(error_code.clone()),
+                        },
+                        BatchProgressEvent::CreditsRefresh {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            completed,
+                            total,
+                            ok: false,
+                            credits: None,
+                            checked_in: None,
+                            usage_remaining_credits: None,
+                            error_code: Some(error_code),
+                        },
+                    ))
+                }
             }
-            Err(error_code) => {
-                failures.push((profile_id.clone(), error_code.clone()));
-                entries.push(CreditsRefreshEntryDto {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    credits: None,
-                    checked_in: None,
-                    usage_remaining_credits: None,
-                    error_code: Some(error_code.clone()),
-                });
-                progress(CreditsRefreshProgressEvent {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    completed: index + 1,
-                    total,
-                    ok: false,
-                    credits: None,
-                    checked_in: None,
-                    usage_remaining_credits: None,
-                    error_code: Some(error_code),
-                });
-            }
-        }
-    }
+        },
+    )?;
+
     checkin_overview::update_credits_from_snapshots(material_root, &snapshots);
     checkin_overview::update_usage_cache(material_root, &usages);
     checkin_overview::update_refresh_failures(material_root, &failures);
@@ -5157,7 +5204,7 @@ async fn refresh_trae_cn_credentials(
 fn refresh_checkin_credentials_inner(
     material_root: &std::path::Path,
     selected: &[String],
-    progress: &dyn Fn(CredentialRefreshProgressEvent),
+    progress: &dyn Fn(BatchProgressEvent),
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     refresh_product_credentials_inner(material_root, selected, OAuthClient::Solo, progress)
 }
@@ -5166,7 +5213,7 @@ fn refresh_product_credentials_inner(
     material_root: &std::path::Path,
     selected: &[String],
     oauth_client: OAuthClient,
-    progress: &dyn Fn(CredentialRefreshProgressEvent),
+    progress: &dyn Fn(BatchProgressEvent),
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     let store = CheckinCredentialStore::new(material_root);
     // 有未收口写回时整批停止，避免把现场继续推进到更难恢复的状态。
@@ -5197,7 +5244,7 @@ fn refresh_checkin_credentials_inner_with(
     selected: &[String],
     now: u64,
     renew: &dyn Fn(&CheckinProfileBinding, u64) -> Result<(), CheckinCredentialError>,
-    progress: &dyn Fn(CredentialRefreshProgressEvent),
+    progress: &dyn Fn(BatchProgressEvent),
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     let registry = AccountRegistry::new(material_root);
     let records = registry
@@ -5205,74 +5252,79 @@ fn refresh_checkin_credentials_inner_with(
         .map_err(|_| "checkin_registry_invalid".to_string())?;
     let mut refreshed = Vec::new();
     let mut failures = Vec::new();
-    let mut entries = Vec::with_capacity(selected.len());
     let maintenance_state = CredentialMaintenanceStateStore::new(material_root);
-    let total = selected.len();
 
-    for (index, profile_id) in selected.iter().enumerate() {
-        let Some(record) = records
-            .iter()
-            .find(|record| &record.profile_id == profile_id)
-        else {
-            failures.push((profile_id.clone(), "credential_missing".to_string()));
-            entries.push(CredentialRefreshEntryDto {
-                profile_id: profile_id.clone(),
-                screen_name: String::new(),
-                refreshed: false,
-                error_code: Some("credential_missing".to_string()),
-            });
-            progress(CredentialRefreshProgressEvent {
-                profile_id: profile_id.clone(),
-                screen_name: String::new(),
-                completed: index + 1,
-                total,
-                refreshed: false,
-                error_code: Some("credential_missing".to_string()),
-            });
-            continue;
-        };
-        let binding = CheckinProfileBinding::from(record);
-        match renew(&binding, now) {
-            Ok(_) => {
-                refreshed.push(profile_id.clone());
-                // 手动成功也清除自动维护的旧退避；手动入口不读取/拦截退避，
-                // 只把确认成功的结果反馈给下一次自动维护。
-                let _ = maintenance_state.record_success(profile_id, now);
-                entries.push(CredentialRefreshEntryDto {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    refreshed: true,
-                    error_code: None,
-                });
-                progress(CredentialRefreshProgressEvent {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    completed: index + 1,
-                    total,
-                    refreshed: true,
-                    error_code: None,
-                });
+    let entries = run_serial_batch(
+        selected,
+        &records,
+        progress,
+        |profile_id, record, completed, total| {
+            let Some(record) = record else {
+                failures.push((profile_id.to_string(), "credential_missing".to_string()));
+                return Ok((
+                    CredentialRefreshEntryDto {
+                        profile_id: profile_id.to_string(),
+                        screen_name: String::new(),
+                        refreshed: false,
+                        error_code: Some("credential_missing".to_string()),
+                    },
+                    BatchProgressEvent::CredentialRefresh {
+                        profile_id: profile_id.to_string(),
+                        screen_name: String::new(),
+                        completed,
+                        total,
+                        refreshed: false,
+                        error_code: Some("credential_missing".to_string()),
+                    },
+                ));
+            };
+            let binding = CheckinProfileBinding::from(record);
+            match renew(&binding, now) {
+                Ok(_) => {
+                    refreshed.push(profile_id.to_string());
+                    // 手动成功也清除自动维护的旧退避；手动入口不读取/拦截退避，
+                    // 只把确认成功的结果反馈给下一次自动维护。
+                    let _ = maintenance_state.record_success(profile_id, now);
+                    Ok((
+                        CredentialRefreshEntryDto {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            refreshed: true,
+                            error_code: None,
+                        },
+                        BatchProgressEvent::CredentialRefresh {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            completed,
+                            total,
+                            refreshed: true,
+                            error_code: None,
+                        },
+                    ))
+                }
+                Err(error) => {
+                    let error_code = credential_maintenance_error_code(&error).to_string();
+                    failures.push((profile_id.to_string(), error_code.clone()));
+                    Ok((
+                        CredentialRefreshEntryDto {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            refreshed: false,
+                            error_code: Some(error_code.clone()),
+                        },
+                        BatchProgressEvent::CredentialRefresh {
+                            profile_id: profile_id.to_string(),
+                            screen_name: record.screen_name.clone(),
+                            completed,
+                            total,
+                            refreshed: false,
+                            error_code: Some(error_code),
+                        },
+                    ))
+                }
             }
-            Err(error) => {
-                let error_code = credential_maintenance_error_code(&error).to_string();
-                failures.push((profile_id.clone(), error_code.clone()));
-                entries.push(CredentialRefreshEntryDto {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    refreshed: false,
-                    error_code: Some(error_code.clone()),
-                });
-                progress(CredentialRefreshProgressEvent {
-                    profile_id: profile_id.clone(),
-                    screen_name: record.screen_name.clone(),
-                    completed: index + 1,
-                    total,
-                    refreshed: false,
-                    error_code: Some(error_code),
-                });
-            }
-        }
-    }
+        },
+    )?;
 
     // 失败证据保留；成功只清除该账号的凭据维护失败标记，不碰额度与签到记录。
     checkin_overview::update_refresh_failures(material_root, &failures);
@@ -5342,8 +5394,9 @@ mod login_receipt_wire_tests {
     }
 }
 
-/// P11-3 批量凭据刷新 / 健康检测的逐账号进度事件契约：
-/// 载荷非敏感白名单、事件与账号一一对应、completed 递增且失败不中断批次。
+/// P11-3 批量凭据刷新 / 健康检测的逐账号进度事件契约（P12-R2b 起载荷统一为
+/// BatchProgressEvent）：载荷非敏感白名单、事件与账号一一对应、
+/// completed 递增且失败不中断批次。
 #[cfg(test)]
 mod progress_event_contract_tests {
     use super::*;
@@ -5368,7 +5421,7 @@ mod progress_event_contract_tests {
 
     #[test]
     fn progress_events_serialize_non_sensitive_payload_shape() {
-        let refresh = CredentialRefreshProgressEvent {
+        let refresh = BatchProgressEvent::CredentialRefresh {
             profile_id: "profile-1".to_string(),
             screen_name: "账号一".to_string(),
             completed: 1,
@@ -5376,7 +5429,7 @@ mod progress_event_contract_tests {
             refreshed: true,
             error_code: None,
         };
-        let health = HealthCheckProgressEvent {
+        let health = BatchProgressEvent::HealthCheck {
             profile_id: "profile-2".to_string(),
             screen_name: "账号二".to_string(),
             completed: 2,
@@ -5385,6 +5438,7 @@ mod progress_event_contract_tests {
             error_code: Some("credential_invalid".to_string()),
         };
         let refresh_json = serde_json::to_value(&refresh).unwrap();
+        assert_eq!(refresh_json["kind"], "credential_refresh");
         assert_eq!(refresh_json["profile_id"], "profile-1");
         assert_eq!(refresh_json["screen_name"], "账号一");
         assert_eq!(refresh_json["completed"], 1);
@@ -5392,6 +5446,7 @@ mod progress_event_contract_tests {
         assert_eq!(refresh_json["refreshed"], true);
         assert!(refresh_json["error_code"].is_null());
         let health_json = serde_json::to_value(&health).unwrap();
+        assert_eq!(health_json["kind"], "health_check");
         assert_eq!(health_json["profile_id"], "profile-2");
         assert_eq!(health_json["completed"], 2);
         assert_eq!(health_json["total"], 2);
@@ -5439,23 +5494,52 @@ mod progress_event_contract_tests {
 
         // 每个账号完成（含失败与缺失）各推送一次进度，失败不中断批次。
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].profile_id, "profile-fail");
-        assert_eq!(events[0].screen_name, "失败账号");
-        assert_eq!(events[0].completed, 1);
-        assert_eq!(events[0].total, 3);
-        assert!(!events[0].refreshed);
-        assert_eq!(
-            events[0].error_code.as_deref(),
-            Some("credential_refresh_failed")
-        );
-        assert_eq!(events[1].profile_id, "profile-ok");
-        assert_eq!(events[1].completed, 2);
-        assert!(events[1].refreshed);
-        assert!(events[1].error_code.is_none());
+        let BatchProgressEvent::CredentialRefresh {
+            profile_id,
+            screen_name,
+            completed,
+            total,
+            refreshed,
+            error_code,
+        } = &events[0]
+        else {
+            panic!("应为凭据刷新链事件");
+        };
+        assert_eq!(profile_id, "profile-fail");
+        assert_eq!(screen_name, "失败账号");
+        assert_eq!(*completed, 1);
+        assert_eq!(*total, 3);
+        assert!(!refreshed);
+        assert_eq!(error_code.as_deref(), Some("credential_refresh_failed"));
+        let BatchProgressEvent::CredentialRefresh {
+            profile_id,
+            completed,
+            refreshed,
+            error_code,
+            ..
+        } = &events[1]
+        else {
+            panic!("应为凭据刷新链事件");
+        };
+        assert_eq!(profile_id, "profile-ok");
+        assert_eq!(*completed, 2);
+        assert!(*refreshed);
+        assert!(error_code.is_none());
         // 缺失档案的进度事件 screen_name 为空（前端回退展示 profile_id）。
-        assert_eq!(events[2].profile_id, "profile-missing");
-        assert_eq!(events[2].completed, 3);
-        assert_eq!(events[2].error_code.as_deref(), Some("credential_missing"));
+        let BatchProgressEvent::CredentialRefresh {
+            profile_id,
+            screen_name,
+            completed,
+            error_code,
+            ..
+        } = &events[2]
+        else {
+            panic!("应为凭据刷新链事件");
+        };
+        assert_eq!(profile_id, "profile-missing");
+        assert_eq!(screen_name, "");
+        assert_eq!(*completed, 3);
+        assert_eq!(error_code.as_deref(), Some("credential_missing"));
         // 整批回执与进度事件一一对应，既有失败语义不回归。
         assert_eq!(results.len(), 3);
         assert!(!results[0].refreshed);
@@ -5480,19 +5564,30 @@ mod progress_event_contract_tests {
         // 凭据材料不可用（绑定公钥无效 → credential_invalid）：不触网即失败，
         // 进度事件与整批回执同步如实带错误码。
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].profile_id, "profile-h");
-        assert_eq!(events[0].screen_name, "健康号");
-        assert_eq!(events[0].completed, 1);
-        assert_eq!(events[0].total, 1);
-        assert!(!events[0].healthy);
-        assert_eq!(events[0].error_code.as_deref(), Some("credential_invalid"));
+        let BatchProgressEvent::HealthCheck {
+            profile_id,
+            screen_name,
+            completed,
+            total,
+            healthy,
+            error_code,
+        } = &events[0]
+        else {
+            panic!("应为健康检测链事件");
+        };
+        assert_eq!(profile_id, "profile-h");
+        assert_eq!(screen_name, "健康号");
+        assert_eq!(*completed, 1);
+        assert_eq!(*total, 1);
+        assert!(!healthy);
+        assert_eq!(error_code.as_deref(), Some("credential_invalid"));
         assert_eq!(results.len(), 1);
         assert!(!results[0].healthy);
     }
 
     #[test]
     fn credits_refresh_progress_serializes_non_sensitive_payload_shape() {
-        let event = CreditsRefreshProgressEvent {
+        let event = BatchProgressEvent::CreditsRefresh {
             profile_id: "profile-1".to_string(),
             screen_name: "账号一".to_string(),
             completed: 1,
@@ -5504,6 +5599,7 @@ mod progress_event_contract_tests {
             error_code: None,
         };
         let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["kind"], "credits_refresh");
         assert_eq!(json["profile_id"], "profile-1");
         assert_eq!(json["screen_name"], "账号一");
         assert_eq!(json["completed"], 1);
@@ -5546,27 +5642,256 @@ mod progress_event_contract_tests {
         // 每个账号完成（含失败与缺失）各推送一次进度，失败不中断批次。
         assert_eq!(events.len(), 3);
         // 成功账号：fixture 快照（credits=0、未签）；额度失败不拖垮积分回执。
-        assert_eq!(events[0].profile_id, "profile-ok");
-        assert_eq!(events[0].screen_name, "成功账号");
-        assert_eq!(events[0].completed, 1);
-        assert_eq!(events[0].total, 3);
-        assert!(events[0].ok);
-        assert_eq!(events[0].credits, Some(0));
-        assert_eq!(events[0].checked_in, Some(false));
-        assert_eq!(events[0].error_code, None);
+        let BatchProgressEvent::CreditsRefresh {
+            profile_id,
+            screen_name,
+            completed,
+            total,
+            ok,
+            credits,
+            checked_in,
+            error_code,
+            ..
+        } = &events[0]
+        else {
+            panic!("应为积分刷新链事件");
+        };
+        assert_eq!(profile_id, "profile-ok");
+        assert_eq!(screen_name, "成功账号");
+        assert_eq!(*completed, 1);
+        assert_eq!(*total, 3);
+        assert!(*ok);
+        assert_eq!(credits, &Some(0));
+        assert_eq!(checked_in, &Some(false));
+        assert!(error_code.is_none());
         // 缺失档案：事件如实带 credential_missing，批次继续。
-        assert_eq!(events[1].profile_id, "profile-missing");
-        assert_eq!(events[1].completed, 2);
-        assert!(!events[1].ok);
-        assert_eq!(events[1].error_code.as_deref(), Some("credential_missing"));
-        assert_eq!(events[2].profile_id, "profile-later");
-        assert_eq!(events[2].completed, 3);
-        assert!(events[2].ok);
+        let BatchProgressEvent::CreditsRefresh {
+            profile_id,
+            completed,
+            ok,
+            error_code,
+            ..
+        } = &events[1]
+        else {
+            panic!("应为积分刷新链事件");
+        };
+        assert_eq!(profile_id, "profile-missing");
+        assert_eq!(*completed, 2);
+        assert!(!ok);
+        assert_eq!(error_code.as_deref(), Some("credential_missing"));
+        let BatchProgressEvent::CreditsRefresh {
+            profile_id,
+            completed,
+            ok,
+            ..
+        } = &events[2]
+        else {
+            panic!("应为积分刷新链事件");
+        };
+        assert_eq!(profile_id, "profile-later");
+        assert_eq!(*completed, 3);
+        assert!(*ok);
         // 整批回执与进度事件一一对应。
         assert_eq!(results.len(), 3);
         assert!(results[0].error_code.is_none());
         assert_eq!(results[1].error_code.as_deref(), Some("credential_missing"));
         assert!(results[2].error_code.is_none());
+    }
+}
+
+/// P12-R2b 统一事件枚举与泛型批量运行器的契约测试：
+/// kind 字面值与前端 `src/types/batchProgress.ts` 的 BatchProgressKind
+/// 三个字符串精确相等（Q2 同批对齐）；运行器内建串行、失败不阻断、
+/// completed（含失败，1 起）递增、空批次不发射语义。
+#[cfg(test)]
+mod batch_runner_tests {
+    use super::*;
+
+    fn record(profile_id: &str, account_id: &str, screen_name: &str) -> AccountRecord {
+        AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: account_id.to_string(),
+            screen_name: screen_name.to_string(),
+            avatar_url: String::new(),
+            device_id: "1234567890123456".to_string(),
+            device_public_key: "public-key".to_string(),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 0,
+            last_verified_at_unix_seconds: 0,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: true,
+            archived: false,
+        }
+    }
+
+    /// kind 字面值必须与前端契约逐一相等；不匹配的 kind 会被前端静默丢弃。
+    #[test]
+    fn batch_progress_event_kind_literals_match_frontend_contract() {
+        let refresh = BatchProgressEvent::CredentialRefresh {
+            profile_id: "p".to_string(),
+            screen_name: String::new(),
+            completed: 1,
+            total: 1,
+            refreshed: true,
+            error_code: None,
+        };
+        let health = BatchProgressEvent::HealthCheck {
+            profile_id: "p".to_string(),
+            screen_name: String::new(),
+            completed: 1,
+            total: 1,
+            healthy: true,
+            error_code: None,
+        };
+        let credits = BatchProgressEvent::CreditsRefresh {
+            profile_id: "p".to_string(),
+            screen_name: String::new(),
+            completed: 1,
+            total: 1,
+            ok: true,
+            credits: None,
+            checked_in: None,
+            usage_remaining_credits: None,
+            error_code: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&refresh).unwrap()["kind"],
+            "credential_refresh"
+        );
+        assert_eq!(serde_json::to_value(&health).unwrap()["kind"], "health_check");
+        assert_eq!(
+            serde_json::to_value(&credits).unwrap()["kind"],
+            "credits_refresh"
+        );
+    }
+
+    /// 公共字段齐全；error_code 为 None 时序列化保留 null（前端类型 string | null，
+    /// 不得被 skip）；载荷维持非敏感白名单。
+    #[test]
+    fn batch_progress_event_common_fields_and_null_error_code() {
+        let credits = BatchProgressEvent::CreditsRefresh {
+            profile_id: "profile-1".to_string(),
+            screen_name: "账号一".to_string(),
+            completed: 2,
+            total: 5,
+            ok: false,
+            credits: None,
+            checked_in: None,
+            usage_remaining_credits: None,
+            error_code: None,
+        };
+        let json = serde_json::to_value(&credits).unwrap();
+        assert_eq!(json["profile_id"], "profile-1");
+        assert_eq!(json["screen_name"], "账号一");
+        assert_eq!(json["completed"], 2);
+        assert_eq!(json["total"], 5);
+        assert!(json.get("error_code").is_some());
+        assert!(json["error_code"].is_null());
+        // 非敏感白名单：不含任何凭据材料字段。
+        assert!(json.get("access_token").is_none());
+        assert!(json.get("refresh_token").is_none());
+        assert!(json.get("device_private_key").is_none());
+    }
+
+    /// 运行器：串行顺序处理；缺失档案不阻断后续账号；completed 含缺失
+    /// 1 起递增、total 为批次总数；每账号各发一次事件；回执保持输入顺序。
+    #[test]
+    fn batch_runner_runs_serially_and_continues_after_failure() {
+        let records = vec![
+            record("profile-a", "account-a", "账号甲"),
+            record("profile-b", "account-b", "账号乙"),
+        ];
+        let selected = vec![
+            "profile-a".to_string(),
+            "profile-missing".to_string(),
+            "profile-b".to_string(),
+        ];
+        let mut calls: Vec<String> = Vec::new();
+        let mut events: Vec<BatchProgressEvent> = Vec::new();
+        let entries: Vec<String> = run_serial_batch(
+            &selected,
+            &records,
+            |event| events.push(event),
+            |profile_id, record, completed, total| {
+                calls.push(profile_id.to_string());
+                let (healthy, error_code) = match record {
+                    Some(_) => (true, None),
+                    None => (false, Some("credential_missing".to_string())),
+                };
+                Ok((
+                    profile_id.to_string(),
+                    BatchProgressEvent::HealthCheck {
+                        profile_id: profile_id.to_string(),
+                        screen_name: record
+                            .map(|r| r.screen_name.clone())
+                            .unwrap_or_default(),
+                        completed,
+                        total,
+                        healthy,
+                        error_code,
+                    },
+                ))
+            },
+        )
+        .unwrap();
+
+        // 串行顺序与输入一致；缺失档案也执行且不阻断后续账号。
+        assert_eq!(
+            calls,
+            vec![
+                "profile-a".to_string(),
+                "profile-missing".to_string(),
+                "profile-b".to_string()
+            ]
+        );
+        // 回执顺序保持输入顺序。
+        assert_eq!(
+            entries,
+            vec![
+                "profile-a".to_string(),
+                "profile-missing".to_string(),
+                "profile-b".to_string()
+            ]
+        );
+        // 每账号各发一次事件，completed 含缺失 1 起递增。
+        assert_eq!(events.len(), 3);
+        for (index, event) in events.iter().enumerate() {
+            let BatchProgressEvent::HealthCheck {
+                profile_id,
+                completed,
+                total,
+                ..
+            } = event
+            else {
+                panic!("应为健康检测链事件");
+            };
+            assert_eq!(*completed, index + 1);
+            assert_eq!(*total, 3);
+            assert_eq!(profile_id, &selected[index]);
+        }
+        // 缺失账号事件如实带 credential_missing。
+        let BatchProgressEvent::HealthCheck { error_code, .. } = &events[1] else {
+            panic!("应为健康检测链事件");
+        };
+        assert_eq!(error_code.as_deref(), Some("credential_missing"));
+    }
+
+    /// 运行器：空批次不执行任何账号、不发射任何事件，返回空回执。
+    #[test]
+    fn batch_runner_empty_selection_emits_no_events() {
+        let mut events: Vec<BatchProgressEvent> = Vec::new();
+        let entries: Vec<String> = run_serial_batch(
+            &[] as &[String],
+            &[] as &[AccountRecord],
+            |event| events.push(event),
+            |_profile_id, _record, _completed, _total| {
+                panic!("空批次不应执行任何账号闭包");
+            },
+        )
+        .unwrap();
+        assert!(entries.is_empty());
+        assert!(events.is_empty());
     }
 }
 
