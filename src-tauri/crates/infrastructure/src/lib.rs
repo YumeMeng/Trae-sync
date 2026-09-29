@@ -42,6 +42,8 @@ pub mod file_identity;
 pub mod fixture_paths;
 pub mod handoff_intent;
 pub mod key_wrapper;
+// P12-R1b：产品×库 → 当前账号解析（组合根 resolve_library_account 系下沉）。
+pub mod library_account;
 pub mod logging;
 #[cfg(feature = "sqlcipher")]
 pub mod master_archive;

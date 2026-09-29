@@ -91,9 +91,15 @@ use traesync_infrastructure::trae_instance::{
 };
 // P5-0 主库环境注册表（环境模型 grill Q1/Q2/Q7：V1 单主库环境档案持久化）。
 // P11-6 追加 master_data_dir_for（Trae CN 只读库目录解析；纯函数形态由单测全限定引用）。
+// P12-R1b 追加 environment_registry_error_code（错误码映射随解析模块下沉共用）。
 use traesync_infrastructure::environment_registry::{
-    self as environment_registry_module, master_data_dir, master_data_dir_for,
-    secondary_data_dir, EnvironmentRegistry, EnvironmentRegistryError, MASTER_ENV_ID,
+    self as environment_registry_module, environment_registry_error_code, master_data_dir,
+    master_data_dir_for, secondary_data_dir, EnvironmentRegistry, MASTER_ENV_ID,
+};
+// P12-R1b：产品×库 → 当前账号解析（原组合根 resolve_library_account 系下沉）。
+use traesync_infrastructure::library_account::{
+    self, observed_profile_id, trae_cn_material_root_from, LibraryAccountResolution,
+    TraeCnPointerLookup,
 };
 // P5-1 主库切号五步事务原语：交接（备份/活动检测/换腿）、凭据互换、接力台账。
 // P7-1 追加 E2 构造路径：construct_auth_identity（凭据包 + GetUserInfo 构造登录态）。
@@ -145,6 +151,12 @@ static COMMON_CONTROLS_V6_DIRECTIVE: [u8; 167] = *b"/manifestdependency:\"type='
 mod checkin_overview;
 mod operation_contract;
 use operation_contract::CommandErrorDto;
+
+// P12-R1b：LibraryContext 值对象与库环境稳定标识下沉 domain（is_master /
+// ensure_writable 纯规则随迁）；转发别名保持 lib.rs 调用面零改动。
+// 依赖实例进程接口的实例操作以扩展 trait 留在组合根（见下方
+// LibraryContextInstanceOps）。
+pub(crate) use traesync_domain::{LibraryContext, TRAE_CN_LIBRARY_ID};
 
 /// 已验证 Work CN 版本的 SQLCipher 技术参数；不属于登录凭证或目录库密钥。
 const WORK_CN_SOURCE_RAW_KEY: &str =
@@ -3093,12 +3105,6 @@ fn trae_cn_material_root(state: &AppState) -> Result<PathBuf, String> {
     Ok(trae_cn_material_root_from(Path::new(&state.storage_root)))
 }
 
-/// P11-6 纯函数形态（库账号解析与单测用）：Trae CN 产品账号根 =
-/// `{storage_root}/products/trae_cn`（与 `trae_cn_material_root` 同源派生规则）。
-fn trae_cn_material_root_from(storage_root: &Path) -> PathBuf {
-    storage_root.join("products").join("trae_cn")
-}
-
 /// 自动签到调度器循环间隔（秒）：兼顾触发及时性与存储读取频率。
 const AUTO_CHECKIN_TICK_SECONDS: u64 = 30;
 
@@ -4648,21 +4654,17 @@ fn resolve_remote_device_account(
             Ok((account, OAuthClient::Solo))
         }
         // Trae CN：默认账号取产品账号池当前指针（switch 命令写入的同一状态）。
+        // P12-R1b：指针→档案查找下沉 library_account（与库作用域同源），
+        // 未选择/悬空两种空形态在此映射为各自的稳定错误码。
         "trae_cn" => {
-            let target = match profile_id {
-                Some(profile) => profile.to_string(),
-                None => ProductAccountStateStore::new(material_root)
-                    .load()
-                    .map_err(|_| "trae_cn_account_state_invalid".to_string())?
-                    .ok_or_else(|| "current_account_unresolved".to_string())?,
+            let account = match library_account::resolve_trae_cn_pointer(material_root, profile_id)?
+            {
+                TraeCnPointerLookup::Registered(account) => account,
+                TraeCnPointerLookup::NoSelection => {
+                    return Err("current_account_unresolved".to_string())
+                }
+                TraeCnPointerLookup::Dangling => return Err("account_not_found".to_string()),
             };
-            let records = AccountRegistry::new(material_root)
-                .load()
-                .map_err(|_| "trae_cn_registry_invalid".to_string())?;
-            let account = records
-                .into_iter()
-                .find(|record| record.profile_id == target)
-                .ok_or_else(|| "account_not_found".to_string())?;
             Ok((account, OAuthClient::TraeCn))
         }
         _ => Err("unknown_product".to_string()),
@@ -6280,37 +6282,20 @@ async fn get_environment_state(
     .map_err(|_| "environment_state_join_failed".to_string())?
 }
 
-/// 主库当前账号实测（2026-09-03 卡死案例修复）：环境注册表的
-/// current_profile_id 只在切号流程写回，用户在 TRAE 官方登录/登出后
-/// 即过期（工具显示与实际登录脱节）。实测源 = 主库登录 blob 明文
-/// userId（`archive_login_user_id`，与 E1 存档核对同源），在账号注册表
-/// 按 account_id 反查 profile。
-/// Some = 实测登录且账号已登记；None = 登出态/blob 不可读/账号未登记
-/// （调用方回退注册表缓存值）。
-fn observed_master_profile_id(
-    accounts: &[traesync_infrastructure::account_registry::AccountRecord],
-    master_instance_dir: &Path,
-) -> Option<String> {
-    let user_id = archive_login_user_id(master_instance_dir)?;
-    accounts
-        .iter()
-        .find(|record| record.account_id == user_id)
-        .map(|record| record.profile_id.clone())
-}
-
 /// 主库当前账号解析（实测优先 + 注册表纠正，get_environment_state /
 /// list_environments 两读取路径共用）：
 /// - 实测登录已登记账号 → 返回实测 profile，并把过期的注册表缓存纠正
 ///   为实测值（fail-soft 幂等收敛；插件同步预检等注册表消费方一并修正）；
 /// - 实测不可用（登出/blob 不可读/账号未登记）→ 保留注册表缓存
 ///   （最后已知账号，不写垃圾值）。
+/// P12-R1b：实测源（`observed_profile_id`）随解析模块下沉共用。
 fn reconcile_master_current_profile(
     registry: &EnvironmentRegistry,
     accounts: &[traesync_infrastructure::account_registry::AccountRecord],
     master_instance_dir: &Path,
     cached_profile_id: Option<&str>,
 ) -> Option<String> {
-    match observed_master_profile_id(accounts, master_instance_dir) {
+    match observed_profile_id(accounts, master_instance_dir) {
         Some(observed) => {
             if cached_profile_id != Some(observed.as_str()) {
                 let _ = registry.set_current_profile(MASTER_ENV_ID, &observed);
@@ -6321,53 +6306,17 @@ fn reconcile_master_current_profile(
     }
 }
 
-/// 解析需要数据归属或账号凭据的库当前账号（P11-5⑤ 泛化：主库/副环境通用）。
-///
-/// 环境注册表是缓存，不能作为授权主体；这里要求库目录登录态 blob
-/// 实测得到已登记账号。登出、blob 不可读或账号未登记时均返回 None，
-/// 防止沿用旧缓存读取或修改另一账号的数据。
-/// 实测已确认账号时顺手收敛该环境的注册表缓存（实测优先，主库/副环境
-/// 各自记忆，互不串写）。
-fn resolve_actual_env_account(
-    material_root: &Path,
-    storage_root: &Path,
-    instance_dir: &Path,
-    env_id: &str,
-) -> Result<Option<traesync_infrastructure::account_registry::AccountRecord>, String> {
-    let registry = EnvironmentRegistry::new(storage_root);
-    let cached = if env_id == MASTER_ENV_ID {
-        registry
-            .ensure_master()
-            .map_err(|_| "environment_registry_invalid".to_string())?
-    } else {
-        registry
-            .find(env_id)
-            .map_err(environment_registry_error_code)?
-            .ok_or_else(|| "library_not_found".to_string())?
-    };
-    let accounts = AccountRegistry::new(material_root)
-        .load()
-        .map_err(|_| "checkin_registry_invalid".to_string())?;
-    let Some(profile_id) = observed_master_profile_id(&accounts, instance_dir) else {
-        return Ok(None);
-    };
-    if cached.current_profile_id.as_deref() != Some(profile_id.as_str()) {
-        // 实测已确认账号时顺手收敛缓存，供环境页等展示路径使用。
-        let _ = registry.set_current_profile(env_id, &profile_id);
-    }
-    Ok(accounts
-        .into_iter()
-        .find(|record| record.profile_id == profile_id))
-}
-
 /// 解析需要数据归属或账号凭据的主库当前账号（P5-5 语义，P11-5⑤ 起为
-/// resolve_actual_env_account 的主库特化入口）。
+/// 实测分支的主库特化入口）。P12-R1b：实测分支下沉
+/// `library_account::resolve_measured_env_account`，此处保留薄转发——
+/// 调用点（插件预检/凭据/自检/远程设备）只持有主库目录，不持有
+/// LibraryContext，语义与错误码口径保持不变。
 fn resolve_actual_master_account(
     material_root: &Path,
     storage_root: &Path,
     master_instance_dir: &Path,
 ) -> Result<Option<traesync_infrastructure::account_registry::AccountRecord>, String> {
-    resolve_actual_env_account(
+    library_account::resolve_measured_env_account(
         material_root,
         storage_root,
         master_instance_dir,
@@ -6377,13 +6326,14 @@ fn resolve_actual_master_account(
 
 /// 需要执行主库归属操作时的强制账号解析；未确认实测账号即拒绝操作。
 /// P11-5⑤：库泛化入口（主库/副环境同义，env_id 由 LibraryContext 提供）。
+/// P12-R1b：转发下沉后的实测分支。
 fn require_actual_env_account(
     material_root: &Path,
     storage_root: &Path,
     instance_dir: &Path,
     env_id: &str,
 ) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
-    resolve_actual_env_account(material_root, storage_root, instance_dir, env_id)?
+    library_account::resolve_measured_env_account(material_root, storage_root, instance_dir, env_id)?
         .ok_or_else(|| "master_current_account_unavailable".to_string())
 }
 
@@ -6400,62 +6350,16 @@ fn require_actual_master_account(
     )
 }
 
-/// 库作用域当前账号解析（P11-5 收官：按库环境分化口径）。
-///
-/// - 主库：实测优先 + 注册表纠正（登录态由官方管理，登出/切号后缓存
-///   可能过期，`resolve_actual_env_account` 原口径不变）；
-/// - 副环境：注册表 current_profile_id 即权威（登录由工具托管，无实测
-///   语义——环境从未启动过 TRAE 时目录内没有登录态可实测，注册表值
-///   是唯一的账号记忆）；注册表值指向未登记/已移除账号时返回 None
-///   （无授权主体，防悬空引用）。
-/// - P11-6 Trae CN 只读库：产品账号池当前指针（switch 命令写入的同一
-///   状态，与 `list_remote_devices` 同源）→ Trae CN 账号注册表档案；
-///   未选择账号或指针悬空时返回 None（前端引导先在账号页登录）。
-fn resolve_library_account(
-    material_root: &Path,
-    storage_root: &Path,
-    ctx: &LibraryContext,
-) -> Result<Option<traesync_infrastructure::account_registry::AccountRecord>, String> {
-    if ctx.env_id == TRAE_CN_LIBRARY_ID {
-        let trae_cn_root = trae_cn_material_root_from(storage_root);
-        let Some(profile_id) = ProductAccountStateStore::new(&trae_cn_root)
-            .load()
-            .map_err(|_| "trae_cn_account_state_invalid".to_string())?
-        else {
-            return Ok(None);
-        };
-        return Ok(AccountRegistry::new(&trae_cn_root)
-            .load()
-            .map_err(|_| "trae_cn_registry_invalid".to_string())?
-            .into_iter()
-            .find(|record| record.profile_id == profile_id));
-    }
-    if ctx.is_master() {
-        return resolve_actual_env_account(material_root, storage_root, &ctx.dir, &ctx.env_id);
-    }
-    let profile_id = EnvironmentRegistry::new(storage_root)
-        .find(&ctx.env_id)
-        .map_err(environment_registry_error_code)?
-        .ok_or_else(|| "library_not_found".to_string())?
-        .current_profile_id;
-    let Some(profile_id) = profile_id else {
-        return Ok(None);
-    };
-    let account = AccountRegistry::new(material_root)
-        .load()
-        .map_err(|_| "checkin_registry_invalid".to_string())?
-        .into_iter()
-        .find(|record| record.profile_id == profile_id);
-    Ok(account)
-}
-
 /// 库作用域强制账号解析（归属写操作入口）：无法确定当前账号即拒绝。
+/// P12-R1b：解析本体下沉 `library_account::resolve_library_account`，
+/// 此处仅保留「无账号 → 稳定错误码」的调用点策略。
 fn require_library_account(
     material_root: &Path,
     storage_root: &Path,
     ctx: &LibraryContext,
 ) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
-    resolve_library_account(material_root, storage_root, ctx)?
+    library_account::resolve_library_account(material_root, storage_root, ctx)?
+        .and_then(LibraryAccountResolution::into_account)
         .ok_or_else(|| "master_current_account_unavailable".to_string())
 }
 
@@ -6711,7 +6615,7 @@ async fn repair_master_current_account(state: tauri::State<'_, AppState>) -> Res
             .map_err(|_| "checkin_registry_invalid".to_string())?;
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-        let observed = observed_master_profile_id(&accounts, &master_dir)
+        let observed = observed_profile_id(&accounts, &master_dir)
             .ok_or_else(|| "master_observed_account_unavailable".to_string())?;
         registry
             .set_current_profile(MASTER_ENV_ID, &observed)
@@ -6834,20 +6738,9 @@ struct EnvironmentLoginReceiptDto {
     removed_mirror_rows: usize,
 }
 
-/// 注册表错误 → 稳定错误码（P6-4 命令族统一口径；InvalidRecord 在
-/// 创建/重命名语境即名称非法）。
-fn environment_registry_error_code(error: EnvironmentRegistryError) -> String {
-    match error {
-        EnvironmentRegistryError::InvalidRecord => "environment_name_invalid",
-        EnvironmentRegistryError::NotFound => "environment_not_found",
-        EnvironmentRegistryError::NameTaken => "environment_name_taken",
-        EnvironmentRegistryError::MasterImmutable => "environment_master_immutable",
-        EnvironmentRegistryError::Invalid | EnvironmentRegistryError::Io => {
-            "environment_registry_invalid"
-        }
-    }
-    .to_string()
-}
+// P12-R1b：`environment_registry_error_code` 下沉
+// traesync_infrastructure::environment_registry（错误类型同模块），经导入
+// 保持全部调用点口径不变。
 
 /// 环境列表（主库置顶，副环境按创建时间升序）。include_size=true 时附带
 /// 体积（主库三件套口径 / 副环境整目录递归；较重，前端仅手动刷新时请求）。
@@ -8381,11 +8274,6 @@ struct MasterHistoryDto {
     fingerprint: InstanceFingerprint,
 }
 
-/// P11-6 Trae CN 产品只读库 id（ADR-0032 决策 5：复用 Library 抽象接入
-/// Trae CN 官方数据根的只读浏览视图）。命名对齐产品 id（`TraeProduct::
-/// TraeCn.product_id()`），与 `master` / `env-*` 同一 id 空间。
-const TRAE_CN_LIBRARY_ID: &str = "trae_cn";
-
 /// ADR-0025 Library 抽象：库 id → 数据目录解析（P11-5⑤ 泛化到副环境）。
 ///
 /// 库是基地概念：主库与副库都是「库」的实例，库内模块面向库编程。
@@ -8434,39 +8322,27 @@ fn resolve_library_env_id(
     }
 }
 
-/// P11-5⑤ 库实例运行上下文：写库类命令（收编/清理/归档应用）按环境
-/// 路由实例生命周期（关/启/运行检测）与备份目录的统一依据。
-/// P11-6 追加 `read_only`：Trae CN 产品库只读（ADR-0032 决策 5），写库
-/// 命令经 `ensure_writable` 统一拒绝。
-struct LibraryContext {
-    /// 环境归属（`master` / `trae_cn` / 副环境 env_id），进度事件与台账路由用。
-    env_id: String,
-    /// 环境显示名（副环境重启窗口标题与主库「当前账号名」口径对齐用）。
-    env_name: String,
-    /// 库数据目录（主库 = 官方目录；副环境 = 环境派生目录；trae_cn = 产品官方数据根）。
-    dir: PathBuf,
-    /// 是否只读库（P11-6：仅 trae_cn 为 true；写库类命令先经 ensure_writable）。
-    read_only: bool,
-}
-
-impl LibraryContext {
-    fn is_master(&self) -> bool {
-        self.env_id == MASTER_ENV_ID
-    }
-
-    /// P11-6（ADR-0032 决策 5）：写库类能力不随 Trae CN 只读浏览开放。
-    /// 归属改写/归档/删除/合并/清理对只读库一律返回稳定错误码
-    /// `library_read_only`，在进入任何实例关闭或备份动作之前拒绝。
-    fn ensure_writable(&self) -> Result<(), String> {
-        if self.read_only {
-            Err("library_read_only".to_string())
-        } else {
-            Ok(())
-        }
-    }
-
+/// P12-R1b：LibraryContext 的实例操作扩展（类型本体已下沉 domain）。
+/// 依赖实例进程接口（infrastructure）的三个方法以私有 trait 形式留在
+/// 组合根——Rust 固有 impl 只能在定义 crate 内，trait 形式让 lib.rs 内
+/// `ctx.xxx()` 调用面零改动；is_master / ensure_writable 纯规则随类型
+/// 迁入 domain。
+trait LibraryContextInstanceOps {
     /// 实例进程匹配口径：主库官方目录口径（含无参启动形态）；
     /// 副环境带参匹配（`--user-data-dir` 指向环境目录）。
+    fn command_line_matches(&self, command_line: &str) -> bool;
+
+    /// 关闭实例：主库用 close_master_instance（覆盖官方无参主进程），
+    /// 副环境用 close_instance（带参口径）。
+    fn close_instance(&self) -> Result<trae_instance_module::CloseOutcome, ()>;
+
+    /// 重启实例（登录身份未变场景：收编/清理/归档应用收尾）。
+    /// 窗口标题：主库 = 当前账号名（P5-5 既有口径）；副环境 = 环境名
+    ///（与环境页启动入口一致，并行环境按名区分）。
+    fn relaunch(&self, window_title: &str) -> Result<TraeInstanceLaunchDto, String>;
+}
+
+impl LibraryContextInstanceOps for LibraryContext {
     fn command_line_matches(&self, command_line: &str) -> bool {
         if self.is_master() {
             trae_instance_module::command_line_matches_master(command_line, &self.dir)
@@ -8475,8 +8351,6 @@ impl LibraryContext {
         }
     }
 
-    /// 关闭实例：主库用 close_master_instance（覆盖官方无参主进程），
-    /// 副环境用 close_instance（带参口径）。
     fn close_instance(&self) -> Result<trae_instance_module::CloseOutcome, ()> {
         let outcome = if self.is_master() {
             close_master_instance(&self.dir)
@@ -8486,9 +8360,6 @@ impl LibraryContext {
         outcome.map_err(|_| ())
     }
 
-    /// 重启实例（登录身份未变场景：收编/清理/归档应用收尾）。
-    /// 窗口标题：主库 = 当前账号名（P5-5 既有口径）；副环境 = 环境名
-    ///（与环境页启动入口一致，并行环境按名区分）。
     fn relaunch(&self, window_title: &str) -> Result<TraeInstanceLaunchDto, String> {
         // matcher 按环境口径二选一（launch_instance_common 收函数指针）。
         let matcher: fn(&str, &Path) -> bool = if self.is_master() {
@@ -8566,7 +8437,12 @@ async fn get_master_history(
     tauri::async_runtime::spawn_blocking(move || {
         // ADR-0025：库目录统一走 resolve_library_dir（指纹与读取同源）。
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        let current_account = resolve_library_account(&material_root, &storage_root, &ctx)?;
+        let current_account = library_account::resolve_library_account(
+            &material_root,
+            &storage_root,
+            &ctx,
+        )?
+        .and_then(LibraryAccountResolution::into_account);
         let current_user_id = current_account
             .as_ref()
             .map(|account| account.account_id.as_str());
@@ -8648,9 +8524,13 @@ async fn get_master_session_messages(
     tauri::async_runtime::spawn_blocking(move || {
         use traesync_infrastructure::account_session_content::SessionMessagesStatus;
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        let current_account =
-            resolve_library_account(&material_root, &storage_root, &ctx)?
-                .ok_or_else(|| "master_current_account_unavailable".to_string())?;
+        let current_account = library_account::resolve_library_account(
+            &material_root,
+            &storage_root,
+            &ctx,
+        )?
+        .and_then(LibraryAccountResolution::into_account)
+        .ok_or_else(|| "master_current_account_unavailable".to_string())?;
         let (status, messages, has_more) = match read_master_session_messages_page(
             &ctx.dir,
             &session_id,
@@ -8728,7 +8608,12 @@ async fn get_master_library_stats(
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         // 体积与库内容统计独立：库打开失败时体积仍可展示（详情页降级不空白）。
         let size_bytes = master_trio_size_bytes(&ctx.dir);
-        let current_account = resolve_library_account(&material_root, &storage_root, &ctx)?;
+        let current_account = library_account::resolve_library_account(
+            &material_root,
+            &storage_root,
+            &ctx,
+        )?
+        .and_then(LibraryAccountResolution::into_account);
         let Some(account) = current_account else {
             // 未登记账号：统计归零 + 状态引导（总览隐藏区块，环境页提示登录）。
             return Ok(MasterLibraryStatsDto {
@@ -8964,7 +8849,12 @@ async fn get_master_checkup(
             .map_err(|_| "checkin_registry_invalid".to_string())?;
         // 当前账号：主库由登录态实测（官方登录态可能漂移）；副环境以
         // 注册表 current_profile_id 为权威（登录由工具托管，无实测语义）。
-        let current = resolve_library_account(&material_root, &storage_root, &ctx)?;
+        let current = library_account::resolve_library_account(
+            &material_root,
+            &storage_root,
+            &ctx,
+        )?
+        .and_then(LibraryAccountResolution::into_account);
 
         match read_master_checkup(&ctx.dir, &raw_key) {
             MasterCheckupStatus::Ready(report) => {
@@ -9107,7 +8997,8 @@ fn incorporate_master_records_inner(
 
     // 前置：当前账号（收编目标）按库口径解析——主库实测优先 + 注册表
     // 缓存回退；副环境注册表 current_profile_id 即权威。
-    let record = resolve_library_account(material_root, storage_root, ctx)?
+    let record = library_account::resolve_library_account(material_root, storage_root, ctx)?
+        .and_then(LibraryAccountResolution::into_account)
         .ok_or_else(|| "incorporate_no_current_account".to_string())?;
     let current_profile = record.profile_id.clone();
     let target_user_id = record.account_id.clone();
@@ -9313,7 +9204,8 @@ fn cleanup_master_empty_projects_inner(
 
     // 重启库实例需要窗口标题：与收编同源，主库取实测当前账号展示名，
     // 副环境用环境名（与启动入口一致）。
-    let record = resolve_library_account(material_root, storage_root, ctx)?
+    let record = library_account::resolve_library_account(material_root, storage_root, ctx)?
+        .and_then(LibraryAccountResolution::into_account)
         .ok_or_else(|| "cleanup_master_no_current_account".to_string())?;
     let window_title = if ctx.is_master() {
         record
@@ -13949,84 +13841,9 @@ mod library_scope_tests {
         }
     }
 
-    /// 构造测试账号档案（与主库 reconcile 测试同款占位形态）。
-    fn scope_account(
-        profile_id: &str,
-        account_id: &str,
-        screen_name: &str,
-    ) -> traesync_infrastructure::account_registry::AccountRecord {
-        traesync_infrastructure::account_registry::AccountRecord {
-            profile_id: profile_id.to_string(),
-            account_id: account_id.to_string(),
-            screen_name: screen_name.to_string(),
-            avatar_url: String::new(),
-            device_id: format!("device-{profile_id}"),
-            device_public_key: format!("pub-{profile_id}"),
-            display_name: None,
-            masked_mobile: String::new(),
-            created_at_unix_seconds: 1,
-            last_verified_at_unix_seconds: 1,
-            device_created_at_unix_seconds: 0,
-            auto_checkin_enabled: false,
-            archived: false,
-        }
-    }
-
-    /// 副环境当前账号以注册表值为权威：目录内无登录态 blob（环境从未
-    /// 启动过 TRAE）时仍能解析——副环境登录由工具托管，无实测语义。
-    #[test]
-    fn resolve_library_account_uses_registry_for_secondary() {
-        let fixture = ScopeFixture::new();
-        let material_root = fixture.root.path().join("material");
-        AccountRegistry::new(&material_root)
-            .upsert(&scope_account("checkin-a", "111", "账号A"))
-            .unwrap();
-        EnvironmentRegistry::new(fixture.root.path())
-            .set_current_profile(&fixture.env_id, "checkin-a")
-            .unwrap();
-        let ctx = resolve_library_context(Some(&fixture.env_id), fixture.root.path()).unwrap();
-
-        let resolved =
-            resolve_library_account(&material_root, fixture.root.path(), &ctx)
-                .unwrap()
-                .expect("副环境注册表登记账号应直接解析（不依赖目录登录态实测）");
-        assert_eq!(resolved.profile_id, "checkin-a");
-        assert_eq!(resolved.account_id, "111");
-    }
-
-    /// 副环境未登记登录账号（注册表无值）：读取与归属操作无法确定目标 → None。
-    #[test]
-    fn resolve_library_account_returns_none_for_unlogged_secondary() {
-        let fixture = ScopeFixture::new();
-        let ctx = resolve_library_context(Some(&fixture.env_id), fixture.root.path()).unwrap();
-
-        let resolved = resolve_library_account(
-            &fixture.root.path().join("material"),
-            fixture.root.path(),
-            &ctx,
-        )
-        .unwrap();
-        assert!(resolved.is_none());
-    }
-
-    /// 副环境注册表值指向未登记账号（账号已从账号页移除）：无授权主体
-    /// → None，与主库「登录未登记账号 → None」同口径，防悬空引用。
-    #[test]
-    fn resolve_library_account_returns_none_for_unknown_profile() {
-        let fixture = ScopeFixture::new();
-        EnvironmentRegistry::new(fixture.root.path())
-            .set_current_profile(&fixture.env_id, "checkin-gone")
-            .unwrap();
-        let ctx = resolve_library_context(Some(&fixture.env_id), fixture.root.path()).unwrap();
-
-        let resolved = resolve_library_account(
-            &fixture.root.path().join("material"),
-            fixture.root.path(),
-            &ctx,
-        )
-        .unwrap();
-        assert!(resolved.is_none());
-    }
+    // P12-R1b：库账号解析三分支语义测试随实现下沉
+    // traesync_infrastructure::library_account（含 into_account 两态与
+    // Trae CN 指针三态契约）；写守卫测试随 LibraryContext 下沉 domain。
 
     /// 备份链按库路由：副环境链枚举环境作用域目录（db 同目录），主库
     /// 口径不变（覆盖根或官方目录 db 同目录）。
@@ -14076,96 +13893,6 @@ mod library_scope_tests {
             ),
             appdata.join("Trae CN")
         );
-    }
-
-    /// 写守卫：trae_cn 库返回 library_read_only；主库/副环境不受影响。
-    #[test]
-    fn library_write_guard_rejects_trae_cn_only() {
-        let read_only = LibraryContext {
-            env_id: TRAE_CN_LIBRARY_ID.to_string(),
-            env_name: "Trae CN".to_string(),
-            dir: PathBuf::from("C:/fixture/Trae CN"),
-            read_only: true,
-        };
-        assert_eq!(
-            read_only.ensure_writable().unwrap_err(),
-            "library_read_only"
-        );
-
-        let master = LibraryContext {
-            env_id: MASTER_ENV_ID.to_string(),
-            env_name: "主库".to_string(),
-            dir: PathBuf::from("C:/fixture/master"),
-            read_only: false,
-        };
-        let secondary = LibraryContext {
-            env_id: "env-1-a".to_string(),
-            env_name: "副环境".to_string(),
-            dir: PathBuf::from("C:/fixture/env-1-a"),
-            read_only: false,
-        };
-        assert!(master.ensure_writable().is_ok());
-        assert!(secondary.ensure_writable().is_ok());
-    }
-
-    /// Trae CN 只读库当前账号 = 产品账号池当前指针 → 产品注册表档案
-    ///（与 switch_trae_cn_account / list_remote_devices 同源，不依赖
-    /// Work 主库注册表与登录态实测）。
-    #[test]
-    fn resolve_library_account_uses_trae_cn_product_pool() {
-        let root = tempfile::tempdir().unwrap();
-        let trae_cn_root = trae_cn_material_root_from(root.path());
-        AccountRegistry::new(&trae_cn_root)
-            .upsert(&scope_account("checkin-cn-1", "888", "Trae CN 账号"))
-            .unwrap();
-        ProductAccountStateStore::new(&trae_cn_root)
-            .save("checkin-cn-1")
-            .unwrap();
-        let ctx = LibraryContext {
-            env_id: TRAE_CN_LIBRARY_ID.to_string(),
-            env_name: "Trae CN".to_string(),
-            dir: root.path().to_path_buf(),
-            read_only: true,
-        };
-        let resolved = resolve_library_account(&root.path().join("checkin"), root.path(), &ctx)
-            .unwrap()
-            .expect("产品池指针指向的注册表账号应直接解析");
-        assert_eq!(resolved.profile_id, "checkin-cn-1");
-        assert_eq!(resolved.account_id, "888");
-    }
-
-    /// 未选择账号（产品池无指针）：None——前端引导先在账号页登录。
-    #[test]
-    fn resolve_library_account_returns_none_for_unselected_trae_cn() {
-        let root = tempfile::tempdir().unwrap();
-        let ctx = LibraryContext {
-            env_id: TRAE_CN_LIBRARY_ID.to_string(),
-            env_name: "Trae CN".to_string(),
-            dir: root.path().to_path_buf(),
-            read_only: true,
-        };
-        let resolved = resolve_library_account(&root.path().join("checkin"), root.path(), &ctx)
-            .unwrap();
-        assert!(resolved.is_none());
-    }
-
-    /// 指针悬空（指向未登记/已移除账号）：None——无授权主体，防悬空引用。
-    #[test]
-    fn resolve_library_account_returns_none_for_dangling_trae_cn_pointer() {
-        let root = tempfile::tempdir().unwrap();
-        let trae_cn_root = trae_cn_material_root_from(root.path());
-        ProductAccountStateStore::new(&trae_cn_root)
-            .save("checkin-gone")
-            .unwrap();
-        let ctx = LibraryContext {
-            env_id: TRAE_CN_LIBRARY_ID.to_string(),
-            env_name: "Trae CN".to_string(),
-            dir: root.path().to_path_buf(),
-            read_only: true,
-        };
-        let resolved = resolve_library_account(&root.path().join("checkin"), root.path(), &ctx)
-            .unwrap();
-        assert!(resolved.is_none());
     }
 
     /// 体检对 trae_cn 库「不适用」：状态 + 全零/空字段形态固定。

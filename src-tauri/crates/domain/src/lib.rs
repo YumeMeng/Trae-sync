@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub mod account_switch;
 pub mod checkin;
 pub mod history;
+pub mod library;
 pub mod sync_plan;
 pub mod workbench_read;
 
@@ -41,6 +42,9 @@ pub use workbench_read::{
     IncompatibleReason, ReadonlyReason, SchemaFingerprint, SourceEventSummary, TableCounts, UserId,
     UserIdError, WorkbenchReadState,
 };
+
+// P12-R1b：库实例运行上下文与库环境稳定标识（自组合根下沉）
+pub use library::{LibraryContext, MASTER_ENV_ID, TRAE_CN_LIBRARY_ID};
 
 // 重导出 T03/T04 历史库核心值对象
 pub use history::{

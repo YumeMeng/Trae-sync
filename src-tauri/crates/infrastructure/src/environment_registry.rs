@@ -33,7 +33,9 @@ const MAX_ENV_NAME_CHARS: usize = 64;
 const MASTER_ENV_NAME: &str = "主库";
 
 /// V1 唯一环境标识（主库，Q7：默认环境，不可删除/不可修改类型）。
-pub const MASTER_ENV_ID: &str = "master";
+/// P12-R1b：常量本体下沉 domain（`LibraryContext::is_master` 同源判定），
+/// 此处转发保持既有导入路径不变。
+pub use traesync_domain::library::MASTER_ENV_ID;
 
 /// 环境注册表错误；不携带敏感内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,22 @@ pub enum EnvironmentRegistryError {
     MasterImmutable,
     /// 读写失败。
     Io,
+}
+
+/// 注册表错误 → 稳定错误码（P6-4 命令族统一口径；InvalidRecord 在
+/// 创建/重命名语境即名称非法）。P12-R1b 自组合根下沉，库账号解析
+/// 模块与命令层共用同一映射。
+pub fn environment_registry_error_code(error: EnvironmentRegistryError) -> String {
+    match error {
+        EnvironmentRegistryError::InvalidRecord => "environment_name_invalid",
+        EnvironmentRegistryError::NotFound => "environment_not_found",
+        EnvironmentRegistryError::NameTaken => "environment_name_taken",
+        EnvironmentRegistryError::MasterImmutable => "environment_master_immutable",
+        EnvironmentRegistryError::Invalid | EnvironmentRegistryError::Io => {
+            "environment_registry_invalid"
+        }
+    }
+    .to_string()
 }
 
 /// 环境档案（V2：多环境）。
