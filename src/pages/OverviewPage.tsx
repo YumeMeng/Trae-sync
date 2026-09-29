@@ -148,153 +148,153 @@ export function OverviewPage({
         </>
       ) : (
         <>
-        {/* G7 证据带：当前登录账号与主库最近活跃时间，读不到主库时显示未登录。 */}
-        <div className="overview-evidence" data-testid="current-account-context">
-          <UserRound size={15} strokeWidth={1.9} aria-hidden="true" />
-          <span className="overview-evidence__label">当前登录：</span>
-          <strong data-testid="current-account-name">
-            {masterState?.current_account_name ?? "未登录"}
-          </strong>
-          {masterStats?.last_active_unix_seconds !== null && masterStats?.last_active_unix_seconds !== undefined && (
-            <span className="overview-evidence__meta">
-              （最近活跃 {formatLastActive(masterStats.last_active_unix_seconds)}）
-            </span>
-          )}
-        </div>
-
-      {/* U-3 签到摘要行（可插拔区块）：真实模式四统计卡 + 快捷操作。 */}
-      {checkinRealMode && checkinOverview !== null && (
-        <section className="overview-checkin" aria-labelledby="overview-checkin-heading" data-testid="overview-checkin">
-          <h2 id="overview-checkin-heading">签到与账号</h2>
-          <div className="overview-checkin__stats">
-            <div className="overview-checkin__stat">
-              <strong>{accountCount}</strong>
-              <span>账号</span>
-            </div>
-            <div className="overview-checkin__stat">
-              <strong>{checkedCount}<em>/{accountCount}</em></strong>
-              <span>今日签到</span>
-            </div>
-            <div className="overview-checkin__stat" title="各账号 TRAE 模型积分（真实额度）合计">
-              <strong>{creditsTotal > 0 ? formatCredits(creditsTotal) : "—"}</strong>
-              <span>模型积分合计</span>
-            </div>
+          {/* G7 证据带：当前登录账号与主库最近活跃时间，读不到主库时显示未登录。 */}
+          <div className="overview-evidence" data-testid="current-account-context">
+            <UserRound size={15} strokeWidth={1.9} aria-hidden="true" />
+            <span className="overview-evidence__label">当前登录：</span>
+            <strong data-testid="current-account-name">
+              {masterState?.current_account_name ?? "未登录"}
+            </strong>
+            {masterStats?.last_active_unix_seconds !== null && masterStats?.last_active_unix_seconds !== undefined && (
+              <span className="overview-evidence__meta">
+                （最近活跃 {formatLastActive(masterStats.last_active_unix_seconds)}）
+              </span>
+            )}
           </div>
-          <div className="overview-checkin__actions">
-            <button
-              type="button"
-              className="btn btn--primary"
-              onClick={() => onNavigate("checkin")}
-              data-testid="overview-checkin-cta"
-            >
-              <CalendarCheck size={15} aria-hidden="true" />
-              {checkedCount < accountCount ? `去签到（余 ${accountCount - checkedCount}）` : "查看签到"}
-            </button>
+
+        {/* U-3 签到摘要行（可插拔区块）：真实模式四统计卡 + 快捷操作。 */}
+        {checkinRealMode && checkinOverview !== null && (
+          <section className="overview-checkin" aria-labelledby="overview-checkin-heading" data-testid="overview-checkin">
+            <h2 id="overview-checkin-heading">签到与账号</h2>
+            <div className="overview-checkin__stats">
+              <div className="overview-checkin__stat">
+                <strong>{accountCount}</strong>
+                <span>账号</span>
+              </div>
+              <div className="overview-checkin__stat">
+                <strong>{checkedCount}<em>/{accountCount}</em></strong>
+                <span>今日签到</span>
+              </div>
+              <div className="overview-checkin__stat" title="各账号 TRAE 模型积分（真实额度）合计">
+                <strong>{creditsTotal > 0 ? formatCredits(creditsTotal) : "—"}</strong>
+                <span>模型积分合计</span>
+              </div>
+            </div>
+            <div className="overview-checkin__actions">
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={() => onNavigate("checkin")}
+                data-testid="overview-checkin-cta"
+              >
+                <CalendarCheck size={15} aria-hidden="true" />
+                {checkedCount < accountCount ? `去签到（余 ${accountCount - checkedCount}）` : "查看签到"}
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => onNavigate("accounts")}
+              >
+                <UserRound size={15} aria-hidden="true" />管理账号
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* 工作台状态（G1 三分支）：有数据 → 统计卡（主库聚合优先，回落旧历史
+            统计）；无数据或目录缺失 → 不出统计，空态引导见下方空态行（互斥不同屏）。 */}
+        {state.data_location.selected && hasOverviewData ? (
+          masterStats?.status === "ready" ? (
+            <div className="overview-page__stats" data-testid="overview-stats-master">
+              <div className="overview-stat">
+                <span className="overview-stat__value">{masterStats.session_count}</span>
+                <span className="overview-stat__label">主库对话</span>
+              </div>
+              <div className="overview-stat">
+                <span className="overview-stat__value">{masterStats.project_count}</span>
+                <span className="overview-stat__label">主库项目</span>
+              </div>
+              <div className="overview-stat" title="主库内出现过的账号数（含历史归属）">
+                <span className="overview-stat__value">{masterStats.participating_account_count}</span>
+                <span className="overview-stat__label">参与账号</span>
+              </div>
+              {masterStats.last_active_unix_seconds !== null && (
+                <div className="overview-stat">
+                  <span className="overview-stat__value overview-stat__value--time">
+                    {formatLastActive(masterStats.last_active_unix_seconds)}
+                  </span>
+                  <span className="overview-stat__label">最近活跃</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="overview-page__stats" data-testid="overview-stats">
+              <div className="overview-stat">
+                <span className="overview-stat__value">{state.history.account_count}</span>
+                <span className="overview-stat__label">账号</span>
+              </div>
+              <div className="overview-stat">
+                <span className="overview-stat__value">{state.history.project_count}</span>
+                <span className="overview-stat__label">项目</span>
+              </div>
+              <div className="overview-stat">
+                <span className="overview-stat__value">{state.history.session_count}</span>
+                <span className="overview-stat__label">对话</span>
+              </div>
+            </div>
+          )
+        ) : null}
+
+        {/* 空态行：目录就绪但无对话（与统计卡互斥），引导去环境页查看主库。 */}
+        {state.data_location.selected && !hasOverviewData && (
+          <p className="overview-page__empty-hint" data-testid="overview-empty-hint">
+            <BookOpen size={14} strokeWidth={2} aria-hidden="true" />
+            主库就绪，暂无对话。
+          </p>
+        )}
+
+        {/* 每屏一个主操作：有数据 → 查看主库记录（进入主库详情页）；
+            无数据但目录就绪 → 去环境页查看主库；
+            目录缺失 → 不出主操作（G1：异常态不加引导按钮）。 */}
+        <div className="overview-page__actions">
+          {state.data_location.selected &&
+            (hasOverviewData ? (
+              <button
+                type="button"
+                className="btn btn--primary btn--large"
+                onClick={() => onNavigate("master-library")}
+                data-testid="overview-scan-cta"
+              >
+                {masterStats?.status === "ready" ? (
+                  <Database size={17} strokeWidth={2} aria-hidden="true" />
+                ) : (
+                  <BookOpen size={17} strokeWidth={2} aria-hidden="true" />
+                )}
+                查看主库记录
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn--primary btn--large"
+                onClick={() => onNavigate("environment")}
+                data-testid="overview-master-cta"
+              >
+                <Database size={17} strokeWidth={2} aria-hidden="true" />
+                去环境页查看主库
+              </button>
+            ))}
+          {!(checkinRealMode && checkinOverview !== null) && (
             <button
               type="button"
               className="btn"
               onClick={() => onNavigate("accounts")}
+              data-testid="overview-accounts-cta"
             >
-              <UserRound size={15} aria-hidden="true" />管理账号
+              <UserRound size={16} strokeWidth={2} aria-hidden="true" />
+              管理账号
             </button>
-          </div>
-        </section>
-      )}
-
-      {/* 工作台状态（G1 三分支）：有数据 → 统计卡（主库聚合优先，回落旧历史
-          统计）；无数据或目录缺失 → 不出统计，空态引导见下方空态行（互斥不同屏）。 */}
-      {state.data_location.selected && hasOverviewData ? (
-        masterStats?.status === "ready" ? (
-          <div className="overview-page__stats" data-testid="overview-stats-master">
-            <div className="overview-stat">
-              <span className="overview-stat__value">{masterStats.session_count}</span>
-              <span className="overview-stat__label">主库对话</span>
-            </div>
-            <div className="overview-stat">
-              <span className="overview-stat__value">{masterStats.project_count}</span>
-              <span className="overview-stat__label">主库项目</span>
-            </div>
-            <div className="overview-stat" title="主库内出现过的账号数（含历史归属）">
-              <span className="overview-stat__value">{masterStats.participating_account_count}</span>
-              <span className="overview-stat__label">参与账号</span>
-            </div>
-            {masterStats.last_active_unix_seconds !== null && (
-              <div className="overview-stat">
-                <span className="overview-stat__value overview-stat__value--time">
-                  {formatLastActive(masterStats.last_active_unix_seconds)}
-                </span>
-                <span className="overview-stat__label">最近活跃</span>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="overview-page__stats" data-testid="overview-stats">
-            <div className="overview-stat">
-              <span className="overview-stat__value">{state.history.account_count}</span>
-              <span className="overview-stat__label">账号</span>
-            </div>
-            <div className="overview-stat">
-              <span className="overview-stat__value">{state.history.project_count}</span>
-              <span className="overview-stat__label">项目</span>
-            </div>
-            <div className="overview-stat">
-              <span className="overview-stat__value">{state.history.session_count}</span>
-              <span className="overview-stat__label">对话</span>
-            </div>
-          </div>
-        )
-      ) : null}
-
-      {/* 空态行：目录就绪但无对话（与统计卡互斥），引导去环境页查看主库。 */}
-      {state.data_location.selected && !hasOverviewData && (
-        <p className="overview-page__empty-hint" data-testid="overview-empty-hint">
-          <BookOpen size={14} strokeWidth={2} aria-hidden="true" />
-          主库就绪，暂无对话。
-        </p>
-      )}
-
-      {/* 每屏一个主操作：有数据 → 查看主库记录（进入主库详情页）；
-          无数据但目录就绪 → 去环境页查看主库；
-          目录缺失 → 不出主操作（G1：异常态不加引导按钮）。 */}
-      <div className="overview-page__actions">
-        {state.data_location.selected &&
-          (hasOverviewData ? (
-            <button
-              type="button"
-              className="btn btn--primary btn--large"
-              onClick={() => onNavigate("master-library")}
-              data-testid="overview-scan-cta"
-            >
-              {masterStats?.status === "ready" ? (
-                <Database size={17} strokeWidth={2} aria-hidden="true" />
-              ) : (
-                <BookOpen size={17} strokeWidth={2} aria-hidden="true" />
-              )}
-              查看主库记录
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="btn btn--primary btn--large"
-              onClick={() => onNavigate("environment")}
-              data-testid="overview-master-cta"
-            >
-              <Database size={17} strokeWidth={2} aria-hidden="true" />
-              去环境页查看主库
-            </button>
-          ))}
-        {!(checkinRealMode && checkinOverview !== null) && (
-          <button
-            type="button"
-            className="btn"
-            onClick={() => onNavigate("accounts")}
-            data-testid="overview-accounts-cta"
-          >
-            <UserRound size={16} strokeWidth={2} aria-hidden="true" />
-            管理账号
-          </button>
-        )}
-      </div>
+          )}
+        </div>
         </>
       )}
     </section>

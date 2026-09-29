@@ -190,6 +190,47 @@
   background: var(--glass);
 }
 
+/* S6：设置页专属控件类，不再跨页借用 account-center/mobile-prompt 类名。 */
+.settings-panel__toggle-row {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 260px;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.settings-panel__toggle-row input {
+  flex: 0 0 auto;
+}
+
+.settings-panel__text-input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--line-control);
+  border-radius: 12px;
+  background: var(--fill-soft);
+  color: var(--text-1);
+  font-size: 13.5px;
+  font-family: inherit;
+}
+
+.settings-panel__text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+/* S5：备份位置低频信息——主视野单行截断，完整路径悬浮（title）可见。 */
+.settings-panel__backup-dir {
+  display: inline-block;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 .settings-panel__fold > summary {
   display: flex;
   align-items: center;

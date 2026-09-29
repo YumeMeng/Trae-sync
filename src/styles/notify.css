@@ -21,7 +21,7 @@ ol[data-sonner-toaster] {
   padding: 11px 16px;
   gap: 10px;
   border: 1px solid var(--line-hair);
-  border-radius: 8px;
+  border-radius: var(--radius-control); /* S7：对齐 token（12px，控件圆角），不用字面值 */
   background: var(--glass-strong);
   backdrop-filter: var(--glass-blur-strong);
   -webkit-backdrop-filter: var(--glass-blur-strong);

@@ -179,7 +179,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
         <div className="account-center__key-grid" data-testid="auto-checkin-settings">
           {/* 总开关用 checkbox 形态（与账号详情页的参与开关一致）；错峰与补偿细节收进悬浮提示 */}
           <label
-            className="account-center__profile-select"
+            className="settings-panel__toggle-row"
             data-testid="auto-checkin-enabled-toggle"
             title="到点后各账号在 0-15 分钟内随机错峰执行；迟于设定时间打开应用会自动补偿执行。"
           >
@@ -295,7 +295,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
               />
             )}
             {/* P11-4② 备份内容可选：凭据文件属敏感材料，默认不勾避免无意识扩散。 */}
-            <label className="account-center__profile-select" data-testid="backup-include-credentials-toggle" title="把账号凭据（加密密文）与账号清单一并备份到备份目录下的凭据子目录；仅同一 Windows 用户可恢复。">
+            <label className="settings-panel__toggle-row" data-testid="backup-include-credentials-toggle" title="把账号凭据（加密密文）与账号清单一并备份到备份目录下的凭据子目录；仅同一 Windows 用户可恢复。">
               <input
                 type="checkbox"
                 checked={includeCredentials}
@@ -333,9 +333,12 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
                 更改备份位置
               </button>
             </div>
-            {/* P11-4① 当前备份位置常驻展示；恢复指引与展示同源（活动备份目录）。 */}
+            {/* P11-4① 当前备份位置：低频信息收悬浮（S5）——主视野单行截断，完整路径悬浮可见。 */}
             <p className="account-center__meta" data-testid="backup-location-current">
-              当前备份位置：<code>{backupChain.backup_dir}</code>
+              当前备份位置：
+              <code className="settings-panel__backup-dir" title={backupChain.backup_dir}>
+                {backupChain.backup_dir}
+              </code>
             </p>
             <details className="settings-panel__fold settings-backup__location" data-testid="master-backup-location-details">
               <summary>查看恢复步骤</summary>
@@ -346,7 +349,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
                   : "未开启自动清理时，备份不会被自动删除。"}
                 人工恢复：先关闭 TRAE，再把所选备份内的文件复制回该目录覆盖原位，然后重新启动。
                 {backupChain.backups.some((entry) => entry.has_credentials)
-                  ? "带「含凭据」的备份在凭据子目录（credentials- 前缀）中保存了账号加密凭据：恢复账号时把该子目录的内容复制回签到材料目录（checkin）即可。"
+                  ? "带「含凭据」的备份在凭据子目录（credentials- 前缀）中保存了账号加密凭据：恢复账号时把该子目录的内容复制回签到材料目录（checkin）即可。凭据子目录随对应主备份一并保留/清理；无对应主备份的凭据目录可手动清理。"
                   : ""}
               </p>
             </details>
@@ -360,7 +363,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
                   新备份将写入新目录；已有备份默认复制过去（原位置保留，可自行清理）。
                 </p>
                 <input
-                  className="mobile-prompt__input"
+                  className="settings-panel__text-input"
                   type="text"
                   value={locationInput}
                   placeholder="输入新备份目录的完整路径，如 D:\\TraeBackups"
@@ -369,7 +372,7 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
                   aria-label="新备份目录"
                   onChange={(event) => setLocationInput(event.target.value)}
                 />
-                <label className="account-center__profile-select" data-testid="backup-location-migrate-toggle">
+                <label className="settings-panel__toggle-row" data-testid="backup-location-migrate-toggle">
                   <input
                     type="checkbox"
                     checked={migrateExisting}

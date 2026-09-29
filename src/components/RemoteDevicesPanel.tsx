@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, LogOut, MonitorSmartphone, RefreshCw } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { EmptyState } from "./EmptyState";
+import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import type { RemoteDeviceEntry, RemoteDeviceSnapshot } from "../types/product";
 
@@ -146,7 +147,6 @@ export function RemoteDevicesPanel({
   const [signOutTarget, setSignOutTarget] = useState<RemoteDeviceEntry | null>(null);
   const [signOutBusy, setSignOutBusy] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   // 账号代次：切换归属账号时递增，让飞行中的旧账号请求结果作废，
   // 防止旧账号快照在重置后被迟到的响应重新写入。
   const accountGenerationRef = useRef(0);
@@ -161,7 +161,6 @@ export function RemoteDevicesPanel({
     setSnapshot(null);
     setLoading(false);
     setError(null);
-    setNotice(null);
     setSignOutTarget(null);
     setSignOutError(null);
   }, [productId, profileId]);
@@ -170,7 +169,6 @@ export function RemoteDevicesPanel({
     const generation = accountGenerationRef.current;
     setLoading(true);
     setError(null);
-    setNotice(null);
     try {
       const result = await invoke<RemoteDeviceSnapshot>("list_remote_devices", {
         productId,
@@ -210,8 +208,8 @@ export function RemoteDevicesPanel({
       await action(signOutTarget.device_id);
       setSignOutTarget(null);
       await load();
-      // 重拉完成后再提示：文案与列表状态一致，且不会被子序列 load 清空。
-      setNotice("已退出该设备，列表已刷新。");
+      // 重拉完成后再通知（P1：通知类走 notify 体系，不再页内横幅）。
+      notify.success("已退出该设备，列表已刷新。");
       // ADR-0031 决策 6：退出成功联动父层后置动作（该账号健康检查），触发一次即可。
       onSignedOut?.(profileId);
     } catch (err) {
@@ -364,11 +362,6 @@ export function RemoteDevicesPanel({
           )}
           {!error && snapshot && (
             <>
-              {notice && (
-                <p className="account-center__message" role="status">
-                  {notice}
-                </p>
-              )}
               {signOutError && (
                 <p className="workbench__error" role="alert">
                   {signOutError}

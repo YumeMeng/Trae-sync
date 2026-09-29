@@ -5,8 +5,13 @@ import { RemoteDevicesPanel } from "../src/components/RemoteDevicesPanel";
 import type { RemoteDeviceEntry, RemoteDeviceSnapshot } from "../src/types/product";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P1：退出成功通知已迁 notify 体系，测试断言 notify.success 调用而非页内横幅。
+vi.mock("../src/platform/notify", () => ({
+  notify: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn(), summary: vi.fn() },
+}));
 
 const mockInvoke = vi.mocked(invoke);
+const notifySuccess = vi.mocked((await import("../src/platform/notify")).notify.success);
 
 /** 构造设备行；未指定的字段给合理默认值。 */
 function entry(deviceId: string, overrides: Partial<RemoteDeviceEntry> = {}): RemoteDeviceEntry {
@@ -420,7 +425,7 @@ describe("RemoteDevicesPanel", () => {
       const listCalls = mockInvoke.mock.calls.filter((call) => call[0] === "list_remote_devices");
       expect(listCalls.length).toBe(2);
     });
-    expect(screen.getByText("已退出该设备，列表已刷新。")).toBeInTheDocument();
+    expect(notifySuccess).toHaveBeenCalledWith("已退出该设备，列表已刷新。");
   });
 
   it("默认退出实现调用 clear_remote_device 命令（切片 3 接入后端）", async () => {
@@ -470,9 +475,9 @@ describe("RemoteDevicesPanel", () => {
 
     fireEvent.click(screen.getByTestId("remote-device-signout-dev-remote-1"));
     fireEvent.click(screen.getByTestId("remote-device-signout-confirm-confirm"));
-    // 触发时机在列表重拉完成之后：notice 出现即代表整个成功链路走完。
+    // 触发时机在列表重拉完成之后：notify.success 出现即代表整个成功链路走完。
     await waitFor(() =>
-      expect(screen.getByText("已退出该设备，列表已刷新。")).toBeInTheDocument(),
+      expect(notifySuccess).toHaveBeenCalledWith("已退出该设备，列表已刷新。"),
     );
     expect(onSignedOut).toHaveBeenCalledTimes(1);
     // ADR-0031 决策 6：联动携带面板归属账号，父层只检测该账号。
