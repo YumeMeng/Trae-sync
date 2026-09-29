@@ -16,7 +16,7 @@ use crate::{
     trae_cn_material_root, AppState,
 };
 #[cfg(windows)]
-use crate::open_login_url_in_browser;
+use crate::oauth_login::open_login_url_in_browser;
 
 /// 远程设备行 DTO：与 ports::RemoteDeviceEntry 对齐的 wire 形态（snake_case）。
 /// device_id 仅用于前端退出定位与内部流转，UI 不渲染。
