@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use traesync_domain::AuthorizationState;
 use traesync_infrastructure::{
-    AccountEvidenceReader, FixedProcessController, SqlCipherProbe, StaticWorkspaceStateProvider,
+    AccountRegistry, AccountEvidenceReader, FixedProcessController, SqlCipherProbe,
+    StaticWorkspaceStateProvider,
 };
 
 use crate::{
@@ -44,4 +45,52 @@ pub(crate) fn make_real_mode_state(storage_root: &Path) -> AppState {
         active_login_browser: Arc::new(Mutex::new(None)),
         checkin_execution_lock: Arc::new(Mutex::new(())),
     }
+}
+
+/// 写入一条已登录账号的注册表档案（设备公钥为真实 P-256 SPKI PEM）。
+/// P12-R3：原 real_checkin_tests 夹具，签到域迁出后由 checkin_schedule 与
+/// lib.rs 留守测试（账号列表 / purge 等）共享。
+pub(crate) fn registered_account(root: &Path, profile_id: &str) {
+    let (_, public_pem) = traesync_infrastructure::generate_device_keypair().unwrap();
+    let registry = AccountRegistry::new(root.join("checkin"));
+    registry
+        .upsert(&traesync_infrastructure::AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: format!("account-{profile_id}"),
+            screen_name: "测试账号".to_string(),
+            avatar_url: String::new(),
+            device_id: "1234567890123456".to_string(),
+            device_public_key: public_pem,
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 0,
+            last_verified_at_unix_seconds: 0,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: true,
+            archived: false,
+        })
+        .unwrap();
+}
+
+/// U-6 W4 测试辅助：写入指定 account_id 的档案（原生目录按
+/// `TRAE SOLO CN_{account_id}` 定位，需纯数字 account_id 才可命中）。
+pub(crate) fn registered_account_with_id(root: &Path, profile_id: &str, account_id: &str) {
+    let registry = AccountRegistry::new(root.join("checkin"));
+    registry
+        .upsert(&traesync_infrastructure::AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: account_id.to_string(),
+            screen_name: "测试账号".to_string(),
+            avatar_url: String::new(),
+            device_id: "1234567890123456".to_string(),
+            device_public_key: "pub".to_string(),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 0,
+            last_verified_at_unix_seconds: 0,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: true,
+            archived: false,
+        })
+        .unwrap();
 }
