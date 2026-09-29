@@ -782,21 +782,34 @@ Work CN 的账号保存、对话主库、直连签到和账号切换行为保持
 - **CN 能力真实性审计结论（2026-09-29 复核）**：① CN 健康检测**真机验收通过**（2/2 账号 HTTP 200/auth 一致/昵称指纹一致，报告 trae-cn-health-probe-1790684645.json；09-28 对照组 401/20310 系其自身请求形状错误，非 CN 凭据问题——「可用性存疑」旧表述作废）；② CN 库只读浏览真机实测通过（17 项目/39 会话/328 消息，探针 trae_cn_library_read_probe.rs 沉淀）；③ 09-28 晚 CN 目录 3 份切号备份已澄清=用户授权的三次 master_handover_manual 真实交接（备份先行+记录归并，participating_account_count=1 即预期结果），无越权写库；④ CN 真实续期长期有效性仍按 ADR-0030 待独立验收；⑤ 参考 master_handover_manual 实现评估「CN 记录归并」是否产品化为收编类功能（用户确认该工具可完成任务）
 - 后续待办：凭据备份凭据子目录裁剪规则随 P3 落地后观察；vitest 闪失一次（高负载下）如复现加 --pool=forks 验证
 
-## Phase 13：Trae CN 实装收尾与库域深化（2026-09-29 范围定案）
+## Phase 13：Trae CN 实装收尾与库域深化（2026-09-29 范围与设计定案）
 
 ### 范围决策（弹窗确认）
 
-1. **CN 签到全量实装**：status 查询（探针已真机验证）+ claim 实装 + 真机验收（用户配合点一次）+ 签到 UI pending→ready；CN 自动签到是否纳入另议。
-2. **CN 记录归并产品化**：用户提出新语义——CN 库按项目分类（类 VS Code），转移以**项目为整体单位**（该项目下所有账号对话同步转移），归档同理；区别于 Work 主库「单一归属、切号即归一」。先调研 CN 库项目/归属机制（schema 同构度/user_id 分布/项目=目录对应/跨账号同项目可能性），再设计方案弹窗确认。
+1. **CN 签到全量实装**：status 查询（探针已真机验证）+ claim 实装 + 真机验收（用户配合点一次）+ 签到 UI pending→ready；**CN 自动签到不接入**（先手动后评估）。
+2. **CN 记录归并产品化**（ADR-0033 选择性写）：以项目为整体单位的跨账号转移（同目录合并语义）+ 会话归档/恢复开放；删除/合并项目仍拒；无路径 empty 项目不参与；入口挂 CN 详情页；**三步真机验收为可用性前置门禁**（归并+官方验证/重启不复活/签到 claim+额度核对），验收不过回退只读。
 3. **小项清理包**：lib.rs 残余实例工具族收编（~400 行）+ 3 个 dead-code 函数与 2 个 unused import 清理 + 旧 12 个测试文件 mock 路由渐进迁移。
-4. **CN 真实续期专项验收**（ADR-0030）：现在执行——真实触发一次 CN 凭据换发，核对 AuthCode→Exchange→身份→journal→健康复核完整证据链。
+4. **CN 真实续期专项验收**（ADR-0030）：✅ **已完成（2026-09-29，3026628）**——一次换发 14 项断言全绿（同设备 AuthCode/身份一致/journal state=verified/refresh 轮换/+14 天/健康复核闭环）；「重启恢复」证据列为独立小项后续补验。
 
-### 验收清单（执行中补充）
+### 机制调研结论（CN 库归属，2026-09-29 落档 trae-cn-project-schema-probe-1790690693.json）
+
+CN 库与 Work 主库 61 表同名同列族；`chat_session` 无 user_id（归属唯一来源=project.user_id 经 JOIN）；项目=目录成立（`project.absolute_path`，17 项目 11 有路径互不重复）；同目录跨账号因 `UNIQUE(biz_project_id, user_id)` 天然多行（Work E5 镜像坑同款）；归档/软删通道同构（hidden_status/deleted_at）。风险：官方云端镜像缓存（server_history_info 11778 行）回写容忍未长期验证→以三步验收门禁兜底。**交接原语已被 CN 客户端真实容忍**（09-28 三次授权交接，官方客户端其后持续正常工作）——ADR-0033 据此立。
+
+### 实施切片（TDD + 相位门，延续纪律）
+
+1. **P13-1 CN 签到实装**：infrastructure `trae_cn_checkin` 协议（status+claim，参照 Work checkin_http 形态与探针实测形状；业务码不压平）；命令+命令壳（checkin_schedule 域复用 run_serial_batch？——CN 先手动单账号，批量暂不需要）；前端 CheckinPage CN 区块 ready（账号列表+签到按钮+额度展示）；真机验收（用户点一次 claim，证据落档）。
+2. **P13-2 CN 项目归并**：infrastructure 归并变体函数（按目录过滤收窄 handover 原语：同 biz 跨账号行合并/镜像清理/换腿；UNIQUE 冲突走合并分支）；命令+CN 详情页入口（目标=当前指针账号，规模预览+单次确认+备份先行+进度事件）；守卫测试（写边界：开放两类/其余 library_read_only）。
+3. **P13-3 CN 归档开放**：LibrarySessionsPanel readOnly 标志按库能力开关（trae_cn 开归档/恢复，仍禁删除合并）；apply 编排复用（备份先行+单事务）；hidden_status 写入属首例——真机验证项。
+4. **P13-4 三步真机验收**（用户配合）：①归并+官方客户端验证 ②重启官方客户端不复活 ③签到 claim+额度核对；报告落档 .scratch/；通过后 PRODUCT_SECTION_STATES 签到 ready + ADR-0033 验收状态回写。
+5. **P13-5 清理包**：lib.rs 实例工具族收编 + dead-code/unused import 清零 + mock 渐进迁移（每文件独立 commit）。
+
+### 验收清单
 
 - [ ] CN 签到：status+claim 实装、真机验收通过、UI ready
-- [ ] CN 记录归并：机制调研结论落档、方案弹窗定案、实现+真机验收
+- [ ] CN 记录归并：ADR-0033 实现+守卫测试+真机三步验收通过
+- [ ] CN 归档：hidden_status 写入真机验证
 - [ ] 清理包：lib.rs 终行数、dead-code 清零、mock 迁移进度
-- [ ] CN 续期专项验收：证据链报告落档、ADR-0030 结论回写
+- [ ] CN 续期专项验收：✅ 证据链报告落档（3026628）；重启恢复证据小项待补
 - [ ] 相位门全量四套件（延续纪律）
 
 ### P12 验收清单

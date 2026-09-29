@@ -2,7 +2,7 @@
 
 > 2026-08-22 建立并清理。本目录只保留与现行方向一致的决策文档。
 
-## 现行 ADR（共 15 份，全部必读）
+## 现行 ADR（共 16 份，全部必读）
 
 | ADR | 主题 | 约束什么 |
 |-----|------|---------|
@@ -21,6 +21,7 @@
 | [0030](0030-trae-cn-credential-maintenance-boundary.md) | Trae CN 凭据维护边界 | Trae CN 使用独立 OAuth/client/凭据根；健康检测与续期进入共享账号模块；不继承 Work 签到/额度；真实续期需独立验收 |
 | [0031](0031-account-remote-device-management.md) | 账号级远程设备管理能力 | 设备列表/退出是账号级共享能力（能力清单声明接入）；原生 ListDevices 主路径 + 官方页兜底；本机禁退（UI 隐藏 + 后端拒绝双防线）；退出逐台单次确认；协议独立 `remote_device` 模块；remint 语义不动 |
 | [0032](0032-product-ui-capability-tri-state.md) | 产品化界面适配与能力三态 | 导航五页全产品开放、页面本体一致；区块按 ready/pending/absent 三态诚实渲染；Trae CN 签到探针门禁（只读先行）；主库只读浏览复用 Library 抽象；文案单一事实源。局部取代 ADR-0029 决策 4/9 与 ADR-0030 决策 5 |
+| [0033](0033-trae-cn-library-selective-write.md) | Trae CN 库选择性写边界 | 修订 ADR-0032 决策 5：CN 库从全只读升级为选择性写（项目归并+归档/恢复两类；删除/合并仍拒）；依据=交接原语已被 CN 客户端真实容忍（09-28 三次授权交接）；三步真机验收为可用性前置门禁；无路径 empty 项目不参与 |
 
 配套决策记录：`docs/DECISIONS-20260822-GRILL.md`（项目方向历史锚点，九问九答全量；部分决策已被本表 ADR 取代，见其头部标注）。
 
