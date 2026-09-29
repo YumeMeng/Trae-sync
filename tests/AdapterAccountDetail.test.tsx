@@ -3,8 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { AdapterAccountDetail } from "../src/components/AdapterAccountDetail";
 import type { AccountView } from "../src/platform/accountAdapter";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P12-R1c 示范：共享 fakeInvoke 路由器。工厂必须内联 async + 动态 import
+//（Vitest 工厂不能引用文件内 import 绑定，时序会错），invoke 替身指向共享
+// mockCoreInvoke 单例；未注册命令 fail-fast 抛错（详见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -45,7 +52,9 @@ function renderDetail(overrides: {
 
 describe("AdapterAccountDetail", () => {
   beforeEach(() => {
-    mockInvoke.mockReset();
+    // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
+    resetRoutes();
+    installFakeInvoke();
   });
 
   afterEach(() => vi.clearAllMocks());
@@ -60,13 +69,14 @@ describe("AdapterAccountDetail", () => {
   });
 
   it("设备模块挂载：默认折叠未触网，展开后按详情账号拉取列表", async () => {
-    mockInvoke.mockResolvedValue({
+    // 原 mockInvoke.mockResolvedValue({...}) 的路由器等价写法：按命令注册响应。
+    mockRoute("list_remote_devices", () => ({
       profile_id: "cn-a",
       account_label: "CN 主账号",
       used_count: 1,
       max_count: 10,
       devices: [],
-    });
+    }));
     renderDetail();
 
     expect(screen.getByTestId("remote-devices-panel")).toBeInTheDocument();

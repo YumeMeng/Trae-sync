@@ -1,4 +1,4 @@
-// @ts-expect-error Vitest 在 Node 环境运行；应用 tsconfig 不引入 Node 类型。
+// @types/node 安装后（P12-R1c golden 测试引入），node:fs 类型可直接解析。
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
