@@ -71,7 +71,10 @@ test.describe("登录设备面板（ADR-0031）", () => {
     await expect(summary).toHaveText(/已用 1 \/ 上限 10 台/);
     await expect(othersToggle).toHaveText(/其他设备 \(0\)/);
     await expect(page.getByTestId("remote-device-row-dev-mock-mobile")).toHaveCount(0);
-    await expect(panel).toContainText("已退出该设备，列表已刷新。");
+    // P1：成功提示已迁 notify 体系，断言 sonner toast（按文本过滤——退出联动健康检查会并发另一条 toast）。
+    await expect(
+      page.locator("[data-sonner-toast]").filter({ hasText: "已退出该设备，列表已刷新。" }),
+    ).toBeVisible();
     // 本机行仍在区块中。
     await expect(page.getByTestId("remote-device-row-dev-mock-local")).toBeVisible();
   });
