@@ -177,8 +177,9 @@ pub use master_handover::{
     backup_master_trio, backup_master_trio_stamped, backup_master_trio_to,
     handover_master_records, handover_master_records_from_merge_with_progress,
     handover_master_records_from_with_progress, handover_master_records_with_progress,
-    list_master_backups, list_master_backups_in, master_database_path, master_db_activity_detected,
-    HandoverProgress, HandoverSession, MasterBackupEntry, MasterHandover, MasterHandoverError,
+    list_master_backups, list_master_backups_in, master_backup_db_name, master_database_path,
+    master_db_activity_detected, HandoverProgress, HandoverSession, MasterBackupEntry,
+    MasterHandover, MasterHandoverError,
 };
 pub use operation_lease::{
     inspect_lock_status, OperationLease, OperationLeaseError, OperationLockStatus,

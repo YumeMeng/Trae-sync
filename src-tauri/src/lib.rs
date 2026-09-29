@@ -44,7 +44,7 @@ use traesync_domain::{
 };
 use traesync_infrastructure::{
     capture_location_identity, capture_location_witness, compare_location_identity,
-    fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, fixture_path_error_text,
+    fetch_installed_plugins, fetch_market_plugins, find_uninstall_target,
     get_user_info, install_market_plugin, load_account_fingerprint_salt,
     load_or_create_account_fingerprint_salt, open_or_initialize_production_catalog, reconcile_plan,
     resolve_current_catalog_generation_id, resolve_current_catalog_path,
@@ -54,15 +54,15 @@ use traesync_infrastructure::{
     AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, CheckinCredentialError,
     CheckinCredentialStore, CheckinProfileBinding, CloudPluginItem, CredentialApplyOutcome,
     CredentialBinding, CredentialMaintenanceStateStore, CredentialState, CredentialStatus,
-    CredentialVault, CredentialVaultError, DeviceRemintService, FixtureCheckinTransport,
-    FixturePathError, FixturePathGuard, FixtureWorkspaceStateProvider, JsonHandoffIntentStore,
+    CredentialVault, DeviceRemintService, FixtureCheckinTransport,
+    FixturePathGuard, FixtureWorkspaceStateProvider, JsonHandoffIntentStore,
     JsonManagedAccountProfileStore, MarketPluginItem, OperationLease,
     PlatformFileIdentityProvider, PluginCloudSyncOutcome, PluginManifest, PluginManifestEntry,
     ProductionCatalogError, ProductionCatalogRuntime, RealCheckinRenewalService,
     RealCheckinTransport, RealReadWorkspaceStateProvider, RealRemoteDeviceManager, RemintError,
     SqlCipherProbe, StorageDeletionPlan, StorageMigrationResult, StorageRootBinding,
     ProductAccountStateStore, TraeProduct, WorkCnProcessController, WorkCnReadLocation,
-    WorkCnReadLocationError, DEFAULT_STORAGE_WARNING_BYTES,
+    DEFAULT_STORAGE_WARNING_BYTES,
 };
 
 #[cfg(test)]
@@ -76,7 +76,7 @@ use traesync_infrastructure::{
 // P7-5 追加 CheckinHttpError / UserInfoFull（健康度凭据包实调判定）。
 use traesync_infrastructure::{
     begin_login_for, complete_login, get_user_info_full, get_user_info_full_for_oauth_client,
-    trae_http_client, CheckinHttpError, LoginError, LoginProduct, LoginSession, OAuthClient,
+    trae_http_client, CheckinHttpError, LoginProduct, LoginSession, OAuthClient,
     UserInfoFull,
     CALLBACK_TIMEOUT_SECONDS,
 };
@@ -107,7 +107,8 @@ use traesync_infrastructure::library_account::{
 use traesync_infrastructure::{
     archive_login_user_id, backup_master_trio_stamped, backup_master_trio_to,
     construct_auth_identity, handover_master_records, handover_master_records_with_progress,
-    list_master_backups_in, master_database_path, master_db_activity_detected,
+    list_master_backups_in, master_backup_db_name, master_database_path,
+    master_db_activity_detected,
     switch_auth_identity, AuthIdentitySwitch, AuthSwitchError, ConstructAuthInput,
     HandoverProgress, MasterHandover, MasterHandoverError, RelayLedger, RelayLedgerEntry,
 };
@@ -150,6 +151,14 @@ static COMMON_CONTROLS_V6_DIRECTIVE: [u8; 167] = *b"/manifestdependency:\"type='
 
 mod checkin_overview;
 mod operation_contract;
+// P12-R2a：命令层错误映射集中地（原 lib.rs 内散布的 7 个映射函数收拢）。
+mod error_mapping;
+// P12-R2a：映射函数随迁专用模块；转发导入保持 lib.rs 调用面零改动。
+use error_mapping::{
+    credential_error_text, credential_maintenance_error_code, fixture_path_command_error,
+    login_command_error, map_master_archive_error, trae_cn_health_error_code,
+    work_cn_location_command_error,
+};
 use operation_contract::CommandErrorDto;
 
 // P12-R1b：LibraryContext 值对象与库环境稳定标识下沉 domain（is_master /
@@ -871,6 +880,50 @@ fn ensure_fixture_runtime(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// P12-R2a 真实模式门禁（TRAE 实例/主库域）：仅 RealReadPreview 可通过。
+/// fixture 模式拒绝并返回稳定错误码 `trae_real_mode_required`（前端/e2e 契约，勿改）。
+/// 收敛自 41 处内联复制；登录域与签到 HTTP 域使用各自的域门禁函数。
+fn ensure_real_preview(state: &AppState) -> Result<(), String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    Ok(())
+}
+
+/// P12-R2a 真实模式门禁（登录域）：仅 RealReadPreview 可通过。
+/// fixture 模式拒绝并返回稳定错误码 `login_real_mode_required`（前端/e2e 契约，勿改）。
+fn ensure_login_real_mode(state: &AppState) -> Result<(), String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("login_real_mode_required".to_string());
+    }
+    Ok(())
+}
+
+/// P12-R2a 真实模式门禁（签到 HTTP 域）：仅 RealReadPreview 可通过。
+/// fixture 模式拒绝并返回稳定错误码 `checkin_http_disabled`（前端/e2e 契约，勿改）。
+fn ensure_checkin_http_enabled(state: &AppState) -> Result<(), String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("checkin_http_disabled".to_string());
+    }
+    Ok(())
+}
+
+/// P12-R2a 命令壳统一阻塞包装：把闭包调度到阻塞线程池并等待完成。
+/// join 失败（任务 panic 或调度器关闭）映射为调用方给定的稳定
+/// `{域}_join_failed` 错误码；闭包自身的 `Result` 原样透传。
+/// 收敛自 spawn_blocking + `.await` + `map_err(|_| join 错误码)` 的重复样板；
+/// 形态特殊（发射后不管、无 join 处理）的调用点不强行迁移。
+async fn run_blocking<T, F>(join_failed_code: &str, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|_| join_failed_code.to_string())
+        .and_then(|inner| inner)
+}
+
 /// 捕获当前读取授权的代次与范围，供一次读取操作绑定使用。
 ///
 /// 代次必须和范围一起捕获；只比较路径会让“撤销后重新授权到同一位置”的旧操作
@@ -962,16 +1015,6 @@ fn should_invalidate_authorized_read_context(error: &str) -> bool {
         || error.contains("APPDATA 不可用")
         || error.contains("TRAE 默认根目录")
         || error.contains("TRAE 默认数据库")
-}
-
-/// Tauri IPC 只返回稳定的脱敏错误；路径细节留在后端内部，不跨边界暴露。
-fn work_cn_location_command_error(_error: &WorkCnReadLocationError) -> String {
-    "data_location_unavailable: TRAE 默认数据位置不可用，请重新授权后重试".to_string()
-}
-
-/// Fixture 路径错误跨 IPC 边界统一脱敏；原始路径只留在本地诊断日志。
-fn fixture_path_command_error(error: FixturePathError) -> String {
-    fixture_path_error_text(&error)
 }
 
 /// 读取入口出现授权漂移时撤销旧绑定；普通目录库/存储错误不应误撤销用户授权。
@@ -1821,19 +1864,6 @@ fn credential_recovery_root_for_context(
             .as_ref()
             .ok_or_else(|| "credential_vault_unavailable".to_string())
             .map(|runtime| runtime.recovery_root.clone()),
-    }
-}
-
-fn credential_error_text(error: CredentialVaultError) -> String {
-    match error {
-        CredentialVaultError::Missing => "credential_missing".to_string(),
-        CredentialVaultError::BindingMismatch => "credential_binding_mismatch".to_string(),
-        CredentialVaultError::TraeNotClosed => "process_running".to_string(),
-        CredentialVaultError::StorageInvalid => "storage_json_invalid".to_string(),
-        CredentialVaultError::StorageTooLarge => "storage_json_too_large".to_string(),
-        CredentialVaultError::UnsupportedAuthKey => "unsupported_login_bundle".to_string(),
-        CredentialVaultError::RecoveryRequired => "credential_manual_recovery_required".to_string(),
-        other => other.to_string(),
     }
 }
 
@@ -3012,7 +3042,8 @@ async fn run_checkin(
         RuntimeMode::Fixture => {
             let ids = selected.clone();
             let app_handle = app.clone();
-            tauri::async_runtime::spawn_blocking(
+            run_blocking(
+                "checkin_join_failed",
                 move || -> Result<traesync_domain::CheckinBatchSummary, String> {
                     let _guard = execution_lock_fixture
                         .try_lock()
@@ -3033,21 +3064,19 @@ async fn run_checkin(
                     Ok(summary)
                 },
             )
-            .await
-            .map_err(|_| "checkin_join_failed".to_string())??
+            .await?
         }
         RuntimeMode::RealReadPreview => {
             let material_root = checkin_material_root(&state)?;
             let ids = selected.clone();
             let app_handle = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            run_blocking("checkin_join_failed", move || {
                 let _guard = execution_lock_real
                     .try_lock()
                     .map_err(|_| "checkin_already_running".to_string())?;
                 run_real_checkin(material_root, ids, cancellation, Some(app_handle))
             })
-            .await
-            .map_err(|_| "checkin_join_failed".to_string())??
+            .await?
         }
     };
     Ok(CheckinBatchSummaryWireDto {
@@ -3847,19 +3876,6 @@ fn synthetic_real_checkin_failure(
     }
 }
 
-/// 凭据维护错误 -> 账号总览可持久化的非敏感原因码。
-fn credential_maintenance_error_code(error: &CheckinCredentialError) -> &'static str {
-    match error {
-        CheckinCredentialError::BindingMismatch => "binding_mismatch",
-        CheckinCredentialError::CredentialRefreshFailed => "credential_refresh_failed",
-        CheckinCredentialError::AuthMismatch => "auth_mismatch",
-        CheckinCredentialError::RecoveryRequired => "manual_recovery_required",
-        CheckinCredentialError::Missing => "credential_missing",
-        CheckinCredentialError::Unavailable => "credential_unavailable",
-        CheckinCredentialError::Invalid => "credential_invalid",
-    }
-}
-
 /// 请求停止尚未开始的签到任务；当前 transport 不强行中断已发出的任务。
 #[tauri::command]
 fn cancel_checkin(state: tauri::State<AppState>) -> bool {
@@ -3950,19 +3966,6 @@ fn generate_login_profile_id() -> String {
     hasher.update(nanos.to_le_bytes());
     hasher.update(std::process::id().to_le_bytes());
     format!("checkin-{}", &hex::encode(hasher.finalize())[..12])
-}
-
-/// 登录命令错误码；不携带 Token、AuthCode 或回调正文。
-fn login_command_error(error: &LoginError) -> String {
-    match error {
-        LoginError::InvalidCallback => "login_callback_invalid",
-        LoginError::ExchangeFailed => "login_exchange_failed",
-        LoginError::ExchangeDeviceLimit => "login_exchange_device_limit",
-        LoginError::InvalidToken => "login_token_invalid",
-        LoginError::Storage => "login_storage_failed",
-        LoginError::Cancelled => "login_cancelled",
-    }
-    .to_string()
 }
 
 /// OAuth 临时浏览器档案保留时长（秒）：目录名即创建时间戳，超龄即废弃。
@@ -4104,9 +4107,7 @@ fn open_login_url_in_browser(
 /// 开始 OAuth 登录（内部逻辑，供命令与测试复用）：
 /// 生成虚拟设备与 PKCE，返回登录 URL 与待保存会话。
 fn begin_checkin_login_inner(state: &AppState) -> Result<(String, LoginSession), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(state)?;
     // 存储根可用性预检：登录入库需要凭据存储位置。
     checkin_material_root(state)?;
     let profile_id = generate_login_profile_id();
@@ -4118,9 +4119,7 @@ fn begin_checkin_login_inner(state: &AppState) -> Result<(String, LoginSession),
 /// 开始 Trae CN 独立 OAuth 登录；浏览器会话可复用，但认证参数和落盘账号池
 /// 与 Work CN 完全不同。
 fn begin_trae_cn_login_inner(state: &AppState) -> Result<(String, LoginSession), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(state)?;
     trae_cn_material_root(state)?;
     let profile_id = generate_login_profile_id();
     let handoff = begin_login_for(&profile_id, LoginProduct::TraeCn)
@@ -4226,7 +4225,7 @@ async fn complete_product_login_inner(
     // 阻塞线程；子进程退出 = 用户关闭了登录窗口，等待即时收尾）。
     let cancel_flag = state.login_cancel.clone();
     let browser_child = state.active_login_browser.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let result = run_blocking("login_join_failed", move || {
         let store = CheckinCredentialStore::new(&material_root);
         let registry = AccountRegistry::new(&material_root);
         let client = trae_http_client();
@@ -4264,8 +4263,7 @@ async fn complete_product_login_inner(
             acceptance_error_code: receipt.acceptance.error_code,
         })
     })
-    .await
-    .map_err(|_| "login_join_failed".to_string())?;
+    .await;
     // 登录流程终结：释放浏览器子进程句柄。drop 不结束进程（正常路径浏览器
     // 由回调页 script 自行关闭；取消路径的结束进程由 cancel 命令负责）。
     let _ = state.active_login_browser.lock().unwrap().take();
@@ -4343,9 +4341,7 @@ fn cancel_trae_cn_login(state: tauri::State<AppState>) -> Result<(), String> {
 
 /// 列出已登录账号（非敏感白名单）；注册表尚未创建时返回空表。
 fn list_checkin_accounts_inner(state: &AppState) -> Result<Vec<CheckinAccountWireDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(&state)?;
     let material_root = checkin_material_root(state)?;
     let registry = AccountRegistry::new(&material_root);
     let records = registry
@@ -4377,9 +4373,7 @@ fn list_checkin_accounts(
 
 /// 列出 Trae CN 自己的账号池；只返回展示字段和当前选择标记。
 fn list_trae_cn_accounts_inner(state: &AppState) -> Result<Vec<TraeCnAccountWireDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(state)?;
     let material_root = trae_cn_material_root(state)?;
     let current_profile_id = ProductAccountStateStore::new(&material_root)
         .load()
@@ -4447,19 +4441,16 @@ async fn check_trae_cn_account_health(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<Vec<TraeCnHealthEntryDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(&state)?;
     let selected = validate_product_profile_ids(profile_ids)?;
     let material_root = trae_cn_material_root(&state)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("trae_cn_health_join_failed", move || {
         check_trae_cn_account_health_inner(&material_root, &selected, &|event| {
             // 逐账号进度事件（P11-3）：AppHandle 借给 emit 闭包传进深层编排。
             let _ = app.emit("health-check-progress", event);
         })
     })
     .await
-    .map_err(|_| "trae_cn_health_join_failed".to_string())?
 }
 
 fn check_trae_cn_account_health_inner(
@@ -4561,16 +4552,6 @@ fn check_trae_cn_account_health_inner(
     Ok(results)
 }
 
-fn trae_cn_health_error_code(error: &CheckinHttpError) -> String {
-    match error {
-        CheckinHttpError::Network => "network_error".to_string(),
-        CheckinHttpError::Http(401 | 403) => "credential_invalid".to_string(),
-        CheckinHttpError::Http(_) => "health_check_failed".to_string(),
-        CheckinHttpError::Business(code) => format!("business_{code}"),
-        CheckinHttpError::Protocol => "health_check_failed".to_string(),
-    }
-}
-
 // ===== ADR-0031 账号级远程设备管理（P10-5 切片 2）：设备列表只读命令 =====
 
 /// 远程设备行 DTO：与 ports::RemoteDeviceEntry 对齐的 wire 形态（snake_case）。
@@ -4605,20 +4586,17 @@ async fn list_remote_devices(
     profile_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<RemoteDeviceSnapshotDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(&state)?;
     let material_root = match product_id.as_str() {
         "work_cn" => checkin_material_root(&state)?,
         "trae_cn" => trae_cn_material_root(&state)?,
         _ => return Err("unknown_product".to_string()),
     };
     let storage_root = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("remote_devices_join_failed", move || {
         list_remote_devices_inner(&material_root, &storage_root, &product_id, profile_id)
     })
     .await
-    .map_err(|_| "remote_devices_join_failed".to_string())?
 }
 
 /// 产品账号路由（list_remote_devices / clear_remote_device 共用，ADR-0031）：
@@ -4733,9 +4711,7 @@ async fn clear_remote_device(
     device_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(&state)?;
     // 参数防御：空目标无法定位设备，直接给稳定原因码。
     if device_id.is_empty() {
         return Err("remote_device_empty_target".to_string());
@@ -4746,7 +4722,7 @@ async fn clear_remote_device(
         _ => return Err("unknown_product".to_string()),
     };
     let storage_root = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("remote_device_join_failed", move || {
         clear_remote_device_inner(
             &material_root,
             &storage_root,
@@ -4756,7 +4732,6 @@ async fn clear_remote_device(
         )
     })
     .await
-    .map_err(|_| "remote_device_join_failed".to_string())?
 }
 
 /// 命令主体（阻塞线程执行）：与 list_remote_devices 同一账号路由
@@ -4817,9 +4792,7 @@ fn switch_trae_cn_account(
     profile_id: String,
     state: tauri::State<AppState>,
 ) -> Result<Vec<TraeCnAccountWireDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("login_real_mode_required".to_string());
-    }
+    ensure_login_real_mode(&state)?;
     let material_root = trae_cn_material_root(&state)?;
     let registry = AccountRegistry::new(&material_root);
     let record = registry
@@ -4955,14 +4928,13 @@ async fn refresh_checkin_credits(
     }
     let material_root = checkin_material_root(&state)?;
     let runtime_mode = state.runtime_mode;
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("checkin_refresh_join_failed", move || {
         refresh_checkin_credits_inner(&material_root, &selected, runtime_mode, &|event| {
             // 逐账号进度事件（P11-3）：AppHandle 借给 emit 闭包传进深层编排。
             let _ = app.emit("credits-refresh-progress", event);
         })
     })
     .await
-    .map_err(|_| "checkin_refresh_join_failed".to_string())?
 }
 
 fn refresh_checkin_credits_inner(
@@ -5131,9 +5103,7 @@ async fn refresh_checkin_credentials(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("checkin_http_disabled".to_string());
-    }
+    ensure_checkin_http_enabled(&state)?;
     let mut selected = Vec::new();
     for profile_id in profile_ids {
         if profile_id.is_empty() || profile_id.len() > 256 {
@@ -5148,7 +5118,7 @@ async fn refresh_checkin_credentials(
     }
     let material_root = checkin_material_root(&state)?;
     let execution_lock = Arc::clone(&state.checkin_execution_lock);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("credential_refresh_join_failed", move || {
         // 凭据换发与签到/设备操作共享互斥，避免并发写入同一凭据包。
         let _guard = execution_lock
             .try_lock()
@@ -5159,7 +5129,6 @@ async fn refresh_checkin_credentials(
         })
     })
     .await
-    .map_err(|_| "credential_refresh_join_failed".to_string())?
 }
 
 /// 手动刷新 Trae CN 自己的登录凭据；使用 CN OAuth client 和独立凭据根。
@@ -5169,13 +5138,11 @@ async fn refresh_trae_cn_credentials(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("checkin_http_disabled".to_string());
-    }
+    ensure_checkin_http_enabled(&state)?;
     let selected = validate_product_profile_ids(Some(profile_ids))?;
     let material_root = trae_cn_material_root(&state)?;
     let execution_lock = Arc::clone(&state.checkin_execution_lock);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("credential_refresh_join_failed", move || {
         // Work 与 Trae CN 共享进程内写入互斥，但各自使用独立凭据根。
         let _guard = execution_lock
             .try_lock()
@@ -5185,7 +5152,6 @@ async fn refresh_trae_cn_credentials(
         })
     })
     .await
-    .map_err(|_| "credential_refresh_join_failed".to_string())?
 }
 
 fn refresh_checkin_credentials_inner(
@@ -6200,16 +6166,13 @@ struct EnvironmentStateDto {
 async fn launch_master_library(
     state: tauri::State<'_, AppState>,
 ) -> Result<TraeInstanceLaunchDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("trae_launch_join_failed", move || {
         launch_master_library_inner(&material_root, &storage_root)
     })
     .await
-    .map_err(|_| "trae_launch_join_failed".to_string())?
 }
 
 fn launch_master_library_inner(
@@ -6275,11 +6238,10 @@ async fn get_environment_state(
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_state_join_failed", move || {
         get_environment_state_inner(&material_root, &storage_root)
     })
     .await
-    .map_err(|_| "environment_state_join_failed".to_string())?
 }
 
 /// 主库当前账号解析（实测优先 + 注册表纠正，get_environment_state /
@@ -6585,27 +6547,22 @@ fn get_master_self_check_inner(
 async fn get_master_self_check(
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterSelfCheckDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_self_check_join_failed", move || {
         get_master_self_check_inner(&material_root, &storage_root)
     })
     .await
-    .map_err(|_| "master_self_check_join_failed".to_string())?
 }
 
 /// 把自检观测到的账号写回环境缓存；只修正工具记录，不修改 TRAE 登录数据。
 #[tauri::command]
 async fn repair_master_current_account(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_self_check_join_failed", move || {
         let registry = EnvironmentRegistry::new(&storage_root);
         let _ = registry
             .ensure_master()
@@ -6622,7 +6579,6 @@ async fn repair_master_current_account(state: tauri::State<'_, AppState>) -> Res
             .map_err(|_| "environment_registry_invalid".to_string())
     })
     .await
-    .map_err(|_| "master_self_check_join_failed".to_string())?
 }
 
 /// 强制把主库的工具缓存指向指定账号。该兜底不修复 TRAE 登录数据，且必须在
@@ -6632,12 +6588,10 @@ async fn force_reset_master_current_account(
     profile_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_self_check_join_failed", move || {
         let _ = trae_instance_account_id(&material_root, &profile_id)?;
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
@@ -6657,7 +6611,6 @@ async fn force_reset_master_current_account(
             .map_err(|_| "environment_registry_invalid".to_string())
     })
     .await
-    .map_err(|_| "master_self_check_join_failed".to_string())?
 }
 
 /// 登记主库当前登录账号（P5-0 持久化原语：首次在主库内登录后登记；
@@ -6667,12 +6620,10 @@ async fn set_environment_current_account(
     profile_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_account_join_failed", move || {
         // 校验账号存在（复用账号实例的档案查询：不存在报 trae_profile_invalid）。
         trae_instance_account_id(&material_root, &profile_id)?;
         EnvironmentRegistry::new(&storage_root)
@@ -6681,7 +6632,6 @@ async fn set_environment_current_account(
             .map_err(|_| "environment_registry_invalid".to_string())
     })
     .await
-    .map_err(|_| "environment_account_join_failed".to_string())?
 }
 
 // ===== P6-4 环境管理 V2（多环境档案 + 生命周期 + 环境登录，ADR-0024）=====
@@ -6767,11 +6717,10 @@ async fn list_environments(
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let include_size = include_size.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_list_join_failed", move || {
         list_environments_inner(&material_root, &storage_root, include_size)
     })
     .await
-    .map_err(|_| "environment_list_join_failed".to_string())?
 }
 
 fn list_environments_inner(
@@ -6887,11 +6836,9 @@ async fn create_environment(
     name: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<EnvironmentRecordDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_create_join_failed", move || {
         let registry = EnvironmentRegistry::new(&storage_root);
         let record = registry
             .create(&name)
@@ -6909,7 +6856,6 @@ async fn create_environment(
         })
     })
     .await
-    .map_err(|_| "environment_create_join_failed".to_string())?
 }
 
 /// 重命名副环境（主库不可改名；目录名跟 env_id 走，不涉及文件操作）。
@@ -6919,11 +6865,9 @@ async fn rename_environment(
     name: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<EnvironmentRecordDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_rename_join_failed", move || {
         let registry = EnvironmentRegistry::new(&storage_root);
         let record = registry
             .rename(&env_id, &name)
@@ -6935,7 +6879,6 @@ async fn rename_environment(
         })
     })
     .await
-    .map_err(|_| "environment_rename_join_failed".to_string())?
 }
 
 /// 环境删除预览（破坏性操作前的规模知情口径，ADR-0018）。
@@ -6944,15 +6887,13 @@ async fn get_environment_delete_preview(
     env_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<EnvironmentDeletePreviewDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_preview_join_failed", move || {
         use traesync_infrastructure::master_stats::{read_total_scale, TotalScaleStatus};
         let registry = EnvironmentRegistry::new(&storage_root);
         let record = registry
@@ -6976,7 +6917,6 @@ async fn get_environment_delete_preview(
         })
     })
     .await
-    .map_err(|_| "environment_preview_join_failed".to_string())?
 }
 
 /// 删除副环境（破坏性操作：档案行 + 数据目录连带删除；单次确认由前端
@@ -6986,13 +6926,10 @@ async fn delete_environment(
     env_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || delete_environment_inner(&storage_root, &env_id))
+    run_blocking("environment_delete_join_failed", move || delete_environment_inner(&storage_root, &env_id))
         .await
-        .map_err(|_| "environment_delete_join_failed".to_string())?
 }
 
 fn delete_environment_inner(storage_root: &Path, env_id: &str) -> Result<bool, String> {
@@ -7037,12 +6974,10 @@ async fn launch_environment(
     env_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<TraeInstanceLaunchDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_launch_join_failed", move || {
         // 主库：官方目录口径 + 当前账号窗口标题（P5-0 编排原样复用）。
         if env_id == environment_registry_module::MASTER_ENV_ID {
             return launch_master_library_inner(&material_root, &storage_root);
@@ -7057,7 +6992,6 @@ async fn launch_environment(
         launch_instance_common(&env_dir, &record.name, None, command_line_uses_data_dir)
     })
     .await
-    .map_err(|_| "environment_launch_join_failed".to_string())?
 }
 
 /// P11-5 环境实例关闭回执（close_environment_instance 返回）。
@@ -7078,15 +7012,12 @@ async fn close_environment_instance(
     env_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<EnvironmentCloseDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_close_join_failed", move || {
         close_environment_instance_inner(&storage_root, &env_id)
     })
     .await
-    .map_err(|_| "environment_close_join_failed".to_string())?
 }
 
 fn close_environment_instance_inner(
@@ -7132,16 +7063,14 @@ async fn login_environment(
     profile_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<EnvironmentLoginReceiptDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("environment_login_join_failed", move || {
         login_environment_inner(
             &material_root,
             &storage_root,
@@ -7151,7 +7080,6 @@ async fn login_environment(
         )
     })
     .await
-    .map_err(|_| "environment_login_join_failed".to_string())?
 }
 
 fn login_environment_inner(
@@ -7365,9 +7293,7 @@ async fn switch_master_account(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterAccountSwitchDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
@@ -7377,28 +7303,29 @@ async fn switch_master_account(
     // 切号尝试日志需要（storage_root 被下方闭包 move 走，先克隆）。
     let journal_storage_root = storage_root.clone();
     let journal_profile_id = profile_id.clone();
-    // spawn_blocking：关实例（最长 5 秒收口）、WAL 采样、文件复制与
+    // 阻塞执行：关实例（最长 5 秒收口）、WAL 采样、文件复制与
     // 数据库事务均为阻塞 IO/长等待。
-    let inner = tauri::async_runtime::spawn_blocking(move || {
-        switch_master_account_inner(
-            &app,
-            &material_root,
-            &storage_root,
-            &raw_key,
-            &profile_id,
-            force,
-        )
-    })
-    .await
-    .map_err(|_| "master_switch_join_failed".to_string());
+    let inner = run_blocking(
+        "master_switch_join_failed",
+        move || {
+            switch_master_account_inner(
+                &app,
+                &material_root,
+                &storage_root,
+                &raw_key,
+                &profile_id,
+                force,
+            )
+        },
+    )
+    .await;
     // 切号尝试日志：成功/失败各记一行（fail-soft，不影响切号结果）。
     let outcome_code = match &inner {
-        Ok(Ok(_)) => "ok",
-        Ok(Err(code)) => code.as_str(),
+        Ok(_) => "ok",
         Err(code) => code.as_str(),
     };
     journal_switch_attempt(&journal_storage_root, &journal_profile_id, outcome_code);
-    inner?
+    inner
 }
 
 /// 切号尝试日志（2026-09-01 稳健性补强）：每次切号一行 JSONL 追加到
@@ -7833,12 +7760,10 @@ async fn preview_master_switch_plugins(
     profile_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterSwitchPluginPreviewDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("plugin_preview_join_failed", move || {
         Ok(preview_master_switch_plugins_inner(
             &material_root,
             &storage_root,
@@ -7846,7 +7771,6 @@ async fn preview_master_switch_plugins(
         ))
     })
     .await
-    .map_err(|_| "plugin_preview_join_failed".to_string())?
 }
 
 /// 双方云端列表 → 预检 DTO（纯函数，tests 复用）：吸收集口径与执行侧
@@ -7998,11 +7922,10 @@ async fn get_trae_instance_states(
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("trae_states_join_failed", move || {
         get_trae_instance_states_inner(&material_root, &storage_root, &profile_ids)
     })
     .await
-    .map_err(|_| "trae_states_join_failed".to_string())?
 }
 
 fn get_trae_instance_states_inner(
@@ -8094,9 +8017,7 @@ async fn get_account_storage_footprint(
     profile_ids: Vec<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<AccountStorageFootprintDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     for profile_id in &profile_ids {
         if profile_id.is_empty() || profile_id.len() > 256 {
             return Err("checkin_profile_invalid".to_string());
@@ -8105,7 +8026,7 @@ async fn get_account_storage_footprint(
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     // spawn_blocking：递归目录大小是阻塞 IO（实例目录可达 GB 级）。
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("footprint_join_failed", move || {
         // 原生目录依赖 APPDATA（与 seed_login_state 同一解析方式）。
         let appdata = std::env::var_os("APPDATA")
             .map(PathBuf::from)
@@ -8113,7 +8034,6 @@ async fn get_account_storage_footprint(
         get_account_storage_footprint_inner(&material_root, &storage_root, &appdata, &profile_ids)
     })
     .await
-    .map_err(|_| "footprint_join_failed".to_string())?
 }
 
 fn get_account_storage_footprint_inner(
@@ -8165,16 +8085,14 @@ async fn purge_account_records(
     profile_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if profile_id.is_empty() || profile_id.len() > 256 {
         return Err("checkin_profile_invalid".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     // spawn_blocking：进程查询（PowerShell）与递归删除都是阻塞 IO。
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("purge_join_failed", move || {
         // 破坏性命令 fail-closed：进程查询失败即拒绝（无法证明实例未运行），
         // 与 launch_master_library 同口径（非 get_trae_instance_states 的宽容降级）。
         let processes = list_trae_processes().map_err(|e| e.code().to_string())?;
@@ -8195,7 +8113,6 @@ async fn purge_account_records(
         )
     })
     .await
-    .map_err(|_| "purge_join_failed".to_string())?
 }
 
 fn purge_account_records_inner(
@@ -8425,16 +8342,14 @@ async fn get_master_history(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterHistoryDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_history_join_failed", move || {
         // ADR-0025：库目录统一走 resolve_library_dir（指纹与读取同源）。
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         let current_account = library_account::resolve_library_account(
@@ -8484,7 +8399,6 @@ async fn get_master_history(
         })
     })
     .await
-    .map_err(|_| "master_history_join_failed".to_string())?
 }
 
 /// P5-3 主库单会话消息读取结果（状态语义与 P3-2 一致）。
@@ -8511,9 +8425,7 @@ async fn get_master_session_messages(
     offset: Option<u32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterSessionMessagesDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
@@ -8521,7 +8433,7 @@ async fn get_master_session_messages(
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     let offset = offset.unwrap_or(0) as usize;
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_session_messages_join_failed", move || {
         use traesync_infrastructure::account_session_content::SessionMessagesStatus;
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         let current_account = library_account::resolve_library_account(
@@ -8553,7 +8465,6 @@ async fn get_master_session_messages(
         })
     })
     .await
-    .map_err(|_| "master_session_messages_join_failed".to_string())?
 }
 
 // ===== P5-4 主库轻量统计 + 备份链（总览/环境卡/设置页数据源）=====
@@ -8592,16 +8503,14 @@ async fn get_master_library_stats(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterLibraryStatsDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_stats_join_failed", move || {
         use traesync_infrastructure::master_stats::{
             master_trio_size_bytes, read_master_stats, MasterStatsStatus,
         };
@@ -8663,7 +8572,6 @@ async fn get_master_library_stats(
         Ok(dto)
     })
     .await
-    .map_err(|_| "master_stats_join_failed".to_string())?
 }
 
 // ===== P11-5 库归档草稿（localStorage 迁入 storage_root，命令层编排）=====
@@ -8697,11 +8605,10 @@ async fn get_archive_draft(
         return Ok(ArchiveDraftDto::empty());
     }
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("archive_draft_join_failed", move || {
         get_archive_draft_inner(&storage_root, &library_id)
     })
     .await
-    .map_err(|_| "archive_draft_join_failed".to_string())?
 }
 
 fn get_archive_draft_inner(storage_root: &Path, library_id: &str) -> Result<ArchiveDraftDto, String> {
@@ -8727,11 +8634,9 @@ async fn set_archive_draft(
     restore_session_ids: Vec<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("archive_draft_join_failed", move || {
         set_archive_draft_inner(
             &storage_root,
             &library_id,
@@ -8740,7 +8645,6 @@ async fn set_archive_draft(
         )
     })
     .await
-    .map_err(|_| "archive_draft_join_failed".to_string())?
 }
 
 fn set_archive_draft_inner(
@@ -8826,16 +8730,14 @@ async fn get_master_checkup(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterCheckupDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_checkup_join_failed", move || {
         use traesync_infrastructure::master_checkup::{read_master_checkup, MasterCheckupStatus};
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         // P11-6（ADR-0032 决策 5）：体检/收编是 Work CN 的账号归属治理
@@ -8918,7 +8820,6 @@ async fn get_master_checkup(
         }
     })
     .await
-    .map_err(|_| "master_checkup_join_failed".to_string())?
 }
 
 /// 收编进度事件（`master-incorporate-progress`；环境页收编弹层消费）。
@@ -8964,24 +8865,19 @@ async fn incorporate_master_records(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterIncorporateResultDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_incorporate_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         ctx.ensure_writable()?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         incorporate_master_records_inner(&app, &material_root, &storage_root, &raw_key, &ctx)
     })
     .await
-    .map_err(|_| "master_incorporate_join_failed".to_string())?
 }
 
 /// 收编编排主体（阻塞上下文）：体检预检 → 四步事务 → 台账 → 回执。
@@ -9170,24 +9066,19 @@ async fn cleanup_master_empty_projects(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterEmptyProjectCleanupDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("cleanup_master_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         ctx.ensure_writable()?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         cleanup_master_empty_projects_inner(&material_root, &storage_root, &raw_key, &ctx)
     })
     .await
-    .map_err(|_| "cleanup_master_join_failed".to_string())?
 }
 
 /// 清理空项目编排主体（阻塞上下文）：预检 → 关实例 → 备份 → 删除 → 重启。
@@ -9322,16 +9213,13 @@ async fn get_master_backup_chain(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterBackupChainDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_backup_chain_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         master_backup_chain_inner(&storage_root, &ctx)
     })
     .await
-    .map_err(|_| "master_backup_chain_join_failed".to_string())?
 }
 
 /// 备份链枚举主体（阻塞上下文）：按库作用域活动目录枚举 + 读保留配置。
@@ -9340,11 +9228,7 @@ fn master_backup_chain_inner(
     ctx: &LibraryContext,
 ) -> Result<MasterBackupChainDto, String> {
     let db_path = master_database_path(&ctx.dir);
-    let db_name = db_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "environment_registry_invalid".to_string())?
-        .to_string();
+    let db_name = master_backup_db_name(&db_path)?;
     // P11-4①/P11-5⑤：枚举当前库作用域活动备份目录——sidecar 备份的
     // 恢复语义是「按文件名找同目录」，展示目录即恢复目录。
     let active_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
@@ -9377,12 +9261,10 @@ async fn create_master_backup(
     state: tauri::State<'_, AppState>,
     include_credentials: bool,
 ) -> Result<String, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     // P5-9：裁剪配置的存储根（闭包外拷出，State 引用不能进 spawn_blocking）。
     let storage_root_for_backup = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_backup_join_failed", move || {
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
         // 运行中禁止（口径同 get_environment_state_inner 的运行检测）。
@@ -9417,7 +9299,6 @@ async fn create_master_backup(
         Ok(backup)
     })
     .await
-    .map_err(|_| "master_backup_join_failed".to_string())?
 }
 
 /// P11-4①：解析当前活动备份目录——配置 backup_dir 有值则写/读该目录，
@@ -9596,11 +9477,9 @@ fn backup_keep_policy(storage_root: &Path) -> u32 {
 async fn get_backup_retention(
     state: tauri::State<'_, AppState>,
 ) -> Result<BackupRetentionDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("backup_retention_join_failed", move || {
         let settings = BackupRetentionStore::new(&storage_root)
             .load()
             .map_err(|_| "backup_retention_invalid".to_string())?;
@@ -9610,7 +9489,6 @@ async fn get_backup_retention(
         })
     })
     .await
-    .map_err(|_| "backup_retention_join_failed".to_string())?
 }
 
 /// P5-9：保存备份保留设置（原子写，立即生效于下一次备份生成）。
@@ -9622,11 +9500,9 @@ async fn set_backup_retention(
     keep: u32,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("backup_retention_join_failed", move || {
         let store = BackupRetentionStore::new(&storage_root);
         let existing = store
             .load()
@@ -9640,7 +9516,6 @@ async fn set_backup_retention(
             .map_err(|_| "backup_retention_save_failed".to_string())
     })
     .await
-    .map_err(|_| "backup_retention_join_failed".to_string())?
 }
 
 /// P11-4①：读取备份位置覆盖配置（None = 主库同目录默认行为）。
@@ -9648,18 +9523,15 @@ async fn set_backup_retention(
 /// 静默当作默认位置。
 #[tauri::command]
 async fn get_backup_dir(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("backup_retention_join_failed", move || {
         BackupRetentionStore::new(&storage_root)
             .load()
             .map(|settings| settings.backup_dir)
             .map_err(|_| "backup_retention_invalid".to_string())
     })
     .await
-    .map_err(|_| "backup_retention_join_failed".to_string())?
 }
 
 /// P11-4①：设置备份位置。Some = 自定义目录（校验：绝对路径、长度上限、
@@ -9671,11 +9543,9 @@ async fn set_backup_dir(
     backup_dir: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("backup_retention_join_failed", move || {
         let storage = PathBuf::from(&storage_root);
         let normalized = validate_backup_dir(backup_dir.as_deref(), &storage)?;
         let store = BackupRetentionStore::new(&storage);
@@ -9688,7 +9558,6 @@ async fn set_backup_dir(
             .map_err(|_| "backup_retention_save_failed".to_string())
     })
     .await
-    .map_err(|_| "backup_retention_join_failed".to_string())?
 }
 
 /// P11-4① 迁移回执 DTO（设置页展示）。
@@ -9718,22 +9587,16 @@ async fn migrate_master_backups(
     target_dir: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<BackupMigrationDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_backup_migrate_join_failed", move || {
         let storage = PathBuf::from(&storage_root);
         let target = validate_backup_dir(Some(&target_dir), &storage)?
             .ok_or_else(|| "backup_dir_invalid".to_string())?;
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
         let db_path = master_database_path(&master_dir);
-        let db_name = db_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| "environment_registry_invalid".to_string())?
-            .to_string();
+        let db_name = master_backup_db_name(&db_path)?;
         let source = resolve_master_backup_dir(&storage, &db_path);
         let outcome: BackupMigrationOutcome =
             migrate_master_backups_inner(&source, &target, &db_name)
@@ -9751,7 +9614,6 @@ async fn migrate_master_backups(
         })
     })
     .await
-    .map_err(|_| "master_backup_migrate_join_failed".to_string())?
 }
 
 /// P5-9 备份保留设置 DTO（设置页展示与编辑）。
@@ -9832,15 +9694,13 @@ async fn get_master_verification(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterVerificationDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<MasterVerificationDto, String> {
+    run_blocking("master_verification_join_failed", move || -> Result<MasterVerificationDto, String> {
         use traesync_infrastructure::master_verification::{
             compare_with_backup, current_master_db_path, read_session_facts, verify_relay_ledger,
         };
@@ -9934,11 +9794,7 @@ async fn get_master_verification(
         // 第二层：备份链选基准（None = 最新）。P11-4①/P11-5⑤：从当前库
         // 作用域活动备份目录取（与备份写入点同口径，副环境不混主库链）。
         let active_dir = resolve_library_backup_dir(&storage_root, &db_path, &ctx.env_id);
-        let db_name = db_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| "environment_registry_invalid".to_string())?
-            .to_string();
+        let db_name = master_backup_db_name(&db_path)?;
         let chain = list_master_backups_in(&active_dir, &db_name);
         let backup_stamps: Vec<u64> = chain
             .iter()
@@ -10013,7 +9869,6 @@ async fn get_master_verification(
         })
     })
     .await
-    .map_err(|_| "master_verification_join_failed".to_string())?
 }
 
 // ===== P5-8b 插件 tab（ADR-0023 环境插件清单）：状态/市场/装/卸/吸收 =====
@@ -10115,12 +9970,10 @@ fn manifest_entries_from_cloud(items: &[CloudPluginItem]) -> Vec<PluginManifestE
 async fn get_plugin_tab_state(
     state: tauri::State<'_, AppState>,
 ) -> Result<PluginTabStateDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("plugin_tab_state_join_failed", move || {
         let token = plugin_tab_account_token(&material_root, &storage_root)?;
         let installed = fetch_installed_plugins(&token)
             .map_err(|_| "plugin_tab_cloud_unavailable".to_string())?;
@@ -10187,7 +10040,6 @@ async fn get_plugin_tab_state(
         })
     })
     .await
-    .map_err(|_| "plugin_tab_state_join_failed".to_string())?
 }
 
 /// 浏览插件市场目录（GET /extensions/api/-/plugin/list，只读）。
@@ -10195,17 +10047,14 @@ async fn get_plugin_tab_state(
 async fn browse_plugin_market(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<MarketPluginItem>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("plugin_market_join_failed", move || {
         let token = plugin_tab_account_token(&material_root, &storage_root)?;
         fetch_market_plugins(&token).map_err(|_| "plugin_market_unavailable".to_string())
     })
     .await
-    .map_err(|_| "plugin_market_join_failed".to_string())?
 }
 
 /// 安装市场插件到当前账号云端（ADR-0023 决策 3：即时改云端 + 更新清单）。
@@ -10218,12 +10067,10 @@ async fn install_plugin(
     display_name: String,
     registry: String,
 ) -> Result<(), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("plugin_install_join_failed", move || {
         let token = plugin_tab_account_token(&material_root, &storage_root)?;
         let plugin = MarketPluginItem {
             plugin_id,
@@ -10288,7 +10135,6 @@ async fn install_plugin(
             .map_err(|_| "plugin_manifest_write_failed".to_string())
     })
     .await
-    .map_err(|_| "plugin_install_join_failed".to_string())?
 }
 
 /// 卸载全账号传播的逐账号回执（ADR-0026 决策 2）。
@@ -10319,12 +10165,10 @@ async fn uninstall_plugin_everywhere(
     state: tauri::State<'_, AppState>,
     record_id: String,
 ) -> Result<PluginUninstallEverywhereDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("plugin_uninstall_join_failed", move || {
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
         let current_account =
@@ -10383,7 +10227,6 @@ async fn uninstall_plugin_everywhere(
         Ok(PluginUninstallEverywhereDto { accounts })
     })
     .await
-    .map_err(|_| "plugin_uninstall_join_failed".to_string())?
 }
 
 /// 账号展示名：备注名优先，回退服务端昵称（界面纪律：内部 ID 不进主视野）。
@@ -10484,19 +10327,6 @@ struct MasterArchiveResultDto {
     affected: u32,
 }
 
-/// 归档通道错误码映射（稳定契约，前端 safeUiError 据此给文案）。
-fn map_master_archive_error(error: MasterArchiveError) -> String {
-    match error {
-        MasterArchiveError::DbUnavailable => "master_archive_no_data".to_string(),
-        MasterArchiveError::DbOpenFailed => "master_archive_open_failed".to_string(),
-        MasterArchiveError::ArchiveUnsupported => "master_archive_unsupported".to_string(),
-        MasterArchiveError::WriteFailed => "master_archive_write_failed".to_string(),
-        MasterArchiveError::BackupFailed => "master_archive_backup_failed".to_string(),
-        MasterArchiveError::MergeInvalid => "master_merge_invalid".to_string(),
-        MasterArchiveError::ArchiveConflict => "master_archive_conflict".to_string(),
-    }
-}
-
 /// P5-8a：兼容旧调用的单批归档原语（hidden_status → 'voice_discussion'）。
 ///
 /// 当前界面使用 `apply_master_archive_changes` 统一完成关实例、备份、事务和重启；
@@ -10508,20 +10338,16 @@ async fn archive_master_sessions(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterArchiveResultDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_archive_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         ctx.ensure_writable()?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         archive_master_sessions_inner(
             &ctx.dir,
@@ -10535,7 +10361,6 @@ async fn archive_master_sessions(
         .map_err(map_master_archive_error)
     })
     .await
-    .map_err(|_| "master_archive_join_failed".to_string())?
 }
 
 /// P5-8a：兼容旧调用的单批恢复原语（hidden_status 还原 NULL）。
@@ -10548,20 +10373,16 @@ async fn restore_master_sessions(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterArchiveResultDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_archive_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         ctx.ensure_writable()?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         restore_master_sessions_inner(
             &ctx.dir,
@@ -10575,7 +10396,6 @@ async fn restore_master_sessions(
         .map_err(map_master_archive_error)
     })
     .await
-    .map_err(|_| "master_archive_join_failed".to_string())?
 }
 
 /// 归档草稿一次性提交回执；`relaunch_outcome=failed` 表示主库已更新，
@@ -10599,9 +10419,7 @@ async fn apply_master_archive_changes(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterArchiveApplyResultDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
@@ -10609,9 +10427,8 @@ async fn apply_master_archive_changes(
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let storage_root_for_prune = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_archive_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         ctx.ensure_writable()?;
         let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         let db_path = master_database_path(&ctx.dir);
@@ -10677,7 +10494,6 @@ async fn apply_master_archive_changes(
         })
     })
     .await
-    .map_err(|_| "master_archive_join_failed".to_string())?
 }
 
 /// P5-8a 真实删除回执（规模供 UI 二次确认与结果展示）。
@@ -10703,9 +10519,7 @@ async fn delete_master_sessions(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterDeleteResultDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
@@ -10714,9 +10528,8 @@ async fn delete_master_sessions(
     let storage_root = PathBuf::from(&state.storage_root);
     // P5-9：删除前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_archive_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         ctx.ensure_writable()?;
         let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         // 运行中禁止（口径同 create_master_backup）：删除前必须能拿到静止
@@ -10758,7 +10571,6 @@ async fn delete_master_sessions(
         result
     })
     .await
-    .map_err(|_| "master_archive_join_failed".to_string())?
 }
 
 /// P5-8c 分组合并回执（规模供 UI 结果展示）。
@@ -10785,9 +10597,7 @@ async fn merge_master_projects(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterMergeResultDto, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     if state.source_raw_key.is_empty() {
         return Err("source_key_unavailable".to_string());
     }
@@ -10796,9 +10606,8 @@ async fn merge_master_projects(
     let storage_root = PathBuf::from(&state.storage_root);
     // P5-9：合并前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("master_archive_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
         ctx.ensure_writable()?;
         let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         // 运行中禁止（口径同 delete_master_sessions）：合并前必须能拿到静止
@@ -10840,7 +10649,6 @@ async fn merge_master_projects(
         result
     })
     .await
-    .map_err(|_| "master_archive_join_failed".to_string())?
 }
 
 /// P3-2/P5-3 共用：infrastructure 消息条目 → 前端 DTO（内容按形态拆平）。
@@ -10905,14 +10713,12 @@ async fn get_relay_ledger(
     library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<RelayLedgerEntryDto>, String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("trae_real_mode_required".to_string());
-    }
+    ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     // ADR-0025：库作用域校验——未知库直接拒绝，不落到默认库。
     let env_id = resolve_library_env_id(library_id.as_deref(), &storage_root)?;
     let material_root = checkin_material_root(&state)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking("relay_ledger_join_failed", move || {
         let records = AccountRegistry::new(&material_root)
             .load()
             .map_err(|_| "checkin_registry_invalid".to_string())?;
@@ -10953,7 +10759,6 @@ async fn get_relay_ledger(
             .collect())
     })
     .await
-    .map_err(|_| "relay_ledger_join_failed".to_string())?
 }
 
 /// 重新读取当前 TRAE 账号证据，并保存非敏感档案。
@@ -12939,6 +12744,117 @@ mod environment_commands_tests {
 // M3：真实签到分支（run_real_checkin）——只覆盖不发网络请求的拦截路径；
 // 真实 HTTP 直连行为由 infrastructure 层的 RealCheckinTransport 测试覆盖。
 // ============================================================================
+
+#[cfg(test)]
+mod command_shell_tests {
+    use super::*;
+
+    /// 构造指定运行模式的极小测试状态（仅门禁与命令壳测试用；
+    /// 完整版构造见 real_checkin_tests::make_real_mode_state）。
+    fn make_gate_state(mode: RuntimeMode) -> AppState {
+        AppState {
+            runtime_mode: mode,
+            capabilities: CapabilityManifest::installed_0_2_1(),
+            production_catalog: None,
+            provider: Arc::new(StaticWorkspaceStateProvider::new()),
+            workbench_probe: SqlCipherProbe::new(),
+            workbench_reader: AccountEvidenceReader::new(),
+            source_raw_key: String::new(),
+            storage_root: String::new(),
+            recovery_root: String::new(),
+            process_controller: Arc::new(FixedProcessController::not_running()),
+            authorization: Arc::new(Mutex::new(AuthorizationSlot::new(
+                AuthorizationState::NotAuthorized,
+            ))),
+            pending_sync_plan: Arc::new(Mutex::new(None)),
+            active_sync_cancellation: Arc::new(Mutex::new(None)),
+            pending_deletion_plan: Arc::new(Mutex::new(None)),
+            managed_account_runtime: Arc::new(Mutex::new(ManagedAccountRuntimeSlot::default())),
+            checkin_cancellation: Arc::new(AtomicBool::new(false)),
+            pending_login: Arc::new(Mutex::new(None)),
+            active_oauth_profile: Arc::new(Mutex::new(None)),
+            login_cancel: Arc::new(AtomicBool::new(false)),
+            active_login_browser: Arc::new(Mutex::new(None)),
+            checkin_execution_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// TRAE 实例/主库域门禁：真实模式通过，fixture 拒绝并返回域稳定错误码。
+    #[test]
+    fn ensure_real_preview_allows_real_mode_and_rejects_fixture() {
+        let real = make_gate_state(RuntimeMode::RealReadPreview);
+        assert!(ensure_real_preview(&real).is_ok());
+
+        let fixture = make_gate_state(RuntimeMode::Fixture);
+        assert_eq!(
+            ensure_real_preview(&fixture).unwrap_err(),
+            "trae_real_mode_required"
+        );
+    }
+
+    /// 登录域门禁：fixture 拒绝时保持登录域自己的稳定错误码。
+    #[test]
+    fn ensure_login_real_mode_allows_real_mode_and_rejects_fixture() {
+        let real = make_gate_state(RuntimeMode::RealReadPreview);
+        assert!(ensure_login_real_mode(&real).is_ok());
+
+        let fixture = make_gate_state(RuntimeMode::Fixture);
+        assert_eq!(
+            ensure_login_real_mode(&fixture).unwrap_err(),
+            "login_real_mode_required"
+        );
+    }
+
+    /// 签到 HTTP 域门禁：fixture 拒绝时保持签到域自己的稳定错误码。
+    #[test]
+    fn ensure_checkin_http_enabled_allows_real_mode_and_rejects_fixture() {
+        let real = make_gate_state(RuntimeMode::RealReadPreview);
+        assert!(ensure_checkin_http_enabled(&real).is_ok());
+
+        let fixture = make_gate_state(RuntimeMode::Fixture);
+        assert_eq!(
+            ensure_checkin_http_enabled(&fixture).unwrap_err(),
+            "checkin_http_disabled"
+        );
+    }
+
+    /// fixture 门禁反向用例：fixture 模式通过，真实模式拒绝。
+    #[test]
+    fn ensure_fixture_runtime_allows_fixture_and_rejects_real_mode() {
+        let fixture = make_gate_state(RuntimeMode::Fixture);
+        assert!(ensure_fixture_runtime(&fixture).is_ok());
+
+        let real = make_gate_state(RuntimeMode::RealReadPreview);
+        assert!(ensure_fixture_runtime(&real).is_err());
+    }
+
+    /// run_blocking：闭包成功值与闭包自身错误原样透传（join 不改写业务结果）。
+    #[test]
+    fn run_blocking_passes_through_success_and_inner_error() {
+        let ok = tauri::async_runtime::block_on(async {
+            run_blocking("test_join_failed", || Ok::<u8, String>(7)).await
+        });
+        assert_eq!(ok, Ok(7));
+
+        let inner_err = tauri::async_runtime::block_on(async {
+            run_blocking("test_join_failed", || Err::<u8, String>("inner_code".to_string())).await
+        });
+        assert_eq!(inner_err, Err("inner_code".to_string()));
+    }
+
+    /// run_blocking：闭包 panic（join 失败）映射为稳定的 join 错误码。
+    /// 测试日志中的 panic 输出来自本用例的故意触发，属预期现象。
+    #[test]
+    fn run_blocking_maps_join_failure_to_stable_error_code() {
+        let joined = tauri::async_runtime::block_on(async {
+            run_blocking("test_join_failed", || -> Result<u8, String> {
+                panic!("故意 panic：验证 join 失败映射")
+            })
+            .await
+        });
+        assert_eq!(joined, Err("test_join_failed".to_string()));
+    }
+}
 
 #[cfg(test)]
 mod real_checkin_tests {

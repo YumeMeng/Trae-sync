@@ -32,6 +32,17 @@ pub fn master_database_path(master_data_dir: &Path) -> PathBuf {
         .join("database.db")
 }
 
+/// 备份链使用的库文件名提取（P12-R2a S2 收敛：lib.rs 三处同形复制合一）。
+/// 从 `master_database_path` 产出的库路径取文件名；无文件名的路径
+/// fail-closed，沿用调用方既有稳定错误码 `environment_registry_invalid`。
+pub fn master_backup_db_name(db_path: &Path) -> Result<String, String> {
+    db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .ok_or_else(|| "environment_registry_invalid".to_string())
+}
+
 /// 交接失败（全部非敏感：不含 key、消息内容或账号信息）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MasterHandoverError {
@@ -1180,6 +1191,20 @@ mod tests {
     use super::*;
     use rusqlite::OpenFlags;
     use std::cell::RefCell;
+
+    /// S2 收敛：db_name 提取原本在 lib.rs 三处同形复制，收敛为本 helper 后
+    /// 正常路径取文件名，无文件名路径（如根目录）沿用既有稳定错误码
+    /// `environment_registry_invalid` fail-closed（零行为变化）。
+    #[test]
+    fn master_backup_db_name_extracts_file_name_or_fails_closed() {
+        let db_path = master_database_path(Path::new("C:/fixture/master"));
+        assert_eq!(master_backup_db_name(&db_path).unwrap(), "database.db");
+
+        assert_eq!(
+            master_backup_db_name(Path::new("/")).unwrap_err(),
+            "environment_registry_invalid"
+        );
+    }
 
     /// 构造加密 fixture 库（表结构覆盖换腿涉及的九张表 + 空镜像冲突场景）。
     fn create_fixture_db(path: &Path, raw_key: &str) {
