@@ -107,6 +107,12 @@ required-features = ["sqlcipher"]
 name = "trae_cn_health_check_probe"
 path = "tests/trae_cn_health_check_probe.rs"
 
+# Trae CN 真实续期专项验收探针（ADR-0030 门禁：一次真实换发 + journal + 健康复核；
+# 显式授权运行，无需 SQLCipher）。
+[[test]]
+name = "trae_cn_credential_refresh_acceptance"
+path = "tests/trae_cn_credential_refresh_acceptance.rs"
+
 # W0 运行中读取一致性探针（U-6 历史页轮询定参）：依赖 SQLCipher 只读路径。
 [[example]]
 name = "w0_probe"
