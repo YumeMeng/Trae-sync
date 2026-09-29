@@ -19,6 +19,8 @@ pub mod account_session_content;
 pub mod account_session_index;
 pub mod account_switch;
 pub(crate) mod atomic_publish;
+// P11-5：库归档草稿存储（localStorage 迁入 storage_root）。
+pub mod archive_draft_store;
 pub mod auto_checkin_store;
 pub mod backup_retention;
 pub mod blob_keepalive;
@@ -29,6 +31,8 @@ pub mod checkin;
 pub mod checkin_credential;
 pub mod checkin_http;
 pub mod checkin_login;
+// P11-6：Trae CN 签到只读探针（ADR-0032 决策 4 门禁；status 类查询先行）。
+pub mod checkin_probe;
 pub mod content_graph;
 pub mod credential_maintenance;
 pub mod credential_vault;
@@ -92,7 +96,8 @@ pub use account_switch::{
     JsonManagedAccountProfileStore,
 };
 pub use auto_checkin_store::{
-    build_staggered_plan, is_valid_hhmm, should_trigger_auto_checkin, AutoCheckinBatchState,
+    build_staggered_plan, is_valid_hhmm, should_recover_interrupted_checkin,
+    should_retry_skipped_checkin, should_trigger_auto_checkin, AutoCheckinBatchState,
     AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, AutoCheckinStoreError,
 };
 pub use blob_keepalive::{
@@ -124,9 +129,14 @@ pub use checkin_http::{
     TRAE_CN_IDE_VERSION, TRAE_IDE_VERSION, TRAE_SOLO_CLIENT_ID, TRAE_SOLO_IDE_VERSION,
 };
 pub use checkin_login::{
-    begin_login, begin_login_for, build_login_url_for, complete_login, LoginCallbackServer,
-    LoginError, LoginHandoff, LoginProduct, LoginReceipt, LoginSession, CALLBACK_TIMEOUT_SECONDS,
-    LOGIN_HOST,
+    begin_login, begin_login_for, build_login_url_for, complete_login, LoginAcceptance,
+    LoginCallbackServer, LoginError, LoginHandoff, LoginProduct, LoginReceipt, LoginSession,
+    CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
+};
+// P11-6：只读探针公开 API（真实探测由 #[ignore] 集成测试显式授权运行）。
+pub use checkin_probe::{
+    build_probe_report, candidate_endpoints, derive_probe_conclusion, probe_trae_cn_status_endpoints,
+    write_probe_report, TraeCnCheckinProbeReport, TraeCnProbeFinding,
 };
 pub use content_graph::DeterministicContentGraphHasher;
 pub use credential_maintenance::{
@@ -162,9 +172,11 @@ pub use master_checkup::{
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_handover::{
-    backup_master_trio, handover_master_records, handover_master_records_with_progress,
-    list_master_backups, master_database_path, master_db_activity_detected, HandoverProgress,
-    HandoverSession, MasterBackupEntry, MasterHandover, MasterHandoverError,
+    backup_master_trio, backup_master_trio_stamped, backup_master_trio_to,
+    handover_master_records, handover_master_records_from_merge_with_progress,
+    handover_master_records_from_with_progress, handover_master_records_with_progress,
+    list_master_backups, list_master_backups_in, master_database_path, master_db_activity_detected,
+    HandoverProgress, HandoverSession, MasterBackupEntry, MasterHandover, MasterHandoverError,
 };
 pub use operation_lease::{
     inspect_lock_status, OperationLease, OperationLeaseError, OperationLockStatus,

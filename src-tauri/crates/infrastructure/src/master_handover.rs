@@ -5,7 +5,7 @@
 //!   归属随行，消息数据零触碰（`server_history_info.user_id` 全 NULL）。
 //! - **E5 坑位**：`UNIQUE(biz_project_id, user_id)` —— 每个登录过环境的账号
 //!   都会在自己名下拉一份同 biz 的空镜像行；交接前必须自动清理目标账号的
-//!   空镜像行，非空冲突报人工决策（禁止静默覆盖）。
+//!   空镜像行，普通交接的非空冲突报人工决策（禁止静默覆盖）。
 //! - **e5-r2**：活跃会话原地换腿——事务内重写本地 session/message/turn/
 //!   task/history/agent_run 身份为新腿，不携带旧 `server_history_info`，
 //!   新腿首发自然创建新云端 conversation（换腿 SQL 逐句移植自验证探针
@@ -70,7 +70,7 @@ pub struct HandoverSession {
     /// 旧腿 session_id（换腿前身份；P5-3 接力台账 from_session_id 数据源，
     /// 历史页据此把多次换腿链回成完整接力轨迹）。
     pub previous_session_id: String,
-    /// 会话所属 project_id（归属随行后不变）。
+    /// 会话随行后的 project_id；合并时指向目标项目。
     pub project_id: String,
     /// 交接前会话归属账号 user_id（P5-5 收编台账逐会话 from 数据源；
     /// 切号路径沿用 previous_owner 单值，多账号杂居时此字段更精确）。
@@ -127,25 +127,65 @@ fn copy_file_create_new(source: &Path, target: &Path) -> Result<(), MasterHandov
     Ok(())
 }
 
-/// 主库三件套备份：db + 存在的 wal/shm 复制为 `.switch-bak-{时间戳}` sidecar。
+/// 当前秒级 UNIX 时间（备份链命名与凭据子目录同戳发号）。
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// 主库三件套备份：db + 存在的 wal/shm 复制为 `.switch-bak-{时间戳}` sidecar
+/// （写入 db 同目录，原行为保留给既有调用方）。
 ///
 /// `create_new` 保证永不覆盖既有备份（含历史备份链）；调用方（切号编排）
 /// 保证此刻主库实例已关闭（第 1 步），复制到的是静止一致的三件套。
 /// 返回备份主文件路径（供 DTO 展示与人工恢复定位）。
 pub fn backup_master_trio(db_path: &Path) -> Result<PathBuf, MasterHandoverError> {
+    backup_master_trio_to(db_path, None)
+}
+
+/// P11-4①：三件套备份写入指定目录（None = db 同目录）。
+///
+/// 目录不存在时创建（设置命令层已校验可创建，此处兜底）；文件名与同目录
+/// 备份链一致（`{db 名}.switch-bak-{时间戳}`），恢复语义不变：按文件名
+/// 找同目录。
+pub fn backup_master_trio_to(
+    db_path: &Path,
+    target_dir: Option<&Path>,
+) -> Result<PathBuf, MasterHandoverError> {
+    backup_master_trio_stamped(db_path, target_dir, unix_seconds_now())
+}
+
+/// 显式时间戳版本（P11-4②）：凭据子目录（`credentials-{stamp}`）需要与
+/// 三件套同戳，由组合根统一发号传入，恢复时按戳配对。
+pub fn backup_master_trio_stamped(
+    db_path: &Path,
+    target_dir: Option<&Path>,
+    stamp: u64,
+) -> Result<PathBuf, MasterHandoverError> {
     if !db_path.is_file() {
         return Err(MasterHandoverError::DbUnavailable);
     }
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let backup = sidecar(db_path, &format!(".switch-bak-{stamp}"));
+    let dir = match target_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|_| MasterHandoverError::Io)?;
+            dir.to_path_buf()
+        }
+        None => db_path.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(MasterHandoverError::Io)?;
+    // 与同目录备份链同名（`{db 名}.switch-bak-{stamp}`）：恢复语义不变，
+    // 按文件名找同目录。create_new 永不覆盖既有备份。
+    let backup = dir.join(format!("{db_name}.switch-bak-{stamp}"));
     copy_file_create_new(db_path, &backup)?;
     for suffix in ["-wal", "-shm"] {
-        let source = sidecar(db_path, suffix);
+        let source = db_path.with_file_name(format!("{db_name}{suffix}"));
         if source.is_file() {
-            copy_file_create_new(&source, &sidecar(&backup, suffix))?;
+            copy_file_create_new(&source, &dir.join(format!("{db_name}.switch-bak-{stamp}{suffix}")))?;
         }
     }
     Ok(backup)
@@ -162,12 +202,11 @@ pub struct MasterBackupEntry {
     pub total_bytes: u64,
     /// 是否带 wal 附属件（运行中备份会缺失一致性，正常切号备份可有可无）。
     pub has_wal: bool,
+    /// 是否带凭据备份子目录（`credentials-{stamp}`，P11-4②）。
+    pub has_credentials: bool,
 }
 
-/// 枚举主库备份链：`{db 目录}/database.db.switch-bak-*`。
-///
-/// 只读扫描 + 按时间戳倒序（最新在前）；命名异常的散件跳过不报错
-/// （备份链展示容错：不因一个异名文件让整页失败）。不读取文件内容。
+/// 枚举主库备份链：`{db 目录}/database.db.switch-bak-*`（db 同目录，原行为）。
 pub fn list_master_backups(db_path: &Path) -> Vec<MasterBackupEntry> {
     let Some(dir) = db_path.parent() else {
         return Vec::new();
@@ -175,6 +214,15 @@ pub fn list_master_backups(db_path: &Path) -> Vec<MasterBackupEntry> {
     let Some(db_name) = db_path.file_name().and_then(|name| name.to_str()) else {
         return Vec::new();
     };
+    list_master_backups_in(dir, db_name)
+}
+
+/// 枚举指定目录内的主库备份链（P11-4①：backup_dir 支撑——备份所在目录
+/// 与 db 目录解耦后，按「活动备份目录 + db 文件名」枚举）。
+///
+/// 只读扫描 + 按时间戳倒序（最新在前）；命名异常的散件跳过不报错
+/// （备份链展示容错：不因一个异名文件让整页失败）。不读取文件内容。
+pub fn list_master_backups_in(dir: &Path, db_name: &str) -> Vec<MasterBackupEntry> {
     let prefix = format!("{db_name}.switch-bak-");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -210,13 +258,13 @@ pub fn list_master_backups(db_path: &Path) -> Vec<MasterBackupEntry> {
     }
     let mut result: Vec<MasterBackupEntry> = chain
         .into_iter()
-        .map(
-            |(stamp_unix_seconds, (total_bytes, has_wal))| MasterBackupEntry {
-                stamp_unix_seconds,
-                total_bytes,
-                has_wal,
-            },
-        )
+        .map(|(stamp_unix_seconds, (total_bytes, has_wal))| MasterBackupEntry {
+            stamp_unix_seconds,
+            total_bytes,
+            has_wal,
+            // P11-4②：凭据子目录存在性（与三件套同戳命名）。
+            has_credentials: dir.join(format!("credentials-{stamp_unix_seconds}")).is_dir(),
+        })
         .collect();
     result.sort_by(|a, b| b.stamp_unix_seconds.cmp(&a.stamp_unix_seconds));
     result
@@ -355,9 +403,86 @@ pub fn handover_master_records_with_progress(
     target_user_id: &str,
     on_progress: &dyn Fn(HandoverProgress),
 ) -> Result<MasterHandover, MasterHandoverError> {
+    handover_master_records_core(
+        db_path,
+        raw_key,
+        target_user_id,
+        None,
+        false,
+        on_progress,
+    )
+}
+
+/// 指定来源账号的选择性交接（手动转移场景）：只把 source 名下带正常会话的
+/// 项目随行到 target，库里其余账号（如更早登录过的账号）的记录原状保留。
+pub fn handover_master_records_from_with_progress(
+    db_path: &Path,
+    raw_key: &str,
+    target_user_id: &str,
+    source_user_id: &str,
+    on_progress: &dyn Fn(HandoverProgress),
+) -> Result<MasterHandover, MasterHandoverError> {
+    handover_master_records_core(
+        db_path,
+        raw_key,
+        target_user_id,
+        Some(source_user_id),
+        false,
+        on_progress,
+    )
+}
+
+/// 指定来源账号的选择性交接 + 合并模式：同 biz 双侧都挂有真实记录时，
+/// 把来源账号待交接的正常会话并入目标项目。来源项目仍有归档或软删除会话时保留，
+/// 目标名下的会话和项目身份不改写。
+pub fn handover_master_records_from_merge_with_progress(
+    db_path: &Path,
+    raw_key: &str,
+    target_user_id: &str,
+    source_user_id: &str,
+    on_progress: &dyn Fn(HandoverProgress),
+) -> Result<MasterHandover, MasterHandoverError> {
+    handover_master_records_core(
+        db_path,
+        raw_key,
+        target_user_id,
+        Some(source_user_id),
+        true,
+        on_progress,
+    )
+}
+
+/// 交接核心实现；`source_user_id` 为 None 时保持全量随行语义；
+/// `merge_conflicts` 为 true 时同 biz 双侧非空走合并而非报错。
+///
+/// 前置条件：主库 TRAE 实例已关闭（调用方五步编排第 1 步保证）。
+fn handover_master_records_core(
+    db_path: &Path,
+    raw_key: &str,
+    target_user_id: &str,
+    source_user_id: Option<&str>,
+    merge_conflicts: bool,
+    on_progress: &dyn Fn(HandoverProgress),
+) -> Result<MasterHandover, MasterHandoverError> {
     if !db_path.is_file() {
         return Err(MasterHandoverError::DbUnavailable);
     }
+    // 来源过滤（手动选择性交接）：服务端 user_id 恒为数字串，校验通过才允许
+    // 拼进 SQL（与 normal_session_filter 同款常量拼接路径，杜绝注入面）。
+    let source_filter_p = match source_user_id {
+        Some(source) if source.chars().all(|c| c.is_ascii_digit()) => {
+            format!(" AND p.user_id = '{source}'")
+        }
+        Some(_) => return Err(MasterHandoverError::DbOpenFailed),
+        None => String::new(),
+    };
+    let source_filter_plain = match source_user_id {
+        Some(source) if source.chars().all(|c| c.is_ascii_digit()) => {
+            format!(" AND user_id = '{source}'")
+        }
+        Some(_) => return Err(MasterHandoverError::DbOpenFailed),
+        None => String::new(),
+    };
     let conn = Connection::open(db_path).map_err(|_| MasterHandoverError::DbOpenFailed)?;
     // busy_timeout 用原生 API 设置：`PRAGMA busy_timeout = N` 会返回结果行，
     // 与 PRAGMA key 同批 execute_batch 会报 ExecuteReturnedResults。
@@ -387,7 +512,7 @@ pub fn handover_master_records_with_progress(
             .prepare(&format!(
                     "SELECT s.session_id, s.project_id, p.user_id FROM chat_session s
                      JOIN project p ON p.project_id = s.project_id
-                     WHERE p.user_id != ?1 AND COALESCE(s.deleted_at, 0) = 0{normal_session_filter}"
+                     WHERE p.user_id != ?1{source_filter_p} AND COALESCE(s.deleted_at, 0) = 0{normal_session_filter}"
                 ))
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         let rows = statement
@@ -417,7 +542,7 @@ pub fn handover_master_records_with_progress(
             &format!(
                 "SELECT p.user_id FROM project p
                  JOIN chat_session s ON s.project_id = p.project_id
-                 WHERE p.user_id IS NOT NULL AND p.user_id != ?1
+                 WHERE p.user_id IS NOT NULL AND p.user_id != ?1{source_filter_p}
                    AND COALESCE(s.deleted_at, 0) = 0{normal_session_filter}
                  GROUP BY p.user_id ORDER BY COUNT(*) DESC LIMIT 1"
             ),
@@ -434,6 +559,7 @@ pub fn handover_master_records_with_progress(
 
     // ===== UNIQUE 冲突预处理（E5 坑位：空镜像自动清理 + 非空冲突报人工）=====
     let mut mirrors_to_delete: Vec<String> = Vec::new();
+    let mut merge_pairs: Vec<(String, String)> = Vec::new();
     // (biz, 非目标侧挂有会话的行数, biz) 分组统计：同 biz 出现多个非空行 = 冲突。
     let mut nonempty_by_biz: HashMap<String, usize> = HashMap::new();
     {
@@ -450,7 +576,7 @@ pub fn handover_master_records_with_progress(
                  FROM project p
                  JOIN project t
                    ON t.biz_project_id = p.biz_project_id AND t.user_id = ?1
-                 WHERE p.user_id != ?1 AND p.biz_project_id IS NOT NULL"
+                 WHERE p.user_id != ?1{source_filter_p} AND p.biz_project_id IS NOT NULL"
             ))
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         let rows = statement
@@ -485,8 +611,13 @@ pub fn handover_master_records_with_progress(
             if target_all_sessions == 0 {
                 mirrors_to_delete.push(target_project);
             } else if source_sessions > 0 {
-                // 双侧都有真实记录：禁止静默覆盖，报人工决策。
-                return Err(MasterHandoverError::TargetConflict(biz_fingerprint(&biz)));
+                if merge_conflicts {
+                    // 合并时保留目标项目身份，只把来源账号待交接的正常会话并入。
+                    merge_pairs.push((source_project, target_project));
+                } else {
+                    // 普通切号仍禁止静默合并同名项目。
+                    return Err(MasterHandoverError::TargetConflict(biz_fingerprint(&biz)));
+                }
             } else if target_sessions > 0 && source_all_sessions == 0 {
                 // 目标名下已有同 biz 真实行、来源行只是空镜像：
                 // 空镜像同样必须清理，否则随行 UPDATE 在来源行上撞 UNIQUE。
@@ -515,7 +646,7 @@ pub fn handover_master_records_with_progress(
                         (SELECT COUNT(*) FROM chat_session cs
                          WHERE cs.project_id = project.project_id)
                  FROM project
-                 WHERE user_id != ?1 AND biz_project_id IS NOT NULL
+                 WHERE user_id != ?1{source_filter_plain} AND biz_project_id IS NOT NULL
                  ORDER BY biz_project_id, rowid"
             ))
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
@@ -618,7 +749,7 @@ pub fn handover_master_records_with_progress(
     let agent_run_map =
         map_column_batch(&conn, "agent_run", "agent_run_id", &session_ids, &mut ids)?;
 
-    // ===== 单事务执行：镜像清理 → 归属随行 → 集合式批量换腿 =====
+    // ===== 单事务执行：镜像清理 → 项目合并 → 归属随行 → 集合式批量换腿 =====
     let tx = conn
         .unchecked_transaction()
         .map_err(|_| MasterHandoverError::DbOpenFailed)?;
@@ -629,12 +760,56 @@ pub fn handover_master_records_with_progress(
         )
         .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         tx.execute("DELETE FROM project WHERE project_id = ?1", [project])
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    }
+    let mut merged_projects = 0;
+    for (source_project, target_project) in &merge_pairs {
+        let merge_sessions: Vec<&str> = sessions_to_switch
+            .iter()
+            .filter(|(_, project_id, _)| project_id == source_project)
+            .map(|(session_id, _, _)| session_id.as_str())
+            .collect();
+        let placeholders = placeholders(merge_sessions.len());
+        let params = || {
+            rusqlite::params_from_iter(
+                std::iter::once(target_project.as_str())
+                    .chain(std::iter::once(source_project.as_str()))
+                    .chain(merge_sessions.iter().copied()),
+            )
+        };
+        let moved_sessions = tx
+            .execute(
+                &format!(
+                    "UPDATE chat_session SET project_id = ?1
+                     WHERE project_id = ?2 AND session_id IN ({placeholders})"
+                ),
+                params(),
+            )
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        if moved_sessions > 0 {
+            tx.execute(
+                &format!(
+                    "UPDATE session_project SET project_id = ?1
+                     WHERE project_id = ?2 AND session_id IN ({placeholders})"
+                ),
+                params(),
+            )
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+            merged_projects += 1;
+        }
+        // 归档、软删除或其他残留会话仍留在来源项目；仅移空的项目行。
+        tx.execute(
+            "DELETE FROM project WHERE project_id = ?1
+             AND NOT EXISTS (SELECT 1 FROM chat_session WHERE project_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM session_project WHERE project_id = ?1)",
+            [source_project],
+        )
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
     }
     let transferred_projects = tx
         .execute(
             &format!(
-                "UPDATE project SET user_id = ?1 WHERE user_id != ?1
+                "UPDATE project SET user_id = ?1 WHERE user_id != ?1{source_filter_plain}
                  AND EXISTS (
                      SELECT 1 FROM chat_session s
                      WHERE s.project_id = project.project_id
@@ -643,7 +818,8 @@ pub fn handover_master_records_with_progress(
             ),
             [target_user_id],
         )
-        .map_err(|_| MasterHandoverError::DbOpenFailed)? as usize;
+        .map_err(|_| MasterHandoverError::DbOpenFailed)? as usize
+        + merged_projects;
 
     // temp 映射表（P7-3）：内存态（temp_store = MEMORY，ID 明文不落盘），
     // 随连接销毁；主库文件结构不变。
@@ -720,7 +896,11 @@ pub fn handover_master_records_with_progress(
             |(index, (source_session, project_id, previous_user_id))| HandoverSession {
                 session_id: leg_maps[index].1.clone(),
                 previous_session_id: source_session.clone(),
-                project_id: project_id.clone(),
+                project_id: merge_pairs
+                    .iter()
+                    .find(|(source_project, _)| source_project == project_id)
+                    .map(|(_, target_project)| target_project.clone())
+                    .unwrap_or_else(|| project_id.clone()),
                 previous_user_id: previous_user_id.clone(),
                 message_count: before_counts
                     .get(source_session)
@@ -1341,6 +1521,207 @@ mod tests {
     }
 
     #[test]
+    fn handover_merges_selected_source_project_into_target() {
+        let db_path = temp_db_path("merge-conflict");
+        let raw_key = "cd".repeat(32);
+        create_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            conn.execute(
+                "INSERT INTO project VALUES ('p-target', '222', 'biz-a', '目标项目', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s-target', 'p-target', '当前活跃对话', 2, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_message
+                 (message_id, session_id, message_role, message_index, deleted_at)
+                 VALUES ('m-target', 's-target', 'user', 0, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_project VALUES ('s-target', 'p-target')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project VALUES ('p-older', '333', 'biz-older', '更早账号项目', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s-older', 'p-older', '更早账号对话', 3, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome = handover_master_records_from_merge_with_progress(
+            &db_path,
+            &raw_key,
+            "222",
+            "111",
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.previous_owner_user_id.as_deref(), Some("111"));
+        assert_eq!(outcome.transferred_projects, 1);
+        assert_eq!(outcome.switched_sessions.len(), 1);
+        let moved = &outcome.switched_sessions[0];
+        assert_eq!(moved.previous_session_id, "s1");
+        assert_eq!(moved.project_id, "p-target");
+        assert_eq!(moved.message_count, 2);
+
+        let conn = open_fixture(&db_path, &raw_key);
+        let moved_project: String = conn
+            .query_row(
+                "SELECT project_id FROM chat_session WHERE session_id = ?1",
+                [&moved.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_project, "p-target");
+        let moved_pivot: String = conn
+            .query_row(
+                "SELECT project_id FROM session_project WHERE session_id = ?1",
+                [&moved.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_pivot, "p-target");
+        let source_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_rows, 0);
+        let target_session: (String, String, String) = conn
+            .query_row(
+                "SELECT session_id, project_id, session_title FROM chat_session WHERE session_id = 's-target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            target_session,
+            (
+                "s-target".to_string(),
+                "p-target".to_string(),
+                "当前活跃对话".to_string()
+            )
+        );
+        let target_message_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_message WHERE session_id = 's-target' AND message_id = 'm-target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_message_count, 1);
+        let older_owner: (String, String) = conn
+            .query_row(
+                "SELECT s.project_id, p.user_id FROM chat_session s
+                 JOIN project p ON p.project_id = s.project_id WHERE s.session_id = 's-older'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(older_owner, ("p-older".to_string(), "333".to_string()));
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn handover_merge_leaves_archived_source_sessions_untouched() {
+        let db_path = temp_db_path("merge-archive");
+        let raw_key = "ef".repeat(32);
+        create_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            conn.execute_batch("ALTER TABLE chat_session ADD COLUMN hidden_status TEXT;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO project VALUES ('p-target', '222', 'biz-a', '目标项目', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session
+                 (session_id, project_id, session_title, updated_at, deleted_at)
+                 VALUES ('s-target', 'p-target', '当前对话', 2, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_session
+                 (session_id, project_id, session_title, updated_at, deleted_at, hidden_status)
+                 VALUES ('s-archived', 'p1', '来源归档对话', 3, NULL, 'voice_discussion')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_project VALUES ('s-archived', 'p1')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let outcome = handover_master_records_from_merge_with_progress(
+            &db_path,
+            &raw_key,
+            "222",
+            "111",
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.switched_sessions.len(), 1);
+        assert_eq!(outcome.transferred_projects, 1);
+        assert_eq!(outcome.switched_sessions[0].project_id, "p-target");
+        let conn = open_fixture(&db_path, &raw_key);
+        let archived: (String, String, String) = conn
+            .query_row(
+                "SELECT session_id, project_id, hidden_status FROM chat_session
+                 WHERE session_id = 's-archived'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            archived,
+            (
+                "s-archived".to_string(),
+                "p1".to_string(),
+                "voice_discussion".to_string()
+            )
+        );
+        let source_owner: String = conn
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_owner, "111");
+        let archived_pivot: String = conn
+            .query_row(
+                "SELECT project_id FROM session_project WHERE session_id = 's-archived'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived_pivot, "p1");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
     fn handover_keeps_session_bearing_row_when_deduplicating_biz() {
         // 2026-08-31 事故场景：同 biz 的非目标侧多行，rowid 最小的是空镜像，
         // 靠后的行挂有活跃会话。必须保留带会话行、只删空镜像，
@@ -1758,5 +2139,86 @@ mod tests {
         // 无任何备份文件 → 空链（不报错）。
         assert!(list_master_backups(&db_path).is_empty());
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    // ===== P11-4① 备份位置可选：跨目录备份 + 目录版枚举 + 凭据标记 =====
+
+    /// backup_master_trio_to(Some)：三件套写入目标目录；db 原目录不产生
+    /// 任何备份文件（防误写）。文件名与同目录备份链一致（恢复语义不变）。
+    #[test]
+    fn backup_master_trio_to_writes_target_dir() {
+        let root = temp_db_path("trio-to");
+        let db_path = root.join("data").join("database.db");
+        std::fs::create_dir_all(&db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, [1u8; 100]).unwrap();
+        std::fs::write(
+            db_path.parent().unwrap().join("database.db-wal"),
+            [2u8; 20],
+        )
+        .unwrap();
+        let target = root.join("backups");
+        let backup = backup_master_trio_to(&db_path, Some(&target)).unwrap();
+        assert_eq!(backup.parent().unwrap(), target);
+        let stamp = backup
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches("database.db.switch-bak-")
+            .to_string();
+        // 目标目录：db + 存在的 wal 一并到位（字节一致）。
+        assert_eq!(
+            std::fs::read(target.join("database.db.switch-bak-".to_string() + &stamp)).unwrap(),
+            [1u8; 100]
+        );
+        assert_eq!(
+            std::fs::read(
+                target.join("database.db.switch-bak-".to_string() + &stamp + "-wal")
+            )
+            .unwrap(),
+            [2u8; 20]
+        );
+        // db 原目录无新备份文件。
+        let left: Vec<_> = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(left.len(), 2, "原目录只剩 db 与 wal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// backup_master_trio_to(None)：等价原 backup_master_trio 同目录行为。
+    #[test]
+    fn backup_master_trio_none_keeps_same_dir() {
+        let db_path = temp_db_path("trio-none");
+        std::fs::write(&db_path, [1u8; 10]).unwrap();
+        let backup = backup_master_trio_to(&db_path, None).unwrap();
+        assert_eq!(backup.parent().unwrap(), db_path.parent().unwrap());
+        assert!(backup
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("database.db.switch-bak-"));
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// 目录版枚举：credentials-{stamp} 子目录映射 has_credentials 标记。
+    #[test]
+    fn list_master_backups_in_reports_credentials() {
+        let root = temp_db_path("chain-cred");
+        let dir = root.parent().unwrap();
+        std::fs::write(dir.join("database.db.switch-bak-1000"), [1u8; 100]).unwrap();
+        std::fs::write(dir.join("database.db.switch-bak-900"), [1u8; 40]).unwrap();
+        // 仅 1000 带凭据子目录。
+        std::fs::create_dir_all(dir.join("credentials-1000")).unwrap();
+        let chain = list_master_backups_in(dir, "database.db");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].stamp_unix_seconds, 1000);
+        assert!(chain[0].has_credentials);
+        assert_eq!(chain[1].stamp_unix_seconds, 900);
+        assert!(!chain[1].has_credentials);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

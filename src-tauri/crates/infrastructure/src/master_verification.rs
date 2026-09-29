@@ -229,15 +229,8 @@ pub fn verify_relay_ledger(
 
 // ===== 第二层：备份对比 =====
 
-/// 备份主文件路径（`.switch-bak-{stamp}`；附属件按同后缀约定）。
-pub fn backup_db_path(db_path: &Path, stamp: u64) -> PathBuf {
-    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    let name = db_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("database.db");
-    dir.join(format!("{name}.switch-bak-{stamp}"))
-}
+// P11-4①：原 backup_db_path（按 db 同目录假定构造备份路径）已随备份位置
+// 可选改造移除——组合根现在按「活动备份目录 + db 文件名」自行解析基准备份。
 
 /// 以指定备份为基准对比当前库（会话级，只读）。
 ///
@@ -483,11 +476,5 @@ mod tests {
         assert_eq!(report.missing.len(), 1); // s4
         assert_eq!(report.missing[0].title.as_deref(), Some("丢失候选"));
         assert_eq!(report.missing[0].message_count, 9);
-    }
-
-    #[test]
-    fn backup_db_path_follows_switch_bak_naming() {
-        let path = backup_db_path(Path::new("C:/data/database.db"), 1756000000);
-        assert!(path.ends_with("database.db.switch-bak-1756000000"));
     }
 }

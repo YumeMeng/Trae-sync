@@ -146,10 +146,13 @@ pub fn master_data_dir_for(
     product: TraeProduct,
 ) -> Result<PathBuf, EnvironmentRegistryError> {
     let appdata = std::env::var("APPDATA").map_err(|_| EnvironmentRegistryError::Io)?;
-    Ok(official_data_dir_from_appdata_for(
-        Path::new(&appdata),
-        product,
-    ))
+    Ok(product_data_dir_from_appdata(Path::new(&appdata), product))
+}
+
+/// 纯函数形态（P11-6 单测与 Trae CN 只读库路由用）：由 APPDATA 根拼出
+/// 指定 TRAE 产品官方目录。与 `master_data_dir_for` 同源，单测无需环境变量。
+pub fn product_data_dir_from_appdata(appdata: &Path, product: TraeProduct) -> PathBuf {
+    official_data_dir_from_appdata_for(appdata, product)
 }
 
 /// 纯函数形态（单测用）：由 APPDATA 根拼出官方目录。

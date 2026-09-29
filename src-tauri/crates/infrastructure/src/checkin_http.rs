@@ -36,7 +36,8 @@ use crate::checkin_credential::{
 };
 use crate::checkin_login::{decode_account_from_jwt, generate_pkce_pair};
 
-const API_BASE: &str = "https://api.trae.cn";
+/// CN 网关基地址（P11-6 提升为 crate 内共享：只读探针与协议层同源）。
+pub(crate) const API_BASE: &str = "https://api.trae.cn";
 const CHECKIN_STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
 const CHECKIN_CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
 const ENT_USAGE_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
@@ -584,6 +585,8 @@ pub struct TokenGrant {
     pub refresh_token_expires_at_unix_seconds: u64,
 }
 
+// 字段名须与服务端 JSON 键逐字一致，保留服务端命名
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct ExchangeResult {
     #[serde(default)]
@@ -596,6 +599,8 @@ struct ExchangeResult {
     RefreshExpireAt: Option<u64>,
 }
 
+// 字段名须与服务端 JSON 键逐字一致，保留服务端命名
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct ExchangeEnvelope {
     #[serde(default)]
@@ -718,6 +723,8 @@ pub fn exchange_token_by_auth_code(
 }
 
 /// `GetPCAuthCode` 响应（新设备铸造入口，2026-08-25 手册实证路线）。
+// 字段名须与服务端 JSON 键逐字一致，保留服务端命名
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct AuthCodeEnvelope {
     #[serde(default)]
@@ -726,6 +733,8 @@ struct AuthCodeEnvelope {
     Result: Option<AuthCodeResult>,
 }
 
+// 字段名须与服务端 JSON 键逐字一致，保留服务端命名
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct AuthCodeResult {
     #[serde(default)]
@@ -963,12 +972,16 @@ pub struct UserInfoFull {
     pub migrate_to_sg: bool,
 }
 
+// 字段名须与服务端 JSON 键逐字一致，保留服务端命名
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct UserInfoEnvelope {
     #[serde(default)]
     Result: Option<UserInfoResult>,
 }
 
+// 字段名须与服务端 JSON 键逐字一致，保留服务端命名
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct UserInfoResult {
     #[serde(default)]

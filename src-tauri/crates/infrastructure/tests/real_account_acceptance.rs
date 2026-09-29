@@ -670,7 +670,7 @@ fn telemetry_headers_status_probe() {
     let now = now_unix_seconds();
 
     // 选健康账号（access token 未过期），最多 2 个：跨账号复验头集合一致性。
-    let mut healthy: Vec<&traesync_infrastructure::AccountRecord> = records
+    let healthy: Vec<&traesync_infrastructure::AccountRecord> = records
         .iter()
         .filter(|record| {
             let binding = CheckinProfileBinding::new(

@@ -10,7 +10,7 @@
 //! 同步，入清单只会制造永久差异。首次启用由命令层从当前账号云端导入。
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 

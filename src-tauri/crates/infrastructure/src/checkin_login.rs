@@ -30,12 +30,12 @@ use sha2::{Digest, Sha256};
 
 use crate::account_registry::{AccountRecord, AccountRegistry};
 use crate::checkin_credential::{
-    generate_device_keypair, CheckinCredentialBundle, CheckinProfileBinding,
-    CheckinCredentialStore,
+    generate_device_keypair, CheckinCredentialBundle, CheckinCredentialError,
+    CheckinProfileBinding, CheckinCredentialStore,
 };
 use crate::checkin_http::{
     exchange_token_by_auth_code, get_user_info_for_oauth_client, CheckinHttpError, OAuthClient,
-    TokenGrant, UserInfoSummary,
+    RealCheckinRenewalService, TokenGrant, UserInfoSummary,
 };
 
 /// 登录页地址（Trae CN v3.3.74 `bootConfig.consoleHost` + `/authorization`）。
@@ -257,6 +257,8 @@ pub fn parse_authorize_callback(query: &str) -> Result<String, LoginError> {
         return Err(LoginError::InvalidCallback);
     }
     let auth_code_info = query_param(query, "authCodeInfo").ok_or(LoginError::InvalidCallback)?;
+    // 字段名须与登录回调 JSON 键逐字一致，保留服务端命名
+    #[allow(non_snake_case)]
     #[derive(Deserialize)]
     struct AuthCodeInfo {
         #[serde(default)]
@@ -406,12 +408,65 @@ pub struct LoginHandoff {
     pub session: LoginSession,
 }
 
+/// 首次登录可持续性验收结果（ADR-0027 决策 1/3）：不含 token 或私钥正文。
+///
+/// 验收 = 用刚入库的候选代次执行一次同设备 AuthCode 滚动换发；失败时
+/// 候选凭据与失败证据保留，不回滚登录、不发起第二次 OAuth。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginAcceptance {
+    /// 验收是否通过：true = 同设备换发成功，登录完成。
+    pub passed: bool,
+    /// 失败时的稳定错误码（与凭据维护错误码同源）；通过为 None。
+    pub error_code: Option<&'static str>,
+}
+
+impl LoginAcceptance {
+    fn passed() -> Self {
+        Self {
+            passed: true,
+            error_code: None,
+        }
+    }
+
+    fn failed(error_code: &'static str) -> Self {
+        Self {
+            passed: false,
+            error_code: Some(error_code),
+        }
+    }
+
+    /// wire 状态字符串：passed / failed（组合根回执 DTO 使用）。
+    pub fn status(&self) -> &'static str {
+        if self.passed {
+            "passed"
+        } else {
+            "failed"
+        }
+    }
+}
+
+/// 验收失败错误码：与组合根的凭据维护错误码（lib.rs
+/// `credential_maintenance_error_code`）保持同一套稳定字符串。
+fn acceptance_error_code(error: &CheckinCredentialError) -> &'static str {
+    match error {
+        CheckinCredentialError::Unavailable => "credential_unavailable",
+        CheckinCredentialError::Missing => "credential_missing",
+        CheckinCredentialError::Invalid => "credential_invalid",
+        CheckinCredentialError::BindingMismatch => "binding_mismatch",
+        CheckinCredentialError::CredentialRefreshFailed => "credential_refresh_failed",
+        CheckinCredentialError::AuthMismatch => "auth_mismatch",
+        CheckinCredentialError::RecoveryRequired => "manual_recovery_required",
+    }
+}
+
 /// 登录成功回执；只含非敏感字段。
 pub struct LoginReceipt {
     pub profile_id: String,
     pub account_id: String,
     pub screen_name: String,
     pub avatar_url: String,
+    /// 首次登录可持续性验收结果（ADR-0027）；失败不回滚登录。
+    pub acceptance: LoginAcceptance,
 }
 
 /// 生成随机登录 trace ID（UUID 形态，仅用于服务端链路追踪）。
@@ -528,7 +583,17 @@ pub fn complete_login(
     // 5. GetUserInfo 补脱敏资料；失败降级（账号 ID 已可从 JWT 解出）。
     let user_info = get_user_info_for_oauth_client(client, &grant.access_token, oauth_client)
         .unwrap_or_default();
-    let receipt = persist_login_result_for(
+    // ADR-0027 首次登录可持续性验收：入库后立即用刚签发的候选代次执行一次
+    // 同设备换发（access 必然未过期，renew_now 走 GetPCAuthCode → 同设备
+    // ExchangeToken 路径，自带 journal 原子发布与身份校验）。验收通过才算
+    // 登录完成；失败不回滚登录，候选凭据与失败证据保留，回执如实带出结果。
+    // 一次 OAuth 约束：失败不重试、不重铸设备、不发起第二次授权。
+    let acceptance_renew = |binding: &CheckinProfileBinding, now: u64| {
+        RealCheckinRenewalService::new_for_oauth_client(store, oauth_client)
+            .renew_now(binding, now)
+            .map(|_| ())
+    };
+    let receipt = persist_and_accept_login(
         session.product,
         &session.profile_id,
         &session.device_id,
@@ -539,10 +604,92 @@ pub fn complete_login(
         &user_info,
         store,
         registry,
+        &acceptance_renew,
     )?;
     // Work 的 Solo 登录与 Trae CN 的独立登录都在各自产品账号池中收口；
     // Trae CN 不进入 Work 的签到/重铸调度。
     Ok(receipt)
+}
+
+/// 入库候选凭据并执行首次登录可持续性验收（ADR-0027，`complete_login` 收尾编排）。
+///
+/// 独立成函数以便 fixture 测试：注入 `renew` 闭包覆盖验收通过/失败两路径，
+/// 失败时断言候选凭据保留、回执带稳定错误码、换发只执行一次（无第二次 OAuth）。
+fn persist_and_accept_login(
+    product: LoginProduct,
+    session_profile_id: &str,
+    device_id: &str,
+    machine_id: &str,
+    device_public_key_pem: &str,
+    device_private_key_pem: &str,
+    grant: TokenGrant,
+    user_info: &UserInfoSummary,
+    store: &CheckinCredentialStore,
+    registry: &AccountRegistry,
+    renew: &dyn Fn(&CheckinProfileBinding, u64) -> Result<(), CheckinCredentialError>,
+) -> Result<LoginReceipt, LoginError> {
+    let receipt = persist_login_result_for(
+        product,
+        session_profile_id,
+        device_id,
+        machine_id,
+        device_public_key_pem,
+        device_private_key_pem,
+        grant,
+        user_info,
+        store,
+        registry,
+    )?;
+    // 验收 binding 用入库后的有效 profile_id（重复登录复用旧档案）与会话设备材料。
+    let binding = CheckinProfileBinding::new(
+        receipt.profile_id.clone(),
+        receipt.account_id.clone(),
+        device_id,
+        device_public_key_pem,
+    );
+    let acceptance = match renew(&binding, unix_now()) {
+        Ok(()) => LoginAcceptance::passed(),
+        Err(error) => {
+            // 失败证据：追加诊断日志（不含 token 正文），与换取失败共用文件。
+            append_acceptance_failure(store.root(), &receipt.profile_id, &error);
+            LoginAcceptance::failed(acceptance_error_code(&error))
+        }
+    };
+    Ok(LoginReceipt {
+        acceptance,
+        // 其余字段原样承接入库回执（profile_id 已为有效值）。
+        profile_id: receipt.profile_id,
+        account_id: receipt.account_id,
+        screen_name: receipt.screen_name,
+        avatar_url: receipt.avatar_url,
+    })
+}
+
+/// 验收失败诊断日志：与换取失败共用 `login-diagnostics.log`，
+/// 记录错误类别（不含 Token 正文）；写失败静默忽略，不影响登录结果。
+fn append_acceptance_failure(
+    root: &std::path::Path,
+    profile_id: &str,
+    error: &CheckinCredentialError,
+) {
+    use std::io::Write;
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return;
+    };
+    // 取出换发链最近一次 ExchangeToken 失败的服务端响应详情（消费即清空）。
+    let detail = crate::checkin_http::take_last_exchange_failure_detail()
+        .unwrap_or_else(|| "no-detail".to_string());
+    let line = format!(
+        "{} acceptance-failed {} {:?} | {}\n",
+        now.as_secs(),
+        profile_id,
+        error,
+        detail
+    );
+    let path = root.join("login-diagnostics.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// 将 ExchangeToken 的服务端错误归一为登录流程错误；两个设备上限码都
@@ -710,11 +857,14 @@ fn persist_login_result_for(
         archived: previous_archived,
     };
     registry.upsert(&record).map_err(|_| LoginError::Storage)?;
+    // 入库路径的占位值：真实验收结果由 persist_and_accept_login 覆盖；
+    // 直接调用入库（旧测试路径）没有验收步骤，按通过表示「无验收失败」。
     Ok(LoginReceipt {
         profile_id: record.profile_id,
         account_id: record.account_id,
         screen_name,
         avatar_url: record.avatar_url,
+        acceptance: LoginAcceptance::passed(),
     })
 }
 
@@ -1231,6 +1381,108 @@ mod tests {
         );
         assert_eq!(result.err(), Some(LoginError::InvalidCallback));
         assert!(registry.load().unwrap().is_empty());
+    }
+
+    // ===== ADR-0027 首次登录可持续性验收（P9-0 / P11-3）=====
+
+    /// 构造登录入库用的最小 TokenGrant（JWT payload 含 data.id）。
+    fn acceptance_grant(account_id: &str, refresh_token: &str) -> TokenGrant {
+        let payload = serde_json::json!({"data": {"id": account_id}, "exp": 1_800_000_000});
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
+        TokenGrant {
+            access_token: format!("eyJhbGciOiJSUzU1NiJ9.{payload_b64}.sig"),
+            refresh_token: refresh_token.to_string(),
+            access_token_expires_at_unix_seconds: 1_800_000_000,
+            refresh_token_expires_at_unix_seconds: 1_800_800_000,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_login_acceptance_passed_rotates_candidate_once() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let registry = AccountRegistry::new(root.path());
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        // fixture 验收：只记录调用次数与绑定，不触网、不改写凭据。
+        let renew = |binding: &CheckinProfileBinding, now: u64| {
+            calls.set(calls.get() + 1);
+            // 验收目标必须是刚入库的候选代次。
+            assert_eq!(binding.profile_id, "profile-accept");
+            assert_eq!(binding.account_id, "1800000000000101");
+            assert!(now > 0);
+            Ok(())
+        };
+        let receipt = persist_and_accept_login(
+            LoginProduct::WorkCn,
+            "profile-accept",
+            "1234567890123456",
+            "machine-accept",
+            &public_pem,
+            &private_pem,
+            acceptance_grant("1800000000000101", "refresh-accept"),
+            &UserInfoSummary::default(),
+            &store,
+            &registry,
+            &renew,
+        )
+        .unwrap();
+        // 验收通过：回执如实标记 passed。
+        assert!(receipt.acceptance.passed);
+        assert_eq!(receipt.acceptance.status(), "passed");
+        assert!(receipt.acceptance.error_code.is_none());
+        // 同设备换发只执行一次；一次 OAuth 约束下不存在第二次授权。
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_login_acceptance_failure_keeps_candidate_and_reports_code() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let registry = AccountRegistry::new(root.path());
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let renew = |_binding: &CheckinProfileBinding, _now: u64| {
+            calls.set(calls.get() + 1);
+            Err(CheckinCredentialError::CredentialRefreshFailed)
+        };
+        let receipt = persist_and_accept_login(
+            LoginProduct::WorkCn,
+            "profile-accept",
+            "1234567890123456",
+            "machine-accept",
+            &public_pem,
+            &private_pem,
+            acceptance_grant("1800000000000101", "refresh-accept"),
+            &UserInfoSummary::default(),
+            &store,
+            &registry,
+            &renew,
+        )
+        .unwrap();
+        // 回执如实带失败结果与稳定错误码；不回滚登录。
+        assert!(!receipt.acceptance.passed);
+        assert_eq!(receipt.acceptance.status(), "failed");
+        assert_eq!(
+            receipt.acceptance.error_code,
+            Some("credential_refresh_failed")
+        );
+        // 无第二次 OAuth：验收失败不重试、不重铸设备、不重新授权（只换发一次）。
+        assert_eq!(calls.get(), 1);
+        // 候选凭据保留：仍是登录时签发的代次，未被验收覆盖或清除。
+        let binding = CheckinProfileBinding::new(
+            "profile-accept",
+            "1800000000000101",
+            "1234567890123456",
+            &public_pem,
+        );
+        let bundle = store.load(&binding).unwrap();
+        assert_eq!(bundle.refresh_token, "refresh-accept");
+        assert_eq!(bundle.access_token_expires_at_unix_seconds, 1_800_000_000);
+        // 账号已注册（登录不回滚，档案保留）。
+        assert!(registry.find("profile-accept").unwrap().is_some());
     }
 
     // P7-4：等待期间外部中止（用户取消 / 浏览器退出）→ 立即以 Cancelled

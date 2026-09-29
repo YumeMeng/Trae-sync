@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use traesync_domain::{
-    ProcessRunningState, ScanFailureReason, ScanOutcome, ScanRequest, SnapshotFileEntry,
-    SnapshotFileKind, SnapshotFingerprint, SnapshotId, SourceSnapshotMeta,
+    ScanFailureReason, ScanOutcome, ScanRequest, SnapshotFileEntry, SnapshotFileKind,
+    SnapshotFingerprint, SnapshotId, SourceSnapshotMeta,
 };
 use traesync_ports::{FileIdentityProvider, SnapshotStore};
 

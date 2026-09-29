@@ -15,7 +15,7 @@
 //! - 按命令构造 application service（注入 raw_key 与 normalizer）
 //! - raw_key 不进入 commands 层、UI 或日志
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -28,11 +28,9 @@ use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 // trait 通过 application 重导出，避免 commands 直接依赖 ports crate
 use traesync_application::{
-    checkin_transport_error_code, AccountEvidenceReaderPort, ApplySyncPlanService,
-    AssignProjectSourceService, BatchCheckinRunner, BrowseHistoryService, BuildSyncPlanService,
-    CatalogRepository, CheckinService, CheckinTransport, DatabaseProbePort,
-    ManagedAccountSwitchService, ProcessControllerPort, RemoteDeviceManager, ScanHistoryService,
-    SyncPlanEvidencePort, WorkbenchReadService, WorkspaceStateProvider,
+    checkin_transport_error_code, AccountEvidenceReaderPort, BatchCheckinRunner, CheckinService,
+    CheckinTransport, ManagedAccountSwitchService, ProcessControllerPort,
+    RemoteDeviceManager, WorkbenchReadService, WorkspaceStateProvider,
 };
 use traesync_commands as commands;
 // R8：组合根直接使用 commands::HistoryCommandError 构造授权失败错误消息
@@ -40,51 +38,38 @@ use traesync_commands::HistoryCommandError;
 use traesync_domain::{
     AccountEvidence, AccountProfile, AccountSwitchPlan, AccountSwitchPreflight,
     AccountVerificationState, AuthorizationState, BrowseAccountNode, BrowseResult,
-    CompatibilityState, ConversationPreview, CurrentAccountEvidence, CurrentAccountState,
-    EvidenceState, HandoffIntent, HandoffIntentState, ManagedAccountRuntime, OperationCancellation,
-    OperationId, PlanAction, PlanExclusionReason, ProcessRunningState, ScanOutcome, SearchHit,
-    SessionIdentity, SyncPlan, SyncPlanContext, SyncPlanExecutionOutcome, SyncScope,
-    TargetFileEvidence, UserId, WorkbenchReadState, WorkspaceState,
-};
-use traesync_infrastructure::operation_manifest::{
-    capture_fixture_failure_scene,
-    reconcile_unfinished_manifests_for_location_with_recovery_handlers,
+    CurrentAccountEvidence, CurrentAccountState, EvidenceState, HandoffIntent, HandoffIntentState,
+    ManagedAccountRuntime, OperationCancellation, OperationId, SyncPlan, SyncScope, UserId,
+    WorkbenchReadState, WorkspaceState,
 };
 use traesync_infrastructure::{
-    capture_location_identity, capture_location_witness, catalog_operation_matches,
-    compare_location_identity, ensure_catalog_initialized, fetch_installed_plugins,
-    fetch_market_plugins, find_uninstall_target, fixture_path_error_text, get_user_info,
-    inspect_lock_status, install_market_plugin, list_operation_summaries,
-    load_account_fingerprint_salt, load_or_create_account_fingerprint_salt,
-    open_or_initialize_production_catalog, persisted_record_matches,
-    reconcile_current_catalog_sidecar, reconcile_plan, resolve_current_catalog_generation_id,
-    resolve_current_catalog_path, salted_user_id_fingerprint, storage_space_status,
-    sync_account_cloud_plugins, uninstall_cloud_plugin, user_id_binding_fingerprint,
-    user_id_display_fingerprint, AccountEvidenceReader, AccountRecord, AccountRegistry,
-    AutoCheckinBatchState, AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore,
-    CatalogPathError, CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding,
-    CloudPluginItem, CredentialApplyOutcome, CredentialBinding, CredentialMaintenanceStateStore,
-    CredentialState, CredentialStatus, CredentialVault, CredentialVaultError, DeviceRemintService,
-    FilesystemSnapshotStore, FixtureCheckinTransport, FixturePathError, FixturePathGuard,
-    FixtureWorkspaceStateProvider, JsonHandoffIntentStore, JsonManagedAccountProfileStore,
-    MarketPluginItem, OperationLease, OperationLockStatus, PersistedScanAuthorization,
+    capture_location_identity, capture_location_witness, compare_location_identity,
+    fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, fixture_path_error_text,
+    get_user_info, install_market_plugin, load_account_fingerprint_salt,
+    load_or_create_account_fingerprint_salt, open_or_initialize_production_catalog, reconcile_plan,
+    resolve_current_catalog_generation_id, resolve_current_catalog_path,
+    salted_user_id_fingerprint, storage_space_status, sync_account_cloud_plugins,
+    uninstall_cloud_plugin, user_id_binding_fingerprint, user_id_display_fingerprint,
+    AccountEvidenceReader, AccountRecord, AccountRegistry, AutoCheckinBatchState,
+    AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore, CheckinCredentialError,
+    CheckinCredentialStore, CheckinProfileBinding, CloudPluginItem, CredentialApplyOutcome,
+    CredentialBinding, CredentialMaintenanceStateStore, CredentialState, CredentialStatus,
+    CredentialVault, CredentialVaultError, DeviceRemintService, FixtureCheckinTransport,
+    FixturePathError, FixturePathGuard, FixtureWorkspaceStateProvider, JsonHandoffIntentStore,
+    JsonManagedAccountProfileStore, MarketPluginItem, OperationLease,
     PlatformFileIdentityProvider, PluginCloudSyncOutcome, PluginManifest, PluginManifestEntry,
     ProductionCatalogError, ProductionCatalogRuntime, RealCheckinRenewalService,
     RealCheckinTransport, RealReadWorkspaceStateProvider, RealRemoteDeviceManager, RemintError,
-    ScanAuthorizationStore,
-    SqlCipherCatalogRepository, SqlCipherProbe, StorageDeletionPlan, StorageMigrationResult,
-    StorageRootBinding, ProductAccountStateStore, TraeProduct, WorkCnProcessController,
-    WorkCnReadLocation, WorkCnReadLocationError, WorkCnSourceNormalizer, WorkCnSyncExecutor,
-    DEFAULT_STORAGE_WARNING_BYTES,
+    SqlCipherProbe, StorageDeletionPlan, StorageMigrationResult, StorageRootBinding,
+    ProductAccountStateStore, TraeProduct, WorkCnProcessController, WorkCnReadLocation,
+    WorkCnReadLocationError, DEFAULT_STORAGE_WARNING_BYTES,
 };
 
 #[cfg(test)]
 use traesync_infrastructure::{FixedProcessController, StaticWorkspaceStateProvider};
 
 use traesync_infrastructure::{
-    build_deletion_plan_with_lease, persist_progress_snapshot, read_progress_snapshot,
-    DeletionCandidate, DeletionTombstone, ProgressPhase, ProgressSnapshot,
-    ThrottledProgressEmitter,
+    build_deletion_plan_with_lease, DeletionCandidate, DeletionTombstone,
 };
 // OAuth 登录流（M4）：会话保存在后端，login_url 由系统浏览器打开。
 // P7-1 追加 get_user_info_full（切号 E2 构造的实调身份校验与资料来源）。
@@ -97,34 +82,38 @@ use traesync_infrastructure::{
 };
 // P2-2 TRAE 实例管理：路径发现、进程状态、窗口聚焦、登录态种子。
 // U-6 W4 追加 native_account_dir / dir_size_recursive（占用统计与彻底删除定位原生目录）。
+// P11-5 追加 close_instance（副环境实例关闭）与 CloseOutcome（关闭回执三态）。
 use traesync_infrastructure::trae_instance::{
-    self as trae_instance_module, command_line_uses_data_dir, dir_size_recursive,
-    discover_trae_executable, focus_instance_windows, instance_data_dir, list_trae_processes,
-    native_account_dir, seed_login_state, seed_login_state_from_donor,
+    self as trae_instance_module, close_instance, close_master_instance,
+    command_line_uses_data_dir, dir_size_recursive, discover_trae_executable,
+    focus_instance_windows, instance_data_dir, list_trae_processes, native_account_dir,
+    seed_login_state, seed_login_state_from_donor, CloseOutcome,
 };
-// 实例关闭（主库变体覆盖官方无参启动形态；close_instance 账号变体已随
-// P6-2 实例功能退役，原语保留在 infrastructure 供 P6-4 环境实例复用）。
-use traesync_infrastructure::trae_instance::close_master_instance;
 // P5-0 主库环境注册表（环境模型 grill Q1/Q2/Q7：V1 单主库环境档案持久化）。
+// P11-6 追加 master_data_dir_for（Trae CN 只读库目录解析；纯函数形态由单测全限定引用）。
 use traesync_infrastructure::environment_registry::{
-    self as environment_registry_module, master_data_dir, secondary_data_dir, EnvironmentRegistry,
-    EnvironmentRegistryError, MASTER_ENV_ID,
+    self as environment_registry_module, master_data_dir, master_data_dir_for,
+    secondary_data_dir, EnvironmentRegistry, EnvironmentRegistryError, MASTER_ENV_ID,
 };
 // P5-1 主库切号五步事务原语：交接（备份/活动检测/换腿）、凭据互换、接力台账。
 // P7-1 追加 E2 构造路径：construct_auth_identity（凭据包 + GetUserInfo 构造登录态）。
+// P11-4 追加：跨目录三件套备份（_to 家族 + 同戳版本）、目录版备份链枚举。
 use traesync_infrastructure::{
-    archive_login_user_id, backup_master_trio, construct_auth_identity, handover_master_records,
-    handover_master_records_with_progress, list_master_backups, master_database_path,
-    master_db_activity_detected, switch_auth_identity, AuthIdentitySwitch, AuthSwitchError,
-    ConstructAuthInput, HandoverProgress, MasterHandover, MasterHandoverError, RelayLedger,
-    RelayLedgerEntry,
+    archive_login_user_id, backup_master_trio_stamped, backup_master_trio_to,
+    construct_auth_identity, handover_master_records, handover_master_records_with_progress,
+    list_master_backups_in, master_database_path, master_db_activity_detected,
+    switch_auth_identity, AuthIdentitySwitch, AuthSwitchError, ConstructAuthInput,
+    HandoverProgress, MasterHandover, MasterHandoverError, RelayLedger, RelayLedgerEntry,
 };
 // P5-9 备份保留策略：定次自动裁剪（设置存取 + 备份链清理）。
+// P11-4 追加：备份位置覆盖读取、目录校验、迁移（_inner 别名避免与命令同名冲突）。
 use traesync_infrastructure::backup_retention::{
-    prune_master_backups, BackupRetentionSettings, BackupRetentionStore,
+    load_backup_dir_override, migrate_master_backups as migrate_master_backups_inner,
+    prune_master_backups, BackupMigrationOutcome, BackupRetentionSettings, BackupRetentionStore,
+    MAX_BACKUP_DIR_BYTES,
 };
 // U-6 W3 会话索引变化检测：三件套 stat 指纹（命令 DTO 直接复用 infrastructure 类型，
-// wire 格式为 snake_case 字段，与 SessionSummaryDto 等现有 DTO 口径一致）。
+// wire 格式为 snake_case 字段，与现有 DTO 口径一致）。
 // U-6 W4 追加 SessionIndexCacheStore：彻底删除记录时清理会话索引缓存。
 use traesync_infrastructure::account_session_index::{InstanceFingerprint, SessionIndexCacheStore};
 // P5-3 历史页主库视图：项目/会话两栏数据源 + 指纹轮询预检 + 主库消息预览。
@@ -136,6 +125,8 @@ use traesync_infrastructure::master_history::{
 };
 // P5-8a 会话归档通道（ADR-0022）：hidden_status 借用 + 真实删除（先备份铁律）。
 // 基础设施函数加 _inner 别名，避免与同名 Tauri 命令函数冲突（E0255）。
+// P11-5 追加 ArchiveDraftStore：库归档草稿迁入 storage_root 持久化。
+use traesync_infrastructure::archive_draft_store::{ArchiveDraftRecord, ArchiveDraftStore, ArchiveDraftStoreError};
 use traesync_infrastructure::{
     apply_master_archive_changes as apply_master_archive_changes_inner,
     archive_master_sessions as archive_master_sessions_inner,
@@ -153,13 +144,7 @@ static COMMON_CONTROLS_V6_DIRECTIVE: [u8; 167] = *b"/manifestdependency:\"type='
 
 mod checkin_overview;
 mod operation_contract;
-#[cfg(not(test))]
-use operation_contract::{
-    attention_error_for_outcome, OperationFinishedEventDto, OperationNeedsAttentionEventDto,
-    OperationProgressEventDto, OperationStageEventDto, OPERATION_FINISHED_EVENT,
-    OPERATION_NEEDS_ATTENTION_EVENT, OPERATION_PROGRESS_EVENT, OPERATION_STAGE_EVENT,
-};
-use operation_contract::{CommandErrorDto, OperationDto, ReconcileUnfinishedOperationsDto};
+use operation_contract::CommandErrorDto;
 
 /// 已验证 Work CN 版本的 SQLCipher 技术参数；不属于登录凭证或目录库密钥。
 const WORK_CN_SOURCE_RAW_KEY: &str =
@@ -226,43 +211,6 @@ impl AuthorizationSlot {
         }
     }
 
-    /// 开始一次授权请求，并立即使旧授权失效。
-    fn begin_grant(&mut self) -> u64 {
-        self.generation = self.generation.checked_add(1).expect("扫描授权代次溢出");
-        self.state = AuthorizationState::NotAuthorized;
-        self.real_location = None;
-        self.real_location_witness = None;
-        self.real_user_fingerprint = None;
-        self.real_auth_fingerprint = None;
-        self.generation
-    }
-
-    /// 仅最新授权请求可提交；旧请求晚返回时保持当前状态不变。
-    fn commit_grant(&mut self, generation: u64, state: AuthorizationState) -> bool {
-        self.commit_grant_with_binding(generation, state, None, None, None, None)
-    }
-
-    /// 提交授权及其真实读取绑定。绑定只存在于后端，不进入序列化 DTO。
-    fn commit_grant_with_binding(
-        &mut self,
-        generation: u64,
-        state: AuthorizationState,
-        location: Option<WorkCnReadLocation>,
-        location_witness: Option<traesync_infrastructure::LocationWitness>,
-        user_fingerprint: Option<String>,
-        auth_fingerprint: Option<String>,
-    ) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.state = state;
-        self.real_location = location;
-        self.real_location_witness = location_witness;
-        self.real_user_fingerprint = user_fingerprint;
-        self.real_auth_fingerprint = auth_fingerprint;
-        true
-    }
-
     /// 撤销属于新的用户意图：递增代次，使所有更早的 pending grant 失效。
     fn revoke(&mut self) {
         self.generation = self.generation.checked_add(1).expect("扫描授权代次溢出");
@@ -305,8 +253,6 @@ struct AppState {
     /// TRAE 源数据库 SQLCipher raw key；生产模式使用已验证技术基线。
     /// 空字符串表示未配置——命令返回错误，不泄露 key 状态。
     source_raw_key: String,
-    /// Trae Sync 自有目录库密钥；生产模式必须与源数据库密钥独立。
-    catalog_key: String,
     /// 存储根路径，从 env `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取。
     /// 快照发布到 `<storage_root>/snapshots/`，目录库由 `catalog/current.json` 选定。
     /// 空字符串表示未配置——扫描命令返回错误。
@@ -323,8 +269,6 @@ struct AppState {
     pending_sync_plan: Arc<Mutex<Option<PendingSyncPlan>>>,
     /// T06：当前写操作的取消令牌；进入目标写入后执行器自行忽略取消。
     active_sync_cancellation: Arc<Mutex<Option<OperationCancellation>>>,
-    /// T11：当前操作的最后一个可查询进度快照。
-    current_progress: Arc<Mutex<Option<ProgressSnapshot>>>,
     /// T12：删除计划只保存在后端，前端不能回传伪造计划执行。
     pending_deletion_plan: Arc<Mutex<Option<StorageDeletionPlan>>>,
     /// P1：账号切换只保存非敏感元数据；真实凭证交接仍由外部账号管理器完成。
@@ -544,81 +488,6 @@ struct ManagedCredentialStatusWireDto {
     format_version: Option<u32>,
 }
 
-/// 前端计划预览白名单；完整 SyncPlan 只留在后端 pending_sync_plan 中。
-#[derive(Debug, Clone, Serialize)]
-struct SyncPlanPreviewDto {
-    operation_id: String,
-    target_account_label: String,
-    scope_snapshot: SyncScope,
-    actions: Vec<SyncPlanPreviewActionDto>,
-    exclusions: Vec<SyncPlanPreviewExclusionDto>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum SyncPlanPreviewActionDto {
-    FollowProject {
-        project_id: String,
-        from_account_label: String,
-        to_account_label: String,
-    },
-    AttachSessions {
-        source_project_id: String,
-        target_project_id: String,
-        session_ids: Vec<SessionIdentity>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SyncPlanPreviewExclusionDto {
-    project_id: String,
-    session_id: Option<SessionIdentity>,
-    reason: PlanExclusionReason,
-}
-
-impl From<&SyncPlan> for SyncPlanPreviewDto {
-    fn from(plan: &SyncPlan) -> Self {
-        Self {
-            operation_id: plan.operation_id().as_str().to_string(),
-            target_account_label: preview_account_label(plan.current_user_id(), "当前账号"),
-            scope_snapshot: plan.scope_snapshot().clone(),
-            actions: plan
-                .actions()
-                .iter()
-                .map(|action| match action {
-                    PlanAction::FollowProject {
-                        project_id,
-                        from_user_id,
-                        to_user_id,
-                    } => SyncPlanPreviewActionDto::FollowProject {
-                        project_id: project_id.clone(),
-                        from_account_label: preview_account_label(from_user_id, "来源账号"),
-                        to_account_label: preview_account_label(to_user_id, "当前账号"),
-                    },
-                    PlanAction::AttachSessions {
-                        source_project_id,
-                        target_project_id,
-                        session_ids,
-                    } => SyncPlanPreviewActionDto::AttachSessions {
-                        source_project_id: source_project_id.clone(),
-                        target_project_id: target_project_id.clone(),
-                        session_ids: session_ids.clone(),
-                    },
-                })
-                .collect(),
-            exclusions: plan
-                .exclusions()
-                .iter()
-                .map(|exclusion| SyncPlanPreviewExclusionDto {
-                    project_id: exclusion.project_id.clone(),
-                    session_id: exclusion.session_id.clone(),
-                    reason: exclusion.reason,
-                })
-                .collect(),
-        }
-    }
-}
-
 /// 请求当前活动的可取消操作停止；无活动操作时直接返回 false。
 ///
 /// 在 P6-2 会话索引/计划族退役后，仍然保留：切换账号与授权撤销时
@@ -767,13 +636,6 @@ struct SessionMessageDto {
     message_type: String,
     created_at_unix_seconds: i64,
     content: SessionMessageContentDto,
-}
-
-/// 计划预览只发送不可逆显示标签；合成 fixture ID 使用稳定角色名回退。
-fn preview_account_label(user_id: &str, fallback: &str) -> String {
-    UserId::from_verified(user_id)
-        .map(|value| format!("TRAE Work CN · {}", user_id_display_fingerprint(&value)))
-        .unwrap_or_else(|_| fallback.to_string())
 }
 
 fn system_time_to_rfc3339(value: std::time::SystemTime) -> String {
@@ -997,13 +859,6 @@ fn ensure_fixture_runtime(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_real_read_runtime(state: &AppState) -> Result<(), String> {
-    if state.runtime_mode != RuntimeMode::RealReadPreview {
-        return Err("fixture 模式不接受生产默认位置命令".to_string());
-    }
-    Ok(())
-}
-
 /// 捕获当前读取授权的代次与范围，供一次读取操作绑定使用。
 ///
 /// 代次必须和范围一起捕获；只比较路径会让“撤销后重新授权到同一位置”的旧操作
@@ -1121,15 +976,6 @@ fn invalidate_on_authorization_error<T>(
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct LockStatusDto {
-    data_location_id: Option<String>,
-    catalog_lock_held: bool,
-    data_location_lock_held: bool,
-    write_allowed: bool,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 struct StorageRootStateDto {
     configured: bool,
     available: bool,
@@ -1142,124 +988,6 @@ struct StorageRootStateDto {
     warning_active: bool,
     automatic_scan_paused: bool,
     reason: Option<String>,
-}
-
-/// 执行前和执行中都从 fixture 重读计划证据，绝不复用建计划时的内存快照。
-struct RuntimeSyncPlanEvidence<'a> {
-    fixture_root: &'a Path,
-    target_db_path: &'a Path,
-    source_raw_key: &'a str,
-    reader: &'a AccountEvidenceReader,
-    probe: &'a SqlCipherProbe,
-}
-
-/// 协调前后必须保持一致的 fixture 账号、位置和文件见证。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FixtureReconciliationWitness {
-    data_location_id: String,
-    current_user_id: String,
-    account_evidence_fingerprint: String,
-    target_file_evidence: TargetFileEvidence,
-}
-
-/// 读取当前授权 fixture 的账号、位置和文件见证；只读，不创建恢复区或目录库。
-fn capture_fixture_reconciliation_witness(
-    state: &AppState,
-    guard: &FixturePathGuard,
-    db_path: &Path,
-) -> Result<FixtureReconciliationWitness, String> {
-    let db_relative_path = db_path
-        .strip_prefix(guard.canonical_root())
-        .map_err(|_| "目标数据库不在已授权数据位置内".to_string())?
-        .to_string_lossy()
-        .into_owned();
-    let location = capture_location_witness(
-        &PlatformFileIdentityProvider::new(),
-        guard.canonical_root(),
-        &db_relative_path,
-    )
-    .map_err(|error| error.to_string())?;
-    let observation = state.process_controller.observe(
-        &location.data_location_id,
-        guard.canonical_root(),
-        &db_relative_path,
-    );
-    if let Some(error_code) = observation.error_code() {
-        return Err(error_code.to_string());
-    }
-
-    let context = read_sync_plan_context(
-        &state.workbench_reader,
-        &state.workbench_probe,
-        &state.source_raw_key,
-        guard.canonical_root(),
-        db_path,
-        std::time::SystemTime::now(),
-        true,
-    )?;
-    if !context.schema_compatible {
-        return Err("schema_unsupported".to_string());
-    }
-    let target_file_evidence = TargetFileEvidence {
-        db_fingerprint: location
-            .db_sha256
-            .ok_or_else(|| "无法读取目标数据库指纹".to_string())?,
-        wal_fingerprint: location.wal_sha256,
-        shm_fingerprint: location.shm_sha256,
-    };
-    if context.data_location_id != location.data_location_id
-        || context.target_file_evidence != target_file_evidence
-    {
-        return Err("data_location_changed".to_string());
-    }
-    Ok(FixtureReconciliationWitness {
-        data_location_id: location.data_location_id,
-        current_user_id: context.current_user_id,
-        account_evidence_fingerprint: context.account_evidence_fingerprint,
-        target_file_evidence,
-    })
-}
-
-/// 协调回调只允许在账号、位置和三件套见证仍相同时写入失败现场或 manifest。
-fn fixture_reconciliation_witness_is_current(
-    state: &AppState,
-    guard: &FixturePathGuard,
-    db_path: &Path,
-    expected: &FixtureReconciliationWitness,
-) -> bool {
-    capture_fixture_reconciliation_witness(state, guard, db_path)
-        .map(|actual| actual == *expected)
-        .unwrap_or(false)
-}
-
-impl SyncPlanEvidencePort for RuntimeSyncPlanEvidence<'_> {
-    fn is_current(&self, plan: &SyncPlan) -> bool {
-        read_sync_plan_context(
-            self.reader,
-            self.probe,
-            self.source_raw_key,
-            self.fixture_root,
-            self.target_db_path,
-            std::time::SystemTime::now(),
-            true,
-        )
-        .map(|context| plan.matches_context(&context))
-        .unwrap_or(false)
-    }
-
-    fn is_current_after_commit(&self, plan: &SyncPlan) -> bool {
-        read_sync_plan_context(
-            self.reader,
-            self.probe,
-            self.source_raw_key,
-            self.fixture_root,
-            self.target_db_path,
-            std::time::SystemTime::now(),
-            true,
-        )
-        .map(|context| plan.matches_post_commit_context(&context))
-        .unwrap_or(false)
-    }
 }
 
 /// 读取已授权 fixture 的目标数据库；未授权时在构造 guard 或访问文件系统前拒绝。
@@ -1385,138 +1113,6 @@ fn resolve_authorized_read_target_for_context(
     Ok(target)
 }
 
-/// 统一包裹浏览、搜索、正文和计划读取，确保授权失效时不会把旧结果继续交给调用方。
-fn with_authorized_read_context<T, F>(state: &AppState, operation: F) -> Result<T, String>
-where
-    F: FnOnce(&AppState, u64, &AuthorizationState) -> Result<T, String>,
-{
-    let (generation, authorization) = capture_authorized_read_context(state)?;
-    let result = operation(state, generation, &authorization);
-    match result {
-        Ok(value) => {
-            match ensure_authorization_context_current(state, generation, &authorization) {
-                Ok(()) => Ok(value),
-                Err(error) => {
-                    invalidate_on_authorization_error(state, generation, &authorization, error)
-                }
-            }
-        }
-        Err(error) => invalidate_on_authorization_error(state, generation, &authorization, error),
-    }
-}
-
-/// 目录库浏览与源数据库读取解耦。生产库存历史来自 Trae Sync 自有目录库，
-/// 不要求当前账号仍登录；fixture 仍沿用显式授权范围。
-fn with_catalog_read_context<T, F>(state: &AppState, operation: F) -> Result<T, String>
-where
-    F: FnOnce(&Path) -> Result<T, String>,
-{
-    match state.runtime_mode {
-        RuntimeMode::Fixture => {
-            with_authorized_read_context(state, |state, generation, authorization| {
-                let (_data_root, _db_path, storage_root) =
-                    resolve_authorized_read_target_for_context(state, generation, authorization)?;
-                operation(&storage_root)
-            })
-        }
-        RuntimeMode::RealReadPreview => {
-            let runtime = state
-                .production_catalog
-                .as_ref()
-                .ok_or_else(|| "生产目录库运行材料不可用".to_string())?;
-            StorageRootBinding::open_existing(
-                &runtime.storage_root,
-                None,
-                Some(&runtime.catalog_id),
-            )
-            .map_err(|error| error.to_string())?;
-            operation(&runtime.storage_root)
-        }
-    }
-}
-
-/// 只有授权代次仍匹配时，才能把计划放入后端缓存；授权锁保持到缓存写入完成。
-fn store_sync_plan_if_current(
-    state: &AppState,
-    generation: u64,
-    authorization: &AuthorizationState,
-    plan: SyncPlan,
-) -> Result<(), String> {
-    let slot = state.authorization.lock().unwrap();
-    if slot.generation != generation || slot.state != *authorization {
-        return Err("authorization_mismatch".to_string());
-    }
-    // 授权锁保持到缓存写入结束，阻止授权变更与旧计划写入交错。
-    *state.pending_sync_plan.lock().unwrap() = Some(PendingSyncPlan { generation, plan });
-    Ok(())
-}
-
-/// 用当前账号、三件套、schema 和固定 mapping 构造计划证据上下文。
-fn read_sync_plan_context(
-    reader: &AccountEvidenceReader,
-    probe: &SqlCipherProbe,
-    raw_key: &str,
-    fixture_root: &Path,
-    db_path: &Path,
-    now: std::time::SystemTime,
-    re_read_after_close: bool,
-) -> Result<SyncPlanContext, String> {
-    let account = if re_read_after_close {
-        reader.re_read_after_close(fixture_root, now)
-    } else {
-        reader.read_account_evidence(fixture_root, now)
-    };
-    if account.evidence_state != EvidenceState::Verified {
-        return Err("当前账号证据未通过双来源验证，无法执行同步计划".to_string());
-    }
-    let current_user_id = account
-        .user_id
-        .as_ref()
-        .map(|user_id| user_id.as_str().to_string())
-        .ok_or_else(|| "当前账号证据不足，无法执行同步计划".to_string())?;
-    let account_evidence_fingerprint = account
-        .auth_fingerprint
-        .as_ref()
-        .map(|fingerprint| fingerprint.0.clone())
-        .ok_or_else(|| "当前账号指纹缺失，无法执行同步计划".to_string())?;
-
-    let compatibility = probe.probe_database(db_path, raw_key);
-    let (schema_compatible, schema_fingerprint) = match compatibility {
-        CompatibilityState::Verified {
-            schema_fingerprint, ..
-        } => (true, schema_fingerprint.0),
-        CompatibilityState::Incompatible { .. } => (false, "incompatible".to_string()),
-    };
-    // T08：计划绑定文件身份和哈希见证，不再把路径字符串当作唯一位置身份。
-    let location_witness = capture_location_witness(
-        &PlatformFileIdentityProvider::new(),
-        fixture_root,
-        db_path
-            .strip_prefix(fixture_root)
-            .map_err(|_| "数据库不在数据位置根目录内".to_string())?
-            .to_string_lossy()
-            .as_ref(),
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(SyncPlanContext {
-        created_at: now,
-        platform_id: "work_cn".to_string(),
-        data_location_id: location_witness.data_location_id,
-        current_user_id,
-        account_evidence_fingerprint,
-        target_file_evidence: TargetFileEvidence {
-            db_fingerprint: location_witness
-                .db_sha256
-                .ok_or_else(|| "无法读取目标数据库指纹".to_string())?,
-            wal_fingerprint: location_witness.wal_sha256,
-            shm_fingerprint: location_witness.shm_sha256,
-        },
-        schema_fingerprint,
-        mapping_version: "work_cn_v1".to_string(),
-        schema_compatible,
-    })
-}
-
 fn recovery_root_path(state: &AppState) -> Result<&Path, String> {
     if state.recovery_root.is_empty() {
         Err("恢复区未配置".to_string())
@@ -1537,117 +1133,6 @@ fn prepare_recovery_root(state: &AppState, guard: &FixturePathGuard) -> Result<P
     guard
         .validate_shared_recovery_root(&safe_candidate)
         .map_err(fixture_path_command_error)
-}
-
-fn current_data_location_id(state: &AppState) -> Option<String> {
-    if state.runtime_mode == RuntimeMode::RealReadPreview {
-        return state
-            .authorization
-            .lock()
-            .unwrap()
-            .real_location_witness
-            .as_ref()
-            .map(|witness| witness.data_location_id.clone());
-    }
-
-    let authorization = state.authorization.lock().unwrap().state.clone();
-    let AuthorizationState::Authorized {
-        canonical_fixture_root,
-        db_relative_path,
-    } = authorization
-    else {
-        return None;
-    };
-    let guard = FixturePathGuard::new(Path::new(&canonical_fixture_root)).ok()?;
-    guard.validate_db_relative_path(&db_relative_path).ok()?;
-    capture_location_witness(
-        &PlatformFileIdentityProvider::new(),
-        guard.canonical_root(),
-        &db_relative_path,
-    )
-    .ok()
-    .map(|witness| witness.data_location_id)
-}
-
-fn set_progress(state: &AppState, snapshot: ProgressSnapshot, app: Option<&tauri::AppHandle>) {
-    if !state.recovery_root.is_empty() {
-        let _ = persist_progress_snapshot(Path::new(&state.recovery_root), &snapshot);
-    }
-    *state.current_progress.lock().unwrap() = Some(snapshot.clone());
-    emit_progress_events(app, &snapshot);
-}
-
-/// 将进度统一桥接为阶段事件和进度事件；持久化查询仍是事件丢失后的权威兜底。
-#[cfg(not(test))]
-fn emit_progress_events(app: Option<&tauri::AppHandle>, snapshot: &ProgressSnapshot) {
-    let Some(app) = app else {
-        return;
-    };
-    let stage = OperationStageEventDto {
-        operation_id: snapshot.operation_id.clone(),
-        phase: snapshot.phase,
-        cancellable: snapshot.cancellable,
-    };
-    let _ = app.emit(OPERATION_STAGE_EVENT, &stage);
-    let _ = app.emit(
-        OPERATION_PROGRESS_EVENT,
-        snapshot as &OperationProgressEventDto,
-    );
-}
-
-/// 单元测试不启动 Tauri runtime，事件桥接由前端和命令编译检查覆盖。
-#[cfg(test)]
-fn emit_progress_events(_app: Option<&tauri::AppHandle>, _snapshot: &ProgressSnapshot) {}
-
-/// 发布终态和需要人工关注的结果；事件发送失败不改变本地安全结论。
-#[cfg(not(test))]
-fn emit_operation_outcome(
-    app: &tauri::AppHandle,
-    operation_id: String,
-    outcome: &SyncPlanExecutionOutcome,
-) {
-    let finished = OperationFinishedEventDto {
-        operation_id: operation_id.clone(),
-        outcome: *outcome,
-    };
-    let _ = app.emit(OPERATION_FINISHED_EVENT, &finished);
-    if let Some(error) = attention_error_for_outcome(outcome) {
-        let attention = OperationNeedsAttentionEventDto {
-            operation_id,
-            error,
-        };
-        let _ = app.emit(OPERATION_NEEDS_ATTENTION_EVENT, &attention);
-    }
-}
-
-/// 发布执行前失败的结构化错误；这类失败没有领域 outcome，仍需让 UI 进入人工关注状态。
-#[cfg(not(test))]
-fn emit_operation_error(app: &tauri::AppHandle, operation_id: String, error: CommandErrorDto) {
-    let attention = OperationNeedsAttentionEventDto {
-        operation_id,
-        error,
-    };
-    let _ = app.emit(OPERATION_NEEDS_ATTENTION_EVENT, &attention);
-}
-
-/// 单元测试不启动 Tauri runtime，避免把 Windows WebView/系统 DLL 装载问题混入业务测试。
-#[cfg(test)]
-fn emit_operation_outcome(
-    _app: &tauri::AppHandle,
-    _operation_id: String,
-    _outcome: &SyncPlanExecutionOutcome,
-) {
-}
-
-/// 单元测试不启动 Tauri runtime；生产错误桥接由编译检查和前端契约测试覆盖。
-#[cfg(test)]
-fn emit_operation_error(_app: &tauri::AppHandle, _operation_id: String, _error: CommandErrorDto) {}
-
-fn progress_phase_for_outcome(outcome: &SyncPlanExecutionOutcome) -> ProgressPhase {
-    match outcome {
-        SyncPlanExecutionOutcome::Completed { .. } => ProgressPhase::Completed,
-        _ => ProgressPhase::Failed,
-    }
 }
 
 /// `get_workspace_state` Tauri command。
@@ -3605,9 +3090,13 @@ fn trae_cn_material_root(state: &AppState) -> Result<PathBuf, String> {
     if state.storage_root.is_empty() {
         return Err("trae_cn_storage_unavailable".to_string());
     }
-    Ok(Path::new(&state.storage_root)
-        .join("products")
-        .join("trae_cn"))
+    Ok(trae_cn_material_root_from(Path::new(&state.storage_root)))
+}
+
+/// P11-6 纯函数形态（库账号解析与单测用）：Trae CN 产品账号根 =
+/// `{storage_root}/products/trae_cn`（与 `trae_cn_material_root` 同源派生规则）。
+fn trae_cn_material_root_from(storage_root: &Path) -> PathBuf {
+    storage_root.join("products").join("trae_cn")
 }
 
 /// 自动签到调度器循环间隔（秒）：兼顾触发及时性与存储读取频率。
@@ -3726,7 +3215,8 @@ fn maintain_all_credentials(material_root: &Path, execution_lock: &Arc<Mutex<()>
 /// 后台线程每 tick 检查触发条件（设置开启 + 今日未发起 + 已到/已过今日时间点）；
 /// 通过后读取注册表筛选 `auto_checkin_enabled` 账号，生成 0~15 分钟错峰计划，
 /// 逐账号短持锁执行（手动批次执行中 try_lock 失败即跳过，决策 5 互斥规则）。
-/// 台账发起即写：错峰期间 App 退出不重复发起，未执行账号由用户手动补签。
+/// 台账发起即写：错峰期间 App 退出后台账停 Running，下次 tick 由中断恢复
+/// 补跑收尾（P11-2②）；撞锁跳过账号当日每约 30 分钟顺延重试（P11-2①）。
 /// 仅真实模式启动（fixture 演示无自动签到语义）。
 fn spawn_auto_checkin_scheduler(
     app: tauri::AppHandle,
@@ -3756,8 +3246,15 @@ fn spawn_auto_checkin_scheduler(
     });
 }
 
-/// 单次调度 tick：判定 -> 发起 -> 错峰执行。任何存储错误静默等待下个 tick
+/// 单次调度 tick：判定 -> 执行对应批次。任何存储错误静默等待下个 tick
 /// （fail-closed：损坏的设置/台账文件不触发自动签到）。
+///
+/// 判定优先级（互斥，逐级落空）：
+/// 1. 常规触发：今日未发起且已到时间点 → 全量错峰首发批次；
+/// 2. 中断恢复：今日台账 Running（批次在本线程同步执行，tick 时观察到的
+///    Running 必为上次进程中断遗留）→ 全量补跑（before 探测防重复 claim）；
+/// 3. 顺延重试：今日台账已完成且仍有撞锁跳过账号，距上次批次结束满
+///    30 分钟 → 只重试 skipped 账号（P11-2①）。
 fn run_auto_checkin_tick(
     app: &tauri::AppHandle,
     material_root: &Path,
@@ -3767,38 +3264,96 @@ fn run_auto_checkin_tick(
     let Ok((settings, ledger)) = store.load() else {
         return;
     };
+    // 总开关关闭时调度器完全静默（含中断补跑与顺延重试）。
+    if !settings.enabled {
+        return;
+    }
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let now_minutes = now.hour() * 60 + now.minute();
-    if !traesync_infrastructure::should_trigger_auto_checkin(
+
+    // 1) 常规触发：今日未发起（台账非今日）且已到/已过今日触发时间点。
+    if traesync_infrastructure::should_trigger_auto_checkin(
         &settings,
         ledger.as_ref(),
         &today,
         now_minutes,
     ) {
+        let eligible_ids = auto_checkin_eligible_ids(material_root);
+        let mut ledger = fresh_auto_checkin_ledger(today.clone(), eligible_ids.len());
+        let _ = store.save_ledger(&ledger);
+        match traesync_infrastructure::build_staggered_plan(eligible_ids) {
+            Ok(plan) => {
+                run_auto_checkin_batch(app, material_root, execution_lock, &store, &mut ledger, plan);
+            }
+            // 随机源异常极罕见；台账已记 Running，下个 tick 走中断恢复补跑。
+            Err(_) => return,
+        }
         return;
     }
-    // 筛选参与自动签到的账号；注册表读取失败按无账号处理（写台账防空转重试）。
-    let eligible_ids: Vec<String> = AccountRegistry::new(material_root)
+
+    // 2) 中断恢复：今日台账 Running = 上次进程中断遗留，重写台账全量补跑。
+    if traesync_infrastructure::should_recover_interrupted_checkin(ledger.as_ref(), &today) {
+        let eligible_ids = auto_checkin_eligible_ids(material_root);
+        let mut ledger = fresh_auto_checkin_ledger(today.clone(), eligible_ids.len());
+        let _ = store.save_ledger(&ledger);
+        // 补跑不错峰：顺序直跑；before 探测让已签账号直接 AlreadyCheckedIn。
+        let plan = eligible_ids.into_iter().map(|id| (id, 0u64)).collect();
+        run_auto_checkin_batch(app, material_root, execution_lock, &store, &mut ledger, plan);
+        return;
+    }
+
+    // 3) 顺延重试：已完成批次仍有撞锁账号且距上次批次结束满 30 分钟。
+    let now_unix = now.timestamp().max(0) as u64;
+    if traesync_infrastructure::should_retry_skipped_checkin(ledger.as_ref(), &today, now_unix) {
+        let Some(saved) = ledger.as_ref() else {
+            return;
+        };
+        let mut ledger = saved.clone();
+        // 只重试撞锁跳过的账号（不错峰）；再撞锁则台账结束时刻随批次刷新，
+        // 自然继续顺延到无 skipped 或当日结束。
+        let plan = ledger.skipped_ids.iter().map(|id| (id.clone(), 0u64)).collect();
+        run_auto_checkin_batch(app, material_root, execution_lock, &store, &mut ledger, plan);
+    }
+}
+
+/// 筛选参与自动签到的账号 id（注册表读取失败按无账号处理）。
+fn auto_checkin_eligible_ids(material_root: &Path) -> Vec<String> {
+    AccountRegistry::new(material_root)
         .load()
         .unwrap_or_default()
         .into_iter()
         .filter(|record| record.auto_checkin_enabled)
         .map(|record| record.profile_id)
-        .collect();
-    // 发起即写台账（state=Running）：中断后今日不再自动发起。
-    let mut ledger = AutoCheckinLedger {
-        date: today.clone(),
+        .collect()
+}
+
+/// 今日新批次台账（首发与中断补跑共用：计数从零起，描述本次批次）。
+fn fresh_auto_checkin_ledger(today: String, total: usize) -> AutoCheckinLedger {
+    AutoCheckinLedger {
+        date: today,
         state: AutoCheckinBatchState::Running,
-        total: eligible_ids.len(),
+        total,
         completed: 0,
         failed: 0,
         skipped: 0,
-    };
-    let _ = store.save_ledger(&ledger);
-    let Ok(plan) = traesync_infrastructure::build_staggered_plan(eligible_ids) else {
-        return; // 随机源异常极罕见；台账已记 Running，下个 tick 不重试（今日作罢）
-    };
+        skipped_ids: Vec::new(),
+        last_batch_finished_at: None,
+    }
+}
+
+/// 执行一个自动签到批次：逐账号短持锁 + 单账号签到路径，实时写台账并
+/// 推送进度；结束时置 Finished 并记录结束时刻（顺延重试的间隔基准）。
+/// plan 为 (profile_id, 相对延迟秒) 升序序列：首发批次错峰 0~15 分钟，
+/// 补跑/重试批次全部为 0（顺序直跑）。
+fn run_auto_checkin_batch(
+    app: &tauri::AppHandle,
+    material_root: &Path,
+    execution_lock: &Arc<Mutex<()>>,
+    store: &AutoCheckinStore,
+    ledger: &mut AutoCheckinLedger,
+    plan: Vec<(String, u64)>,
+) {
     // 进度事件的名称查找表（与 run_real_checkin 相同约定）。
     let name_by_profile: std::collections::BTreeMap<String, String> =
         AccountRegistry::new(material_root)
@@ -3810,14 +3365,18 @@ fn run_auto_checkin_tick(
     let mut previous_delay = 0u64;
     let mut handled = 0usize;
     for (profile_id, delay) in plan {
-        // 增量睡眠到该账号目标时刻（plan 按延迟升序）。
+        // 增量睡眠到该账号目标时刻（plan 按延迟升序；补跑/重试全为 0）。
         std::thread::sleep(std::time::Duration::from_secs(delay - previous_delay));
         previous_delay = delay;
         handled += 1;
-        // 决策 5 互斥：手动批次执行中跳过该账号，当日不重试。
+        // 决策 5 互斥：手动批次执行中跳过该账号，记入当日顺延重试集合
+        // （重试批次再撞锁则保持原状，等下个 30 分钟周期）。
         let Ok(_guard) = execution_lock.try_lock() else {
-            ledger.skipped += 1;
-            let _ = store.save_ledger(&ledger);
+            if !ledger.skipped_ids.contains(&profile_id) {
+                ledger.skipped += 1;
+                ledger.skipped_ids.push(profile_id.clone());
+                let _ = store.save_ledger(ledger);
+            }
             emit_auto_checkin_progress(
                 app,
                 &profile_id,
@@ -3856,7 +3415,13 @@ fn run_auto_checkin_tick(
         } else {
             ledger.failed += 1;
         }
-        let _ = store.save_ledger(&ledger);
+        // 重试批次中已有结论的账号移出顺延重试集合：签成转 completed、
+        // 真实失败转 failed，均不再反复重试（skipped 计数同步回落）。
+        if let Some(position) = ledger.skipped_ids.iter().position(|id| id == &profile_id) {
+            ledger.skipped_ids.remove(position);
+            ledger.skipped = ledger.skipped.saturating_sub(1);
+        }
+        let _ = store.save_ledger(ledger);
         emit_auto_checkin_progress(
             app,
             &profile_id,
@@ -3868,7 +3433,8 @@ fn run_auto_checkin_tick(
         );
     }
     ledger.state = AutoCheckinBatchState::Finished;
-    let _ = store.save_ledger(&ledger);
+    ledger.last_batch_finished_at = Some(chrono::Utc::now().timestamp().max(0) as u64);
+    let _ = store.save_ledger(ledger);
     // 完成事件（前端横幅，决策 5：应用内通知）。
     let _ = app.emit(
         "auto-checkin-finished",
@@ -4337,6 +3903,13 @@ struct CheckinLoginReceiptWireDto {
     account_id: String,
     screen_name: String,
     avatar_url: String,
+    /// 首次登录可持续性验收结果（ADR-0027）：passed / failed。
+    /// failed 表示凭据已入库、账号已注册，但同设备换发验收未通过；
+    /// 前端如实展示，不自动重试、不发起第二次授权。
+    acceptance: &'static str,
+    /// 验收失败的稳定错误码；通过时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance_error_code: Option<&'static str>,
 }
 
 /// Trae CN 登录完成回执；只返回产品账号页需要的非敏感展示字段。
@@ -4345,6 +3918,11 @@ struct TraeCnLoginReceiptWireDto {
     profile_id: String,
     screen_name: String,
     avatar_url: String,
+    /// 首次登录可持续性验收结果（ADR-0027）：与 Work 回执同一套语义。
+    acceptance: &'static str,
+    /// 验收失败的稳定错误码；通过时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance_error_code: Option<&'static str>,
 }
 
 /// Trae CN 独立账号池条目；不把账号 ID、设备绑定或令牌发给前端。
@@ -4687,6 +4265,10 @@ async fn complete_product_login_inner(
             account_id: receipt.account_id,
             screen_name: receipt.screen_name,
             avatar_url: receipt.avatar_url,
+            // 验收结果如实透出：失败时登录仍成立（凭据与账号保留），前端按
+            // failed + 稳定错误码提示；不在此层自动重试或二次授权。
+            acceptance: receipt.acceptance.status(),
+            acceptance_error_code: receipt.acceptance.error_code,
         })
     })
     .await
@@ -4729,6 +4311,10 @@ async fn complete_trae_cn_login(
         profile_id: receipt.profile_id,
         screen_name: receipt.screen_name,
         avatar_url: receipt.avatar_url,
+        // Trae CN 复用同一 complete_login 编排，验收语义与 Work 一致；
+        // CN 真实续期效果仍以 ADR-0030 的独立实测验收为准。
+        acceptance: receipt.acceptance,
+        acceptance_error_code: receipt.acceptance_error_code,
     })
 }
 
@@ -4755,11 +4341,6 @@ fn cancel_login_inner(state: &AppState) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-#[tauri::command]
-fn cancel_checkin_login(state: tauri::State<AppState>) -> Result<(), String> {
-    cancel_login_inner(&state)
 }
 
 #[tauri::command]
@@ -4876,6 +4457,7 @@ fn list_trae_cn_accounts(
 async fn check_trae_cn_account_health(
     profile_ids: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<TraeCnHealthEntryDto>, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("login_real_mode_required".to_string());
@@ -4883,7 +4465,10 @@ async fn check_trae_cn_account_health(
     let selected = validate_product_profile_ids(profile_ids)?;
     let material_root = trae_cn_material_root(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        check_trae_cn_account_health_inner(&material_root, &selected)
+        check_trae_cn_account_health_inner(&material_root, &selected, &|event| {
+            // 逐账号进度事件（P11-3）：AppHandle 借给 emit 闭包传进深层编排。
+            let _ = app.emit("health-check-progress", event);
+        })
     })
     .await
     .map_err(|_| "trae_cn_health_join_failed".to_string())?
@@ -4892,6 +4477,7 @@ async fn check_trae_cn_account_health(
 fn check_trae_cn_account_health_inner(
     material_root: &Path,
     selected: &[String],
+    progress: &dyn Fn(HealthCheckProgressEvent),
 ) -> Result<Vec<TraeCnHealthEntryDto>, String> {
     let registry = AccountRegistry::new(material_root);
     let records = registry
@@ -4900,13 +4486,22 @@ fn check_trae_cn_account_health_inner(
     let store = CheckinCredentialStore::new(material_root);
     let client = trae_http_client();
     let now = unix_now_seconds();
+    let total = selected.len();
     let mut results = Vec::with_capacity(selected.len());
 
-    for profile_id in selected {
+    for (index, profile_id) in selected.iter().enumerate() {
         let Some(record) = records.iter().find(|record| &record.profile_id == profile_id) else {
             results.push(TraeCnHealthEntryDto {
                 profile_id: profile_id.clone(),
                 screen_name: String::new(),
+                healthy: false,
+                error_code: Some("credential_missing".to_string()),
+            });
+            progress(HealthCheckProgressEvent {
+                profile_id: profile_id.clone(),
+                screen_name: String::new(),
+                completed: index + 1,
+                total,
                 healthy: false,
                 error_code: Some("credential_missing".to_string()),
             });
@@ -4953,13 +4548,31 @@ fn check_trae_cn_account_health_inner(
                     healthy: true,
                     error_code: None,
                 });
+                progress(HealthCheckProgressEvent {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    completed: index + 1,
+                    total,
+                    healthy: true,
+                    error_code: None,
+                });
             }
-            Err(error_code) => results.push(TraeCnHealthEntryDto {
-                profile_id: profile_id.clone(),
-                screen_name: record.screen_name.clone(),
-                healthy: false,
-                error_code: Some(error_code),
-            }),
+            Err(error_code) => {
+                results.push(TraeCnHealthEntryDto {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    healthy: false,
+                    error_code: Some(error_code.clone()),
+                });
+                progress(HealthCheckProgressEvent {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    completed: index + 1,
+                    total,
+                    healthy: false,
+                    error_code: Some(error_code),
+                });
+            }
         }
     }
     Ok(results)
@@ -5298,6 +4911,62 @@ struct CredentialRefreshEntryDto {
     error_code: Option<String>,
 }
 
+/// 凭据刷新逐账号进度事件（`credential-refresh-progress`）：批量手动刷新
+/// 每完成一个账号推送一次，前端可展示「第 i/N 个账号」的实时进度；
+/// 载荷为非敏感白名单，不含 token 或任何凭据材料。
+#[derive(Debug, Clone, Serialize)]
+struct CredentialRefreshProgressEvent {
+    profile_id: String,
+    screen_name: String,
+    /// 已处理账号数（含失败，1 起）。
+    completed: usize,
+    /// 批次账号总数。
+    total: usize,
+    /// 该账号本次换发是否成功。
+    refreshed: bool,
+    /// 失败原因码；成功为 None。
+    error_code: Option<String>,
+}
+
+/// 健康检测逐账号进度事件（`health-check-progress`）：批量健康检测每完成
+/// 一个账号推送一次；载荷为非敏感白名单，不含凭据材料。
+#[derive(Debug, Clone, Serialize)]
+struct HealthCheckProgressEvent {
+    profile_id: String,
+    screen_name: String,
+    /// 已检测账号数（含失败，1 起）。
+    completed: usize,
+    /// 批次账号总数。
+    total: usize,
+    /// 该账号健康检测是否通过。
+    healthy: bool,
+    /// 失败原因码；成功为 None。
+    error_code: Option<String>,
+}
+
+/// 积分/额度刷新逐账号进度事件（`credits-refresh-progress`）：只读刷新
+/// 每完成一个账号推送一次；结果字段与 `CreditsRefreshEntryDto` 同源，
+/// 均为非敏感展示值，不含 token 或任何凭据材料。
+#[derive(Debug, Clone, Serialize)]
+struct CreditsRefreshProgressEvent {
+    profile_id: String,
+    screen_name: String,
+    /// 已刷新账号数（含失败，1 起）。
+    completed: usize,
+    /// 批次账号总数。
+    total: usize,
+    /// 该账号本次刷新是否成功。
+    ok: bool,
+    /// 最新积分；失败或未取到为 None。
+    credits: Option<i64>,
+    /// 最新「今日已签」状态；失败为 None。
+    checked_in: Option<bool>,
+    /// 额度剩余；失败或未取到为 None。
+    usage_remaining_credits: Option<f64>,
+    /// 失败原因码；成功为 None。
+    error_code: Option<String>,
+}
+
 /// 只读刷新积分：逐账号调 status + ide_user_ent_usage（不 claim、不消耗签到资格），
 /// 成功快照分别写回积分/额度缓存。串行执行、账号间无间隔（仅查询，实时完成；
 /// 签到 claim 才需要 3-8 秒随机间隔防风控）。单账号失败不影响其余账号；
@@ -5306,6 +4975,7 @@ struct CredentialRefreshEntryDto {
 async fn refresh_checkin_credits(
     profile_ids: Vec<String>,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<CreditsRefreshEntryDto>, String> {
     let mut selected = Vec::new();
     for profile_id in &profile_ids {
@@ -5322,7 +4992,10 @@ async fn refresh_checkin_credits(
     let material_root = checkin_material_root(&state)?;
     let runtime_mode = state.runtime_mode;
     tauri::async_runtime::spawn_blocking(move || {
-        refresh_checkin_credits_inner(&material_root, &selected, runtime_mode)
+        refresh_checkin_credits_inner(&material_root, &selected, runtime_mode, &|event| {
+            // 逐账号进度事件（P11-3）：AppHandle 借给 emit 闭包传进深层编排。
+            let _ = app.emit("credits-refresh-progress", event);
+        })
     })
     .await
     .map_err(|_| "checkin_refresh_join_failed".to_string())?
@@ -5332,6 +5005,7 @@ fn refresh_checkin_credits_inner(
     material_root: &std::path::Path,
     selected: &[String],
     runtime_mode: RuntimeMode,
+    progress: &dyn Fn(CreditsRefreshProgressEvent),
 ) -> Result<Vec<CreditsRefreshEntryDto>, String> {
     let registry = AccountRegistry::new(material_root);
     let records = registry
@@ -5348,11 +5022,23 @@ fn refresh_checkin_credits_inner(
     let mut usages: Vec<(String, traesync_domain::EntitlementUsageSnapshot)> = Vec::new();
     // 失败账号原因码：写入积分缓存持久化（卡片“刷新失败”标记，成功后清除）。
     let mut failures: Vec<(String, String)> = Vec::new();
-    for profile_id in selected.iter() {
+    let total = selected.len();
+    for (index, profile_id) in selected.iter().enumerate() {
         let Some(record) = records.iter().find(|r| &r.profile_id == profile_id) else {
             entries.push(CreditsRefreshEntryDto {
                 profile_id: profile_id.clone(),
                 screen_name: String::new(),
+                credits: None,
+                checked_in: None,
+                usage_remaining_credits: None,
+                error_code: Some("credential_missing".to_string()),
+            });
+            progress(CreditsRefreshProgressEvent {
+                profile_id: profile_id.clone(),
+                screen_name: String::new(),
+                completed: index + 1,
+                total,
+                ok: false,
                 credits: None,
                 checked_in: None,
                 usage_remaining_credits: None,
@@ -5434,12 +5120,34 @@ fn refresh_checkin_credits_inner(
                     usage_remaining_credits,
                     error_code: None,
                 });
+                progress(CreditsRefreshProgressEvent {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    completed: index + 1,
+                    total,
+                    ok: true,
+                    credits: snapshot.credits,
+                    checked_in: Some(snapshot.checked_in),
+                    usage_remaining_credits,
+                    error_code: None,
+                });
             }
             Err(error_code) => {
                 failures.push((profile_id.clone(), error_code.clone()));
                 entries.push(CreditsRefreshEntryDto {
                     profile_id: profile_id.clone(),
                     screen_name: record.screen_name.clone(),
+                    credits: None,
+                    checked_in: None,
+                    usage_remaining_credits: None,
+                    error_code: Some(error_code.clone()),
+                });
+                progress(CreditsRefreshProgressEvent {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    completed: index + 1,
+                    total,
+                    ok: false,
                     credits: None,
                     checked_in: None,
                     usage_remaining_credits: None,
@@ -5462,6 +5170,7 @@ fn refresh_checkin_credits_inner(
 async fn refresh_checkin_credentials(
     profile_ids: Vec<String>,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("checkin_http_disabled".to_string());
@@ -5485,7 +5194,10 @@ async fn refresh_checkin_credentials(
         let _guard = execution_lock
             .try_lock()
             .map_err(|_| "credential_refresh_busy".to_string())?;
-        refresh_checkin_credentials_inner(&material_root, &selected)
+        refresh_checkin_credentials_inner(&material_root, &selected, &|event| {
+            // 逐账号进度事件（P11-3）：AppHandle 借给 emit 闭包传进深层编排。
+            let _ = app.emit("credential-refresh-progress", event);
+        })
     })
     .await
     .map_err(|_| "credential_refresh_join_failed".to_string())?
@@ -5496,6 +5208,7 @@ async fn refresh_checkin_credentials(
 async fn refresh_trae_cn_credentials(
     profile_ids: Vec<String>,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("checkin_http_disabled".to_string());
@@ -5508,7 +5221,9 @@ async fn refresh_trae_cn_credentials(
         let _guard = execution_lock
             .try_lock()
             .map_err(|_| "credential_refresh_busy".to_string())?;
-        refresh_product_credentials_inner(&material_root, &selected, OAuthClient::TraeCn)
+        refresh_product_credentials_inner(&material_root, &selected, OAuthClient::TraeCn, &|event| {
+            let _ = app.emit("credential-refresh-progress", event);
+        })
     })
     .await
     .map_err(|_| "credential_refresh_join_failed".to_string())?
@@ -5517,14 +5232,16 @@ async fn refresh_trae_cn_credentials(
 fn refresh_checkin_credentials_inner(
     material_root: &std::path::Path,
     selected: &[String],
+    progress: &dyn Fn(CredentialRefreshProgressEvent),
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
-    refresh_product_credentials_inner(material_root, selected, OAuthClient::Solo)
+    refresh_product_credentials_inner(material_root, selected, OAuthClient::Solo, progress)
 }
 
 fn refresh_product_credentials_inner(
     material_root: &std::path::Path,
     selected: &[String],
     oauth_client: OAuthClient,
+    progress: &dyn Fn(CredentialRefreshProgressEvent),
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     let store = CheckinCredentialStore::new(material_root);
     // 有未收口写回时整批停止，避免把现场继续推进到更难恢复的状态。
@@ -5537,9 +5254,13 @@ fn refresh_product_credentials_inner(
 
     let now = unix_now_seconds();
     let renewal = RealCheckinRenewalService::new_for_oauth_client(&store, oauth_client);
-    refresh_checkin_credentials_inner_with(material_root, selected, now, &|binding, timestamp| {
-        renewal.renew_now(binding, timestamp).map(|_| ())
-    })
+    refresh_checkin_credentials_inner_with(
+        material_root,
+        selected,
+        now,
+        &|binding, timestamp| renewal.renew_now(binding, timestamp).map(|_| ()),
+        progress,
+    )
 }
 
 /// 手动刷新命令的结果收集边界。
@@ -5551,6 +5272,7 @@ fn refresh_checkin_credentials_inner_with(
     selected: &[String],
     now: u64,
     renew: &dyn Fn(&CheckinProfileBinding, u64) -> Result<(), CheckinCredentialError>,
+    progress: &dyn Fn(CredentialRefreshProgressEvent),
 ) -> Result<Vec<CredentialRefreshEntryDto>, String> {
     let registry = AccountRegistry::new(material_root);
     let records = registry
@@ -5560,8 +5282,9 @@ fn refresh_checkin_credentials_inner_with(
     let mut failures = Vec::new();
     let mut entries = Vec::with_capacity(selected.len());
     let maintenance_state = CredentialMaintenanceStateStore::new(material_root);
+    let total = selected.len();
 
-    for profile_id in selected {
+    for (index, profile_id) in selected.iter().enumerate() {
         let Some(record) = records
             .iter()
             .find(|record| &record.profile_id == profile_id)
@@ -5570,6 +5293,14 @@ fn refresh_checkin_credentials_inner_with(
             entries.push(CredentialRefreshEntryDto {
                 profile_id: profile_id.clone(),
                 screen_name: String::new(),
+                refreshed: false,
+                error_code: Some("credential_missing".to_string()),
+            });
+            progress(CredentialRefreshProgressEvent {
+                profile_id: profile_id.clone(),
+                screen_name: String::new(),
+                completed: index + 1,
+                total,
                 refreshed: false,
                 error_code: Some("credential_missing".to_string()),
             });
@@ -5593,6 +5324,14 @@ fn refresh_checkin_credentials_inner_with(
                     refreshed: true,
                     error_code: None,
                 });
+                progress(CredentialRefreshProgressEvent {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    completed: index + 1,
+                    total,
+                    refreshed: true,
+                    error_code: None,
+                });
             }
             Err(error) => {
                 let error_code = credential_maintenance_error_code(&error).to_string();
@@ -5600,6 +5339,14 @@ fn refresh_checkin_credentials_inner_with(
                 entries.push(CredentialRefreshEntryDto {
                     profile_id: profile_id.clone(),
                     screen_name: record.screen_name.clone(),
+                    refreshed: false,
+                    error_code: Some(error_code.clone()),
+                });
+                progress(CredentialRefreshProgressEvent {
+                    profile_id: profile_id.clone(),
+                    screen_name: record.screen_name.clone(),
+                    completed: index + 1,
+                    total,
                     refreshed: false,
                     error_code: Some(error_code),
                 });
@@ -5611,6 +5358,296 @@ fn refresh_checkin_credentials_inner_with(
     checkin_overview::update_refresh_failures(material_root, &failures);
     checkin_overview::clear_refresh_failures(material_root, &refreshed);
     Ok(entries)
+}
+
+#[cfg(test)]
+mod login_receipt_wire_tests {
+    use super::*;
+    use traesync_infrastructure::LoginAcceptance;
+
+    fn work_receipt(acceptance: LoginAcceptance) -> CheckinLoginReceiptWireDto {
+        CheckinLoginReceiptWireDto {
+            profile_id: "profile-1".to_string(),
+            account_id: "700001".to_string(),
+            screen_name: "账号一".to_string(),
+            avatar_url: String::new(),
+            acceptance: acceptance.status(),
+            acceptance_error_code: acceptance.error_code,
+        }
+    }
+
+    #[test]
+    fn acceptance_passed_receipt_omits_error_code() {
+        let json = serde_json::to_value(&work_receipt(LoginAcceptance {
+            passed: true,
+            error_code: None,
+        }))
+        .unwrap();
+        assert_eq!(json["acceptance"], "passed");
+        assert!(json.get("acceptance_error_code").is_none());
+    }
+
+    #[test]
+    fn acceptance_failed_receipt_carries_stable_error_code_only() {
+        let json = serde_json::to_value(&work_receipt(LoginAcceptance {
+            passed: false,
+            error_code: Some("credential_refresh_failed"),
+        }))
+        .unwrap();
+        assert_eq!(json["acceptance"], "failed");
+        assert_eq!(json["acceptance_error_code"], "credential_refresh_failed");
+        // 非敏感白名单：token / 私钥正文不得进入登录回执。
+        assert!(json.get("access_token").is_none());
+        assert!(json.get("refresh_token").is_none());
+        assert!(json.get("device_private_key").is_none());
+    }
+
+    #[test]
+    fn trae_cn_receipt_carries_same_acceptance_semantics() {
+        let dto = TraeCnLoginReceiptWireDto {
+            profile_id: "profile-cn".to_string(),
+            screen_name: "CN 账号".to_string(),
+            avatar_url: String::new(),
+            acceptance: LoginAcceptance {
+                passed: false,
+                error_code: Some("credential_refresh_failed"),
+            }
+            .status(),
+            acceptance_error_code: Some("credential_refresh_failed"),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["acceptance"], "failed");
+        assert_eq!(json["acceptance_error_code"], "credential_refresh_failed");
+        assert!(json.get("access_token").is_none());
+    }
+}
+
+/// P11-3 批量凭据刷新 / 健康检测的逐账号进度事件契约：
+/// 载荷非敏感白名单、事件与账号一一对应、completed 递增且失败不中断批次。
+#[cfg(test)]
+mod progress_event_contract_tests {
+    use super::*;
+
+    fn record(profile_id: &str, account_id: &str, screen_name: &str) -> AccountRecord {
+        AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: account_id.to_string(),
+            screen_name: screen_name.to_string(),
+            avatar_url: String::new(),
+            device_id: "1234567890123456".to_string(),
+            device_public_key: "public-key".to_string(),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 0,
+            last_verified_at_unix_seconds: 0,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: true,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn progress_events_serialize_non_sensitive_payload_shape() {
+        let refresh = CredentialRefreshProgressEvent {
+            profile_id: "profile-1".to_string(),
+            screen_name: "账号一".to_string(),
+            completed: 1,
+            total: 2,
+            refreshed: true,
+            error_code: None,
+        };
+        let health = HealthCheckProgressEvent {
+            profile_id: "profile-2".to_string(),
+            screen_name: "账号二".to_string(),
+            completed: 2,
+            total: 2,
+            healthy: false,
+            error_code: Some("credential_invalid".to_string()),
+        };
+        let refresh_json = serde_json::to_value(&refresh).unwrap();
+        assert_eq!(refresh_json["profile_id"], "profile-1");
+        assert_eq!(refresh_json["screen_name"], "账号一");
+        assert_eq!(refresh_json["completed"], 1);
+        assert_eq!(refresh_json["total"], 2);
+        assert_eq!(refresh_json["refreshed"], true);
+        assert!(refresh_json["error_code"].is_null());
+        let health_json = serde_json::to_value(&health).unwrap();
+        assert_eq!(health_json["profile_id"], "profile-2");
+        assert_eq!(health_json["completed"], 2);
+        assert_eq!(health_json["total"], 2);
+        assert_eq!(health_json["healthy"], false);
+        assert_eq!(health_json["error_code"], "credential_invalid");
+        // 两种载荷都不含任何凭据材料字段。
+        for payload in [&refresh_json, &health_json] {
+            assert!(payload.get("access_token").is_none());
+            assert!(payload.get("refresh_token").is_none());
+            assert!(payload.get("device_private_key").is_none());
+        }
+    }
+
+    #[test]
+    fn manual_refresh_emits_progress_per_account_and_continues() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = AccountRegistry::new(root.path());
+        registry
+            .upsert(&record("profile-fail", "account-fail", "失败账号"))
+            .unwrap();
+        registry
+            .upsert(&record("profile-ok", "account-ok", "成功账号"))
+            .unwrap();
+        let selected = vec![
+            "profile-fail".to_string(),
+            "profile-ok".to_string(),
+            "profile-missing".to_string(),
+        ];
+        let events = std::cell::RefCell::new(Vec::new());
+        let results = refresh_checkin_credentials_inner_with(
+            root.path(),
+            &selected,
+            1_800_000_000,
+            &|binding, _| {
+                if binding.profile_id == "profile-fail" {
+                    Err(CheckinCredentialError::CredentialRefreshFailed)
+                } else {
+                    Ok(())
+                }
+            },
+            &|event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        let events = events.into_inner();
+
+        // 每个账号完成（含失败与缺失）各推送一次进度，失败不中断批次。
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].profile_id, "profile-fail");
+        assert_eq!(events[0].screen_name, "失败账号");
+        assert_eq!(events[0].completed, 1);
+        assert_eq!(events[0].total, 3);
+        assert!(!events[0].refreshed);
+        assert_eq!(
+            events[0].error_code.as_deref(),
+            Some("credential_refresh_failed")
+        );
+        assert_eq!(events[1].profile_id, "profile-ok");
+        assert_eq!(events[1].completed, 2);
+        assert!(events[1].refreshed);
+        assert!(events[1].error_code.is_none());
+        // 缺失档案的进度事件 screen_name 为空（前端回退展示 profile_id）。
+        assert_eq!(events[2].profile_id, "profile-missing");
+        assert_eq!(events[2].completed, 3);
+        assert_eq!(events[2].error_code.as_deref(), Some("credential_missing"));
+        // 整批回执与进度事件一一对应，既有失败语义不回归。
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].refreshed);
+        assert!(results[1].refreshed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trae_cn_health_emits_progress_per_account() {
+        let root = tempfile::tempdir().unwrap();
+        AccountRegistry::new(root.path())
+            .upsert(&record("profile-h", "account-h", "健康号"))
+            .unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let results = check_trae_cn_account_health_inner(
+            root.path(),
+            &["profile-h".to_string()],
+            &|event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        let events = events.into_inner();
+        // 凭据材料不可用（绑定公钥无效 → credential_invalid）：不触网即失败，
+        // 进度事件与整批回执同步如实带错误码。
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].profile_id, "profile-h");
+        assert_eq!(events[0].screen_name, "健康号");
+        assert_eq!(events[0].completed, 1);
+        assert_eq!(events[0].total, 1);
+        assert!(!events[0].healthy);
+        assert_eq!(events[0].error_code.as_deref(), Some("credential_invalid"));
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].healthy);
+    }
+
+    #[test]
+    fn credits_refresh_progress_serializes_non_sensitive_payload_shape() {
+        let event = CreditsRefreshProgressEvent {
+            profile_id: "profile-1".to_string(),
+            screen_name: "账号一".to_string(),
+            completed: 1,
+            total: 2,
+            ok: true,
+            credits: Some(200),
+            checked_in: Some(false),
+            usage_remaining_credits: Some(80.5),
+            error_code: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["profile_id"], "profile-1");
+        assert_eq!(json["screen_name"], "账号一");
+        assert_eq!(json["completed"], 1);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["credits"], 200);
+        assert_eq!(json["checked_in"], false);
+        assert_eq!(json["usage_remaining_credits"], 80.5);
+        assert!(json["error_code"].is_null());
+        // 非敏感白名单：不含任何凭据材料字段。
+        assert!(json.get("access_token").is_none());
+        assert!(json.get("refresh_token").is_none());
+        assert!(json.get("device_private_key").is_none());
+    }
+
+    #[test]
+    fn credits_refresh_emits_progress_per_account_and_continues() {
+        let root = tempfile::tempdir().unwrap();
+        AccountRegistry::new(root.path())
+            .upsert(&record("profile-ok", "account-ok", "成功账号"))
+            .unwrap();
+        AccountRegistry::new(root.path())
+            .upsert(&record("profile-later", "account-later", "后续账号"))
+            .unwrap();
+        let selected = vec![
+            "profile-ok".to_string(),
+            "profile-missing".to_string(),
+            "profile-later".to_string(),
+        ];
+        let events = std::cell::RefCell::new(Vec::new());
+        let results = refresh_checkin_credits_inner(
+            root.path(),
+            &selected,
+            RuntimeMode::Fixture,
+            &|event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        let events = events.into_inner();
+
+        // 每个账号完成（含失败与缺失）各推送一次进度，失败不中断批次。
+        assert_eq!(events.len(), 3);
+        // 成功账号：fixture 快照（credits=0、未签）；额度失败不拖垮积分回执。
+        assert_eq!(events[0].profile_id, "profile-ok");
+        assert_eq!(events[0].screen_name, "成功账号");
+        assert_eq!(events[0].completed, 1);
+        assert_eq!(events[0].total, 3);
+        assert!(events[0].ok);
+        assert_eq!(events[0].credits, Some(0));
+        assert_eq!(events[0].checked_in, Some(false));
+        assert_eq!(events[0].error_code, None);
+        // 缺失档案：事件如实带 credential_missing，批次继续。
+        assert_eq!(events[1].profile_id, "profile-missing");
+        assert_eq!(events[1].completed, 2);
+        assert!(!events[1].ok);
+        assert_eq!(events[1].error_code.as_deref(), Some("credential_missing"));
+        assert_eq!(events[2].profile_id, "profile-later");
+        assert_eq!(events[2].completed, 3);
+        assert!(events[2].ok);
+        // 整批回执与进度事件一一对应。
+        assert_eq!(results.len(), 3);
+        assert!(results[0].error_code.is_none());
+        assert_eq!(results[1].error_code.as_deref(), Some("credential_missing"));
+        assert!(results[2].error_code.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -5664,6 +5701,8 @@ mod credential_refresh_contract_tests {
                     Ok(())
                 }
             },
+            // 既有失败语义回归：进度事件由 progress_event_contract_tests 覆盖。
+            &|_| {},
         )
         .unwrap();
 
@@ -6345,42 +6384,141 @@ fn reconcile_master_current_profile(
     }
 }
 
-/// 解析需要数据归属或账号凭据的主库当前账号。
+/// 解析需要数据归属或账号凭据的库当前账号（P11-5⑤ 泛化：主库/副环境通用）。
 ///
-/// 环境注册表是缓存，不能作为授权主体；这里要求主库登录态 blob
+/// 环境注册表是缓存，不能作为授权主体；这里要求库目录登录态 blob
 /// 实测得到已登记账号。登出、blob 不可读或账号未登记时均返回 None，
 /// 防止沿用旧缓存读取或修改另一账号的数据。
-fn resolve_actual_master_account(
+/// 实测已确认账号时顺手收敛该环境的注册表缓存（实测优先，主库/副环境
+/// 各自记忆，互不串写）。
+fn resolve_actual_env_account(
     material_root: &Path,
     storage_root: &Path,
-    master_instance_dir: &Path,
+    instance_dir: &Path,
+    env_id: &str,
 ) -> Result<Option<traesync_infrastructure::account_registry::AccountRecord>, String> {
     let registry = EnvironmentRegistry::new(storage_root);
-    let cached = registry
-        .ensure_master()
-        .map_err(|_| "environment_registry_invalid".to_string())?;
+    let cached = if env_id == MASTER_ENV_ID {
+        registry
+            .ensure_master()
+            .map_err(|_| "environment_registry_invalid".to_string())?
+    } else {
+        registry
+            .find(env_id)
+            .map_err(environment_registry_error_code)?
+            .ok_or_else(|| "library_not_found".to_string())?
+    };
     let accounts = AccountRegistry::new(material_root)
         .load()
         .map_err(|_| "checkin_registry_invalid".to_string())?;
-    let Some(profile_id) = observed_master_profile_id(&accounts, master_instance_dir) else {
+    let Some(profile_id) = observed_master_profile_id(&accounts, instance_dir) else {
         return Ok(None);
     };
     if cached.current_profile_id.as_deref() != Some(profile_id.as_str()) {
         // 实测已确认账号时顺手收敛缓存，供环境页等展示路径使用。
-        let _ = registry.set_current_profile(MASTER_ENV_ID, &profile_id);
+        let _ = registry.set_current_profile(env_id, &profile_id);
     }
     Ok(accounts
         .into_iter()
         .find(|record| record.profile_id == profile_id))
 }
 
+/// 解析需要数据归属或账号凭据的主库当前账号（P5-5 语义，P11-5⑤ 起为
+/// resolve_actual_env_account 的主库特化入口）。
+fn resolve_actual_master_account(
+    material_root: &Path,
+    storage_root: &Path,
+    master_instance_dir: &Path,
+) -> Result<Option<traesync_infrastructure::account_registry::AccountRecord>, String> {
+    resolve_actual_env_account(
+        material_root,
+        storage_root,
+        master_instance_dir,
+        MASTER_ENV_ID,
+    )
+}
+
 /// 需要执行主库归属操作时的强制账号解析；未确认实测账号即拒绝操作。
+/// P11-5⑤：库泛化入口（主库/副环境同义，env_id 由 LibraryContext 提供）。
+fn require_actual_env_account(
+    material_root: &Path,
+    storage_root: &Path,
+    instance_dir: &Path,
+    env_id: &str,
+) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
+    resolve_actual_env_account(material_root, storage_root, instance_dir, env_id)?
+        .ok_or_else(|| "master_current_account_unavailable".to_string())
+}
+
 fn require_actual_master_account(
     material_root: &Path,
     storage_root: &Path,
     master_instance_dir: &Path,
 ) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
-    resolve_actual_master_account(material_root, storage_root, master_instance_dir)?
+    require_actual_env_account(
+        material_root,
+        storage_root,
+        master_instance_dir,
+        MASTER_ENV_ID,
+    )
+}
+
+/// 库作用域当前账号解析（P11-5 收官：按库环境分化口径）。
+///
+/// - 主库：实测优先 + 注册表纠正（登录态由官方管理，登出/切号后缓存
+///   可能过期，`resolve_actual_env_account` 原口径不变）；
+/// - 副环境：注册表 current_profile_id 即权威（登录由工具托管，无实测
+///   语义——环境从未启动过 TRAE 时目录内没有登录态可实测，注册表值
+///   是唯一的账号记忆）；注册表值指向未登记/已移除账号时返回 None
+///   （无授权主体，防悬空引用）。
+/// - P11-6 Trae CN 只读库：产品账号池当前指针（switch 命令写入的同一
+///   状态，与 `list_remote_devices` 同源）→ Trae CN 账号注册表档案；
+///   未选择账号或指针悬空时返回 None（前端引导先在账号页登录）。
+fn resolve_library_account(
+    material_root: &Path,
+    storage_root: &Path,
+    ctx: &LibraryContext,
+) -> Result<Option<traesync_infrastructure::account_registry::AccountRecord>, String> {
+    if ctx.env_id == TRAE_CN_LIBRARY_ID {
+        let trae_cn_root = trae_cn_material_root_from(storage_root);
+        let Some(profile_id) = ProductAccountStateStore::new(&trae_cn_root)
+            .load()
+            .map_err(|_| "trae_cn_account_state_invalid".to_string())?
+        else {
+            return Ok(None);
+        };
+        return Ok(AccountRegistry::new(&trae_cn_root)
+            .load()
+            .map_err(|_| "trae_cn_registry_invalid".to_string())?
+            .into_iter()
+            .find(|record| record.profile_id == profile_id));
+    }
+    if ctx.is_master() {
+        return resolve_actual_env_account(material_root, storage_root, &ctx.dir, &ctx.env_id);
+    }
+    let profile_id = EnvironmentRegistry::new(storage_root)
+        .find(&ctx.env_id)
+        .map_err(environment_registry_error_code)?
+        .ok_or_else(|| "library_not_found".to_string())?
+        .current_profile_id;
+    let Some(profile_id) = profile_id else {
+        return Ok(None);
+    };
+    let account = AccountRegistry::new(material_root)
+        .load()
+        .map_err(|_| "checkin_registry_invalid".to_string())?
+        .into_iter()
+        .find(|record| record.profile_id == profile_id);
+    Ok(account)
+}
+
+/// 库作用域强制账号解析（归属写操作入口）：无法确定当前账号即拒绝。
+fn require_library_account(
+    material_root: &Path,
+    storage_root: &Path,
+    ctx: &LibraryContext,
+) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
+    resolve_library_account(material_root, storage_root, ctx)?
         .ok_or_else(|| "master_current_account_unavailable".to_string())
 }
 
@@ -7022,40 +7160,44 @@ async fn delete_environment(
         return Err("trae_real_mode_required".to_string());
     }
     let storage_root = PathBuf::from(&state.storage_root);
-    tauri::async_runtime::spawn_blocking(move || {
-        let registry = EnvironmentRegistry::new(&storage_root);
-        let record = registry
-            .find(&env_id)
-            .map_err(environment_registry_error_code)?
-            .ok_or_else(|| "environment_not_found".to_string())?;
-        if record.is_master() {
-            return Err("environment_master_immutable".to_string());
-        }
-        let env_dir = secondary_data_dir(&storage_root, &record.env_id);
-        // 运行中禁止删除（数据目录被进程占用，强删必产生半删状态）。
-        let running = list_trae_processes()
-            .map(|processes| {
-                processes.iter().any(|process| {
-                    process
-                        .command_line
-                        .as_deref()
-                        .is_some_and(|line| command_line_uses_data_dir(line, &env_dir))
-                })
+    tauri::async_runtime::spawn_blocking(move || delete_environment_inner(&storage_root, &env_id))
+        .await
+        .map_err(|_| "environment_delete_join_failed".to_string())?
+}
+
+fn delete_environment_inner(storage_root: &Path, env_id: &str) -> Result<bool, String> {
+    let registry = EnvironmentRegistry::new(storage_root);
+    let record = registry
+        .find(env_id)
+        .map_err(environment_registry_error_code)?
+        .ok_or_else(|| "environment_not_found".to_string())?;
+    if record.is_master() {
+        return Err("environment_master_immutable".to_string());
+    }
+    let env_dir = secondary_data_dir(storage_root, &record.env_id);
+    // 运行中禁止删除（数据目录被进程占用，强删必产生半删状态）。
+    let running = list_trae_processes()
+        .map(|processes| {
+            processes.iter().any(|process| {
+                process
+                    .command_line
+                    .as_deref()
+                    .is_some_and(|line| command_line_uses_data_dir(line, &env_dir))
             })
-            .unwrap_or(false);
-        if running {
-            return Err("environment_delete_running".to_string());
-        }
-        // 先删档案行（原子写）再删目录：目录删除失败时环境已从列表消失，
-        // 残留目录交用户手动清理——不会出现「有档案无目录」的坏环境。
-        registry
-            .remove(&env_id)
-            .map_err(environment_registry_error_code)?;
-        std::fs::remove_dir_all(&env_dir).map_err(|_| "environment_delete_failed".to_string())?;
-        Ok(true)
-    })
-    .await
-    .map_err(|_| "environment_delete_join_failed".to_string())?
+        })
+        .unwrap_or(false);
+    if running {
+        return Err("environment_delete_running".to_string());
+    }
+    // 先删档案行（原子写）再删目录：目录删除失败时环境已从列表消失，
+    // 残留目录交用户手动清理——错误信息携带完整路径（P11-5），供前端
+    // 提示用户定位；路径不属于敏感信息（用户自己机器上的可见目录）。
+    registry
+        .remove(env_id)
+        .map_err(environment_registry_error_code)?;
+    std::fs::remove_dir_all(&env_dir)
+        .map_err(|_| format!("environment_delete_failed_residue:{}", env_dir.display()))?;
+    Ok(true)
 }
 
 /// 启动/聚焦环境实例（主库沿用 P5-0 既有编排；副环境 --user-data-dir
@@ -7086,6 +7228,64 @@ async fn launch_environment(
     })
     .await
     .map_err(|_| "environment_launch_join_failed".to_string())?
+}
+
+/// P11-5 环境实例关闭回执（close_environment_instance 返回）。
+#[derive(Clone, Debug, Serialize)]
+struct EnvironmentCloseDto {
+    /// closed=优雅关闭完成；force_closed=优雅未成已强制结束；
+    /// not_running=本就未运行（幂等，不报错）。
+    outcome: &'static str,
+}
+
+/// P11-5 关闭环境实例（主库/副环境通用，界面「关闭」按钮后端）：
+/// 按各环境既有的进程匹配口径（主库官方目录口径 / 副环境带参匹配）定位
+/// 实例进程树，taskkill /T（WM_CLOSE 优雅关闭）先行，TRAE 驻留托盘时再
+/// /T /F 强制兜底；未运行幂等返回 not_running。主库/副环境复用同一套
+/// 关闭原语（trae_instance::close_master_instance / close_instance）。
+#[tauri::command]
+async fn close_environment_instance(
+    env_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<EnvironmentCloseDto, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let storage_root = PathBuf::from(&state.storage_root);
+    tauri::async_runtime::spawn_blocking(move || {
+        close_environment_instance_inner(&storage_root, &env_id)
+    })
+    .await
+    .map_err(|_| "environment_close_join_failed".to_string())?
+}
+
+fn close_environment_instance_inner(
+    storage_root: &Path,
+    env_id: &str,
+) -> Result<EnvironmentCloseDto, String> {
+    // 主库：官方目录口径（覆盖官方无参启动的主进程形态）；副环境：
+    // 带参匹配口径（--user-data-dir 指向环境目录）。档案不存在先拒绝，
+    // 不做任何进程操作。
+    let outcome = if env_id == environment_registry_module::MASTER_ENV_ID {
+        let instance_dir =
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        close_master_instance(&instance_dir)
+    } else {
+        let record = EnvironmentRegistry::new(storage_root)
+            .find(env_id)
+            .map_err(environment_registry_error_code)?
+            .ok_or_else(|| "environment_not_found".to_string())?;
+        close_instance(&secondary_data_dir(storage_root, &record.env_id))
+    };
+    match outcome {
+        Ok(CloseOutcome::Closed) => Ok(EnvironmentCloseDto { outcome: "closed" }),
+        Ok(CloseOutcome::ForceClosed) => Ok(EnvironmentCloseDto {
+            outcome: "force_closed",
+        }),
+        Ok(CloseOutcome::NotRunning) => Ok(EnvironmentCloseDto { outcome: "not_running" }),
+        // 强制结束后进程仍存在（如权限不足）：稳定错误码，前端提示手动关闭。
+        Err(_) => Err("environment_close_failed".to_string()),
+    }
 }
 
 /// 环境登录账号（P6-4 核心事务）：选环境 + 选账号 → 凭据互换。
@@ -7174,10 +7374,14 @@ fn login_environment_inner(
             // 与主库切号第 3 步同一编排，仅目标目录不同）。
             // 备份铁律（ADR-0018）：交接动库前先留三件套副本。
             if db_path.is_file() {
-                backup_master_trio(&db_path)
+                // P11-4①/P11-5⑤：写入库作用域活动备份目录——副环境链落在
+                // 覆盖目录的环境子目录（未覆盖时 db 同目录），不与主库链混放。
+                let backup_dir =
+                    resolve_library_backup_dir(storage_root, &db_path, env_id);
+                backup_master_trio_to(&db_path, Some(&backup_dir))
                     .map_err(|_| "environment_login_backup_failed".to_string())?;
-                // P5-9：备份生成后按保留策略清理旧备份（静默容错）。
-                prune_backups_if_enabled(&db_path, storage_root);
+                // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动该库链）。
+                prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
             }
             // 回滚材料：互换前的登录态原始字节（P7-2 杂交态防线）。
             let storage_path = env_dir
@@ -7539,7 +7743,9 @@ fn switch_master_account_inner(
     // 第 2 步：三件套备份（ADR-0018 铁律：破坏性批量操作前先备份；
     // create_new 保证永不覆盖既有备份链）。
     emit("backing_up");
-    let backup_path = backup_master_trio(&db_path).map_err(|error| match error {
+    // P11-4①：写入当前活动备份目录（backup_dir 覆盖或 db 同目录）。
+    let backup_dir = resolve_master_backup_dir(storage_root, &db_path);
+    let backup_path = backup_master_trio_to(&db_path, Some(&backup_dir)).map_err(|error| match error {
         MasterHandoverError::DbUnavailable => "master_switch_db_missing".to_string(),
         _ => "master_switch_backup_failed".to_string(),
     })?;
@@ -8134,6 +8340,7 @@ fn get_account_storage_footprint_inner(
 /// 守卫（后端只做守卫，不做自动触发；确认与二次确认由前端引导）：
 /// - 账号不存在拒绝（无档案即无 account_id 可定位原生目录）；
 /// - 实例运行中一律拒绝（复用进程观测逻辑，防删除运行中数据损坏库文件）；
+/// - 执行前备份主库三件套（ADR-0018 备份铁律，P11-4③）；备份失败拒绝执行；
 /// - 归档与否不做强制（由前端引导）。
 ///
 /// 注意：本命令不删注册表档案与凭据包——那是 remove_checkin_account
@@ -8159,10 +8366,15 @@ async fn purge_account_records(
         let appdata = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_default();
+        // P11-4③：主库三件套备份定位（与切号/收编同源；解析失败 fail-closed 拒绝）。
+        let master_db_path = master_data_dir()
+            .map(|dir| master_database_path(&dir))
+            .map_err(|_| "environment_registry_invalid".to_string())?;
         purge_account_records_inner(
             &material_root,
             &storage_root,
             &appdata,
+            &master_db_path,
             &profile_id,
             &processes,
         )
@@ -8175,6 +8387,7 @@ fn purge_account_records_inner(
     material_root: &Path,
     storage_root: &Path,
     appdata: &Path,
+    master_db_path: &Path,
     profile_id: &str,
     processes: &[trae_instance_module::TraeProcessInfo],
 ) -> Result<(), String> {
@@ -8194,6 +8407,17 @@ fn purge_account_records_inner(
     });
     if running {
         return Err("purge_instance_running".to_string());
+    }
+    // 备份铁律（ADR-0018 / P11-4③）：purge 前备份主库三件套（与切号/收编/
+    // 环境登录同家族纪律）；主库 db 不存在（TRAE 从未启动）无需备份。
+    // 备份失败一律拒绝执行——无备份不动数据。
+    if master_db_path.is_file() {
+        // P11-4①：写入当前活动备份目录（backup_dir 覆盖或 db 同目录）。
+        let backup_dir = resolve_master_backup_dir(storage_root, master_db_path);
+        backup_master_trio_to(master_db_path, Some(&backup_dir))
+            .map_err(|_| "purge_backup_failed".to_string())?;
+        // P5-9：备份生成后按保留策略清理旧备份（静默容错，与家族一致）。
+        prune_backups_if_enabled(master_db_path, storage_root);
     }
     // 删除 1：实例数据目录（缺失视为成功——幂等）。
     remove_dir_all_if_exists(&instance_dir)?;
@@ -8217,17 +8441,6 @@ fn remove_dir_all_if_exists(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// P3-1 单条会话摘要（前端展示：标题、时间、消息数）。
-#[derive(Clone, Serialize)]
-struct SessionSummaryDto {
-    session_id: String,
-    title: String,
-    message_count: u32,
-    /// unix 秒；源库毫秒已归一化，缺失为 null。
-    updated_at_unix_seconds: Option<i64>,
-    deleted: bool,
-}
-
 // ===== P5-3 历史页主库视图（Q4/Q5：项目两栏 + 接力轨迹 + 消息预览）=====
 
 /// P5-3 主库历史读取结果（两栏数据源 + 轮询指纹）。
@@ -8246,19 +8459,163 @@ struct MasterHistoryDto {
     fingerprint: InstanceFingerprint,
 }
 
-/// ADR-0025 Library 抽象：库 id → 数据目录解析。
+/// P11-6 Trae CN 产品只读库 id（ADR-0032 决策 5：复用 Library 抽象接入
+/// Trae CN 官方数据根的只读浏览视图）。命名对齐产品 id（`TraeProduct::
+/// TraeCn.product_id()`），与 `master` / `env-*` 同一 id 空间。
+const TRAE_CN_LIBRARY_ID: &str = "trae_cn";
+
+/// ADR-0025 Library 抽象：库 id → 数据目录解析（P11-5⑤ 泛化到副环境）。
 ///
 /// 库是基地概念：主库与副库都是「库」的实例，库内模块面向库编程。
-/// V1 库注册表只有 master 一个条目（`None` 缺省兼容既有调用）；
-/// 其他 id 一律 `library_not_found`（副库落地时新增注册表条目即可，
-/// 模块代码零改动）。
-fn resolve_library_dir(library_id: Option<&str>) -> Result<PathBuf, String> {
-    match library_id {
-        None | Some("master") => {
+/// 库注册表即环境注册表（ADR-0024）：`master` = 官方目录（`None` 缺省
+/// 兼容既有调用）；`env-*` = 环境派生目录 `{storage_root}\environments\{env_id}`；
+/// P11-6 追加 `trae_cn` = Trae CN 官方数据根（`%APPDATA%\Trae CN`，只读库）；
+/// 未登记 id 一律 `library_not_found`（不落默认库）。
+fn resolve_library_dir(library_id: Option<&str>, storage_root: &Path) -> Result<PathBuf, String> {
+    match resolve_library_env_id(library_id, storage_root)?.as_str() {
+        MASTER_ENV_ID => {
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())
         }
-        Some(_) => Err("library_not_found".to_string()),
+        TRAE_CN_LIBRARY_ID => trae_cn_library_dir(),
+        env_id => Ok(secondary_data_dir(storage_root, env_id)),
     }
+}
+
+/// P11-6：Trae CN 官方数据根（只读库目录）。
+///
+/// 与主库同源规则：APPDATA 下的固定官方目录（`%APPDATA%\Trae CN`，P10
+/// 研究确认的只读数据根），不接受调用者传入任意路径。APPDATA 缺失时报
+/// 稳定错误码（fail-closed，不猜路径）。
+fn trae_cn_library_dir() -> Result<PathBuf, String> {
+    master_data_dir_for(TraeProduct::TraeCn)
+        .map_err(|_| "trae_cn_data_root_unavailable".to_string())
+}
+
+/// ADR-0025：库 id → 环境归属解析。
+///
+/// `None` / `"master"` → 主库环境；`"trae_cn"` → Trae CN 产品只读库
+///（P11-6，产品库不入环境注册表）；其余 id 必须在环境注册表在册
+///（副环境 env_id 即库 id），未登记一律 `library_not_found`。
+fn resolve_library_env_id(
+    library_id: Option<&str>,
+    storage_root: &Path,
+) -> Result<String, String> {
+    match library_id {
+        None | Some(MASTER_ENV_ID) => Ok(MASTER_ENV_ID.to_string()),
+        // P11-6：Trae CN 产品库是固定注册项，不查环境注册表。
+        Some(TRAE_CN_LIBRARY_ID) => Ok(TRAE_CN_LIBRARY_ID.to_string()),
+        Some(env_id) => EnvironmentRegistry::new(storage_root)
+            .find(env_id)
+            .map_err(environment_registry_error_code)?
+            .ok_or_else(|| "library_not_found".to_string())
+            .map(|record| record.env_id),
+    }
+}
+
+/// P11-5⑤ 库实例运行上下文：写库类命令（收编/清理/归档应用）按环境
+/// 路由实例生命周期（关/启/运行检测）与备份目录的统一依据。
+/// P11-6 追加 `read_only`：Trae CN 产品库只读（ADR-0032 决策 5），写库
+/// 命令经 `ensure_writable` 统一拒绝。
+struct LibraryContext {
+    /// 环境归属（`master` / `trae_cn` / 副环境 env_id），进度事件与台账路由用。
+    env_id: String,
+    /// 环境显示名（副环境重启窗口标题与主库「当前账号名」口径对齐用）。
+    env_name: String,
+    /// 库数据目录（主库 = 官方目录；副环境 = 环境派生目录；trae_cn = 产品官方数据根）。
+    dir: PathBuf,
+    /// 是否只读库（P11-6：仅 trae_cn 为 true；写库类命令先经 ensure_writable）。
+    read_only: bool,
+}
+
+impl LibraryContext {
+    fn is_master(&self) -> bool {
+        self.env_id == MASTER_ENV_ID
+    }
+
+    /// P11-6（ADR-0032 决策 5）：写库类能力不随 Trae CN 只读浏览开放。
+    /// 归属改写/归档/删除/合并/清理对只读库一律返回稳定错误码
+    /// `library_read_only`，在进入任何实例关闭或备份动作之前拒绝。
+    fn ensure_writable(&self) -> Result<(), String> {
+        if self.read_only {
+            Err("library_read_only".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 实例进程匹配口径：主库官方目录口径（含无参启动形态）；
+    /// 副环境带参匹配（`--user-data-dir` 指向环境目录）。
+    fn command_line_matches(&self, command_line: &str) -> bool {
+        if self.is_master() {
+            trae_instance_module::command_line_matches_master(command_line, &self.dir)
+        } else {
+            command_line_uses_data_dir(command_line, &self.dir)
+        }
+    }
+
+    /// 关闭实例：主库用 close_master_instance（覆盖官方无参主进程），
+    /// 副环境用 close_instance（带参口径）。
+    fn close_instance(&self) -> Result<trae_instance_module::CloseOutcome, ()> {
+        let outcome = if self.is_master() {
+            close_master_instance(&self.dir)
+        } else {
+            close_instance(&self.dir)
+        };
+        outcome.map_err(|_| ())
+    }
+
+    /// 重启实例（登录身份未变场景：收编/清理/归档应用收尾）。
+    /// 窗口标题：主库 = 当前账号名（P5-5 既有口径）；副环境 = 环境名
+    ///（与环境页启动入口一致，并行环境按名区分）。
+    fn relaunch(&self, window_title: &str) -> Result<TraeInstanceLaunchDto, String> {
+        // matcher 按环境口径二选一（launch_instance_common 收函数指针）。
+        let matcher: fn(&str, &Path) -> bool = if self.is_master() {
+            trae_instance_module::command_line_matches_master
+        } else {
+            command_line_uses_data_dir
+        };
+        launch_instance_common(&self.dir, window_title, None, matcher)
+    }
+}
+
+/// ADR-0025：库 id → 运行上下文（目录 + 环境归属 + 显示名 + 只读标记）。
+///
+/// P11-6：`trae_cn` 分支构建产品只读库上下文——目录为 Trae CN 官方数据根，
+/// 显示名取产品注册表 `display_name`，`read_only = true`（写库命令拒绝）。
+fn resolve_library_context(
+    library_id: Option<&str>,
+    storage_root: &Path,
+) -> Result<LibraryContext, String> {
+    let env_id = resolve_library_env_id(library_id, storage_root)?;
+    // P11-6：Trae CN 产品库独立分支（不入环境注册表；目录与名称来自产品注册表）。
+    if env_id == TRAE_CN_LIBRARY_ID {
+        return Ok(LibraryContext {
+            env_id,
+            env_name: TraeProduct::TraeCn.display_name().to_string(),
+            dir: trae_cn_library_dir()?,
+            read_only: true,
+        });
+    }
+    let dir = if env_id == MASTER_ENV_ID {
+        master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?
+    } else {
+        secondary_data_dir(storage_root, &env_id)
+    };
+    let env_name = if env_id == MASTER_ENV_ID {
+        "主库".to_string()
+    } else {
+        EnvironmentRegistry::new(storage_root)
+            .find(&env_id)
+            .map_err(environment_registry_error_code)?
+            .ok_or_else(|| "library_not_found".to_string())?
+            .name
+    };
+    Ok(LibraryContext {
+        env_id,
+        env_name,
+        dir,
+        read_only: false,
+    })
 }
 
 /// P5-3：读取主库历史（当前账号正常会话 + 全局归档会话）。
@@ -8266,7 +8623,8 @@ fn resolve_library_dir(library_id: Option<&str>) -> Result<PathBuf, String> {
 /// 当前账号 = 主库登录态 blob 实测 user_id → 账号注册表 account_id；正常会话按
 /// `project.user_id` 过滤，归档会话不受账号过滤影响。`previous` 为前端保存的
 /// 上一轮指纹，另带当前账号身份，避免切号后文件指纹未变时错误返回 unchanged。
-/// `library_id` 为库实例引用（ADR-0025，缺省主库）。
+/// `library_id` 为库实例引用（ADR-0025，缺省主库）。P11-6：`trae_cn` 库
+/// 放行（同一套 SQL；当前账号取 Trae CN 产品账号池指针，未登录引导先登录）。
 #[tauri::command]
 async fn get_master_history(
     previous: Option<InstanceFingerprint>,
@@ -8285,13 +8643,12 @@ async fn get_master_history(
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // ADR-0025：库目录统一走 resolve_library_dir（指纹与读取同源）。
-        let master_dir = resolve_library_dir(library_id.as_deref())?;
-        let current_account =
-            resolve_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        let current_account = resolve_library_account(&material_root, &storage_root, &ctx)?;
         let current_user_id = current_account
             .as_ref()
             .map(|account| account.account_id.as_str());
-        let fingerprint = stat_master_fingerprint(&master_dir);
+        let fingerprint = stat_master_fingerprint(&ctx.dir);
         if previous == Some(fingerprint.clone())
             && previous_current_user_id.as_deref() == current_user_id
         {
@@ -8315,7 +8672,7 @@ async fn get_master_history(
         };
         let current_user_id = account.account_id.clone();
         let (status, projects, sessions) =
-            match read_master_history(&master_dir, &raw_key, &current_user_id) {
+            match read_master_history(&ctx.dir, &raw_key, &current_user_id) {
                 MasterHistoryStatus::Ready { projects, sessions } => ("ready", projects, sessions),
                 MasterHistoryStatus::NoMasterData => ("no_master_data", Vec::new(), Vec::new()),
                 MasterHistoryStatus::ReadFailed => ("read_failed", Vec::new(), Vec::new()),
@@ -8347,7 +8704,8 @@ struct MasterSessionMessagesDto {
 ///
 /// 与账号实例读取共用解析路径；通过隔离三件套副本只读打开，
 /// 主库实例运行中可随时读取。`library_id` 为库实例引用
-/// （ADR-0025，缺省主库）。
+/// （ADR-0025，缺省主库）。P11-6：`trae_cn` 库放行（同一套 SQL，
+/// 账号解析走产品账号池指针）。
 #[tauri::command]
 async fn get_master_session_messages(
     session_id: String,
@@ -8367,12 +8725,12 @@ async fn get_master_session_messages(
     let offset = offset.unwrap_or(0) as usize;
     tauri::async_runtime::spawn_blocking(move || {
         use traesync_infrastructure::account_session_content::SessionMessagesStatus;
-        let master_dir = resolve_library_dir(library_id.as_deref())?;
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         let current_account =
-            resolve_actual_master_account(&material_root, &storage_root, &master_dir)?
+            resolve_library_account(&material_root, &storage_root, &ctx)?
                 .ok_or_else(|| "master_current_account_unavailable".to_string())?;
         let (status, messages, has_more) = match read_master_session_messages_page(
-            &master_dir,
+            &ctx.dir,
             &session_id,
             &raw_key,
             offset,
@@ -8419,12 +8777,17 @@ struct MasterLibraryStatsDto {
     size_bytes: u64,
 }
 
-/// P5-4：主库聚合统计（总览页统计卡 + 环境卡会话胶囊数据源）。
+/// P5-4：库聚合统计（总览页统计卡 + 环境卡会话胶囊数据源）。
 ///
-/// 轻量只读：4 条聚合 SQL，主库运行中可随时读取。当前账号解析与
-/// get_master_history 同口径（主库登录态实测 → 账号注册表 account_id）。
+/// 轻量只读：4 条聚合 SQL，库实例运行中可随时读取。当前账号解析与
+/// get_master_history 同口径（登录态实测 → 账号注册表 account_id）。
+/// P11-5⑤：`library_id` 为库实例引用（缺省主库；副环境统计自身目录，
+/// 主库统计口径不变）。P11-6：`trae_cn` 库放行（同一套 SQL）——若其
+/// schema 与 Work 有字段差异，聚合按现实降级（能算的算，不能算的归零
+/// 并按 read_failed 返回，不 panic）；账号解析走产品账号池指针。
 #[tauri::command]
 async fn get_master_library_stats(
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterLibraryStatsDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -8440,12 +8803,10 @@ async fn get_master_library_stats(
         use traesync_infrastructure::master_stats::{
             master_trio_size_bytes, read_master_stats, MasterStatsStatus,
         };
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         // 体积与库内容统计独立：库打开失败时体积仍可展示（详情页降级不空白）。
-        let size_bytes = master_trio_size_bytes(&master_dir);
-        let current_account =
-            resolve_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let size_bytes = master_trio_size_bytes(&ctx.dir);
+        let current_account = resolve_library_account(&material_root, &storage_root, &ctx)?;
         let Some(account) = current_account else {
             // 未登记账号：统计归零 + 状态引导（总览隐藏区块，环境页提示登录）。
             return Ok(MasterLibraryStatsDto {
@@ -8460,7 +8821,7 @@ async fn get_master_library_stats(
             });
         };
         let current_user_id = account.account_id.clone();
-        let dto = match read_master_stats(&master_dir, &raw_key, &current_user_id) {
+        let dto = match read_master_stats(&ctx.dir, &raw_key, &current_user_id) {
             MasterStatsStatus::Ready(stats) => MasterLibraryStatsDto {
                 status: "ready",
                 current_user_id: Some(current_user_id),
@@ -8498,6 +8859,102 @@ async fn get_master_library_stats(
     .map_err(|_| "master_stats_join_failed".to_string())?
 }
 
+// ===== P11-5 库归档草稿（localStorage 迁入 storage_root，命令层编排）=====
+
+/// P11-5 库归档草稿 DTO（get_archive_draft 返回；字段与前端草稿状态同构）。
+#[derive(Clone, Serialize)]
+struct ArchiveDraftDto {
+    archive_session_ids: Vec<String>,
+    restore_session_ids: Vec<String>,
+}
+
+impl ArchiveDraftDto {
+    fn empty() -> Self {
+        Self {
+            archive_session_ids: Vec::new(),
+            restore_session_ids: Vec::new(),
+        }
+    }
+}
+
+/// P11-5 读取库归档草稿（storage_root/archive-drafts.json，每库一键）。
+/// 存储文件损坏 fail-closed：返回空草稿且不删除文件（铁律），旧草稿由
+/// 前端 localStorage 迁移路径兜底。
+#[tauri::command]
+async fn get_archive_draft(
+    library_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ArchiveDraftDto, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        // fixture 模式无真实存储：返回空草稿（迁移与写入路径在真实模式生效）。
+        return Ok(ArchiveDraftDto::empty());
+    }
+    let storage_root = PathBuf::from(&state.storage_root);
+    tauri::async_runtime::spawn_blocking(move || {
+        get_archive_draft_inner(&storage_root, &library_id)
+    })
+    .await
+    .map_err(|_| "archive_draft_join_failed".to_string())?
+}
+
+fn get_archive_draft_inner(storage_root: &Path, library_id: &str) -> Result<ArchiveDraftDto, String> {
+    let drafts = ArchiveDraftStore::new(storage_root)
+        .load()
+        // 损坏 fail-closed：按空草稿处理，不删除文件（铁律）。
+        .unwrap_or_default();
+    Ok(drafts
+        .get(library_id)
+        .map(|record| ArchiveDraftDto {
+            archive_session_ids: record.archive_session_ids.clone(),
+            restore_session_ids: record.restore_session_ids.clone(),
+        })
+        .unwrap_or_else(ArchiveDraftDto::empty))
+}
+
+/// P11-5 保存库归档草稿（空草稿即清除该库键）。存储层拒绝时返回稳定
+/// 错误码，前端回退 localStorage 兜底，不静默丢草稿。
+#[tauri::command]
+async fn set_archive_draft(
+    library_id: String,
+    archive_session_ids: Vec<String>,
+    restore_session_ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let storage_root = PathBuf::from(&state.storage_root);
+    tauri::async_runtime::spawn_blocking(move || {
+        set_archive_draft_inner(
+            &storage_root,
+            &library_id,
+            &archive_session_ids,
+            &restore_session_ids,
+        )
+    })
+    .await
+    .map_err(|_| "archive_draft_join_failed".to_string())?
+}
+
+fn set_archive_draft_inner(
+    storage_root: &Path,
+    library_id: &str,
+    archive_session_ids: &[String],
+    restore_session_ids: &[String],
+) -> Result<bool, String> {
+    let record = ArchiveDraftRecord {
+        archive_session_ids: archive_session_ids.to_vec(),
+        restore_session_ids: restore_session_ids.to_vec(),
+    };
+    ArchiveDraftStore::new(storage_root)
+        .set(library_id, &record)
+        .map(|_| true)
+        .map_err(|error| match error {
+            ArchiveDraftStoreError::Invalid => "archive_draft_store_invalid".to_string(),
+            ArchiveDraftStoreError::Io => "archive_draft_store_unavailable".to_string(),
+        })
+}
+
 // ===== P5-5 主库体检 + 收编（编排层）=====
 
 /// 体检报告中的账号分布行（get_master_checkup 返回）。
@@ -8523,9 +8980,13 @@ struct MasterCheckupAccountDto {
 }
 
 /// P5-5 主库体检报告（get_master_checkup 返回，只读）。
+///
+/// status：ready / no_current_account / no_master_data / read_failed；
+/// P11-6 追加 `not_applicable` = Trae CN 只读库不适用体检（前端按
+/// absent 渲染「该产品无此能力」）。
 #[derive(Clone, Serialize)]
 struct MasterCheckupDto {
-    /// ready / no_current_account / no_master_data / read_failed。
+    /// ready / no_current_account / no_master_data / read_failed / not_applicable。
     status: &'static str,
     /// 当前账号账号名（回执与引导文案用；无当前账号为 None）。
     current_account_name: Option<String>,
@@ -8537,11 +8998,27 @@ struct MasterCheckupDto {
     orphan_session_count: u64,
 }
 
-/// P5-5 环境页体检：主库记录分布 + 滞留账号 + 孤儿行（只读聚合）。
+/// P11-6：Trae CN 只读库的体检「不适用」形态（字段全空/零，无库读取）。
+fn master_checkup_not_applicable() -> MasterCheckupDto {
+    MasterCheckupDto {
+        status: "not_applicable",
+        current_account_name: None,
+        accounts: Vec::new(),
+        orphan_project_count: 0,
+        orphan_session_count: 0,
+    }
+}
+
+/// P5-5 环境页体检：库记录分布 + 滞留账号 + 孤儿行（只读聚合）。
 ///
-/// 进页自动执行（与统计格同读同刷）；只读打开，主库运行中可随时读取。
+/// 进页自动执行（与统计格同读同刷）；只读打开，库实例运行中可随时读取。
+/// P11-5⑤：`library_id` 为库实例引用（缺省主库；副环境对自身数据目录
+/// 体检，未注册账号/空镜像语义同义——user_id 维度一致）。
 #[tauri::command]
-async fn get_master_checkup(state: tauri::State<'_, AppState>) -> Result<MasterCheckupDto, String> {
+async fn get_master_checkup(
+    library_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<MasterCheckupDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("trae_real_mode_required".to_string());
     }
@@ -8553,15 +9030,21 @@ async fn get_master_checkup(state: tauri::State<'_, AppState>) -> Result<MasterC
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
         use traesync_infrastructure::master_checkup::{read_master_checkup, MasterCheckupStatus};
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：体检/收编是 Work CN 的账号归属治理
+        // 概念，Trae CN 只读库不适用——返回「不适用」形态（前端按 absent
+        // 渲染「该产品无此能力」），不做任何库读取。
+        if ctx.read_only {
+            return Ok(master_checkup_not_applicable());
+        }
         let records = AccountRegistry::new(&material_root)
             .load()
             .map_err(|_| "checkin_registry_invalid".to_string())?;
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-        // 当前账号必须来自主库登录态实测，不能沿用环境档案缓存。
-        let current = resolve_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        // 当前账号：主库由登录态实测（官方登录态可能漂移）；副环境以
+        // 注册表 current_profile_id 为权威（登录由工具托管，无实测语义）。
+        let current = resolve_library_account(&material_root, &storage_root, &ctx)?;
 
-        match read_master_checkup(&master_dir, &raw_key) {
+        match read_master_checkup(&ctx.dir, &raw_key) {
             MasterCheckupStatus::Ready(report) => {
                 let Some(current) = current.as_ref() else {
                     return Ok(MasterCheckupDto {
@@ -8629,9 +9112,12 @@ async fn get_master_checkup(state: tauri::State<'_, AppState>) -> Result<MasterC
 /// 收编进度事件（`master-incorporate-progress`；环境页收编弹层消费）。
 ///
 /// 阶段：closing → backing_up → incorporating → restarting → done。
+/// P11-5⑤：载荷带 env_id 区分库实例（主库 "master" / 副环境 env_id），
+/// 多库收编弹层并行时只推进自己目标的事件。
 #[derive(Clone, Serialize)]
 struct MasterIncorporateProgressEvent {
     stage: &'static str,
+    env_id: String,
 }
 
 /// P5-5 收编回执（incorporate_master_records 返回）。
@@ -8653,15 +9139,17 @@ struct MasterIncorporateResultDto {
     relaunch_outcome: String,
 }
 
-/// P5-5 一键收编：非当前账号记录全部归入当前账号。
+/// P5-5 一键收编：非当前账号记录全部归入当前账号（P11-5⑤ 泛化到副环境）。
 ///
 /// 编排与切号五步同构（关实例 → 备份 → 归属改写/换腿 → 重启），但不做
 /// 登录互换与插件对账——收编不改登录身份，插件环境不变。
-/// 破坏性批量操作：主库生成中拒绝（`master_incorporate_busy`）；
+/// 破坏性批量操作：库生成中拒绝（`master_incorporate_busy`）；
 /// 执行前自动 `.switch-bak-*` 备份（ADR-0018 铁律，备份失败不执行）。
+/// `library_id` 为库实例引用（ADR-0025，缺省主库；副环境 env_id 即库 id）。
 #[tauri::command]
 async fn incorporate_master_records(
     app: tauri::AppHandle,
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterIncorporateResultDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -8674,36 +9162,48 @@ async fn incorporate_master_records(
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        incorporate_master_records_inner(&app, &material_root, &storage_root, &raw_key)
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        ctx.ensure_writable()?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        incorporate_master_records_inner(&app, &material_root, &storage_root, &raw_key, &ctx)
     })
     .await
     .map_err(|_| "master_incorporate_join_failed".to_string())?
 }
 
 /// 收编编排主体（阻塞上下文）：体检预检 → 四步事务 → 台账 → 回执。
+/// 库实例差异全部由 LibraryContext 承载（目录 / 关启口径 / 备份目录 / 台账）。
 fn incorporate_master_records_inner(
     app: &tauri::AppHandle,
     material_root: &Path,
     storage_root: &Path,
     raw_key: &str,
+    ctx: &LibraryContext,
 ) -> Result<MasterIncorporateResultDto, String> {
     use traesync_infrastructure::master_checkup::{read_master_checkup, MasterCheckupStatus};
 
-    // 前置：当前账号（收编目标）必须由主库登录态实测且已登记。
-    let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-    let record = resolve_actual_master_account(material_root, storage_root, &master_dir)?
+    // 前置：当前账号（收编目标）按库口径解析——主库实测优先 + 注册表
+    // 缓存回退；副环境注册表 current_profile_id 即权威。
+    let record = resolve_library_account(material_root, storage_root, ctx)?
         .ok_or_else(|| "incorporate_no_current_account".to_string())?;
     let current_profile = record.profile_id.clone();
     let target_user_id = record.account_id.clone();
-    let window_title = record
-        .display_name
-        .clone()
-        .unwrap_or_else(|| record.screen_name.clone());
+    // 重启窗口标题：主库 = 当前账号名（P5-5 口径）；副环境 = 环境名
+    //（与环境页启动入口一致，并行环境按名区分）。
+    let window_title = if ctx.is_master() {
+        record
+            .display_name
+            .clone()
+            .unwrap_or_else(|| record.screen_name.clone())
+    } else {
+        ctx.env_name.clone()
+    };
 
-    let db_path = master_database_path(&master_dir);
+    let db_path = master_database_path(&ctx.dir);
 
-    // 预检（只读）：确认确有滞留记录才关实例——避免空跑打扰正在使用的主库。
-    let stale_count = match read_master_checkup(&master_dir, raw_key) {
+    // 预检（只读）：确认确有滞留记录才关实例——避免空跑打扰正在使用的库。
+    let stale_count = match read_master_checkup(&ctx.dir, raw_key) {
         MasterCheckupStatus::Ready(report) => report.stale_rows(&target_user_id).len(),
         MasterCheckupStatus::NoMasterData => return Err("master_switch_db_missing".to_string()),
         MasterCheckupStatus::ReadFailed => return Err("master_incorporate_read_failed".to_string()),
@@ -8715,7 +9215,10 @@ fn incorporate_master_records_inner(
     let emit = |stage: &'static str| {
         let _ = app.emit(
             "master-incorporate-progress",
-            MasterIncorporateProgressEvent { stage },
+            MasterIncorporateProgressEvent {
+                stage,
+                env_id: ctx.env_id.clone(),
+            },
         );
     };
 
@@ -8726,19 +9229,21 @@ fn incorporate_master_records_inner(
         return Err("master_incorporate_busy".to_string());
     }
 
-    // 第 1 步：关闭主库实例（与切号同纪律：改写前拿到静止一致的库）。
+    // 第 1 步：关闭库实例（与切号同纪律：改写前拿到静止一致的库）。
     emit("closing");
-    close_master_instance(&master_dir)
+    ctx.close_instance()
         .map_err(|_| "master_incorporate_close_failed".to_string())?;
 
     // 第 2 步：三件套备份（ADR-0018 铁律；create_new 永不覆盖备份链）。
     emit("backing_up");
-    let backup_path = backup_master_trio(&db_path).map_err(|error| match error {
+    // P11-4①/P11-5⑤：写入当前库作用域活动备份目录（副环境链与主库链隔离）。
+    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
+    let backup_path = backup_master_trio_to(&db_path, Some(&backup_dir)).map_err(|error| match error {
         MasterHandoverError::DbUnavailable => "master_switch_db_missing".to_string(),
         _ => "master_switch_backup_failed".to_string(),
     })?;
-    // P5-9：备份生成后按保留策略清理旧备份（静默容错，不影响收编流程）。
-    prune_backups_if_enabled(&db_path, storage_root);
+    // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前库的链）。
+    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
 
     // 第 3 步：归属改写 + 换腿 + 完整性校验（交接原语单事务；非空
     // UNIQUE 冲突报人工决策，禁止静默覆盖）。
@@ -8753,17 +9258,18 @@ fn incorporate_master_records_inner(
     )?;
 
     // 接力台账（逐会话 from = 原归属账号，保溯源链；fail-soft 不阻断收编）。
-    let relay_ledger_written =
-        append_incorporate_ledger(storage_root, &handover, &target_user_id, &current_profile);
+    // P11-5⑤：台账按库隔离，副环境收编不混入主库轨迹。
+    let relay_ledger_written = append_incorporate_ledger(
+        storage_root,
+        &ctx.env_id,
+        &handover,
+        &target_user_id,
+        &current_profile,
+    );
 
-    // 第 4 步：重启主库（登录身份未变，带参启动聚焦原窗口标题）。
+    // 第 4 步：重启库实例（登录身份未变；主库带账号名标题、副环境带环境名）。
     emit("restarting");
-    let relaunch = launch_instance_common(
-        &master_dir,
-        &window_title,
-        None,
-        trae_instance_module::command_line_matches_master,
-    )?;
+    let relaunch = ctx.relaunch(&window_title)?;
     emit("done");
 
     Ok(MasterIncorporateResultDto {
@@ -8781,8 +9287,11 @@ fn incorporate_master_records_inner(
 ///
 /// 与切号 append_relay_ledger 的差异：切号沿用 previous_owner 单值
 /// （Q3 单账号不变量），收编面向多账号杂居，逐会话取 previous_user_id。
+/// P11-5⑤：台账按库隔离（relay_ledger_root）——副环境收编轨迹写
+/// 独立文件，不混入主库台账（主库两层校验不受环境收编影响）。
 fn append_incorporate_ledger(
     storage_root: &Path,
+    env_id: &str,
     handover: &MasterHandover,
     to_user_id: &str,
     to_profile_id: &str,
@@ -8808,9 +9317,22 @@ fn append_incorporate_ledger(
             switched_at_unix_seconds,
         })
         .collect();
-    RelayLedger::new(storage_root.join("environments"))
+    RelayLedger::new(relay_ledger_root(storage_root, env_id))
         .append(&entries)
         .is_ok()
+}
+
+/// P11-5⑤ 台账存储根按库路由：主库 = storage_root/environments（原位置
+/// 不变）；副环境 = storage_root/environments/relay-ledgers/{env_id}——
+/// 各库独立台账文件（relay-ledger.json），按文件名找同库。
+fn relay_ledger_root(storage_root: &Path, env_id: &str) -> PathBuf {
+    if env_id == MASTER_ENV_ID {
+        return storage_root.join("environments");
+    }
+    storage_root
+        .join("environments")
+        .join("relay-ledgers")
+        .join(env_id)
 }
 
 /// P5-5 清理空项目回执（cleanup_master_empty_projects 返回）。
@@ -8829,8 +9351,10 @@ struct MasterEmptyProjectCleanupDto {
 /// 编排与收编同构（关实例 → 备份 → 删除 → 重启）；执行前自动
 /// `.switch-bak-*` 备份（ADR-0018 铁律，备份失败不执行）。生成中拒绝
 /// （`cleanup_master_busy`）；孤儿行保持只报告不处理（保守口径）。
+/// P11-5⑤：`library_id` 为库实例引用（缺省主库；副环境同义）。
 #[tauri::command]
 async fn cleanup_master_empty_projects(
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterEmptyProjectCleanupDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -8843,36 +9367,46 @@ async fn cleanup_master_empty_projects(
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        cleanup_master_empty_projects_inner(&material_root, &storage_root, &raw_key)
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        ctx.ensure_writable()?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        cleanup_master_empty_projects_inner(&material_root, &storage_root, &raw_key, &ctx)
     })
     .await
     .map_err(|_| "cleanup_master_join_failed".to_string())?
 }
 
 /// 清理空项目编排主体（阻塞上下文）：预检 → 关实例 → 备份 → 删除 → 重启。
+/// 库实例差异全部由 LibraryContext 承载（目录 / 关启口径 / 备份目录）。
 fn cleanup_master_empty_projects_inner(
     material_root: &Path,
     storage_root: &Path,
     raw_key: &str,
+    ctx: &LibraryContext,
 ) -> Result<MasterEmptyProjectCleanupDto, String> {
     use traesync_infrastructure::master_checkup::{
         delete_master_empty_projects, read_master_checkup, MasterCheckupStatus,
     };
 
-    let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-    // 重启主库需要窗口标题：与收编同源，取实测当前账号的展示名。
-    let record = resolve_actual_master_account(material_root, storage_root, &master_dir)?
+    // 重启库实例需要窗口标题：与收编同源，主库取实测当前账号展示名，
+    // 副环境用环境名（与启动入口一致）。
+    let record = resolve_library_account(material_root, storage_root, ctx)?
         .ok_or_else(|| "cleanup_master_no_current_account".to_string())?;
-    let window_title = record
-        .display_name
-        .clone()
-        .unwrap_or_else(|| record.screen_name.clone());
+    let window_title = if ctx.is_master() {
+        record
+            .display_name
+            .clone()
+            .unwrap_or_else(|| record.screen_name.clone())
+    } else {
+        ctx.env_name.clone()
+    };
 
-    let db_path = master_database_path(&master_dir);
+    let db_path = master_database_path(&ctx.dir);
 
-    // 预检（只读）：确认确有空项目才关实例——避免空跑打扰正在使用的主库。
+    // 预检（只读）：确认确有空项目才关实例——避免空跑打扰正在使用的库。
     // 体检口径与删除范围一致（软删残留不计入），预检总数即预期删除规模。
-    let empty_total = match read_master_checkup(&master_dir, raw_key) {
+    let empty_total = match read_master_checkup(&ctx.dir, raw_key) {
         MasterCheckupStatus::Ready(report) => report.empty_project_total(),
         MasterCheckupStatus::NoMasterData => return Err("master_switch_db_missing".to_string()),
         MasterCheckupStatus::ReadFailed => return Err("cleanup_master_read_failed".to_string()),
@@ -8888,23 +9422,20 @@ fn cleanup_master_empty_projects_inner(
         return Err("cleanup_master_busy".to_string());
     }
 
-    // 第 1 步：关闭主库实例（与收编同纪律：删除前拿到静止一致的库）。
-    close_master_instance(&master_dir)
+    // 第 1 步：关闭库实例（与收编同纪律：删除前拿到静止一致的库）。
+    ctx.close_instance()
         .map_err(|_| "cleanup_master_close_failed".to_string())?;
 
-    // 失败恢复：删除提交前的失败路径尽力重启主库，不把实例留在关闭态
+    // 失败恢复：删除提交前的失败路径尽力重启库实例，不把实例留在关闭态
     // （与归档提交同纪律）。
     let restart_after_failure = || {
-        let _ = launch_instance_common(
-            &master_dir,
-            &window_title,
-            None,
-            trae_instance_module::command_line_matches_master,
-        );
+        let _ = ctx.relaunch(&window_title);
     };
 
     // 第 2 步：三件套备份（ADR-0018 铁律；create_new 永不覆盖备份链）。
-    let backup_path = match backup_master_trio(&db_path) {
+    // P11-4①/P11-5⑤：写入当前库作用域活动备份目录（副环境链与主库链隔离）。
+    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
+    let backup_path = match backup_master_trio_to(&db_path, Some(&backup_dir)) {
         Ok(path) => path,
         Err(error) => {
             restart_after_failure();
@@ -8914,11 +9445,11 @@ fn cleanup_master_empty_projects_inner(
             });
         }
     };
-    // P5-9：备份生成后按保留策略清理旧备份（静默容错，不影响清理流程）。
-    prune_backups_if_enabled(&db_path, storage_root);
+    // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前库的链）。
+    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
 
     // 第 3 步：单事务删除空项目行（范围与体检口径一致，返回实际删除数）。
-    let deleted_projects = match delete_master_empty_projects(&master_dir, raw_key) {
+    let deleted_projects = match delete_master_empty_projects(&ctx.dir, raw_key) {
         Ok(count) => count,
         Err(error) => {
             restart_after_failure();
@@ -8930,15 +9461,10 @@ fn cleanup_master_empty_projects_inner(
         }
     };
 
-    // 第 4 步：重启主库（登录身份未变）。重启失败不回滚删除——数据已备份且
+    // 第 4 步：重启库实例（登录身份未变）。重启失败不回滚删除——数据已备份且
     // 删除已提交，按 relaunch_outcome="failed" 回执标注，前端据实提示
     // （与归档提交同口径，避免"清理未完成"的误导文案）。
-    let relaunch_outcome = match launch_instance_common(
-        &master_dir,
-        &window_title,
-        None,
-        trae_instance_module::command_line_matches_master,
-    ) {
+    let relaunch_outcome = match ctx.relaunch(&window_title) {
         Ok(relaunch) => relaunch.outcome.to_string(),
         Err(_) => "failed".to_string(),
     };
@@ -8958,6 +9484,8 @@ struct MasterBackupEntryDto {
     total_bytes: u64,
     /// 是否带 wal 附属件。
     has_wal: bool,
+    /// 是否带凭据备份子目录（credentials-{stamp}，P11-4②）。
+    has_credentials: bool,
 }
 
 /// P5-4 主库备份链（get_master_backup_chain 返回）。
@@ -8966,55 +9494,80 @@ struct MasterBackupChainDto {
     backups: Vec<MasterBackupEntryDto>,
     /// 备份所在目录（展示与人工恢复定位）。
     backup_dir: String,
-    /// 建议保留份数（默认 5）；实际清理行为由备份保留设置决定（P5-9，ADR-0018 修订）。
+    /// 保留份数：读 backup-retention.json 实际配置（读取失败回退默认 5，
+    /// P11-4④）；实际清理行为由备份保留设置决定（P5-9，ADR-0018 修订）。
     keep_policy: u32,
 }
 
-/// P5-4：枚举主库备份链（设置页备份分区数据源，只读）。
+/// P5-4：枚举库备份链（设置页备份分区 + 库详情页数据源，只读）。
+///
+/// P11-5 收官：`library_id` 为库实例引用（缺省主库；副环境枚举自身
+/// 作用域活动备份目录——覆盖时为环境子目录，未覆盖为 db 同目录）。
 #[tauri::command]
 async fn get_master_backup_chain(
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterBackupChainDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("trae_real_mode_required".to_string());
     }
+    let storage_root = PathBuf::from(&state.storage_root);
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-        let db_path = master_database_path(&master_dir);
-        let backups: Vec<MasterBackupEntryDto> = list_master_backups(&db_path)
-            .into_iter()
-            .map(|entry| MasterBackupEntryDto {
-                stamp_unix_seconds: entry.stamp_unix_seconds,
-                total_bytes: entry.total_bytes,
-                has_wal: entry.has_wal,
-            })
-            .collect();
-        Ok(MasterBackupChainDto {
-            backup_dir: db_path
-                .parent()
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_default(),
-            keep_policy: 5,
-            backups,
-        })
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        master_backup_chain_inner(&storage_root, &ctx)
     })
     .await
     .map_err(|_| "master_backup_chain_join_failed".to_string())?
 }
 
+/// 备份链枚举主体（阻塞上下文）：按库作用域活动目录枚举 + 读保留配置。
+fn master_backup_chain_inner(
+    storage_root: &Path,
+    ctx: &LibraryContext,
+) -> Result<MasterBackupChainDto, String> {
+    let db_path = master_database_path(&ctx.dir);
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "environment_registry_invalid".to_string())?
+        .to_string();
+    // P11-4①/P11-5⑤：枚举当前库作用域活动备份目录——sidecar 备份的
+    // 恢复语义是「按文件名找同目录」，展示目录即恢复目录。
+    let active_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
+    let backups: Vec<MasterBackupEntryDto> = list_master_backups_in(&active_dir, &db_name)
+        .into_iter()
+        .map(|entry| MasterBackupEntryDto {
+            stamp_unix_seconds: entry.stamp_unix_seconds,
+            total_bytes: entry.total_bytes,
+            has_wal: entry.has_wal,
+            has_credentials: entry.has_credentials,
+        })
+        .collect();
+    Ok(MasterBackupChainDto {
+        backup_dir: active_dir.display().to_string(),
+        keep_policy: backup_keep_policy(storage_root),
+        backups,
+    })
+}
+
 /// P5-4：手动创建主库数据备份（设置页入口）。
 ///
 /// 备份复制主库三件套为 `.switch-bak-{时间戳}`（create_new 永不覆盖既有
-/// 备份链）。主库实例运行中拒绝（`master_backup_running`）：运行中复制
-/// 可能捕获不一致快照，先关闭主库再备份（与切号事务第 1 步同纪律）。
+/// 备份链），写入当前活动备份目录（P11-4①：backup_dir 覆盖或 db 同目录）。
+/// 主库实例运行中拒绝（`master_backup_running`）：运行中复制可能捕获不一致
+/// 快照，先关闭主库再备份（与切号事务第 1 步同纪律）。
+/// `include_credentials`（P11-4②）：为 true 时把签到凭据材料白名单整拷到
+/// 备份目录下 `credentials-{同时间戳}/` 子目录（只拷密文与注册表）。
 #[tauri::command]
-async fn create_master_backup(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn create_master_backup(
+    state: tauri::State<'_, AppState>,
+    include_credentials: bool,
+) -> Result<String, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("trae_real_mode_required".to_string());
     }
     // P5-9：裁剪配置的存储根（闭包外拷出，State 引用不能进 spawn_blocking）。
-    let storage_root_for_prune = state.storage_root.clone();
+    let storage_root_for_backup = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let master_dir =
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
@@ -9032,31 +9585,196 @@ async fn create_master_backup(state: tauri::State<'_, AppState>) -> Result<Strin
             return Err("master_backup_running".to_string());
         }
         let db_path = master_database_path(&master_dir);
-        let backup = backup_master_trio(&db_path)
+        let storage = Path::new(&storage_root_for_backup);
+        let active_dir = resolve_master_backup_dir(storage, &db_path);
+        // P11-4②：凭据子目录与三件套同戳（统一发号，恢复时按戳配对）。
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backup = backup_master_trio_stamped(&db_path, Some(&active_dir), stamp)
             .map(|path| path.display().to_string())
             .map_err(|_| "master_backup_failed".to_string())?;
-        // P5-9：备份生成后按保留策略清理旧备份（静默容错）。
-        prune_backups_if_enabled(&db_path, Path::new(&storage_root_for_prune));
+        if include_credentials {
+            copy_credentials_backup(&storage.join("checkin"), &active_dir, stamp)?;
+        }
+        // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前目录链）。
+        prune_backups_if_enabled(&db_path, storage);
         Ok(backup)
     })
     .await
     .map_err(|_| "master_backup_join_failed".to_string())?
 }
 
+/// P11-4①：解析当前活动备份目录——配置 backup_dir 有值则写/读该目录，
+/// 否则主库 db 同目录（原行为）。fail-soft：配置损坏回退默认位置，
+/// 不阻断备份/切号主流程（与裁剪的静默容错同口径）。
+fn resolve_master_backup_dir(storage_root: &Path, db_path: &Path) -> PathBuf {
+    if let Some(dir) = load_backup_dir_override(storage_root) {
+        return dir;
+    }
+    db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// P11-5⑤：库作用域活动备份目录——副环境备份链与主库链物理隔离。
+///
+/// 主库口径不变（`resolve_master_backup_dir`：覆盖根或 db 同目录）；
+/// 副环境在 backup_dir 覆盖时落到「覆盖目录/environments/{env_id}/」
+/// 子目录——主库链、其他环境链互不可见，裁剪（同前缀文件名匹配）
+/// 天然不越界；未覆盖时 = db 同目录（环境目录本身即隔离边界）。
+/// 备份文件名保持 `{db 名}.switch-bak-{时间戳}`：恢复语义「按文件名
+/// 找同目录」不变。
+fn resolve_library_backup_dir(storage_root: &Path, db_path: &Path, env_id: &str) -> PathBuf {
+    if env_id == MASTER_ENV_ID {
+        return resolve_master_backup_dir(storage_root, db_path);
+    }
+    if let Some(dir) = load_backup_dir_override(storage_root) {
+        return dir.join("environments").join(env_id);
+    }
+    db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// P11-4① 备份位置校验（set/migrate 命令同口径）：绝对路径、长度上限、
+/// 可创建（目录或其父级）、不落入签到材料根（防凭据材料与备份互混）。
+/// 返回可直接使用的路径；None = 恢复默认位置。
+fn validate_backup_dir(
+    backup_dir: Option<&str>,
+    storage_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = backup_dir else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_BACKUP_DIR_BYTES {
+        return Err("backup_dir_invalid".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err("backup_dir_invalid".to_string());
+    }
+    // 不允许等于或落入签到材料根内部：凭据材料与备份文件互相混入会破坏
+    // 两边的目录语义（白名单拷贝、裁剪与恢复指引都以目录边界为准）。
+    if path.starts_with(storage_root.join("checkin")) {
+        return Err("backup_dir_conflicts_checkin".to_string());
+    }
+    // 目录可不存在，但须可创建（create_dir_all 幂等；父级不可达即拒绝）。
+    std::fs::create_dir_all(&path).map_err(|_| "backup_dir_unavailable".to_string())?;
+    Ok(Some(path))
+}
+
+/// P11-4② 凭据备份白名单：只拷密文与注册表；白名单之外的任何文件
+/// （含未来的未知新增）一律不拷——防御性保证明文 token/私钥不进备份目录。
+/// 各条目内容：accounts.json = 非敏感账号注册表；profiles = DPAPI 凭据包
+/// （TRVCKN01 密文容器）；renewals = 续期日志（manifest 仅含哈希与阶段，
+/// bundle.before 为写回前密文备份）；refresh-rescue = 救援标记（仅 sha256
+/// 摘要与时间戳）；retired = 退役凭据包（密文）。
+const CREDENTIAL_BACKUP_ENTRIES: &[&str] =
+    &["accounts.json", "profiles", "renewals", "refresh-rescue", "retired"];
+
+/// P11-4②：拷贝签到凭据材料白名单到备份目录 `credentials-{stamp}/` 子目录。
+///
+/// 只拷密文与注册表，任何明文 token/私钥不得出现；材料根不存在（从未登录）
+/// 时不创建子目录直接成功（返回 false）。返回是否实际创建了凭据子目录。
+fn copy_credentials_backup(
+    material_root: &Path,
+    backup_dir: &Path,
+    stamp: u64,
+) -> Result<bool, String> {
+    if !material_root.is_dir() {
+        return Ok(false);
+    }
+    let target_root = backup_dir.join(format!("credentials-{stamp}"));
+    if target_root.exists() {
+        // 同戳子目录已存在：拒绝而非覆盖（与备份链 create_new 同纪律）。
+        return Err("master_backup_credentials_exists".to_string());
+    }
+    std::fs::create_dir_all(&target_root)
+        .map_err(|_| "master_backup_credentials_failed".to_string())?;
+    for entry in CREDENTIAL_BACKUP_ENTRIES {
+        let source = material_root.join(entry);
+        let target = target_root.join(entry);
+        match std::fs::symlink_metadata(&source) {
+            Ok(meta) if meta.is_dir() => copy_credentials_dir(&source, &target)?,
+            Ok(meta) if meta.is_file() => {
+                std::fs::copy(&source, &target)
+                    .map_err(|_| "master_backup_credentials_failed".to_string())?;
+            }
+            // 符号链接/重解析点等非常规对象一律拒绝（fail-closed：不猜测内容）。
+            Ok(_) => return Err("master_backup_credentials_failed".to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("master_backup_credentials_failed".to_string()),
+        }
+    }
+    Ok(true)
+}
+
+/// 递归复制凭据材料子目录（仅常规文件与子目录；符号链接等拒绝）。
+fn copy_credentials_dir(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target)
+        .map_err(|_| "master_backup_credentials_failed".to_string())?;
+    let entries =
+        std::fs::read_dir(source).map_err(|_| "master_backup_credentials_failed".to_string())?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|_| "master_backup_credentials_failed".to_string())?;
+        let child_meta = std::fs::symlink_metadata(entry.path())
+            .map_err(|_| "master_backup_credentials_failed".to_string())?;
+        let child_target = target.join(entry.file_name());
+        if child_meta.is_dir() {
+            copy_credentials_dir(&entry.path(), &child_target)?;
+        } else if child_meta.is_file() {
+            std::fs::copy(entry.path(), &child_target)
+                .map_err(|_| "master_backup_credentials_failed".to_string())?;
+        } else {
+            return Err("master_backup_credentials_failed".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// P5-9 备份保留策略：读配置，启用时裁剪备份链（静默容错）。
 ///
 /// 配置读取失败（损坏/IO 错误）不裁剪——保留策略失效宁可多留不可误删；
 /// 裁剪本身失败也静默（下次备份生成时再试），不阻断任何主流程。
+/// P11-4①：只裁剪当前活动备份目录下的链，位置变更前的旧目录不碰。
 fn prune_backups_if_enabled(db_path: &Path, storage_root: &Path) {
+    if storage_root.as_os_str().is_empty() {
+        return;
+    }
+    let active_dir = resolve_master_backup_dir(storage_root, db_path);
+    prune_backups_if_enabled_in(db_path, storage_root, &active_dir);
+}
+
+/// P11-4①：库作用域裁剪（P11-5⑤ 泛化）——裁剪指定活动备份目录内的
+/// `{db 名}.switch-bak-*` 链。目录由调用方按库解析（主库 = 覆盖根或
+/// db 同目录；副环境 = 覆盖目录下环境子目录或 db 同目录），互不越界。
+fn prune_backups_if_enabled_in(db_path: &Path, storage_root: &Path, active_dir: &Path) {
     if storage_root.as_os_str().is_empty() {
         return;
     }
     let store = BackupRetentionStore::new(storage_root);
     if let Ok(settings) = store.load() {
         if settings.enabled {
-            prune_master_backups(db_path, settings.keep);
+            if let Some(db_name) = db_path.file_name().and_then(|name| name.to_str()) {
+                prune_master_backups(active_dir, db_name, settings.keep);
+            }
         }
     }
+}
+
+/// P11-4④：读取备份保留配置的保留份数（备份链展示用，fail-soft）。
+/// 未配置返回默认 5；配置损坏或 IO 失败同样回退默认 5（展示字段不阻塞）。
+fn backup_keep_policy(storage_root: &Path) -> u32 {
+    BackupRetentionStore::new(storage_root)
+        .load()
+        .map(|settings| settings.keep)
+        .unwrap_or(BackupRetentionSettings::default().keep)
 }
 
 /// P5-9：读取备份保留设置（设置页备份分区数据源）。
@@ -9082,6 +9800,8 @@ async fn get_backup_retention(
 }
 
 /// P5-9：保存备份保留设置（原子写，立即生效于下一次备份生成）。
+/// P11-4①：读旧配置合并保存——备份位置（backup_dir）不属于本命令的
+/// 编辑范围，整体覆盖会把它抹掉。
 #[tauri::command]
 async fn set_backup_retention(
     enabled: bool,
@@ -9093,12 +9813,131 @@ async fn set_backup_retention(
     }
     let storage_root = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        BackupRetentionStore::new(&storage_root)
-            .save(&BackupRetentionSettings { enabled, keep })
+        let store = BackupRetentionStore::new(&storage_root);
+        let existing = store
+            .load()
+            .map_err(|_| "backup_retention_invalid".to_string())?;
+        store
+            .save(&BackupRetentionSettings {
+                enabled,
+                keep,
+                backup_dir: existing.backup_dir,
+            })
             .map_err(|_| "backup_retention_save_failed".to_string())
     })
     .await
     .map_err(|_| "backup_retention_join_failed".to_string())?
+}
+
+/// P11-4①：读取备份位置覆盖配置（None = 主库同目录默认行为）。
+/// 配置损坏时报错（fail-closed 展示层）：让用户看到配置坏了，而不是
+/// 静默当作默认位置。
+#[tauri::command]
+async fn get_backup_dir(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let storage_root = state.storage_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        BackupRetentionStore::new(&storage_root)
+            .load()
+            .map(|settings| settings.backup_dir)
+            .map_err(|_| "backup_retention_invalid".to_string())
+    })
+    .await
+    .map_err(|_| "backup_retention_join_failed".to_string())?
+}
+
+/// P11-4①：设置备份位置。Some = 自定义目录（校验：绝对路径、长度上限、
+/// 可创建、不落签到材料根）；None = 恢复默认（主库同目录）。
+/// 立即生效于下一次备份生成；既有备份不移动（如需搬迁先调
+/// migrate_master_backups 再调本命令）。
+#[tauri::command]
+async fn set_backup_dir(
+    backup_dir: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let storage_root = state.storage_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let storage = PathBuf::from(&storage_root);
+        let normalized = validate_backup_dir(backup_dir.as_deref(), &storage)?;
+        let store = BackupRetentionStore::new(&storage);
+        let mut settings = store
+            .load()
+            .map_err(|_| "backup_retention_invalid".to_string())?;
+        settings.backup_dir = normalized.map(|path| path.display().to_string());
+        store
+            .save(&settings)
+            .map_err(|_| "backup_retention_save_failed".to_string())
+    })
+    .await
+    .map_err(|_| "backup_retention_join_failed".to_string())?
+}
+
+/// P11-4① 迁移回执 DTO（设置页展示）。
+#[derive(Clone, Serialize)]
+struct BackupMigrationDto {
+    /// 本次确认落位新目录的文件数（含幂等已存在项）。
+    migrated_files: usize,
+    /// 失败清单（用户可读原因；出现即中止位置切换，由用户排查后重试）。
+    failures: Vec<BackupMigrationFailureDto>,
+}
+
+/// 迁移失败单条记录（file_name 为备份目录内相对名，不含绝对路径）。
+#[derive(Clone, Serialize)]
+struct BackupMigrationFailureDto {
+    file_name: String,
+    reason: String,
+}
+
+/// P11-4①：把当前备份目录的全部备份产物**复制**到 targetDir（不移动、
+/// 原位保留——铁律：不自动删快照），逐文件 sha256 校验；部分失败时已复制
+/// 的保留并返回失败清单，不回滚。
+///
+/// 调用顺序约束：须在 set_backup_dir 之前调用（此刻活动目录仍是旧位置，
+/// 枚举到的才是待迁备份）；重复调用幂等（目标已存在且内容一致计入成功）。
+#[tauri::command]
+async fn migrate_master_backups(
+    target_dir: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<BackupMigrationDto, String> {
+    if state.runtime_mode != RuntimeMode::RealReadPreview {
+        return Err("trae_real_mode_required".to_string());
+    }
+    let storage_root = state.storage_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let storage = PathBuf::from(&storage_root);
+        let target = validate_backup_dir(Some(&target_dir), &storage)?
+            .ok_or_else(|| "backup_dir_invalid".to_string())?;
+        let master_dir =
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let db_path = master_database_path(&master_dir);
+        let db_name = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "environment_registry_invalid".to_string())?
+            .to_string();
+        let source = resolve_master_backup_dir(&storage, &db_path);
+        let outcome: BackupMigrationOutcome =
+            migrate_master_backups_inner(&source, &target, &db_name)
+                .map_err(|_| "master_backup_migrate_failed".to_string())?;
+        Ok(BackupMigrationDto {
+            migrated_files: outcome.migrated_files,
+            failures: outcome
+                .failures
+                .into_iter()
+                .map(|failure| BackupMigrationFailureDto {
+                    file_name: failure.file_name,
+                    reason: failure.reason,
+                })
+                .collect(),
+        })
+    })
+    .await
+    .map_err(|_| "master_backup_migrate_join_failed".to_string())?
 }
 
 /// P5-9 备份保留设置 DTO（设置页展示与编辑）。
@@ -9171,9 +10010,12 @@ struct MasterVerificationDto {
 ///
 /// `backup_stamp` 为 None 时用最新备份做对比基准；指定链上其他备份点可
 /// 排查更早发生的丢失。当前库/备份库均经隔离三件套副本只读打开。
+/// P11-5 收官：`library_id` 为库实例引用（缺省主库；台账与备份链均按
+/// 库作用域解析——副环境读自己的台账与链，不混入主库轨迹）。
 #[tauri::command]
 async fn get_master_verification(
     backup_stamp: Option<u64>,
+    library_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<MasterVerificationDto, String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
@@ -9186,15 +10028,14 @@ async fn get_master_verification(
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<MasterVerificationDto, String> {
         use traesync_infrastructure::master_verification::{
-            backup_db_path, compare_with_backup, current_master_db_path, read_session_facts,
-            verify_relay_ledger,
+            compare_with_backup, current_master_db_path, read_session_facts, verify_relay_ledger,
         };
 
-        let db_path = current_master_db_path(
-            &master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?,
-        );
+        // 库作用域解析：当前库 db、台账根、活动备份目录全部按库路由。
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        let db_path = current_master_db_path(&ctx.dir);
         if !db_path.is_file() {
-            // 主库从未启动：两层都无对象，前端引导文案。
+            // 库从未启动：两层都无对象，前端引导文案。
             return Ok(MasterVerificationDto {
                 ledger: LedgerVerificationDto {
                     status: "no_master_data".to_string(),
@@ -9215,12 +10056,14 @@ async fn get_master_verification(
         }
 
         // 台账：文件不存在 = 从未切号（no_ledger，正常空态）；损坏 = 报错。
-        let ledger_entries = match RelayLedger::new(storage_root.join("environments")).load() {
-            Ok(entries) => entries,
-            Err(
-                traesync_infrastructure::relay_ledger::RelayLedgerError::Io,
-            ) => return Err("relay_ledger_unavailable".to_string()),
-            Err(_) => return Err("relay_ledger_invalid".to_string()),
+        // P11-5⑤：台账按库隔离（relay_ledger_root 路由）。
+        let ledger_entries =
+            match RelayLedger::new(relay_ledger_root(&storage_root, &ctx.env_id)).load() {
+                Ok(entries) => entries,
+                Err(
+                    traesync_infrastructure::relay_ledger::RelayLedgerError::Io,
+                ) => return Err("relay_ledger_unavailable".to_string()),
+                Err(_) => return Err("relay_ledger_invalid".to_string()),
         };
 
         // 第一层：当前库会话事实 + 台账核对。
@@ -9274,8 +10117,15 @@ async fn get_master_verification(
                 .collect(),
         };
 
-        // 第二层：备份链选基准（None = 最新）。
-        let chain = list_master_backups(&db_path);
+        // 第二层：备份链选基准（None = 最新）。P11-4①/P11-5⑤：从当前库
+        // 作用域活动备份目录取（与备份写入点同口径，副环境不混主库链）。
+        let active_dir = resolve_library_backup_dir(&storage_root, &db_path, &ctx.env_id);
+        let db_name = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "environment_registry_invalid".to_string())?
+            .to_string();
+        let chain = list_master_backups_in(&active_dir, &db_name);
         let backup_stamps: Vec<u64> = chain
             .iter()
             .map(|entry| entry.stamp_unix_seconds)
@@ -9294,7 +10144,8 @@ async fn get_master_verification(
             let chosen_stamp = backup_stamp
                 .filter(|stamp| backup_stamps.contains(stamp))
                 .unwrap_or(backup_stamps[0]);
-            let chosen_path = backup_db_path(&db_path, chosen_stamp);
+            // P11-4①：基准备份按活动目录解析（不再假定与 db 同目录）。
+            let chosen_path = active_dir.join(format!("{db_name}.switch-bak-{chosen_stamp}"));
             if !chosen_path.is_file() {
                 return Ok(MasterVerificationDto {
                     ledger: ledger_dto,
@@ -9863,11 +10714,13 @@ async fn archive_master_sessions(
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir = resolve_library_dir(library_id.as_deref())?;
-        let current_account =
-            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        ctx.ensure_writable()?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         archive_master_sessions_inner(
-            &master_dir,
+            &ctx.dir,
             &raw_key,
             &session_ids,
             &current_account.account_id,
@@ -9901,11 +10754,13 @@ async fn restore_master_sessions(
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir = resolve_library_dir(library_id.as_deref())?;
-        let current_account =
-            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        ctx.ensure_writable()?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         restore_master_sessions_inner(
-            &master_dir,
+            &ctx.dir,
             &raw_key,
             &session_ids,
             &current_account.account_id,
@@ -9951,14 +10806,20 @@ async fn apply_master_archive_changes(
     let storage_root = PathBuf::from(&state.storage_root);
     let storage_root_for_prune = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir = resolve_library_dir(library_id.as_deref())?;
-        let current_account =
-            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
-        let db_path = master_database_path(&master_dir);
-        let window_title = current_account
-            .display_name
-            .clone()
-            .unwrap_or_else(|| current_account.screen_name.clone());
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        ctx.ensure_writable()?;
+        let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
+        let db_path = master_database_path(&ctx.dir);
+        // 重启窗口标题：主库 = 当前账号名（P5-8a 口径）；副环境 = 环境名。
+        let window_title = if ctx.is_master() {
+            current_account
+                .display_name
+                .clone()
+                .unwrap_or_else(|| current_account.screen_name.clone())
+        } else {
+            ctx.env_name.clone()
+        };
 
         if db_path.is_file()
             && master_db_activity_detected(&db_path, std::time::Duration::from_millis(800))
@@ -9966,18 +10827,16 @@ async fn apply_master_archive_changes(
             return Err("master_archive_busy".to_string());
         }
 
-        close_master_instance(&master_dir)
+        ctx.close_instance()
             .map_err(|_| "master_archive_close_failed".to_string())?;
 
         let restart_after_failure = || {
-            let _ = launch_instance_common(
-                &master_dir,
-                &window_title,
-                None,
-                trae_instance_module::command_line_matches_master,
-            );
+            let _ = ctx.relaunch(&window_title);
         };
-        let _backup_path = match backup_master_trio(&db_path) {
+        // P11-4①/P11-5⑤：写入当前库作用域活动备份目录（副环境链与主库链隔离）。
+        let backup_dir =
+            resolve_library_backup_dir(Path::new(&storage_root_for_prune), &db_path, &ctx.env_id);
+        let _backup_path = match backup_master_trio_to(&db_path, Some(&backup_dir)) {
             Ok(path) => path,
             Err(error) => {
                 restart_after_failure();
@@ -9987,10 +10846,10 @@ async fn apply_master_archive_changes(
                 });
             }
         };
-        prune_backups_if_enabled(&db_path, Path::new(&storage_root_for_prune));
+        prune_backups_if_enabled_in(&db_path, Path::new(&storage_root_for_prune), &backup_dir);
 
         let outcome = match apply_master_archive_changes_inner(
-            &master_dir,
+            &ctx.dir,
             &raw_key,
             &archive_session_ids,
             &restore_session_ids,
@@ -10003,12 +10862,7 @@ async fn apply_master_archive_changes(
             }
         };
 
-        let relaunch_outcome = match launch_instance_common(
-            &master_dir,
-            &window_title,
-            None,
-            trae_instance_module::command_line_matches_master,
-        ) {
+        let relaunch_outcome = match ctx.relaunch(&window_title) {
             Ok(relaunch) => relaunch.outcome.to_string(),
             Err(_) => "failed".to_string(),
         };
@@ -10057,17 +10911,19 @@ async fn delete_master_sessions(
     // P5-9：删除前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir = resolve_library_dir(library_id.as_deref())?;
-        let current_account =
-            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        ctx.ensure_writable()?;
+        let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         // 运行中禁止（口径同 create_master_backup）：删除前必须能拿到静止
-        // 一致的三件套备份。
+        // 一致的三件套备份。P11-5⑤：运行检测按库环境口径匹配。
         let running = list_trae_processes()
             .map(|processes| {
                 processes.iter().any(|process| {
-                    process.command_line.as_deref().is_some_and(|line| {
-                        trae_instance_module::command_line_matches_master(line, &master_dir)
-                    })
+                    process
+                        .command_line
+                        .as_deref()
+                        .is_some_and(|line| ctx.command_line_matches(line))
                 })
             })
             .unwrap_or(false);
@@ -10075,7 +10931,7 @@ async fn delete_master_sessions(
             return Err("master_delete_running".to_string());
         }
         let result = delete_master_sessions_inner(
-            &master_dir,
+            &ctx.dir,
             &raw_key,
             &session_ids,
             &current_account.account_id,
@@ -10088,9 +10944,12 @@ async fn delete_master_sessions(
         })
         .map_err(map_master_archive_error);
         // P5-9：删除链已生成新备份，按保留策略清理旧备份（静默容错）。
+        // P11-5⑤：裁剪目标 = 库作用域活动目录（副环境不误伤主库链）。
         if result.is_ok() {
-            let db_path = master_database_path(&master_dir);
-            prune_backups_if_enabled(&db_path, Path::new(&storage_root_for_prune));
+            let db_path = master_database_path(&ctx.dir);
+            let backup_dir =
+                resolve_library_backup_dir(Path::new(&storage_root_for_prune), &db_path, &ctx.env_id);
+            prune_backups_if_enabled_in(&db_path, Path::new(&storage_root_for_prune), &backup_dir);
         }
         result
     })
@@ -10134,17 +10993,19 @@ async fn merge_master_projects(
     // P5-9：合并前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
     let storage_root_for_prune = state.storage_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let master_dir = resolve_library_dir(library_id.as_deref())?;
-        let current_account =
-            require_actual_master_account(&material_root, &storage_root, &master_dir)?;
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        // P11-6（ADR-0032 决策 5）：只读库一律拒绝写操作（稳定错误码 library_read_only）。
+        ctx.ensure_writable()?;
+        let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
         // 运行中禁止（口径同 delete_master_sessions）：合并前必须能拿到静止
-        // 一致的三件套备份。
+        // 一致的三件套备份。P11-5⑤：运行检测按库环境口径匹配。
         let running = list_trae_processes()
             .map(|processes| {
                 processes.iter().any(|process| {
-                    process.command_line.as_deref().is_some_and(|line| {
-                        trae_instance_module::command_line_matches_master(line, &master_dir)
-                    })
+                    process
+                        .command_line
+                        .as_deref()
+                        .is_some_and(|line| ctx.command_line_matches(line))
                 })
             })
             .unwrap_or(false);
@@ -10152,7 +11013,7 @@ async fn merge_master_projects(
             return Err("master_merge_running".to_string());
         }
         let result = merge_master_projects_inner(
-            &master_dir,
+            &ctx.dir,
             &raw_key,
             &source_project_ids,
             &target_project_id,
@@ -10165,9 +11026,12 @@ async fn merge_master_projects(
         })
         .map_err(map_master_archive_error);
         // P5-9：合并链已生成新备份，按保留策略清理旧备份（静默容错）。
+        // P11-5⑤：裁剪目标 = 库作用域活动目录（副环境不误伤主库链）。
         if result.is_ok() {
-            let db_path = master_database_path(&master_dir);
-            prune_backups_if_enabled(&db_path, Path::new(&storage_root_for_prune));
+            let db_path = master_database_path(&ctx.dir);
+            let backup_dir =
+                resolve_library_backup_dir(Path::new(&storage_root_for_prune), &db_path, &ctx.env_id);
+            prune_backups_if_enabled_in(&db_path, Path::new(&storage_root_for_prune), &backup_dir);
         }
         result
     })
@@ -10229,8 +11093,9 @@ struct RelayLedgerEntryDto {
 
 /// P5-3：读取接力台账（全部记录，前端按 session_id / from_session_id
 /// 链回成完整接力轨迹）。台账损坏报错不静默重建（铁律）。
-/// `library_id` 为库实例引用（ADR-0025，缺省主库；V1 台账随主库
-/// 存储于存储根 environments 目录，此处仅校验库 id 合法性）。
+/// `library_id` 为库实例引用（ADR-0025，缺省主库）。P11-5⑤：台账按库
+/// 隔离（relay_ledger_root）——主库读存储根 environments 目录原文件，
+/// 副环境读 relay-ledgers/{env_id} 独立文件。
 #[tauri::command]
 async fn get_relay_ledger(
     library_id: Option<String>,
@@ -10239,10 +11104,10 @@ async fn get_relay_ledger(
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("trae_real_mode_required".to_string());
     }
-    // ADR-0025：库作用域校验——未知库直接拒绝，不落到默认库。
-    resolve_library_dir(library_id.as_deref())?;
-    let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
+    // ADR-0025：库作用域校验——未知库直接拒绝，不落到默认库。
+    let env_id = resolve_library_env_id(library_id.as_deref(), &storage_root)?;
+    let material_root = checkin_material_root(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let records = AccountRegistry::new(&material_root)
             .load()
@@ -10260,7 +11125,7 @@ async fn get_relay_ledger(
                 )
             })
             .collect();
-        let entries = RelayLedger::new(storage_root.join("environments"))
+        let entries = RelayLedger::new(relay_ledger_root(&storage_root, &env_id))
             .load()
             .map_err(|error| match error {
                 traesync_infrastructure::relay_ledger::RelayLedgerError::Invalid => {
@@ -10521,18 +11386,6 @@ fn restore_operation(
     Err(CommandErrorDto::gate_not_qualified(
         "Gate H/L 未 Qualified：恢复能力保持禁用。",
     ))
-}
-
-fn is_operation_lease_busy_error(error: &str) -> bool {
-    error.starts_with("operation_lease_busy:")
-}
-
-fn catalog_path_error_text(error: CatalogPathError) -> String {
-    if error == CatalogPathError::CatalogWriteProtocolUpgradeRequired {
-        error.code().to_string()
-    } else {
-        error.to_string()
-    }
 }
 
 fn current_verified_profile_id(state: &AppState) -> Option<String> {
@@ -10911,7 +11764,7 @@ pub fn run() {
         runtime_mode,
         provider,
         source_raw_key,
-        catalog_key,
+        _catalog_key,
         storage_root,
         recovery_root,
         production_catalog,
@@ -11017,7 +11870,6 @@ pub fn run() {
             workbench_probe,
             workbench_reader,
             source_raw_key,
-            catalog_key,
             storage_root,
             recovery_root,
             process_controller: Arc::new(WorkCnProcessController::default()),
@@ -11027,7 +11879,6 @@ pub fn run() {
             ))),
             pending_sync_plan: Arc::new(Mutex::new(None)),
             active_sync_cancellation: Arc::new(Mutex::new(None)),
-            current_progress: Arc::new(Mutex::new(None)),
             pending_deletion_plan: Arc::new(Mutex::new(None)),
             managed_account_runtime: Arc::new(Mutex::new(initial_managed_account_runtime)),
             checkin_cancellation: Arc::new(AtomicBool::new(false)),
@@ -11115,6 +11966,8 @@ pub fn run() {
             delete_environment,
             launch_environment,
             login_environment,
+            // P11-5：环境实例关闭（主库/副环境通用，界面「关闭」按钮）。
+            close_environment_instance,
             // P5-1：主库切号五步事务（关实例→备份→凭据互换→交接→重启）。
             switch_master_account,
             preview_master_switch_plugins,
@@ -11128,6 +11981,9 @@ pub fn run() {
             create_master_backup,
             get_backup_retention,
             set_backup_retention,
+            get_backup_dir,
+            set_backup_dir,
+            migrate_master_backups,
             get_master_verification,
             // P5-8a 会话归档通道（ADR-0022）：归档/恢复/真实删除。
             archive_master_sessions,
@@ -11135,6 +11991,9 @@ pub fn run() {
             apply_master_archive_changes,
             delete_master_sessions,
             merge_master_projects,
+            // P11-5 库归档草稿（localStorage 迁入 storage_root 持久化）。
+            get_archive_draft,
+            set_archive_draft,
             // P5-5 主库体检 + 一键收编（环境页）。
             get_master_checkup,
             incorporate_master_records,
@@ -11721,6 +12580,143 @@ mod master_switch_tests {
             "checkin-b"
         ));
     }
+
+    /// P11-4④：keep_policy 读实际备份保留配置；未配置/损坏时 fail-soft
+    /// 回退默认 5（展示字段不阻塞）。
+    #[test]
+    fn backup_keep_policy_reads_actual_config_with_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        // 未配置（文件不存在）：默认 5。
+        assert_eq!(backup_keep_policy(root.path()), 5);
+        // 已配置：读实际值。
+        BackupRetentionStore::new(root.path())
+            .save(&BackupRetentionSettings {
+                enabled: true,
+                keep: 12,
+                backup_dir: None,
+            })
+            .unwrap();
+        assert_eq!(backup_keep_policy(root.path()), 12);
+        // 配置损坏：fail-soft 回退默认 5。
+        std::fs::write(root.path().join("backup-retention.json"), "not json").unwrap();
+        assert_eq!(backup_keep_policy(root.path()), 5);
+    }
+
+    /// P11-4①：活动备份目录解析——未配置回退 db 同目录；配置了覆盖用之；
+    /// 配置损坏 fail-soft 回退 db 同目录（不阻断主流程）。
+    #[test]
+    fn resolve_master_backup_dir_prefers_configured_override() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("master").join("database.db");
+        // 未配置：db 同目录。
+        assert_eq!(
+            resolve_master_backup_dir(root.path(), &db_path),
+            root.path().join("master")
+        );
+        // 配置了覆盖：用它。
+        let custom = root.path().join("custom-backups");
+        BackupRetentionStore::new(root.path())
+            .save(&BackupRetentionSettings {
+                enabled: true,
+                keep: 5,
+                backup_dir: Some(custom.display().to_string()),
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_master_backup_dir(root.path(), &db_path),
+            custom
+        );
+        // 配置损坏：fail-soft 回退 db 同目录。
+        std::fs::write(root.path().join("backup-retention.json"), "not json").unwrap();
+        assert_eq!(
+            resolve_master_backup_dir(root.path(), &db_path),
+            root.path().join("master")
+        );
+    }
+
+    /// P11-4①：备份位置校验（set/migrate 命令同口径）——None 合法；
+    /// 相对路径/空/超长拒绝；可创建目录通过并建立；签到材料根（含其内部）
+    /// 拒绝。
+    #[test]
+    fn validate_backup_dir_rejects_invalid_and_accepts_creatable() {
+        let root = tempfile::tempdir().unwrap();
+        // None：恢复默认位置。
+        assert_eq!(validate_backup_dir(None, root.path()).unwrap(), None);
+        // 相对路径 / 空白 / 超长：拒绝。
+        assert!(validate_backup_dir(Some("relative/dir"), root.path()).is_err());
+        assert!(validate_backup_dir(Some("   "), root.path()).is_err());
+        let too_long = format!("D:\\{}", "a".repeat(MAX_BACKUP_DIR_BYTES + 1));
+        assert!(validate_backup_dir(Some(&too_long), root.path()).is_err());
+        // 可创建（父级存在）：通过并创建目录。
+        let target = root.path().join("new-backups");
+        assert_eq!(
+            validate_backup_dir(Some(target.to_str().unwrap()), root.path()).unwrap(),
+            Some(target.clone())
+        );
+        assert!(target.is_dir());
+        // 等于签到材料根与其内部子目录：拒绝。
+        let checkin = root.path().join("checkin");
+        assert!(validate_backup_dir(Some(checkin.to_str().unwrap()), root.path()).is_err());
+        let inner = checkin.join("profiles");
+        assert!(validate_backup_dir(Some(inner.to_str().unwrap()), root.path()).is_err());
+    }
+
+    /// P11-4②：凭据备份白名单——密文与注册表在、模拟明文与未知目录不在
+    /// （明文 token 永不落备份目录的安全断言）。
+    #[test]
+    fn credentials_backup_copies_whitelist_only() {
+        let root = tempfile::tempdir().unwrap();
+        let material = root.path().join("checkin");
+        std::fs::create_dir_all(material.join("profiles")).unwrap();
+        std::fs::create_dir_all(material.join("renewals").join("op-1")).unwrap();
+        std::fs::create_dir_all(material.join("refresh-rescue")).unwrap();
+        std::fs::create_dir_all(material.join("retired")).unwrap();
+        std::fs::write(material.join("accounts.json"), b"{}").unwrap();
+        std::fs::write(material.join("profiles").join("abc.checkin"), b"TRVCKN01-cipher").unwrap();
+        std::fs::write(material.join("renewals").join("op-1").join("manifest.json"), b"{}").unwrap();
+        std::fs::write(
+            material.join("renewals").join("op-1").join("bundle.before"),
+            b"TRVCKN01-cipher2",
+        )
+        .unwrap();
+        std::fs::write(material.join("refresh-rescue").join("m.json"), b"{}").unwrap();
+        std::fs::write(material.join("retired").join("x.checkin"), b"TRVCKN01-old").unwrap();
+        // 模拟异常明文与未知目录：白名单之外，绝不入备份。
+        std::fs::write(material.join("plaintext-token.txt"), b"secret-token").unwrap();
+        std::fs::create_dir_all(material.join("unknown-dir")).unwrap();
+        std::fs::write(material.join("unknown-dir").join("x.bin"), b"?").unwrap();
+
+        let backup_dir = root.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let created = copy_credentials_backup(&material, &backup_dir, 1234).unwrap();
+        assert!(created);
+        let cred = backup_dir.join("credentials-1234");
+        assert!(cred.join("accounts.json").is_file());
+        assert!(cred.join("profiles").join("abc.checkin").is_file());
+        assert!(cred.join("renewals").join("op-1").join("bundle.before").is_file());
+        assert!(cred.join("refresh-rescue").join("m.json").is_file());
+        assert!(cred.join("retired").join("x.checkin").is_file());
+        // 白名单之外一律不拷（防御性：明文 token 永不进备份目录）。
+        assert!(!cred.join("plaintext-token.txt").exists());
+        assert!(!cred.join("unknown-dir").exists());
+        // 内容字节一致。
+        assert_eq!(
+            std::fs::read(cred.join("profiles").join("abc.checkin")).unwrap(),
+            b"TRVCKN01-cipher"
+        );
+    }
+
+    /// P11-4②：材料根不存在（从未登录）不创建凭据子目录，直接成功。
+    #[test]
+    fn credentials_backup_missing_root_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let backup_dir = root.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let created =
+            copy_credentials_backup(&root.path().join("checkin"), &backup_dir, 7).unwrap();
+        assert!(!created);
+        assert!(!backup_dir.join("credentials-7").exists());
+    }
 }
 
 // ============================================================================
@@ -12025,6 +13021,117 @@ mod master_self_check_tests {
 }
 
 // ============================================================================
+// P11-5 环境命令 inner 层：删除残留路径错误 + 关闭实例幂等。
+// close 的主库分支依赖真实 APPDATA 目录，可能触及用户正在运行的主库实例，
+// 不做单测（由 e2e / 人工验证）；副环境分支用 tempdir data_dir，安全。
+// ============================================================================
+
+#[cfg(test)]
+mod environment_commands_tests {
+    use super::*;
+
+    /// 测试根：storage_root + 按需登记的副环境档案。
+    struct EnvFixture {
+        root: tempfile::TempDir,
+    }
+
+    impl EnvFixture {
+        fn new() -> Self {
+            Self {
+                root: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn storage_root(&self) -> PathBuf {
+            self.root.path().to_path_buf()
+        }
+
+        fn create_env(&self, name: &str) -> traesync_infrastructure::environment_registry::EnvironmentRecord {
+            EnvironmentRegistry::new(self.root.path()).create(name).unwrap()
+        }
+    }
+
+    #[test]
+    fn delete_environment_success_removes_directory() {
+        let fixture = EnvFixture::new();
+        let record = fixture.create_env("测试环境");
+        let env_dir = secondary_data_dir(fixture.root.path(), &record.env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+
+        delete_environment_inner(fixture.root.path(), &record.env_id).unwrap();
+
+        // 档案行与目录一并移除。
+        assert!(!env_dir.exists());
+        assert!(EnvironmentRegistry::new(fixture.root.path())
+            .find(&record.env_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn delete_environment_rejects_master_and_missing() {
+        let fixture = EnvFixture::new();
+        // 主库先建档：命中「主库不可删除」而非「档案不存在」。
+        EnvironmentRegistry::new(fixture.root.path())
+            .ensure_master()
+            .unwrap();
+        assert_eq!(
+            delete_environment_inner(fixture.root.path(), MASTER_ENV_ID).unwrap_err(),
+            "environment_master_immutable"
+        );
+        assert_eq!(
+            delete_environment_inner(fixture.root.path(), "env-none").unwrap_err(),
+            "environment_not_found"
+        );
+    }
+
+    #[test]
+    fn delete_environment_directory_failure_reports_residue_path() {
+        let fixture = EnvFixture::new();
+        let record = fixture.create_env("测试环境");
+        // 在 env_dir 位置放一个普通文件：remove_dir_all 对非目录必然失败，
+        // 以此构造「目录删除失败」而不依赖进程锁。
+        let env_dir = secondary_data_dir(fixture.root.path(), &record.env_id);
+        std::fs::create_dir_all(env_dir.parent().unwrap()).unwrap();
+        std::fs::write(&env_dir, "not a directory").unwrap();
+
+        let error = delete_environment_inner(fixture.root.path(), &record.env_id).unwrap_err();
+
+        // P11-5：稳定错误码 + 完整残留路径（冒号后为路径），供前端提示
+        // 用户手动清理定位。
+        assert_eq!(
+            error,
+            format!("environment_delete_failed_residue:{}", env_dir.display())
+        );
+        // 残留物仍在（不静默删除，铁律）。
+        assert!(env_dir.exists());
+    }
+
+    /// close 原语仅 Windows（taskkill）；进程列表查询只读安全。
+    #[cfg(windows)]
+    #[test]
+    fn close_environment_missing_reports_not_found_without_process_actions() {
+        let fixture = EnvFixture::new();
+        // 档案不存在：先拒绝，不做任何进程操作。
+        assert_eq!(
+            close_environment_instance_inner(fixture.root.path(), "env-none").unwrap_err(),
+            "environment_not_found"
+        );
+    }
+
+    /// close 原语仅 Windows（taskkill）；tempdir data_dir 不会有真实
+    /// TRAE 进程使用，走 NotRunning 幂等分支（无 taskkill、无等待）。
+    #[cfg(windows)]
+    #[test]
+    fn close_environment_not_running_is_idempotent() {
+        let fixture = EnvFixture::new();
+        let record = fixture.create_env("测试环境");
+        let receipt = close_environment_instance_inner(fixture.root.path(), &record.env_id).unwrap();
+        assert_eq!(receipt.outcome, "not_running");
+    }
+}
+
+// ============================================================================
 // M3：真实签到分支（run_real_checkin）——只覆盖不发网络请求的拦截路径；
 // 真实 HTTP 直连行为由 infrastructure 层的 RealCheckinTransport 测试覆盖。
 // ============================================================================
@@ -12043,7 +13150,6 @@ mod real_checkin_tests {
             workbench_probe: SqlCipherProbe::new(),
             workbench_reader: AccountEvidenceReader::new(),
             source_raw_key: "0".repeat(64),
-            catalog_key: "0".repeat(64),
             storage_root: storage_root.to_string_lossy().into_owned(),
             recovery_root: String::new(),
             process_controller: Arc::new(FixedProcessController::not_running()),
@@ -12052,7 +13158,6 @@ mod real_checkin_tests {
             ))),
             pending_sync_plan: Arc::new(Mutex::new(None)),
             active_sync_cancellation: Arc::new(Mutex::new(None)),
-            current_progress: Arc::new(Mutex::new(None)),
             pending_deletion_plan: Arc::new(Mutex::new(None)),
             managed_account_runtime: Arc::new(Mutex::new(ManagedAccountRuntimeSlot::default())),
             checkin_cancellation: Arc::new(AtomicBool::new(false)),
@@ -12142,9 +13247,14 @@ mod real_checkin_tests {
         let records = registry.load().expect("生产注册表读取失败");
         assert!(!records.is_empty(), "生产注册表为空");
         let ids: Vec<String> = records.iter().map(|r| r.profile_id.clone()).collect();
-        let entries =
-            refresh_checkin_credits_inner(&material_root, &ids, RuntimeMode::RealReadPreview)
-                .expect("真实 refresh 失败");
+        let entries = refresh_checkin_credits_inner(
+            &material_root,
+            &ids,
+            RuntimeMode::RealReadPreview,
+            // 真实验收脚本：不需要进度推送。
+            &|_| {},
+        )
+        .expect("真实 refresh 失败");
         for entry in &entries {
             println!(
                 "== refresh {} -> credits={:?} usage={:?} err={:?}",
@@ -12438,6 +13548,7 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
+            &root.path().join("master").join("database.db"),
             "profile-a",
             &processes,
         )
@@ -12456,6 +13567,7 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
+            &root.path().join("master").join("database.db"),
             "profile-404",
             &[],
         )
@@ -12496,6 +13608,7 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
+            &root.path().join("master").join("database.db"),
             "profile-a",
             &[],
         )
@@ -12514,10 +13627,100 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
+            &root.path().join("master").join("database.db"),
             "profile-a",
             &[],
         )
         .unwrap();
+    }
+
+    /// P11-4③：purge 备份先行——主库 db 存在时先留三件套备份（create_new
+    /// 永不覆盖既有链），备份成功后再执行删除。
+    #[test]
+    fn purge_backs_up_master_trio_before_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        registered_account_with_id(root.path(), "profile-a", "1234567890");
+        let instance_dir = root.path().join("trae-instances").join("profile-a");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        std::fs::write(instance_dir.join("storage.json"), b"{}").unwrap();
+        // 主库 db + wal 现场（备份只做文件复制，字节内容任意）。
+        let master_dir = root.path().join("master");
+        std::fs::create_dir_all(&master_dir).unwrap();
+        let master_db = master_dir.join("database.db");
+        std::fs::write(&master_db, b"master-db-bytes").unwrap();
+        std::fs::write(master_dir.join("database.db-wal"), b"wal-bytes").unwrap();
+        let appdata = tempfile::tempdir().unwrap();
+
+        purge_account_records_inner(
+            &root.path().join("checkin"),
+            root.path(),
+            appdata.path(),
+            &master_db,
+            "profile-a",
+            &[],
+        )
+        .unwrap();
+
+        // 备份生成：主文件内容与 db 一致，且带 wal 附属件。
+        let backup_main = std::fs::read_dir(&master_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("database.db.switch-bak-")
+                    && !name.ends_with("-wal")
+                    && !name.ends_with("-shm")
+            })
+            .expect("备份主文件应存在");
+        assert_eq!(
+            std::fs::read(backup_main.path()).unwrap(),
+            b"master-db-bytes"
+        );
+        let backup_name = backup_main.file_name().to_string_lossy().into_owned();
+        assert!(master_dir.join(format!("{backup_name}-wal")).is_file());
+        // 备份先行不阻断删除主流程：三处现场照常清理。
+        assert!(!instance_dir.exists());
+    }
+
+    /// P11-4③：备份失败一律拒绝执行（无备份不动数据），删除零发生。
+    /// 预占未来数秒的同名备份位使 create_new 撞车，确定性触发备份失败。
+    #[test]
+    fn purge_rejects_when_master_backup_fails() {
+        let root = tempfile::tempdir().unwrap();
+        registered_account_with_id(root.path(), "profile-a", "1234567890");
+        let instance_dir = root.path().join("trae-instances").join("profile-a");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        std::fs::write(instance_dir.join("storage.json"), b"{}").unwrap();
+        let master_dir = root.path().join("master");
+        std::fs::create_dir_all(&master_dir).unwrap();
+        let master_db = master_dir.join("database.db");
+        std::fs::write(&master_db, b"master-db-bytes").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for stamp in now - 2..=now + 5 {
+            std::fs::write(
+                master_dir.join(format!("database.db.switch-bak-{stamp}")),
+                b"occupied",
+            )
+            .unwrap();
+        }
+        let appdata = tempfile::tempdir().unwrap();
+
+        let error = purge_account_records_inner(
+            &root.path().join("checkin"),
+            root.path(),
+            appdata.path(),
+            &master_db,
+            "profile-a",
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "purge_backup_failed");
+        // 守卫生效：实例目录原样保留（未发生任何删除）。
+        assert!(instance_dir.join("storage.json").is_file());
     }
 
     /// v6：9074 上下文标注——设备铸造后 5 分钟内被拒报 device_too_new，
@@ -12562,5 +13765,476 @@ mod real_checkin_tests {
         let mut other = result_with("business_9095");
         annotate_device_too_new(&mut other, Some(now - 10));
         assert_eq!(other.detail_code.as_deref(), Some("business_9095"));
+    }
+}
+
+// ============================================================================
+// P11-5⑤ 副环境全量补齐：库作用域解析 / 备份链隔离 / 环境台账 单测。
+// 只测组合根的纯逻辑编排接缝；开库读写由 infrastructure 层各自覆盖。
+// ============================================================================
+
+#[cfg(test)]
+mod library_scope_tests {
+    use super::*;
+
+    /// 测试夹具：storage_root + 一个已登记副环境。
+    struct ScopeFixture {
+        root: tempfile::TempDir,
+        env_id: String,
+    }
+
+    impl ScopeFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let record = EnvironmentRegistry::new(root.path())
+                .create("测试环境")
+                .unwrap();
+            Self {
+                env_id: record.env_id,
+                root,
+            }
+        }
+    }
+
+    /// 库 id → 环境归属：缺省/主库 → master；副环境 → env_id；未知库拒绝。
+    #[test]
+    fn resolve_library_env_id_routes_master_and_secondary() {
+        let fixture = ScopeFixture::new();
+        assert_eq!(
+            resolve_library_env_id(None, fixture.root.path()).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            resolve_library_env_id(Some("master"), fixture.root.path()).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            resolve_library_env_id(Some(&fixture.env_id), fixture.root.path()).unwrap(),
+            fixture.env_id
+        );
+        assert_eq!(
+            resolve_library_env_id(Some("env-none"), fixture.root.path()).unwrap_err(),
+            "library_not_found"
+        );
+    }
+
+    /// 副环境库目录 = 环境派生目录（ADR-0024 data_dir 规则），不指向官方目录。
+    #[test]
+    fn resolve_library_dir_maps_secondary_to_env_data_dir() {
+        let fixture = ScopeFixture::new();
+        let dir = resolve_library_dir(Some(&fixture.env_id), fixture.root.path()).unwrap();
+        assert_eq!(dir, secondary_data_dir(fixture.root.path(), &fixture.env_id));
+        // 未知库一律拒绝（不落默认库）。
+        assert_eq!(
+            resolve_library_dir(Some("env-none"), fixture.root.path()).unwrap_err(),
+            "library_not_found"
+        );
+    }
+
+    /// 副环境活动备份目录：backup_dir 覆盖时落在覆盖目录下的
+    /// environments/{env_id} 子目录（与主库链隔离）；未覆盖时 = db 同目录
+    ///（各环境目录天然隔离）。主库口径不变（覆盖根直用，不入子目录）。
+    #[test]
+    fn resolve_library_backup_dir_isolates_secondary_chains() {
+        let fixture = ScopeFixture::new();
+        let env_db = secondary_data_dir(fixture.root.path(), &fixture.env_id).join("ModularData")
+            .join("ai-agent")
+            .join("database.db");
+        // 未覆盖：db 同目录。
+        assert_eq!(
+            resolve_library_backup_dir(fixture.root.path(), &env_db, &fixture.env_id),
+            env_db.parent().unwrap()
+        );
+        // 覆盖：覆盖目录下按环境分目录，不与主库链混放。
+        let custom = fixture.root.path().join("custom-backups");
+        BackupRetentionStore::new(fixture.root.path())
+            .save(&BackupRetentionSettings {
+                enabled: true,
+                keep: 5,
+                backup_dir: Some(custom.display().to_string()),
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_library_backup_dir(fixture.root.path(), &env_db, &fixture.env_id),
+            custom.join("environments").join(&fixture.env_id)
+        );
+        // 主库备份目录仍是覆盖根（P11-4 行为不变，不受环境子目录影响）。
+        let master_db = fixture.root.path().join("master").join("database.db");
+        assert_eq!(
+            resolve_library_backup_dir(fixture.root.path(), &master_db, MASTER_ENV_ID),
+            custom
+        );
+    }
+
+    /// 裁剪只动指定活动目录内的链：主库裁剪不误伤环境链，环境裁剪不误伤主库链。
+    #[test]
+    fn prune_backups_if_enabled_in_only_touches_given_chain_dir() {
+        let fixture = ScopeFixture::new();
+        BackupRetentionStore::new(fixture.root.path())
+            .save(&BackupRetentionSettings {
+                enabled: true,
+                keep: 1,
+                backup_dir: None,
+            })
+            .unwrap();
+        let custom = fixture.root.path().join("custom-backups");
+        let env_backup_dir = custom.join("environments").join(&fixture.env_id);
+        std::fs::create_dir_all(&env_backup_dir).unwrap();
+
+        // 主库链 2 份 + 环境链 2 份（不同目录，同名文件形态）。
+        std::fs::write(custom.join("database.db.switch-bak-100"), "a").unwrap();
+        std::fs::write(custom.join("database.db.switch-bak-200"), "b").unwrap();
+        std::fs::write(env_backup_dir.join("database.db.switch-bak-100"), "a").unwrap();
+        std::fs::write(env_backup_dir.join("database.db.switch-bak-200"), "b").unwrap();
+
+        // 主库裁剪（keep=1）：只清主库目录旧链，环境子目录不动。
+        prune_backups_if_enabled_in(
+            Path::new("C:/x/database.db"),
+            fixture.root.path(),
+            &custom,
+        );
+        assert!(!custom.join("database.db.switch-bak-100").exists());
+        assert!(custom.join("database.db.switch-bak-200").exists());
+        assert!(env_backup_dir.join("database.db.switch-bak-100").exists());
+
+        // 环境裁剪：只清环境子目录旧链，主库目录不动（主库链经第一轮
+        // 裁剪后只剩最新一份 200，验证它未被环境裁剪误伤）。
+        prune_backups_if_enabled_in(
+            Path::new("C:/x/database.db"),
+            fixture.root.path(),
+            &env_backup_dir,
+        );
+        assert!(!env_backup_dir.join("database.db.switch-bak-100").exists());
+        assert!(env_backup_dir.join("database.db.switch-bak-200").exists());
+        assert!(custom.join("database.db.switch-bak-200").exists());
+    }
+
+    /// 收编台账按库隔离：主库仍写 environments/relay-ledger.json；
+    /// 副环境写 environments/relay-ledgers/{env_id}/relay-ledger.json，
+    /// 不污染主库轨迹（主库校验不受环境收编影响）。
+    #[test]
+    fn incorporate_ledger_routes_by_library_scope() {
+        let fixture = ScopeFixture::new();
+        let handover = sample_handover(Some("111"));
+
+        // 主库：原位置不变。
+        assert!(append_incorporate_ledger(
+            fixture.root.path(),
+            MASTER_ENV_ID,
+            &handover,
+            "999",
+            "222"
+        ));
+        assert!(fixture
+            .root
+            .path()
+            .join("environments")
+            .join("relay-ledger.json")
+            .exists());
+
+        // 副环境：独立文件，主库台账不受影响。
+        assert!(append_incorporate_ledger(
+            fixture.root.path(),
+            &fixture.env_id,
+            &handover,
+            "999",
+            "222"
+        ));
+        let env_ledger = fixture
+            .root
+            .path()
+            .join("environments")
+            .join("relay-ledgers")
+            .join(&fixture.env_id)
+            .join("relay-ledger.json");
+        assert!(env_ledger.exists());
+        let entries =
+            RelayLedger::new(env_ledger.parent().unwrap().parent().unwrap().join(&fixture.env_id))
+                .load()
+                .unwrap();
+        assert_eq!(entries.len(), 2);
+        // 第 4 参 = 归入目标 user_id，第 5 参 = 目标 profile_id（参数位次
+        // 与 append_incorporate_ledger 签名对齐）。
+        assert_eq!(entries[0].to_user_id, "999");
+        assert_eq!(entries[0].to_profile_id, "222");
+    }
+
+    /// 台账读取根按库路由：环境库读 relay-ledgers/{env_id}，主库读原文件。
+    #[test]
+    fn relay_ledger_root_routes_by_library_scope() {
+        let fixture = ScopeFixture::new();
+        assert_eq!(
+            relay_ledger_root(fixture.root.path(), MASTER_ENV_ID),
+            fixture.root.path().join("environments")
+        );
+        assert_eq!(
+            relay_ledger_root(fixture.root.path(), &fixture.env_id),
+            fixture
+                .root
+                .path()
+                .join("environments")
+                .join("relay-ledgers")
+                .join(&fixture.env_id)
+        );
+    }
+
+    // ===== P11-5 收官：副环境当前账号注册表权威 + 备份链库路由 =====
+
+    /// 构造两会话交接样本（仅台账消费的字段有意义；master_switch_tests
+    /// 模块的 helper 为私有，此处本地重建同款形态）。
+    fn sample_handover(previous_owner: Option<&str>) -> MasterHandover {
+        use traesync_infrastructure::HandoverSession;
+        let previous_user_id = previous_owner.unwrap_or("").to_string();
+        MasterHandover {
+            previous_owner_user_id: previous_owner.map(str::to_string),
+            transferred_projects: 2,
+            removed_mirror_rows: 1,
+            switched_sessions: vec![
+                HandoverSession {
+                    session_id: "6c-new-a".to_string(),
+                    previous_session_id: "old-a".to_string(),
+                    project_id: "p1".to_string(),
+                    previous_user_id: previous_user_id.clone(),
+                    message_count: 12,
+                },
+                HandoverSession {
+                    session_id: "6c-new-b".to_string(),
+                    previous_session_id: "old-b".to_string(),
+                    project_id: "p2".to_string(),
+                    previous_user_id,
+                    message_count: 5,
+                },
+            ],
+        }
+    }
+
+    /// 构造测试账号档案（与主库 reconcile 测试同款占位形态）。
+    fn scope_account(
+        profile_id: &str,
+        account_id: &str,
+        screen_name: &str,
+    ) -> traesync_infrastructure::account_registry::AccountRecord {
+        traesync_infrastructure::account_registry::AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: account_id.to_string(),
+            screen_name: screen_name.to_string(),
+            avatar_url: String::new(),
+            device_id: format!("device-{profile_id}"),
+            device_public_key: format!("pub-{profile_id}"),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 1,
+            last_verified_at_unix_seconds: 1,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: false,
+            archived: false,
+        }
+    }
+
+    /// 副环境当前账号以注册表值为权威：目录内无登录态 blob（环境从未
+    /// 启动过 TRAE）时仍能解析——副环境登录由工具托管，无实测语义。
+    #[test]
+    fn resolve_library_account_uses_registry_for_secondary() {
+        let fixture = ScopeFixture::new();
+        let material_root = fixture.root.path().join("material");
+        AccountRegistry::new(&material_root)
+            .upsert(&scope_account("checkin-a", "111", "账号A"))
+            .unwrap();
+        EnvironmentRegistry::new(fixture.root.path())
+            .set_current_profile(&fixture.env_id, "checkin-a")
+            .unwrap();
+        let ctx = resolve_library_context(Some(&fixture.env_id), fixture.root.path()).unwrap();
+
+        let resolved =
+            resolve_library_account(&material_root, fixture.root.path(), &ctx)
+                .unwrap()
+                .expect("副环境注册表登记账号应直接解析（不依赖目录登录态实测）");
+        assert_eq!(resolved.profile_id, "checkin-a");
+        assert_eq!(resolved.account_id, "111");
+    }
+
+    /// 副环境未登记登录账号（注册表无值）：读取与归属操作无法确定目标 → None。
+    #[test]
+    fn resolve_library_account_returns_none_for_unlogged_secondary() {
+        let fixture = ScopeFixture::new();
+        let ctx = resolve_library_context(Some(&fixture.env_id), fixture.root.path()).unwrap();
+
+        let resolved = resolve_library_account(
+            &fixture.root.path().join("material"),
+            fixture.root.path(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// 副环境注册表值指向未登记账号（账号已从账号页移除）：无授权主体
+    /// → None，与主库「登录未登记账号 → None」同口径，防悬空引用。
+    #[test]
+    fn resolve_library_account_returns_none_for_unknown_profile() {
+        let fixture = ScopeFixture::new();
+        EnvironmentRegistry::new(fixture.root.path())
+            .set_current_profile(&fixture.env_id, "checkin-gone")
+            .unwrap();
+        let ctx = resolve_library_context(Some(&fixture.env_id), fixture.root.path()).unwrap();
+
+        let resolved = resolve_library_account(
+            &fixture.root.path().join("material"),
+            fixture.root.path(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// 备份链按库路由：副环境链枚举环境作用域目录（db 同目录），主库
+    /// 口径不变（覆盖根或官方目录 db 同目录）。
+    #[test]
+    fn master_backup_chain_inner_reads_library_scoped_dir() {
+        let fixture = ScopeFixture::new();
+        let ctx = resolve_library_context(Some(&fixture.env_id), fixture.root.path()).unwrap();
+        let env_db = ctx.dir.join("ModularData").join("ai-agent").join("database.db");
+        std::fs::create_dir_all(env_db.parent().unwrap()).unwrap();
+        std::fs::write(env_db.with_file_name("database.db.switch-bak-100"), "a").unwrap();
+        std::fs::write(env_db.with_file_name("database.db.switch-bak-200"), "b").unwrap();
+
+        let chain = master_backup_chain_inner(fixture.root.path(), &ctx).unwrap();
+        assert_eq!(chain.backups.len(), 2);
+        // 目录即环境链所在目录（恢复语义「按文件名找同目录」）。
+        assert_eq!(chain.backup_dir, env_db.parent().unwrap().display().to_string());
+        // 时间戳倒序（最新在前）。
+        assert_eq!(chain.backups[0].stamp_unix_seconds, 200);
+        // 未配置保留策略时读默认值 5。
+        assert_eq!(chain.keep_policy, 5);
+    }
+    // ===== P11-6：Trae CN 只读库（ADR-0032 决策 5）=====
+
+    /// 库 id → 环境归属：trae_cn 是固定注册项（不查环境注册表、不落默认库）。
+    #[test]
+    fn resolve_library_env_id_registers_trae_cn() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_library_env_id(Some(TRAE_CN_LIBRARY_ID), root.path()).unwrap(),
+            TRAE_CN_LIBRARY_ID
+        );
+        // 其他未登记 id 仍拒绝（trae_cn 注册不改变 fail-closed 口径）。
+        assert_eq!(
+            resolve_library_env_id(Some("env-none"), root.path()).unwrap_err(),
+            "library_not_found"
+        );
+    }
+
+    /// Trae CN 只读库目录 = APPDATA 下的产品官方数据根（与主库同源规则）。
+    #[test]
+    fn trae_cn_library_dir_shape_from_appdata() {
+        let appdata = Path::new("C:/Users/u/AppData/Roaming");
+        assert_eq!(
+            traesync_infrastructure::environment_registry::product_data_dir_from_appdata(
+                appdata,
+                TraeProduct::TraeCn
+            ),
+            appdata.join("Trae CN")
+        );
+    }
+
+    /// 写守卫：trae_cn 库返回 library_read_only；主库/副环境不受影响。
+    #[test]
+    fn library_write_guard_rejects_trae_cn_only() {
+        let read_only = LibraryContext {
+            env_id: TRAE_CN_LIBRARY_ID.to_string(),
+            env_name: "Trae CN".to_string(),
+            dir: PathBuf::from("C:/fixture/Trae CN"),
+            read_only: true,
+        };
+        assert_eq!(
+            read_only.ensure_writable().unwrap_err(),
+            "library_read_only"
+        );
+
+        let master = LibraryContext {
+            env_id: MASTER_ENV_ID.to_string(),
+            env_name: "主库".to_string(),
+            dir: PathBuf::from("C:/fixture/master"),
+            read_only: false,
+        };
+        let secondary = LibraryContext {
+            env_id: "env-1-a".to_string(),
+            env_name: "副环境".to_string(),
+            dir: PathBuf::from("C:/fixture/env-1-a"),
+            read_only: false,
+        };
+        assert!(master.ensure_writable().is_ok());
+        assert!(secondary.ensure_writable().is_ok());
+    }
+
+    /// Trae CN 只读库当前账号 = 产品账号池当前指针 → 产品注册表档案
+    ///（与 switch_trae_cn_account / list_remote_devices 同源，不依赖
+    /// Work 主库注册表与登录态实测）。
+    #[test]
+    fn resolve_library_account_uses_trae_cn_product_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let trae_cn_root = trae_cn_material_root_from(root.path());
+        AccountRegistry::new(&trae_cn_root)
+            .upsert(&scope_account("checkin-cn-1", "888", "Trae CN 账号"))
+            .unwrap();
+        ProductAccountStateStore::new(&trae_cn_root)
+            .save("checkin-cn-1")
+            .unwrap();
+        let ctx = LibraryContext {
+            env_id: TRAE_CN_LIBRARY_ID.to_string(),
+            env_name: "Trae CN".to_string(),
+            dir: root.path().to_path_buf(),
+            read_only: true,
+        };
+        let resolved = resolve_library_account(&root.path().join("checkin"), root.path(), &ctx)
+            .unwrap()
+            .expect("产品池指针指向的注册表账号应直接解析");
+        assert_eq!(resolved.profile_id, "checkin-cn-1");
+        assert_eq!(resolved.account_id, "888");
+    }
+
+    /// 未选择账号（产品池无指针）：None——前端引导先在账号页登录。
+    #[test]
+    fn resolve_library_account_returns_none_for_unselected_trae_cn() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = LibraryContext {
+            env_id: TRAE_CN_LIBRARY_ID.to_string(),
+            env_name: "Trae CN".to_string(),
+            dir: root.path().to_path_buf(),
+            read_only: true,
+        };
+        let resolved = resolve_library_account(&root.path().join("checkin"), root.path(), &ctx)
+            .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// 指针悬空（指向未登记/已移除账号）：None——无授权主体，防悬空引用。
+    #[test]
+    fn resolve_library_account_returns_none_for_dangling_trae_cn_pointer() {
+        let root = tempfile::tempdir().unwrap();
+        let trae_cn_root = trae_cn_material_root_from(root.path());
+        ProductAccountStateStore::new(&trae_cn_root)
+            .save("checkin-gone")
+            .unwrap();
+        let ctx = LibraryContext {
+            env_id: TRAE_CN_LIBRARY_ID.to_string(),
+            env_name: "Trae CN".to_string(),
+            dir: root.path().to_path_buf(),
+            read_only: true,
+        };
+        let resolved = resolve_library_account(&root.path().join("checkin"), root.path(), &ctx)
+            .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// 体检对 trae_cn 库「不适用」：状态 + 全零/空字段形态固定。
+    #[test]
+    fn master_checkup_not_applicable_shape() {
+        let dto = master_checkup_not_applicable();
+        assert_eq!(dto.status, "not_applicable");
+        assert_eq!(dto.current_account_name, None);
+        assert!(dto.accounts.is_empty());
+        assert_eq!(dto.orphan_project_count, 0);
+        assert_eq!(dto.orphan_session_count, 0);
     }
 }
