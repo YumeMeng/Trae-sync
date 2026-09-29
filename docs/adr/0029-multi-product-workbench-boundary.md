@@ -4,6 +4,8 @@
 
 Accepted，2026-09-22。基于 `.scratch/research-multi-product-adaptation-20260922.md` 的本地只读探测、官方产品资料和网页 Agent 复核结果建立。本 ADR 不承诺跨产品凭据自动迁移；任何未来改变该边界的决定必须另开 ADR。
 
+> **⚠️ 局部取代标注（2026-09-28）**：决策 4（未适配能力不进主导航）与决策 9（Trae CN 不显示签到入口）已被 **ADR-0032** 的「导航五页全产品开放 + 区块能力三态（ready/pending/absent）+ Trae CN 签到探针门禁」取代。其余决策（产品上下文隔离、凭据/数据库隔离、验收状态流、禁止跨产品迁移）继续有效。
+
 ## 背景
 
 Trae Sync 原定位是 TRAE Work CN 多账号日常管理工作台。现在需要逐步承载 Trae CN 等产品，但 Work CN 与 Trae CN 具有不同的安装包类型、认证通道、数据根和能力集合。两套客户端的本地认证 blob 字段结构相似，不能据此推出 token、设备身份或 native storage 可以直接跨产品使用。
