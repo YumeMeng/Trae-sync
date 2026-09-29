@@ -96,6 +96,12 @@ name = "catalog_sidecar_contract"
 path = "tests/catalog_sidecar_contract.rs"
 required-features = ["sqlcipher"]
 
+# Trae CN 只读库真实读取探针（真机验收：密钥/路径/读路径三事实），依赖 SQLCipher。
+[[test]]
+name = "trae_cn_library_read_probe"
+path = "tests/trae_cn_library_read_probe.rs"
+required-features = ["sqlcipher"]
+
 # W0 运行中读取一致性探针（U-6 历史页轮询定参）：依赖 SQLCipher 只读路径。
 [[example]]
 name = "w0_probe"
