@@ -794,12 +794,7 @@ fn persist_login_result_for(
         .as_ref()
         .and_then(|old| {
             store
-                .load(&CheckinProfileBinding::new(
-                    old.profile_id.clone(),
-                    old.account_id.clone(),
-                    old.device_id.clone(),
-                    old.device_public_key.clone(),
-                ))
+                .load(&CheckinProfileBinding::from(old))
                 .ok()
         })
         .and_then(|bundle| bundle.mobile_full);

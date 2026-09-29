@@ -3150,12 +3150,7 @@ fn maintain_all_credentials(material_root: &Path, execution_lock: &Arc<Mutex<()>
 
     for record in records {
         let profile_id = record.profile_id.clone();
-        let binding = CheckinProfileBinding::new(
-            record.profile_id,
-            record.account_id,
-            record.device_id,
-            record.device_public_key,
-        );
+        let binding = CheckinProfileBinding::from(&record);
         // 退避状态落盘后，App 重启不会把失败账号重新当成可立即尝试，
         // 从而避免启动/定时器反复消耗服务端请求。
         let allowed = match maintenance_state.is_attempt_allowed(&profile_id, now) {
@@ -3649,15 +3644,7 @@ fn run_real_checkin(
             blocked.push((profile_id.clone(), None));
             continue;
         };
-        bindings.insert(
-            profile_id.clone(),
-            CheckinProfileBinding::new(
-                record.profile_id.clone(),
-                record.account_id.clone(),
-                record.device_id.clone(),
-                record.device_public_key.clone(),
-            ),
-        );
+        bindings.insert(profile_id.clone(), CheckinProfileBinding::from(record));
     }
 
     let store = CheckinCredentialStore::new(&material_root);
@@ -4424,12 +4411,7 @@ fn trae_cn_local_credential_status(
     record: &AccountRecord,
     now_unix_seconds: u64,
 ) -> &'static str {
-    let binding = CheckinProfileBinding::new(
-        record.profile_id.clone(),
-        record.account_id.clone(),
-        record.device_id.clone(),
-        record.device_public_key.clone(),
-    );
+    let binding = CheckinProfileBinding::from(record);
     match store.load(&binding) {
         Ok(bundle)
             if bundle.client_id == OAuthClient::TraeCn.client_id()
@@ -4507,12 +4489,7 @@ fn check_trae_cn_account_health_inner(
             });
             continue;
         };
-        let binding = CheckinProfileBinding::new(
-            record.profile_id.clone(),
-            record.account_id.clone(),
-            record.device_id.clone(),
-            record.device_public_key.clone(),
-        );
+        let binding = CheckinProfileBinding::from(record);
         let result = store
             .load(&binding)
             .map_err(|error| credential_maintenance_error_code(&error).to_string())
@@ -4719,12 +4696,7 @@ fn list_remote_devices_inner(
         account_label
     };
 
-    let binding = CheckinProfileBinding::new(
-        record.profile_id.clone(),
-        record.account_id.clone(),
-        record.device_id.clone(),
-        record.device_public_key.clone(),
-    );
+    let binding = CheckinProfileBinding::from(&record);
     let manager = RealRemoteDeviceManager::new(material_root, binding, oauth_client);
     let snapshot = manager
         .list_devices(&record.profile_id)
@@ -4797,12 +4769,7 @@ fn clear_remote_device_inner(
 ) -> Result<(), String> {
     let (record, oauth_client) =
         resolve_remote_device_account(material_root, storage_root, product_id, profile_id)?;
-    let binding = CheckinProfileBinding::new(
-        record.profile_id.clone(),
-        record.account_id.clone(),
-        record.device_id.clone(),
-        record.device_public_key.clone(),
-    );
+    let binding = CheckinProfileBinding::from(&record);
     let manager = RealRemoteDeviceManager::new(material_root, binding, oauth_client);
     manager
         .clear_refresh_token(&record.profile_id, device_id)
@@ -4857,12 +4824,7 @@ fn switch_trae_cn_account(
         .find(&profile_id)
         .map_err(|_| "trae_cn_registry_invalid".to_string())?
         .ok_or_else(|| "trae_cn_account_not_found".to_string())?;
-    let binding = CheckinProfileBinding::new(
-        record.profile_id,
-        record.account_id,
-        record.device_id,
-        record.device_public_key,
-    );
+    let binding = CheckinProfileBinding::from(&record);
     let bundle = CheckinCredentialStore::new(&material_root)
         .load(&binding)
         .map_err(|_| "trae_cn_credential_invalid".to_string())?;
@@ -5046,12 +5008,7 @@ fn refresh_checkin_credits_inner(
             });
             continue;
         };
-        let binding = CheckinProfileBinding::new(
-            record.profile_id.clone(),
-            record.account_id.clone(),
-            record.device_id.clone(),
-            record.device_public_key.clone(),
-        );
+        let binding = CheckinProfileBinding::from(record);
         // 手机号补采用克隆：binding 随后 move 进 transport 的绑定表。
         let backfill_binding = binding.clone();
         let refresh_result = match runtime_mode {
@@ -5306,12 +5263,7 @@ fn refresh_checkin_credentials_inner_with(
             });
             continue;
         };
-        let binding = CheckinProfileBinding::new(
-            record.profile_id.clone(),
-            record.account_id.clone(),
-            record.device_id.clone(),
-            record.device_public_key.clone(),
-        );
+        let binding = CheckinProfileBinding::from(record);
         match renew(&binding, now) {
             Ok(_) => {
                 refreshed.push(profile_id.clone());
@@ -5849,12 +5801,7 @@ fn set_account_mobile(
     // 清除路径：空输入 = 回退脱敏号展示（输入错了的后悔药）。
     if trimmed.is_empty() {
         let store = CheckinCredentialStore::new(&material_root);
-        let binding = CheckinProfileBinding::new(
-            record.profile_id,
-            record.account_id,
-            record.device_id,
-            record.device_public_key,
-        );
+        let binding = CheckinProfileBinding::from(&record);
         store
             .set_mobile_full(&binding, None)
             .map_err(|_| "mobile_save_failed".to_string())?;
@@ -5875,12 +5822,7 @@ fn set_account_mobile(
     }
 
     let store = CheckinCredentialStore::new(&material_root);
-    let binding = CheckinProfileBinding::new(
-        record.profile_id,
-        record.account_id,
-        record.device_id,
-        record.device_public_key,
-    );
+    let binding = CheckinProfileBinding::from(&record);
     store
         .set_mobile_full(&binding, Some(trimmed))
         .map_err(|_| "mobile_save_failed".to_string())?;
@@ -5956,12 +5898,7 @@ fn credential_login_state(
         trae_instance_module::InstanceLoginState::LoggedIn
             | trae_instance_module::InstanceLoginState::Stale
     );
-    let binding = CheckinProfileBinding::new(
-        record.profile_id.clone(),
-        record.account_id.clone(),
-        record.device_id.clone(),
-        record.device_public_key.clone(),
-    );
+    let binding = CheckinProfileBinding::from(record);
     let Ok(bundle) = store.load(&binding) else {
         // 无凭据包 = 未登录（存档提示仍上报，老账号可能可走 E1 切换）。
         return (
@@ -7619,12 +7556,7 @@ fn switch_login_identity_dual_path(
 ) -> Result<AuthIdentitySwitch, AuthSwitchError> {
     // ===== E2 首选：凭据包 + GetUserInfo 实调构造 =====
     let store = CheckinCredentialStore::new(material_root);
-    let binding = CheckinProfileBinding::new(
-        record.profile_id.clone(),
-        record.account_id.clone(),
-        record.device_id.clone(),
-        record.device_public_key.clone(),
-    );
+    let binding = CheckinProfileBinding::from(record);
     let e2_result = store
         .load(&binding)
         .map_err(|_| AuthSwitchError::DonorAuthUnavailable)
@@ -7965,12 +7897,7 @@ fn sync_plugins_for_switch(
     let store = CheckinCredentialStore::new(material_root);
     let load_token = |record: &traesync_infrastructure::account_registry::AccountRecord| {
         store
-            .load(&CheckinProfileBinding::new(
-                record.profile_id.clone(),
-                record.account_id.clone(),
-                record.device_id.clone(),
-                record.device_public_key.clone(),
-            ))
+            .load(&CheckinProfileBinding::from(record))
             .map(|bundle| bundle.access_token)
     };
     let (Ok(source_token), Ok(target_token)) =
@@ -8101,12 +8028,7 @@ fn preview_master_switch_plugins_inner(
     let store = CheckinCredentialStore::new(material_root);
     let load_token = |record: &traesync_infrastructure::account_registry::AccountRecord| {
         store
-            .load(&CheckinProfileBinding::new(
-                record.profile_id.clone(),
-                record.account_id.clone(),
-                record.device_id.clone(),
-                record.device_public_key.clone(),
-            ))
+            .load(&CheckinProfileBinding::from(record))
             .map(|bundle| bundle.access_token)
     };
     let (Ok(source_token), Ok(target_token)) = (load_token(&source), load_token(target)) else {
@@ -10249,12 +10171,7 @@ fn plugin_tab_account_token(material_root: &Path, storage_root: &Path) -> Result
     let account = resolve_actual_master_account(material_root, storage_root, &master_dir)?
         .ok_or_else(|| "plugin_tab_no_account".to_string())?;
     CheckinCredentialStore::new(material_root)
-        .load(&CheckinProfileBinding::new(
-            account.profile_id,
-            account.account_id,
-            account.device_id,
-            account.device_public_key,
-        ))
+        .load(&CheckinProfileBinding::from(&account))
         .map(|bundle| bundle.access_token)
         .map_err(|_| "plugin_tab_credential_unavailable".to_string())
 }
@@ -10658,12 +10575,7 @@ fn propagate_uninstall_to_accounts(
         marketplace_plugin_id,
         |record| {
             store
-                .load(&CheckinProfileBinding::new(
-                    record.profile_id.clone(),
-                    record.account_id.clone(),
-                    record.device_id.clone(),
-                    record.device_public_key.clone(),
-                ))
+                .load(&CheckinProfileBinding::from(record))
                 .ok()
                 .map(|bundle| bundle.access_token)
         },

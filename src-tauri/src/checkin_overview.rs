@@ -445,12 +445,7 @@ pub fn build_overview(material_root: &Path) -> Result<Vec<CheckinOverviewEntryDt
         .map(|record| {
             // 凭据包到期时间与通道判定：解密读取只取时间戳/client_id，
             // 不向 DTO 泄露任何令牌材料。
-            let bundle = CheckinProfileBinding::new(
-                record.profile_id.clone(),
-                record.account_id.clone(),
-                record.device_id.clone(),
-                record.device_public_key.clone(),
-            );
+            let bundle = CheckinProfileBinding::from(&record);
             let (access_expires, refresh_expires, credential_legacy, mobile_full) = store
                 .load(&bundle)
                 .map(|bundle| {

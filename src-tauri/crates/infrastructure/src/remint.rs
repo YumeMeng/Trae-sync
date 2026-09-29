@@ -99,12 +99,7 @@ impl DeviceRemintService {
             .ok_or(RemintError::ProfileNotFound)?;
         let bundle = self
             .store
-            .load(&CheckinProfileBinding::new(
-                record.profile_id.clone(),
-                record.account_id.clone(),
-                record.device_id.clone(),
-                record.device_public_key.clone(),
-            ))
+            .load(&CheckinProfileBinding::from(&record))
             .map_err(|_| RemintError::CredentialUnavailable)?;
 
         // ---- 全新设备四件套（成套生成，绝不复用旧值） ----
@@ -169,12 +164,7 @@ impl DeviceRemintService {
         // 重铸保留已补录的完整手机号（与新设备无绑定关系；旧包读取失败按未补录）。
         let previous_mobile_full = self
             .store
-            .load(&CheckinProfileBinding::new(
-                record.profile_id.clone(),
-                record.account_id.clone(),
-                record.device_id.clone(),
-                record.device_public_key.clone(),
-            ))
+            .load(&CheckinProfileBinding::from(record))
             .ok()
             .and_then(|bundle| bundle.mobile_full);
         let bundle = CheckinCredentialBundle {

@@ -32,6 +32,7 @@ use openssl::sign::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::account_registry::AccountRecord;
 use crate::atomic_publish::publish_replacing;
 use crate::key_wrapper::{protect_secret, unprotect_secret};
 
@@ -118,6 +119,20 @@ impl CheckinProfileBinding {
             account_id: account_id.into(),
             device_id: device_id.into(),
             device_public_key: device_public_key.into(),
+        }
+    }
+}
+
+/// 从账号档案直拷四个身份字段构造绑定（P12-R1 消重）：字段一一对应，
+/// display_name 等展示/偏好字段自然丢弃。只提供借用版——调用点多在
+/// 循环中续用 record，所有权版会引入冗余克隆。
+impl From<&AccountRecord> for CheckinProfileBinding {
+    fn from(record: &AccountRecord) -> Self {
+        Self {
+            profile_id: record.profile_id.clone(),
+            account_id: record.account_id.clone(),
+            device_id: record.device_id.clone(),
+            device_public_key: record.device_public_key.clone(),
         }
     }
 }
@@ -1415,6 +1430,32 @@ mod tests {
             FIXTURE_DEVICE_A,
             device_public_key,
         )
+    }
+
+    #[test]
+    fn binding_from_account_record_copies_identity_fields() {
+        // From<&AccountRecord> 直拷：四个身份字段一一对应；展示/偏好字段
+        //（display_name 等）不参与构造，自然丢弃。
+        let record = crate::account_registry::AccountRecord {
+            profile_id: "profile-a".to_string(),
+            account_id: FIXTURE_ACCOUNT_A.to_string(),
+            screen_name: "测试用户".to_string(),
+            avatar_url: String::new(),
+            device_id: FIXTURE_DEVICE_A.to_string(),
+            device_public_key: "public-key-pem".to_string(),
+            display_name: Some("本地别名".to_string()),
+            masked_mobile: "138****0000".to_string(),
+            created_at_unix_seconds: 1_800_000_000,
+            last_verified_at_unix_seconds: 1_800_000_000,
+            device_created_at_unix_seconds: 1_800_000_000,
+            auto_checkin_enabled: true,
+            archived: false,
+        };
+        let binding = CheckinProfileBinding::from(&record);
+        assert_eq!(binding.profile_id, record.profile_id);
+        assert_eq!(binding.account_id, record.account_id);
+        assert_eq!(binding.device_id, record.device_id);
+        assert_eq!(binding.device_public_key, record.device_public_key);
     }
 
     fn fixture_bundle(
