@@ -42,7 +42,8 @@ const CHECKIN_STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
 const CHECKIN_CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
 const ENT_USAGE_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
 const EXCHANGE_TOKEN_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
-const GET_USER_INFO_PATH: &str = "/cloudide/api/v3/trae/GetUserInfo";
+/// CN 资料查询端点路径（提升为 crate 内共享：健康检测形状取证与协议层同源）。
+pub(crate) const GET_USER_INFO_PATH: &str = "/cloudide/api/v3/trae/GetUserInfo";
 const GET_PC_AUTH_CODE_PATH: &str = "/cloudide/api/v3/trae/oauth/GetPCAuthCode";
 /// GetPCAuthCode 的固定回调地址：该接口不实际回调（仅参数校验），
 /// 与真实客户端请求一致（r34/r36 探针实测，2026-08-25）。

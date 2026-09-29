@@ -137,8 +137,8 @@ pub use checkin_login::{
 };
 // P11-6：只读探针公开 API（真实探测由 #[ignore] 集成测试显式授权运行）。
 pub use checkin_probe::{
-    build_probe_report, candidate_endpoints, derive_probe_conclusion, probe_trae_cn_status_endpoints,
-    write_probe_report, TraeCnCheckinProbeReport, TraeCnProbeFinding,
+    build_probe_report, candidate_endpoints, derive_probe_conclusion, probe_get_user_info_shape,
+    probe_trae_cn_status_endpoints, write_probe_report, TraeCnCheckinProbeReport, TraeCnProbeFinding,
 };
 pub use content_graph::DeterministicContentGraphHasher;
 pub use credential_maintenance::{

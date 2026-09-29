@@ -19,7 +19,7 @@ use reqwest::blocking::Client;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::checkin_http::{API_BASE, TRAE_CN_IDE_VERSION};
+use crate::checkin_http::{API_BASE, GET_USER_INFO_PATH, TRAE_CN_IDE_VERSION};
 
 /// Trae CN 探针使用的客户端标识头形态。
 ///
@@ -238,6 +238,64 @@ fn probe_one(
 
 fn response_status_is_success(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+/// GetUserInfo 健康检测形状取证（真机验收：原始响应形状记录）。
+///
+/// 请求形状与 `get_user_info_full_with_request` 的 TraeCn 分支逐字同源：
+/// 同端点常量（`GET_USER_INFO_PATH`）、同认证头（仅 `x-cloudide-token`）、
+/// 同体（`ReqSource=IDE` + `TRAE_CN_IDE_VERSION`），不带签到遥测头集合——
+/// 这是 `check_trae_cn_account_health_inner` 的真实请求形状，与签到探针
+/// 对照组（Authorization + 遥测头）形状不同。只读幂等查询；结果只含
+/// HTTP 状态码、业务码、形状摘要与哈希，不含 token 或响应原文。
+pub fn probe_get_user_info_shape(client: &Client, access_token: &str) -> TraeCnProbeFinding {
+    let url = format!("{API_BASE}{GET_USER_INFO_PATH}");
+    let body = serde_json::json!({
+        "ReqSource": "IDE",
+        "IDEVersion": TRAE_CN_IDE_VERSION,
+    });
+    let sent = client
+        .post(&url)
+        .header("x-cloudide-token", access_token)
+        .json(&body)
+        .send();
+    let mut finding = match sent {
+        Err(_) => TraeCnProbeFinding {
+            endpoint: format!("POST {GET_USER_INFO_PATH}"),
+            outcome: "network_error".to_string(),
+            http_status: None,
+            business_code: None,
+            body_top_level_keys: Vec::new(),
+            body_field_presence: Vec::new(),
+            body_sha256_8: String::new(),
+            body_byte_len: 0,
+        },
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body_text = response.text().unwrap_or_default();
+            let (keys, presence, hash, len) = shape_summary(&body_text);
+            TraeCnProbeFinding {
+                endpoint: format!("POST {GET_USER_INFO_PATH}"),
+                outcome: if response_status_is_success(status) {
+                    "ok".to_string()
+                } else {
+                    "http_error".to_string()
+                },
+                http_status: Some(status),
+                business_code: extract_business_code(&body_text),
+                body_top_level_keys: keys,
+                body_field_presence: presence,
+                body_sha256_8: hash,
+                body_byte_len: len,
+            }
+        }
+    };
+    if finding.outcome == "ok" && finding.body_top_level_keys.is_empty() && finding.body_byte_len > 0
+    {
+        // 2xx 但响应体不是 JSON：协议形态与 GetUserInfo 信封口径不符。
+        finding.outcome = "protocol_error".to_string();
+    }
+    finding
 }
 
 /// 从探测结果推导结论（纯函数；落档与单测共用）。
