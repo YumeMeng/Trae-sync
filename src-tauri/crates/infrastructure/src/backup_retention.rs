@@ -1,9 +1,9 @@
 //! 备份保留策略：定次自动裁剪（P5-9，2026-09-02 grill 定案）。
 //!
 //! 每次新备份生成后，删除超出保留数的旧备份（`.switch-bak-{时间戳}`
-//! 主文件 + wal/shm 附属件连带删）。保留数默认 5、可调（1-50）、可关闭；
-//! 关闭时完全不自动删除（回退为永不自动删）。裁剪失败静默跳过
-//! （下次备份生成时再试），不阻断备份与切号主流程。
+//! 主文件 + wal/shm 附属件 + 同 stamp 凭据子目录连带删；R0-P3）。保留数
+//! 默认 5、可调（1-50）、可关闭；关闭时完全不自动删除（回退为永不自动
+//! 删）。裁剪失败静默跳过（下次备份生成时再试），不阻断备份与切号主流程。
 //!
 //! 文件布局：`{storage_root}/backup-retention.json`；损坏时报错不静默重建
 //! （与台账/档案同纪律——配置文件是用户决策的证据）。
@@ -159,6 +159,10 @@ pub fn load_backup_dir_override(storage_root: &Path) -> Option<PathBuf> {
 ///
 /// P11-4①：只处理 `backup_dir` 指定目录内的链——位置变更后旧目录的备份
 /// 不再被自动清理（铁律：不自动删快照，旧位置由用户手动处置）。
+/// R0-P3：删除某份主备份时，同 stamp 的凭据子目录（`credentials-{stamp}`）
+/// 同进同退连带删除（存在才删，失败静默跳过）；keep 计数完全以主备份链
+/// 为准，凭据子目录不参与计数；孤儿凭据子目录（对应主备份已不在）永不
+/// 触碰（铁律：不自动删证据，由恢复指引提示用户手动清理）。
 /// 返回删除的备份数。删除失败静默跳过（该份下次再试，不影响其余）；
 /// `keep` 为 0 时不删任何东西（防御：调用方语义上应先确认启用）。
 /// 只按 `list_master_backups_in` 的枚举结果删——命名异常的散件不属备份链，
@@ -171,7 +175,8 @@ pub fn prune_master_backups(backup_dir: &Path, db_name: &str, keep: u32) -> usiz
     // chain 已按时间戳倒序（最新在前）；跳过前 keep 份，其余逐份删除。
     let mut removed = 0;
     for entry in chain.iter().skip(keep as usize) {
-        let base = format!("{db_name}.switch-bak-{}", entry.stamp_unix_seconds);
+        let stamp = entry.stamp_unix_seconds;
+        let base = format!("{db_name}.switch-bak-{stamp}");
         let mut removed_this = true;
         for name in [&base, &format!("{base}-wal"), &format!("{base}-shm")] {
             // 删除失败不中断整体裁剪；该份下次备份生成时再试。
@@ -181,6 +186,12 @@ pub fn prune_master_backups(backup_dir: &Path, db_name: &str, keep: u32) -> usiz
                     removed_this = false;
                 }
             }
+        }
+        // R0-P3：同 stamp 凭据子目录随主备份一并删除（存在才删，失败
+        // 静默跳过——与主备份删除同口径，不影响主备份计数）。
+        let credentials_dir = backup_dir.join(format!("credentials-{stamp}"));
+        if credentials_dir.exists() {
+            let _ = fs::remove_dir_all(&credentials_dir);
         }
         if removed_this {
             removed += 1;
@@ -474,6 +485,70 @@ mod tests {
             .join("database.db.switch-bak-abc")
             .is_file());
         assert!(dir.path().join("unrelated.txt").is_file());
+    }
+
+    // ===== R0-P3 凭据备份子目录纳入保留裁剪（同 stamp 同进同退）=====
+
+    /// 测试辅助：在备份目录写一个 credentials-{stamp} 凭据子目录（含一个文件）。
+    fn write_credentials_dir(dir: &Path, stamp: u64) {
+        let cred = dir.join(format!("credentials-{stamp}"));
+        std::fs::create_dir_all(&cred).unwrap();
+        std::fs::write(cred.join("accounts.json"), b"{}").unwrap();
+    }
+
+    /// 裁剪主备份时，同 stamp 的凭据子目录连带删除；保留份的凭据子目录不动。
+    #[test]
+    fn prune_removes_credentials_dir_with_same_stamp() {
+        let dir = tempdir().unwrap();
+        // 3 份主备份，各自带同 stamp 凭据子目录。
+        write_backup(dir.path(), "database.db", 1000, false);
+        write_backup(dir.path(), "database.db", 900, false);
+        write_backup(dir.path(), "database.db", 800, false);
+        write_credentials_dir(dir.path(), 1000);
+        write_credentials_dir(dir.path(), 900);
+        write_credentials_dir(dir.path(), 800);
+        let removed = prune_master_backups(dir.path(), "database.db", 2);
+        assert_eq!(removed, 1);
+        // 最旧的 800 主备份连带同 stamp 凭据子目录一起删除。
+        assert!(!dir.path().join("database.db.switch-bak-800").is_file());
+        assert!(!dir.path().join("credentials-800").exists());
+        // 保留份（1000/900）的凭据子目录原样保留。
+        assert!(dir.path().join("credentials-1000").is_dir());
+        assert!(dir.path().join("credentials-900").is_dir());
+    }
+
+    /// keep 计数完全以主备份链为准：凭据子目录不参与链计数（不顶替保留份数）。
+    #[test]
+    fn prune_keep_count_ignores_credentials_dirs() {
+        let dir = tempdir().unwrap();
+        // 2 份主备份各带凭据子目录，另有 1 个无主备份的凭据目录。
+        write_backup(dir.path(), "database.db", 1000, false);
+        write_backup(dir.path(), "database.db", 900, false);
+        write_credentials_dir(dir.path(), 1000);
+        write_credentials_dir(dir.path(), 900);
+        write_credentials_dir(dir.path(), 700);
+        // 链只数主备份：2 份主备份 keep=2 → 一份不删。
+        assert_eq!(prune_master_backups(dir.path(), "database.db", 2), 0);
+        assert!(dir.path().join("database.db.switch-bak-1000").is_file());
+        assert!(dir.path().join("database.db.switch-bak-900").is_file());
+        assert!(dir.path().join("credentials-700").is_dir());
+    }
+
+    /// 孤儿凭据子目录（对应主备份已被手动删除）不自动清理
+    /// （铁律：不自动删证据），仅在恢复指引提示用户手动处置。
+    #[test]
+    fn prune_leaves_orphan_credentials_dir() {
+        let dir = tempdir().unwrap();
+        write_backup(dir.path(), "database.db", 1000, false);
+        write_backup(dir.path(), "database.db", 900, false);
+        // 孤儿：credentials-800 存在但 800 主备份已不在（枚举不会看到它）。
+        write_credentials_dir(dir.path(), 800);
+        let removed = prune_master_backups(dir.path(), "database.db", 1);
+        assert_eq!(removed, 1);
+        // 900 被裁剪但没有凭据子目录可删；孤儿的 800 凭据目录保留。
+        assert!(!dir.path().join("database.db.switch-bak-900").is_file());
+        assert!(!dir.path().join("credentials-900").exists());
+        assert!(dir.path().join("credentials-800").is_dir());
     }
 
     // ===== P11-4① 备份位置可选：配置兼容 / override / 跨目录裁剪隔离 / 迁移 =====

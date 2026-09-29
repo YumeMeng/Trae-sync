@@ -13909,6 +13909,35 @@ mod library_scope_tests {
         assert!(custom.join("database.db.switch-bak-200").exists());
     }
 
+    /// R0-P3：保留裁剪关闭（enabled=false）时全不动——主备份与凭据
+    /// 子目录一并保留（铁律：永不自动删）。
+    #[test]
+    fn prune_disabled_leaves_master_and_credentials_untouched() {
+        let fixture = ScopeFixture::new();
+        BackupRetentionStore::new(fixture.root.path())
+            .save(&BackupRetentionSettings {
+                enabled: false,
+                keep: 1,
+                backup_dir: None,
+            })
+            .unwrap();
+        let custom = fixture.root.path().join("custom-backups");
+        std::fs::create_dir_all(custom.join("credentials-100")).unwrap();
+        std::fs::write(custom.join("database.db.switch-bak-100"), "a").unwrap();
+        std::fs::write(custom.join("database.db.switch-bak-200"), "b").unwrap();
+        std::fs::write(custom.join("credentials-100").join("accounts.json"), "{}").unwrap();
+
+        prune_backups_if_enabled_in(
+            Path::new("C:/x/database.db"),
+            fixture.root.path(),
+            &custom,
+        );
+        // 主备份与凭据子目录全部原样保留。
+        assert!(custom.join("database.db.switch-bak-100").exists());
+        assert!(custom.join("database.db.switch-bak-200").exists());
+        assert!(custom.join("credentials-100").join("accounts.json").exists());
+    }
+
     /// 收编台账按库隔离：主库仍写 environments/relay-ledger.json；
     /// 副环境写 environments/relay-ledgers/{env_id}/relay-ledger.json，
     /// 不污染主库轨迹（主库校验不受环境收编影响）。
