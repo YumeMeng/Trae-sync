@@ -60,10 +60,9 @@ use traesync_infrastructure::trae_instance::{
 use crate::{
     capture_authorized_read_context, checkin_material_root, checkin_overview,
     ensure_authorization_context_current, ensure_checkin_http_enabled, ensure_login_real_mode,
-    ensure_real_preview, launch_instance_common, manifest_entries_from_cloud, recovery_root_path,
-    resolve_actual_master_account, resolve_authorized_read_target_for_context, run_blocking,
-    trae_instance_account_id, trae_instance_module, AppState, ManagedAccountRuntimeSlot,
-    RuntimeMode,
+    ensure_real_preview, launch_instance_common, recovery_root_path, resolve_actual_master_account,
+    resolve_authorized_read_target_for_context, run_blocking, trae_instance_account_id,
+    trae_instance_module, AppState, ManagedAccountRuntimeSlot, RuntimeMode,
 };
 use crate::checkin_schedule::{run_serial_batch, BatchProgressEvent};
 use crate::error_mapping::{
@@ -71,6 +70,8 @@ use crate::error_mapping::{
     trae_cn_health_error_code,
 };
 use crate::library_archive::{prune_backups_if_enabled, resolve_master_backup_dir};
+// P12-R3：清单构造原语随插件域迁 plugins。
+use crate::plugins::manifest_entries_from_cloud;
 
 /// Tauri 账号中心专用 wire DTO；不把 domain 内部指纹、备份引用或认证材料发给前端。
 #[derive(Debug, Clone, Serialize)]
