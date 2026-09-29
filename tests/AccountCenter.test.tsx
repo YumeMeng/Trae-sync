@@ -570,6 +570,31 @@ describe("AccountCenter", () => {
     });
   });
 
+  it("进度事件按 kind 分发：kind 匹配正常上屏，不匹配的 kind 静默丢弃（P12-R2c 统一契约）", async () => {
+    const entry = overviewEntry("profile-kind-1", "契约账号");
+    mockRealMode([entry]);
+
+    render(<AccountCenter active={true} />);
+    await screen.findByText("契约账号");
+    fireEvent.click(screen.getByTestId("account-refresh-credits"));
+
+    // credits-refresh-progress 事件携带 health_check kind：链路不匹配，静默丢弃。
+    act(() => {
+      progressHandlerOf("credits-refresh-progress")({
+        payload: { kind: "health_check", profile_id: entry.profile_id, screen_name: "契约账号", completed: 1, total: 1, healthy: true, error_code: null },
+      });
+    });
+    expect(screen.getByText("正在查询最新额度…")).toBeInTheDocument();
+
+    // 携带匹配的 credits_refresh kind：正常上屏。
+    act(() => {
+      progressHandlerOf("credits-refresh-progress")({
+        payload: { kind: "credits_refresh", profile_id: entry.profile_id, screen_name: "契约账号", completed: 1, total: 1, ok: true, credits: 1250, checked_in: true, usage_remaining_credits: 100, error_code: null },
+      });
+    });
+    expect(screen.getByText("正在处理 1/1：契约账号")).toBeInTheDocument();
+  });
+
   it("Work 健康检测网络步骤由 credits-refresh-progress 驱动进度文案（P11-3）", async () => {
     const entryA = overviewEntry("profile-hc-cred-a", "探测账号甲");
     const entryB = overviewEntry("profile-hc-cred-b", "探测账号乙");

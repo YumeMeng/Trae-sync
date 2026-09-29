@@ -22,7 +22,6 @@ import {
 } from "lucide-react";
 import type { AppPage } from "./NavigationRail";
 import type {
-  ArchiveDraftDto,
   MasterHistoryDto,
   MasterArchiveApplyResultDto,
   MasterMergeResultDto,
@@ -34,6 +33,8 @@ import type { SessionMessageDto } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
+// 归档草稿状态机（P12-R2c 自本组件收敛为 hook；迁移语义见 hook 注释）。
+import { useArchiveDraft } from "../hooks/useArchiveDraft";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { EmptyState } from "./EmptyState";
 
@@ -102,77 +103,10 @@ const UNLINKED_GROUP_ID = "__unlinked__";
 /** 消息流分页大小（后端按时间倒序取页后反转为升序）。 */
 const CHAT_WINDOW_LIMIT = 2000;
 
-/** 归档草稿存储键前缀；按库隔离（P11-5 起仅作迁移源，草稿正本在工具管理数据）。 */
-const ARCHIVE_DRAFT_STORAGE_PREFIX = "trae-sync:archive-draft:";
-
-interface ArchiveDraft {
-  readonly archiveSessionIds: readonly string[];
-  readonly restoreSessionIds: readonly string[];
-}
-
 /** 需要就地恢复的异常收尾（P11-1 切片②）：带一句原因与重试动作。 */
 interface ArchiveRecovery {
   readonly kind: "relaunch" | "refresh";
   readonly message: string;
-}
-
-const EMPTY_ARCHIVE_DRAFT: ArchiveDraft = {
-  archiveSessionIds: [],
-  restoreSessionIds: [],
-};
-
-function archiveDraftStorageKey(libraryId: string): string {
-  return `${ARCHIVE_DRAFT_STORAGE_PREFIX}${encodeURIComponent(libraryId)}`;
-}
-
-/** 草稿是否有未提交内容（空草稿在后端表现为删除该库键）。 */
-function draftHasChanges(draft: ArchiveDraft): boolean {
-  return draft.archiveSessionIds.length > 0 || draft.restoreSessionIds.length > 0;
-}
-
-/**
- * 前端草稿状态 → 后端命令参数。请求方向 Tauri 自动做 camelCase→snake_case
- * 参数转换（与 apply_master_archive_changes 同惯例），因此传 camelCase；
- * 响应方向是 serde 序列化，保持 snake_case（见 dtoToDraft）。
- */
-function draftToDto(draft: ArchiveDraft): {
-  archiveSessionIds: string[];
-  restoreSessionIds: string[];
-} {
-  return {
-    archiveSessionIds: [...draft.archiveSessionIds],
-    restoreSessionIds: [...draft.restoreSessionIds],
-  };
-}
-
-/** 后端草稿返回 → 前端草稿状态。 */
-function dtoToDraft(dto: ArchiveDraftDto): ArchiveDraft {
-  return {
-    archiveSessionIds: [...dto.archive_session_ids],
-    restoreSessionIds: [...dto.restore_session_ids],
-  };
-}
-
-/** 读取 localStorage 旧草稿（P11-5 迁移源）；坏数据按空草稿处理，不阻断列表。 */
-function readLegacyDraft(libraryId: string): ArchiveDraft {
-  try {
-    const raw = window.localStorage.getItem(archiveDraftStorageKey(libraryId));
-    if (!raw) return EMPTY_ARCHIVE_DRAFT;
-    const value: unknown = JSON.parse(raw);
-    if (!value || typeof value !== "object") return EMPTY_ARCHIVE_DRAFT;
-    const record = value as { archiveSessionIds?: unknown; restoreSessionIds?: unknown };
-    const strings = (candidate: unknown): string[] =>
-      Array.isArray(candidate)
-        ? [...new Set(candidate.filter((item): item is string => typeof item === "string"))]
-        : [];
-    const archiveSessionIds = strings(record.archiveSessionIds);
-    const restoreSessionIds = strings(record.restoreSessionIds).filter(
-      (id) => !archiveSessionIds.includes(id),
-    );
-    return { archiveSessionIds, restoreSessionIds };
-  } catch {
-    return EMPTY_ARCHIVE_DRAFT;
-  }
 }
 
 export function LibrarySessionsPanel({
@@ -206,14 +140,16 @@ export function LibrarySessionsPanel({
   const [selectedSessionIds, setSelectedSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [selectedProjectIds, setSelectedProjectIds] = useState<ReadonlySet<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
-  // 归档/恢复先落在草稿（P11-5 起持久化到工具管理数据），用户点击应用时
-  // 才一次性写入主库；初始为空，待库草稿从后端读入。
-  const [archiveDraft, setArchiveDraft] = useState<ArchiveDraft>(EMPTY_ARCHIVE_DRAFT);
-  // 草稿持久化全部失败（后端 + localStorage 回退都不可用）时的显式提示。
-  const [archiveDraftStorageError, setArchiveDraftStorageError] = useState<string | null>(null);
-  // 已完成后端草稿加载的库 id：加载未完成前禁止写回，防止空/旧草稿
-  // 覆盖其他库或上一会话的持久化内容（跨库写保护）。
-  const draftLoadedForRef = useRef<string | null>(null);
+  // 归档/恢复先落在草稿（P12-R2c：草稿状态机收敛到 useArchiveDraft——
+  // 后端读入 + localStorage 一次性迁移 + 写回回退），用户点击应用时才
+  // 一次性写入主库；加载未完成前为空草稿。
+  const {
+    draft: archiveDraft,
+    setDraft: setArchiveDraft,
+    hasChanges: archiveDraftHasChanges,
+    storageError: archiveDraftStorageError,
+    reset: resetArchiveDraft,
+  } = useArchiveDraft(library.id, { active, readOnly });
   // 数据库已更新但实例启动或列表刷新失败时，保留带重试按钮的就地恢复入口
   // （正常完成的回执走全局通知，不再保留页内横幅）。
   const [archiveRecovery, setArchiveRecovery] = useState<ArchiveRecovery | null>(null);
@@ -226,109 +162,6 @@ export function LibrarySessionsPanel({
   // 指纹相同但主库切号时文件可能未变，身份也必须参与 unchanged 判定。
   const currentUserIdRef = useRef<string | null>(null);
   const pollCancelled = useRef(false);
-
-  const archiveDraftHasChanges = draftHasChanges(archiveDraft);
-
-  // ===== P11-5 归档草稿持久化（localStorage 迁入工具管理数据）=====
-
-  // 切换库实例时切换对应草稿：读后端（storage_root/archive-drafts.json，
-  // 损坏 fail-closed 返回空草稿）；后端为空且 localStorage 有旧草稿时迁移
-  // （写入成功才清除旧键，失败保留旧键并提示，本会话仍可用旧草稿）。
-  // 页面不可见时不发起 IPC，active 后补读。只读库不参与草稿机制（P11-6）。
-  useEffect(() => {
-    if (!active || readOnly) return;
-    const libraryId = library.id;
-    let cancelled = false;
-    // 加载未完成前先复位：草稿清空 + 关闭写回（ref 校验）。
-    draftLoadedForRef.current = null;
-    setArchiveDraft(EMPTY_ARCHIVE_DRAFT);
-    setArchiveDraftStorageError(null);
-    void (async () => {
-      let draft: ArchiveDraft = EMPTY_ARCHIVE_DRAFT;
-      try {
-        draft = dtoToDraft(await invoke<ArchiveDraftDto>("get_archive_draft", { libraryId }));
-      } catch {
-        // 命令不可用按空草稿处理；后续写入失败仍会回退 localStorage。
-      }
-      if (cancelled) return;
-      if (draftHasChanges(draft)) {
-        draftLoadedForRef.current = libraryId;
-        setArchiveDraft(draft);
-        return;
-      }
-      // 后端无草稿：尝试一次性迁移 localStorage 旧草稿（老版本升级路径）。
-      const legacy = readLegacyDraft(libraryId);
-      if (draftHasChanges(legacy)) {
-        try {
-          await invoke("set_archive_draft", { libraryId, ...draftToDto(legacy) });
-          try {
-            window.localStorage.removeItem(archiveDraftStorageKey(libraryId));
-          } catch {
-            // 清旧键失败无碍：正本已写入后端，localStorage 仅为迁移源。
-          }
-          if (!cancelled) setArchiveDraft(legacy);
-        } catch {
-          // 迁移失败：草稿保留在 localStorage，本会话照常使用，显式提示。
-          if (!cancelled) {
-            setArchiveDraft(legacy);
-            notify.warning("归档草稿迁移到新存储失败，本次暂由本机浏览器存储保存，未丢失。");
-          }
-        }
-      }
-      if (!cancelled) draftLoadedForRef.current = libraryId;
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [active, readOnly, library.id]);
-
-  // 草稿变化时写回工具管理数据；后端写入失败回退 localStorage 并显式提示
-  // （不静默丢草稿）。仅对「已完成后端加载」的库生效，防止跨库误写。
-  // 只读库不写草稿（P11-6）。
-  useEffect(() => {
-    if (readOnly || draftLoadedForRef.current !== library.id) return;
-    const libraryId = library.id;
-    let cancelled = false;
-    void (async () => {
-      try {
-        await invoke("set_archive_draft", { libraryId, ...draftToDto(archiveDraft) });
-        // 后端写入成功：localStorage 至多是迁移残留，统一清理。
-        try {
-          window.localStorage.removeItem(archiveDraftStorageKey(libraryId));
-        } catch {
-          // 清理失败无碍正本；不提示。
-        }
-        if (!cancelled) setArchiveDraftStorageError(null);
-      } catch {
-        // 回退 localStorage：空草稿清旧键，有内容则暂存。
-        try {
-          const key = archiveDraftStorageKey(libraryId);
-          if (!archiveDraftHasChanges) window.localStorage.removeItem(key);
-          else window.localStorage.setItem(key, JSON.stringify(archiveDraft));
-          if (!cancelled) {
-            setArchiveDraftStorageError(null);
-            notify.warning(
-              archiveDraftHasChanges
-                ? "归档草稿暂存到工具数据失败，已改存本机浏览器存储，重启应用后仍可恢复。"
-                : "归档草稿清理未能写入工具数据，重启应用后可能再次出现该草稿。",
-            );
-          }
-        } catch {
-          // 双重失败才升级为页内横幅：当前状态保留，但不能静默。
-          if (!cancelled) {
-            setArchiveDraftStorageError(
-              archiveDraftHasChanges
-                ? "归档设置暂存失败，关闭应用可能丢失未提交草稿。请先恢复本地存储后再离开。"
-                : "未能清理本地归档草稿，重启后可能再次出现。",
-            );
-          }
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [archiveDraft, archiveDraftHasChanges, readOnly, library.id]);
 
   const load = useCallback(
     async (force: boolean) => {
@@ -914,7 +747,7 @@ export function LibrarySessionsPanel({
       });
       const archivedCount = result.archived_sessions;
       const restoredCount = result.restored_sessions;
-      setArchiveDraft(EMPTY_ARCHIVE_DRAFT);
+      resetArchiveDraft();
       exitSelectMode();
       let refreshFailed = false;
       try {
@@ -978,7 +811,7 @@ export function LibrarySessionsPanel({
   /** 放弃未提交的归档设置，不触碰主库。 */
   const discardArchiveDraft = useCallback(() => {
     if (batchBusy) return;
-    setArchiveDraft(EMPTY_ARCHIVE_DRAFT);
+    resetArchiveDraft();
     notify.info("已放弃未提交的归档设置，主库没有变化。");
   }, [batchBusy]);
 

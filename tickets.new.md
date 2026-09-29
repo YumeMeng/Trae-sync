@@ -784,7 +784,7 @@ Work CN 的账号保存、对话主库、直连签到和账号切换行为保持
 ### P12 验收清单
 
 - [x] R0：提交落地（2026-09-29：C1 1624cea ADR 链 / C2 16983c0 前端全量 / C3 9711a30 后端全量 / C5 a509428 tickets（.scratch 为 gitignore 本地归档，examples 移出至 .scratch/tools/ 并剥离个人路径）；R0 修复 81c0e80 P1/S5/S6/S7/S9 + 31cae82 S4 + b438826 P3 凭据同 stamp 同进同退（4 新测试）+ 690db89 e2e 断言随迁；终验 cargo 全量 0 failed / vitest 313 / e2e 39）
-- [ ] R1：From 消重 18→0 处手工搬运；解析器 enum 落地调用点迁移；mock 路由 + union golden 断言
+- [x] R1：From 消重 18→0 处手工搬运（0333285：21 生产点迁移/28 new() 保留含 1 非同源登录手拼）；解析器 enum 落地（9b5fb0f：LibraryAccountResolution Measured/Registry + into_account，LibraryContext 迁 domain，TraeCnPointerLookup 三态，消除 2 处同构）；mock 路由 + union golden 断言（4e1eb55：91 条清单、gen-command-union.mjs、fakeInvoke 共享路由器、示范迁移 1 文件）
 - [ ] R2：门禁 56→0 处复制；批量运行器 + 前端 11 处 listen 收敛；useArchiveDraft 9 格矩阵单测
 - [ ] R3：lib.rs 薄根化（mod 按域），全量测试绿
 - [ ] 每阶段全量四套件验收（延续 P11 纪律）

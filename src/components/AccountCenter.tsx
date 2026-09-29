@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { ArrowDownAZ, ArrowLeftRight, HeartPulse, LayoutGrid, List, RefreshCw, ShieldCheck, UserPlus, UserRound } from "lucide-react";
 import type {
   CheckinCapabilityDto,
@@ -14,6 +13,8 @@ import type {
   TraeInstanceLoginState,
   TraeInstanceStateDto,
 } from "../types/account_switch";
+import type { BatchProgressEvent, BatchProgressKind } from "../types/batchProgress";
+import { useTauriEvents } from "../hooks/useTauriEvents";
 import type { EnvironmentStateDto } from "../types/environment";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { displayMobile, effectiveDisplayName } from "../utils/accountDisplay";
@@ -46,47 +47,21 @@ interface AccountCenterProps {
   adapter?: AccountAdapter | null;
 }
 
-/** 批量凭据刷新逐账号进度事件（credential-refresh-progress）载荷；非敏感白名单。 */
-interface CredentialRefreshProgressEvent {
-  profile_id: string;
-  screen_name: string;
-  /** 已处理账号数（含失败，1 起）。 */
-  completed: number;
-  total: number;
-  refreshed: boolean;
-  error_code: string | null;
-}
-
-/** 批量健康检测逐账号进度事件（health-check-progress）载荷；非敏感白名单。 */
-interface HealthCheckProgressEvent {
-  profile_id: string;
-  screen_name: string;
-  /** 已检测账号数（含失败，1 起）。 */
-  completed: number;
-  total: number;
-  healthy: boolean;
-  error_code: string | null;
-}
-
-/** 积分/额度刷新逐账号进度事件（credits-refresh-progress）载荷；与 CreditsRefreshEntryDto 同源。 */
-interface CreditsRefreshProgressEvent {
-  profile_id: string;
-  screen_name: string;
-  /** 已刷新账号数（含失败，1 起）。 */
-  completed: number;
-  total: number;
-  ok: boolean;
-  credits: number | null;
-  checked_in: boolean | null;
-  usage_remaining_credits: number | null;
-  error_code: string | null;
-}
-
 /** 批量操作进度文案的最小展示状态：第 i/N 个账号名。 */
 interface BatchProgress {
   completed: number;
   total: number;
   name: string;
+}
+
+/**
+ * 批量进度事件解析（P12-R2 Q2 统一契约）：三链载荷统一为 BatchProgressEvent。
+ * 载荷暂无 kind（R2b 未落地）时按事件名降级推断——即视为该订阅的预期链；
+ * 带 kind 时校验，未知/不匹配 kind 静默丢弃。返回进度文案所需的最小状态。
+ */
+function resolveBatchProgress(payload: BatchProgressEvent, expected: BatchProgressKind): BatchProgress | null {
+  if (payload.kind !== undefined && payload.kind !== expected) return null;
+  return { completed: payload.completed, total: payload.total, name: payload.screen_name };
 }
 
 /** 首登验收失败原因码 → 括号内的一句人话；未覆盖码回退凭据错误码词表。 */
@@ -148,14 +123,26 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const [credentialRefreshBusy, setCredentialRefreshBusy] = useState(false);
   // 一键健康检测进行中（本地检测 + 网络探测，按钮禁用 + 进度提示）。
   const [healthBusy, setHealthBusy] = useState(false);
-  // 批量操作逐账号进度（P11-3）：事件实时驱动「正在处理 i/N：账号名」文案；
-  // 操作开始时清零，命令返回走既有结果摘要后随 busy 一起清除。
-  const [credentialProgress, setCredentialProgress] = useState<BatchProgress | null>(null);
-  const [healthProgress, setHealthProgress] = useState<BatchProgress | null>(null);
+  // 批量操作逐账号进度（P11-3，P12-R2c 收敛为单 state 按 kind 判别）：
+  // 事件实时驱动「正在处理 i/N：账号名」文案；操作开始时清零，命令返回
+  // 走既有结果摘要后随 busy 一起清除。三链按钮互斥不并发，渲染处按链取派生值。
+  const [batchProgress, setBatchProgress] = useState<Partial<Record<BatchProgressKind, BatchProgress>>>({});
   // 额度刷新逐账号进度：refresh_checkin_credits 同时服务「刷新额度」与
-  // 「健康检测网络步骤」，同一事件源且两流程按钮互斥不并发，单状态即可；
-  // 开始时清零防止上一批账号名串显到新流程。
-  const [creditsProgress, setCreditsProgress] = useState<BatchProgress | null>(null);
+  // 「健康检测网络步骤」，同一事件源且两流程按钮互斥不并发，单状态即可。
+  const credentialProgress = batchProgress.credential_refresh ?? null;
+  const healthProgress = batchProgress.health_check ?? null;
+  const creditsProgress = batchProgress.credits_refresh ?? null;
+  // 按 kind 写入/清除单条进度（null = 清除）；同值短路避免多余渲染。
+  const setKindProgress = useCallback((kind: BatchProgressKind, progress: BatchProgress | null) => {
+    setBatchProgress((current) => {
+      const previous = current[kind] ?? null;
+      if (previous === progress) return current;
+      const next = { ...current };
+      if (progress) next[kind] = progress;
+      else delete next[kind];
+      return next;
+    });
+  }, []);
   // G15 纯本地刷新进行中（毫秒级本地读取，仅驱动按钮图标旋转）。
   const [localRefreshBusy, setLocalRefreshBusy] = useState(false);
   // 选中的账号：非空时进入独立详情视图。
@@ -275,34 +262,24 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     return () => { cancelled = true; };
   }, [active, adapter, checkinCapability?.real_http_enabled, overviewProfileKey]);
 
-  // 批量操作逐账号进度事件（P11-3）：挂载期订阅、卸载清理。页面以 hidden
-  // 切换仍保持挂载，事件在页面隐藏期间也会到达并更新状态，重新显示即为最新
-  // 进度；结果摘要由命令返回后的既有 notify.summary 路径发布，这里只管进度文案。
-  useEffect(() => {
-    let cancelled = false;
-    const unlisteners: Array<() => void> = [];
-    const addUnlisten = (promise: Promise<() => void>) => {
-      void promise.then((fn) => {
-        if (cancelled) fn();
-        else unlisteners.push(fn);
-      }).catch(() => undefined);
-    };
-    addUnlisten(listen<CredentialRefreshProgressEvent>("credential-refresh-progress", (event) => {
-      const payload = event.payload;
-      setCredentialProgress({ completed: payload.completed, total: payload.total, name: payload.screen_name });
-    }));
-    addUnlisten(listen<HealthCheckProgressEvent>("health-check-progress", (event) => {
-      const payload = event.payload;
-      setHealthProgress({ completed: payload.completed, total: payload.total, name: payload.screen_name });
-    }));
-    addUnlisten(listen<CreditsRefreshProgressEvent>("credits-refresh-progress", (event) => {
-      const payload = event.payload;
-      setCreditsProgress({ completed: payload.completed, total: payload.total, name: payload.screen_name });
-    }));
-    return () => {
-      cancelled = true;
-      unlisteners.forEach((fn) => fn());
-    };
+  // 批量操作逐账号进度事件（P11-3，P12-R2c 迁 useTauriEvents）：挂载期订阅、
+  // 卸载清理。页面以 hidden 切换仍保持挂载，事件在页面隐藏期间也会到达并更新
+  // 状态，重新显示即为最新进度；结果摘要由命令返回后的既有 notify.summary
+  // 路径发布，这里只管进度文案。载荷统一 BatchProgressEvent：按事件名对应
+  // 预期 kind 校验（暂无 kind 的旧载荷降级接受），未知 kind 静默丢弃。
+  useTauriEvents({
+    "credential-refresh-progress": (payload: BatchProgressEvent) => {
+      const progress = resolveBatchProgress(payload, "credential_refresh");
+      if (progress) setKindProgress("credential_refresh", progress);
+    },
+    "health-check-progress": (payload: BatchProgressEvent) => {
+      const progress = resolveBatchProgress(payload, "health_check");
+      if (progress) setKindProgress("health_check", progress);
+    },
+    "credits-refresh-progress": (payload: BatchProgressEvent) => {
+      const progress = resolveBatchProgress(payload, "credits_refresh");
+      if (progress) setKindProgress("credits_refresh", progress);
+    },
   }, []);
 
   // P5-2 环境档案：主库当前登录账号驱动「使用中」标记与切换按钮分布。
@@ -565,8 +542,8 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     const isHealth = action === "health";
     if (isHealth ? healthBusy : credentialRefreshBusy) return;
     // 操作开始清掉上一批残留进度，避免新批次串显旧账号名。
-    if (isHealth) { setHealthProgress(null); setHealthBusy(true); }
-    else { setCredentialProgress(null); setCredentialRefreshBusy(true); }
+    if (isHealth) { setKindProgress("health_check", null); setHealthBusy(true); }
+    else { setKindProgress("credential_refresh", null); setCredentialRefreshBusy(true); }
     try {
       const result: AccountActionResult = await adapter.runAction(action, targetAccountId);
       await refreshAdapterSnapshot();
@@ -578,15 +555,15 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     } catch (reason: unknown) {
       notify.error(safeUiErrorMessage(reason, isHealth ? "健康检测未完成，请稍后重试。" : "凭据刷新未完成，请稍后重试。"));
     } finally {
-      if (isHealth) { setHealthBusy(false); setHealthProgress(null); }
-      else { setCredentialRefreshBusy(false); setCredentialProgress(null); }
+      if (isHealth) { setHealthBusy(false); setKindProgress("health_check", null); }
+      else { setCredentialRefreshBusy(false); setKindProgress("credential_refresh", null); }
     }
   }, [adapter, credentialRefreshBusy, healthBusy, refreshAdapterSnapshot]);
 
   // 批量刷新额度：逐账号只读查询（后端串行、无间隔实时完成），刷新全部卡片。
   const handleRefreshAllCredits = useCallback(() => {
     if (creditsBusy || overview.length === 0) return;
-    setCreditsProgress(null);
+    setKindProgress("credits_refresh", null);
     setCreditsBusy(true);
     void (async () => {
       try {
@@ -606,7 +583,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         notify.error(safeUiErrorMessage(reason, "额度刷新未完成，请稍后重试。"));
       } finally {
         setCreditsBusy(false);
-        setCreditsProgress(null);
+        setKindProgress("credits_refresh", null);
       }
     })();
   }, [creditsBusy, overview, refreshOverview]);
@@ -631,7 +608,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
       return;
     }
     if (credentialRefreshBusy || overview.length === 0) return;
-    setCredentialProgress(null);
+    setKindProgress("credential_refresh", null);
     setCredentialRefreshBusy(true);
     void (async () => {
       try {
@@ -665,7 +642,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         notify.error(safeUiErrorMessage(reason, "凭据刷新未完成，请稍后重试。"));
       } finally {
         setCredentialRefreshBusy(false);
-        setCredentialProgress(null);
+        setKindProgress("credential_refresh", null);
       }
     })();
   }, [adapter, credentialRefreshBusy, overview, refreshOverview, runAdapterAction]);
@@ -686,8 +663,8 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
       ? overview.filter((entry) => entry.profile_id === targetProfileId)
       : overview;
     if (healthBusy || targets.length === 0) return;
-    setHealthProgress(null);
-    setCreditsProgress(null);
+    setKindProgress("health_check", null);
+    setKindProgress("credits_refresh", null);
     setHealthBusy(true);
     void (async () => {
       try {
@@ -708,8 +685,8 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         notify.error(safeUiErrorMessage(reason, "健康检测未完成，请稍后重试。"));
       } finally {
         setHealthBusy(false);
-        setHealthProgress(null);
-        setCreditsProgress(null);
+        setKindProgress("health_check", null);
+        setKindProgress("credits_refresh", null);
       }
     })();
   }, [adapter, adapterSnapshot?.accounts.length, healthBusy, overview, refreshOverview, runAdapterAction]);
