@@ -809,9 +809,14 @@ CN 库与 Work 主库 61 表同名同列族；`chat_session` 无 user_id（归�
 - [x] CN 记录归并：ADR-0033 实现+守卫测试+e2e（9b7d9c4：domain ensure_project_merge_writable / infrastructure 归并变体 preview+merge / 三命令+进度事件 / CN 详情页入口+清单联动；同目录跨账号行合并 UNIQUE 冲突走合并分支；真机应用内归并待下次真实切号顺带验收——原语已有 4 次手动真机背书）
 - [x] CN 归档：hidden_status 写入实现+e2e（767d1de：domain ensure_archive_writable / run_trae_cn_archive_apply 客户端运行拒绝+备份先行+恢复切当前指针 / 面板 libraryWriteCapability 三态 full/archive-only/none；真机 hidden_status 写入验收待 P13-4）
 - [ ] P13-4 三步真机验收（用户配合，延后）：①应用内归档往返+官方客户端验证 ②重启官方客户端不复活 ③签到 claim+额度核对；归并项待下次真实切号顺带；完成后回写 ADR-0033 验收状态
-- [ ] P13-5 清理包：lib.rs 实例工具族收编 + dead-code/unused import 清零 + 旧测试文件 mock 渐进迁移（执行中）
+- [x] P13-5 清理包（2026-09-30，d9b5ed1/53d0b78/d13ca69/cece0cd）：lib.rs 实例工具族收编 instance_tools.rs（lib.rs 2000→1523 行，纯移动）；R3 存量警告 6→1（require_actual_*/EnvFixture::storage_root 删除；resolve_library_dir 按定案保留——有测试引用）；13 个旧测试文件全部迁入 fakeInvoke 共享路由器（0 跳过）。**发现断头链路**：cancel_checkin_login 前端在调（AccountCenter:518）但后端 generate_handler 未注册（P7-4 Work CN 登录取消链路断头，原被测试自由 mock 掩盖）——已开票待办
 - [x] CN 续期专项验收：✅ 证据链报告落档（3026628）；重启恢复证据小项待补
-- [ ] 相位门全量四套件（延续纪律；P13-5 完成后终验）
+- [x] 相位门全量四套件：cargo 35 组 0 failed（lib 126/infrastructure 817）/ vitest 355 / e2e 44 / typecheck ✓
+
+### P13 后续待办
+
+- **cancel_checkin_login 断头链路修复**：后端补注册命令（generate_handler + 命令实现或改调既有 cancel 编排）+ AccountCenter 取消链路真实验证；修复前测试侧以 CommandName 断言保持原状
+- CN 真实续期重启恢复证据小项（ADR-0030 收尾）
 
 ### P12 验收清单
 
