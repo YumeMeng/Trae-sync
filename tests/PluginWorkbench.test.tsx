@@ -3,11 +3,14 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { PluginWorkbench } from "../src/components/PluginWorkbench";
 import type { PluginTabStateDto } from "../src/types/plugins";
+import type { CommandName } from "../src/types/commandNames";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-// mock Tauri invoke——前端测试不依赖真实后端
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
-}));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 // P11-1 切片②：安装/移除结果等一次性提示已迁到 notify；断言 notify 调用。
 vi.mock("../src/platform/notify", async (importOriginal) => {
@@ -101,19 +104,26 @@ const MARKET = [
   },
 ];
 
-/** 默认路由：插件状态 + 市场目录（G23 起已装段分类关联也用市场数据）。 */
+/** 默认路由：插件状态 + 市场目录（G23 起已装段分类关联也用市场数据）。
+ * handlers 提供的命令覆盖默认路由；未覆盖的两个已知命令回默认响应。 */
 function mockRoutes(handlers: Record<string, (args?: unknown) => unknown> = {}) {
-  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-    if (command in handlers) return handlers[command](args);
-    if (command === "get_plugin_tab_state") return tabState();
-    if (command === "browse_plugin_market") return MARKET;
-    return undefined;
-  });
+  for (const [command, handler] of Object.entries(handlers)) {
+    mockRoute(command as CommandName, handler);
+  }
+  if (!("get_plugin_tab_state" in handlers)) {
+    mockRoute("get_plugin_tab_state", () => tabState());
+  }
+  if (!("browse_plugin_market" in handlers)) {
+    mockRoute("browse_plugin_market", () => MARKET);
+  }
 }
 
 describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // 等价于原 mockRoutes 每用例重设实现：清调用历史 + 清空路由表。
+    resetRoutes();
+    installFakeInvoke();
   });
 
   it("已装列表表格渲染：切号保留标签 + 内置条目移除禁用 + 分类关联", async () => {
@@ -377,11 +387,10 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
   });
 
   it("读取失败显示稳定错误文案（plugin_tab_no_account）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") throw new Error("plugin_tab_no_account");
-      if (command === "browse_plugin_market") return MARKET;
-      return undefined;
+    mockRoute("get_plugin_tab_state", () => {
+      throw new Error("plugin_tab_no_account");
     });
+    mockRoute("browse_plugin_market", () => MARKET);
     render(<PluginWorkbench active />);
 
     await waitFor(() => {
@@ -392,10 +401,9 @@ describe("PluginWorkbench（G23 插件 tab 表格化 + 实时同步）", () => {
   });
 
   it("市场目录读取失败不阻断已装列表（分类列留空，fail-soft）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_plugin_tab_state") return tabState();
-      if (command === "browse_plugin_market") throw new Error("plugin_market_unavailable");
-      return undefined;
+    mockRoute("get_plugin_tab_state", () => tabState());
+    mockRoute("browse_plugin_market", () => {
+      throw new Error("plugin_market_unavailable");
     });
     render(<PluginWorkbench active />);
 

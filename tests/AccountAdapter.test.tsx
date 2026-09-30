@@ -2,69 +2,63 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { AccountWorkbench } from "../src/components/AccountWorkbench";
 import { accountAdapterFor, createTraeCnAccountAdapter } from "../src/platform/accountAdapter";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
-}));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 const mockInvoke = vi.mocked(invoke);
 
 describe("账号适配器与共享工作台", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_product_identity_state") {
-        return [{
-          product_id: "trae_cn",
-          display_name: "Trae CN",
-          identity_status: "recognized",
-          credential_status: "need_authorization",
-          relation_to_work: "same_identity",
-        }];
-      }
-      if (command === "list_trae_cn_accounts") {
-        return [
-          {
-            profile_id: "cn-main",
-            display_name: "CN 主账号",
-            avatar_url: "",
-            last_verified_at: "2026-09-22T10:00:00Z",
-            status: "active",
-            is_current: true,
-          },
-          {
-            profile_id: "cn-backup",
-            display_name: "CN 备用账号",
-            avatar_url: "",
-            last_verified_at: null,
-            status: "unknown",
-            is_current: false,
-          },
-        ];
-      }
-      if (command === "begin_trae_cn_login") return { login_url: "https://example.test/login" };
-      if (command === "complete_trae_cn_login") return {
-        profile_id: "cn-new",
-        screen_name: "CN 新账号",
+    resetRoutes();
+    installFakeInvoke();
+    mockRoute("get_product_identity_state", () => [{
+      product_id: "trae_cn",
+      display_name: "Trae CN",
+      identity_status: "recognized",
+      credential_status: "need_authorization",
+      relation_to_work: "same_identity",
+    }]);
+    mockRoute("list_trae_cn_accounts", () => [
+      {
+        profile_id: "cn-main",
+        display_name: "CN 主账号",
         avatar_url: "",
-        acceptance: "passed",
-      };
-      if (command === "cancel_trae_cn_login") return undefined;
-      if (command === "switch_trae_cn_account") return [];
-      if (command === "check_trae_cn_account_health") {
-        return [
-          { profile_id: "cn-main", screen_name: "CN 主账号", healthy: true, error_code: null },
-          { profile_id: "cn-backup", screen_name: "CN 备用账号", healthy: false, error_code: "credential_invalid" },
-        ];
-      }
-      if (command === "refresh_trae_cn_credentials") {
-        return [
-          { profile_id: "cn-main", screen_name: "CN 主账号", refreshed: true, error_code: null },
-          { profile_id: "cn-backup", screen_name: "CN 备用账号", refreshed: false, error_code: "credential_refresh_failed" },
-        ];
-      }
-      throw new Error(`未模拟的命令: ${command}`);
-    });
+        last_verified_at: "2026-09-22T10:00:00Z",
+        status: "active",
+        is_current: true,
+      },
+      {
+        profile_id: "cn-backup",
+        display_name: "CN 备用账号",
+        avatar_url: "",
+        last_verified_at: null,
+        status: "unknown",
+        is_current: false,
+      },
+    ]);
+    mockRoute("begin_trae_cn_login", () => ({ login_url: "https://example.test/login" }));
+    mockRoute("complete_trae_cn_login", () => ({
+      profile_id: "cn-new",
+      screen_name: "CN 新账号",
+      avatar_url: "",
+      acceptance: "passed",
+    }));
+    mockRoute("cancel_trae_cn_login", () => undefined);
+    mockRoute("switch_trae_cn_account", () => []);
+    mockRoute("check_trae_cn_account_health", () => [
+      { profile_id: "cn-main", screen_name: "CN 主账号", healthy: true, error_code: null },
+      { profile_id: "cn-backup", screen_name: "CN 备用账号", healthy: false, error_code: "credential_invalid" },
+    ]);
+    mockRoute("refresh_trae_cn_credentials", () => [
+      { profile_id: "cn-main", screen_name: "CN 主账号", refreshed: true, error_code: null },
+      { profile_id: "cn-backup", screen_name: "CN 备用账号", refreshed: false, error_code: "credential_refresh_failed" },
+    ]);
   });
 
   it("通过产品 ID 路由到 CN 适配器，并保留 Work 的渐进迁移入口", () => {

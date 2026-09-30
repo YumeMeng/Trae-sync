@@ -9,8 +9,13 @@ import type {
   CheckinOverviewEntryDto,
   CheckinResultDto,
 } from "../src/types/account_switch";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 // P11-3：批量操作进度事件监听 mock（jsdom 无 Tauri IPC，需可注入事件载荷）。
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
@@ -149,43 +154,36 @@ function checkinResult(profileId: string, outcome: string, overrides: Partial<Ch
 
 /** 真实模式默认 mock：一个已登录账号的完整总览。 */
 function mockRealMode(entries: CheckinOverviewEntryDto[], stateView = state()) {
-  mockInvoke.mockImplementation(async (command) => {
-    if (command === "get_managed_account_state") return stateView;
-    if (command === "get_checkin_capability") return realCapability;
-    if (command === "get_checkin_overview") return entries;
-    // 登录凭据健康度默认全部未初始化（徽章显示「未登录」）。
-    if (command === "get_trae_instance_states") {
-      return entries.map((entry) => ({
-        profile_id: entry.profile_id,
-        login_state: "uninitialized",
-        archive_available: false,
-      }));
-    }
-    throw new Error(`unexpected command: ${String(command)}`);
-  });
+  mockRoute("get_managed_account_state", () => stateView);
+  mockRoute("get_checkin_capability", () => realCapability);
+  mockRoute("get_checkin_overview", () => entries);
+  // 登录凭据健康度默认全部未初始化（徽章显示「未登录」）。
+  mockRoute("get_trae_instance_states", () =>
+    entries.map((entry) => ({
+      profile_id: entry.profile_id,
+      login_state: "uninitialized",
+      archive_available: false,
+    })),
+  );
 }
 
 describe("AccountCenter", () => {
   beforeEach(() => {
     // U-2 视图/排序偏好存 localStorage：测试间必须清零，防止偏好泄漏串扰断言。
     window.localStorage.clear();
-    mockInvoke.mockReset();
+    // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
+    resetRoutes();
+    installFakeInvoke();
     // P11-3：进度事件订阅默认 resolve 空清理函数（卸载时调用）。
     vi.mocked(listen).mockResolvedValue(() => undefined);
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
   });
 
   afterEach(() => vi.clearAllMocks());
 
   it("fixture 模式回退到已保存账号列表，不加载总览也不出现添加入口", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return fixtureCapability;
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => fixtureCapability);
 
     render(<AccountCenter active={true} />);
     expect(await screen.findByText("工作账号 A")).toBeInTheDocument();
@@ -279,26 +277,20 @@ describe("AccountCenter", () => {
   it("详情页刷新额度调用单账号只读命令并回写提示", async () => {
     const entries = [overviewEntry("profile-login-1", "登录账号甲", { usage_remaining_credits: null, usage_cached_at: null })];
     let refreshed = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return refreshed
-          ? [overviewEntry("profile-login-1", "登录账号甲")]
-          : entries;
-      }
-      if (command === "refresh_checkin_credits") {
-        refreshed = true;
-        return [{
-          profile_id: "profile-login-1",
-          screen_name: "登录账号甲",
-          credits: 1250,
-          checked_in: true,
-          usage_remaining_credits: 236.5,
-          error_code: null,
-        }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () =>
+      refreshed ? [overviewEntry("profile-login-1", "登录账号甲")] : entries);
+    mockRoute("refresh_checkin_credits", () => {
+      refreshed = true;
+      return [{
+        profile_id: "profile-login-1",
+        screen_name: "登录账号甲",
+        credits: 1250,
+        checked_in: true,
+        usage_remaining_credits: 236.5,
+        error_code: null,
+      }];
     });
 
     render(<AccountCenter active={true} />);
@@ -316,23 +308,20 @@ describe("AccountCenter", () => {
   it("详情页刷新登录凭据只调用凭据命令，不触发额度查询或签到", async () => {
     const entry = overviewEntry("profile-credential-one", "凭据账号甲");
     let refreshed = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry];
-      if (command === "get_trae_instance_states") {
-        return [{ profile_id: entry.profile_id, login_state: "logged_in", archive_available: false }];
-      }
-      if (command === "refresh_checkin_credentials") {
-        refreshed = true;
-        return [{
-          profile_id: entry.profile_id,
-          screen_name: entry.screen_name,
-          refreshed: true,
-          error_code: null,
-        }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry]);
+    mockRoute("get_trae_instance_states", () => [
+      { profile_id: entry.profile_id, login_state: "logged_in", archive_available: false },
+    ]);
+    mockRoute("refresh_checkin_credentials", () => {
+      refreshed = true;
+      return [{
+        profile_id: entry.profile_id,
+        screen_name: entry.screen_name,
+        refreshed: true,
+        error_code: null,
+      }];
     });
 
     render(<AccountCenter active={true} />);
@@ -357,25 +346,20 @@ describe("AccountCenter", () => {
   it("账号列表刷新全部凭据按账号展示成功与失败，不触发额度查询", async () => {
     const entryA = overviewEntry("profile-credential-all-a", "凭据成功账号");
     const entryB = overviewEntry("profile-credential-all-b", "凭据失败账号");
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entryA, entryB];
-      if (command === "get_trae_instance_states") {
-        return [entryA, entryB].map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: "logged_in",
-          archive_available: false,
-        }));
-      }
-      if (command === "refresh_checkin_credentials") {
-        return [
-          { profile_id: entryA.profile_id, screen_name: entryA.screen_name, refreshed: true, error_code: null },
-          { profile_id: entryB.profile_id, screen_name: entryB.screen_name, refreshed: false, error_code: "credential_refresh_failed" },
-        ];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entryA, entryB]);
+    mockRoute("get_trae_instance_states", () =>
+      [entryA, entryB].map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: "logged_in",
+        archive_available: false,
+      })),
+    );
+    mockRoute("refresh_checkin_credentials", () => [
+      { profile_id: entryA.profile_id, screen_name: entryA.screen_name, refreshed: true, error_code: null },
+      { profile_id: entryB.profile_id, screen_name: entryB.screen_name, refreshed: false, error_code: "credential_refresh_failed" },
+    ]);
 
     render(<AccountCenter active={true} />);
     await screen.findByText("凭据成功账号");
@@ -410,22 +394,19 @@ describe("AccountCenter", () => {
     const entryB = overviewEntry("profile-credential-all-b", "凭据失败账号");
     // noop 初始化规避 TS 对闭包赋值的窄化；命令挂起期间由事件先上屏。
     let resolveRefresh: (entries: unknown) => void = () => undefined;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entryA, entryB];
-      if (command === "get_trae_instance_states") {
-        return [entryA, entryB].map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: "logged_in",
-          archive_available: false,
-        }));
-      }
-      if (command === "refresh_checkin_credentials") {
-        // 挂起命令：让进度事件先于结果到达（与后端串行批次一致）。
-        return new Promise((resolve) => { resolveRefresh = resolve; });
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entryA, entryB]);
+    mockRoute("get_trae_instance_states", () =>
+      [entryA, entryB].map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: "logged_in",
+        archive_available: false,
+      })),
+    );
+    mockRoute("refresh_checkin_credentials", () => {
+      // 挂起命令：让进度事件先于结果到达（与后端串行批次一致）。
+      return new Promise((resolve) => { resolveRefresh = resolve; });
     });
 
     render(<AccountCenter active={true} />);
@@ -470,22 +451,19 @@ describe("AccountCenter", () => {
     const entryB = overviewEntry("profile-health-p-b", "检测账号乙");
     // noop 初始化规避 TS 对闭包赋值的窄化；探测挂起期间由事件先上屏。
     let resolveProbe: (entries: unknown) => void = () => undefined;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entryA, entryB];
-      if (command === "get_trae_instance_states") {
-        return [entryA, entryB].map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: "logged_in",
-          archive_available: false,
-        }));
-      }
-      if (command === "refresh_checkin_credits") {
-        // 网络探测挂起：进度事件先于批次结果到达。
-        return new Promise((resolve) => { resolveProbe = resolve; });
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entryA, entryB]);
+    mockRoute("get_trae_instance_states", () =>
+      [entryA, entryB].map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: "logged_in",
+        archive_available: false,
+      })),
+    );
+    mockRoute("refresh_checkin_credits", () => {
+      // 网络探测挂起：进度事件先于批次结果到达。
+      return new Promise((resolve) => { resolveProbe = resolve; });
     });
 
     render(<AccountCenter active={true} />);
@@ -522,22 +500,19 @@ describe("AccountCenter", () => {
     const entryB = overviewEntry("profile-credits-p-b", "额度账号乙");
     // noop 初始化规避 TS 对闭包赋值的窄化；命令挂起期间由事件先上屏。
     let resolveCredits: (entries: unknown) => void = () => undefined;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entryA, entryB];
-      if (command === "get_trae_instance_states") {
-        return [entryA, entryB].map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: "logged_in",
-          archive_available: false,
-        }));
-      }
-      if (command === "refresh_checkin_credits") {
-        // 挂起命令：让进度事件先于结果到达（与后端串行批次一致）。
-        return new Promise((resolve) => { resolveCredits = resolve; });
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entryA, entryB]);
+    mockRoute("get_trae_instance_states", () =>
+      [entryA, entryB].map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: "logged_in",
+        archive_available: false,
+      })),
+    );
+    mockRoute("refresh_checkin_credits", () => {
+      // 挂起命令：让进度事件先于结果到达（与后端串行批次一致）。
+      return new Promise((resolve) => { resolveCredits = resolve; });
     });
 
     render(<AccountCenter active={true} />);
@@ -600,22 +575,18 @@ describe("AccountCenter", () => {
     const entryB = overviewEntry("profile-hc-cred-b", "探测账号乙");
     // noop 初始化规避 TS 对闭包赋值的窄化；探测挂起期间由事件先上屏。
     let resolveProbe: (entries: unknown) => void = () => undefined;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entryA, entryB];
-      if (command === "get_trae_instance_states") {
-        return [entryA, entryB].map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: "logged_in",
-          archive_available: false,
-        }));
-      }
-      if (command === "refresh_checkin_credits") {
-        return new Promise((resolve) => { resolveProbe = resolve; });
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entryA, entryB]);
+    mockRoute("get_trae_instance_states", () =>
+      [entryA, entryB].map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: "logged_in",
+        archive_available: false,
+      })),
+    );
+    mockRoute("refresh_checkin_credits", () =>
+      new Promise((resolve) => { resolveProbe = resolve; }));
 
     render(<AccountCenter active={true} />);
     await screen.findByText("探测账号甲");
@@ -652,19 +623,13 @@ describe("AccountCenter", () => {
   it("详情页立即签到执行单账号批次，成功后显示奖励已发放", async () => {
     const entries = [overviewEntry("profile-login-1", "登录账号甲", { checked_in: false })];
     let checkedIn = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return checkedIn
-          ? [overviewEntry("profile-login-1", "登录账号甲")]
-          : entries;
-      }
-      if (command === "run_checkin") {
-        checkedIn = true;
-        return { total: 1, completed: 1, failed: 0, cancelled: 0, results: [checkinResult("profile-login-1", "claimed")] };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () =>
+      checkedIn ? [overviewEntry("profile-login-1", "登录账号甲")] : entries);
+    mockRoute("run_checkin", () => {
+      checkedIn = true;
+      return { total: 1, completed: 1, failed: 0, cancelled: 0, results: [checkinResult("profile-login-1", "claimed")] };
     });
 
     render(<AccountCenter active={true} />);
@@ -694,17 +659,13 @@ describe("AccountCenter", () => {
   it("详情页自动签到开关：退出参与后调用单账号命令并更新提示", async () => {
     // 初始参与自动签到；切换后总览回填关闭状态。
     let autoEnabled = true;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [overviewEntry("profile-login-1", "登录账号甲", { auto_checkin_enabled: autoEnabled })];
-      }
-      if (command === "set_account_auto_checkin") {
-        autoEnabled = false;
-        return undefined;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () =>
+      [overviewEntry("profile-login-1", "登录账号甲", { auto_checkin_enabled: autoEnabled })]);
+    mockRoute("set_account_auto_checkin", () => {
+      autoEnabled = false;
+      return undefined;
     });
 
     render(<AccountCenter active={true} />);
@@ -728,15 +689,12 @@ describe("AccountCenter", () => {
 
   it("详情页删除账号需二次确认，确认后删除并回到列表", async () => {
     let removed = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return removed ? [] : [overviewEntry("profile-login-1", "登录账号甲")];
-      if (command === "remove_checkin_account") {
-        removed = true;
-        return undefined;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (removed ? [] : [overviewEntry("profile-login-1", "登录账号甲")]));
+    mockRoute("remove_checkin_account", () => {
+      removed = true;
+      return undefined;
     });
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-login-1"));
@@ -766,20 +724,17 @@ describe("AccountCenter", () => {
 
   it("详情页重铸签到设备：确认后调用命令并提示下次使用新设备", async () => {
     const entries = [overviewEntry("profile-login-1", "登录账号甲")];
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return entries;
-      if (command === "get_trae_instance_states") {
-        return entries.map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: "uninitialized",
-          archive_available: false,
-        }));
-      }
-      if (command === "reset_checkin_device") return "1234567890123456";
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => entries);
+    mockRoute("get_trae_instance_states", () =>
+      entries.map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: "uninitialized",
+        archive_available: false,
+      })),
+    );
+    mockRoute("reset_checkin_device", () => "1234567890123456");
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-login-1"));
     // 重置设备有二次确认弹层，确认后执行。
@@ -811,21 +766,16 @@ describe("AccountCenter", () => {
       overviewEntry("profile-login-1", "登录账号甲"),
       overviewEntry("profile-login-2", "登录账号乙"),
     ]);
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [overviewEntry("profile-login-1", "登录账号甲"), overviewEntry("profile-login-2", "登录账号乙")];
-      }
-      if (command === "refresh_checkin_credits") {
-        return [
-          { profile_id: "profile-login-1", screen_name: "登录账号甲", credits: 1250, checked_in: true, error_code: null },
-          { profile_id: "profile-login-2", screen_name: "登录账号乙", credits: 980, checked_in: true, error_code: null },
-        ];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
-
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      overviewEntry("profile-login-1", "登录账号甲"),
+      overviewEntry("profile-login-2", "登录账号乙"),
+    ]);
+    mockRoute("refresh_checkin_credits", () => [
+      { profile_id: "profile-login-1", screen_name: "登录账号甲", credits: 1250, checked_in: true, error_code: null },
+      { profile_id: "profile-login-2", screen_name: "登录账号乙", credits: 980, checked_in: true, error_code: null },
+    ]);
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-refresh-credits"));
 
@@ -844,24 +794,19 @@ describe("AccountCenter", () => {
     const before = [overviewEntry("profile-login-1", "登录账号甲")];
     const after = [...before, overviewEntry("profile-login-2", "登录账号乙")];
     let loginStarted = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return loginStarted ? after : before;
-      if (command === "begin_checkin_login") {
-        loginStarted = true;
-        return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      }
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-login-2",
-          account_id: "account-profile-login-2",
-          screen_name: "登录账号乙",
-          avatar_url: "",
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
+    mockRoute("begin_checkin_login", () => {
+      loginStarted = true;
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
     });
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-login-2",
+      account_id: "account-profile-login-2",
+      screen_name: "登录账号乙",
+      avatar_url: "",
+    }));
 
     render(<AccountCenter active={true} />);
     await screen.findByText("登录账号甲");
@@ -886,23 +831,18 @@ describe("AccountCenter", () => {
   });
 
   it("P11-3 首登验收未通过：账号已保存但额外弹验收警告（Work 路径）", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [];
-      if (command === "begin_checkin_login") return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-accept-1",
-          account_id: "account-profile-accept-1",
-          screen_name: "验收账号",
-          avatar_url: "",
-          acceptance: "failed",
-          acceptance_error_code: "credential_refresh_failed",
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => []);
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-accept-1",
+      account_id: "account-profile-accept-1",
+      screen_name: "验收账号",
+      avatar_url: "",
+      acceptance: "failed",
+      acceptance_error_code: "credential_refresh_failed",
+    }));
 
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-add-primary"));
@@ -920,30 +860,23 @@ describe("AccountCenter", () => {
   });
 
   it("P11-3 CN 适配器登录：验收未通过同样弹警告并透传原因", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_product_identity_state") return [];
-      if (command === "list_trae_cn_accounts") {
-        return [{
-          profile_id: "cn-accept",
-          display_name: "CN 验收账号",
-          avatar_url: "",
-          last_verified_at: null,
-          status: "active",
-          is_current: true,
-        }];
-      }
-      if (command === "begin_trae_cn_login") return { login_url: "https://example.test/login" };
-      if (command === "complete_trae_cn_login") {
-        return {
-          profile_id: "cn-accept",
-          screen_name: "CN 验收账号",
-          avatar_url: "",
-          acceptance: "failed",
-          acceptance_error_code: "credential_refresh_failed",
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-accept",
+      display_name: "CN 验收账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+    mockRoute("begin_trae_cn_login", () => ({ login_url: "https://example.test/login" }));
+    mockRoute("complete_trae_cn_login", () => ({
+      profile_id: "cn-accept",
+      screen_name: "CN 验收账号",
+      avatar_url: "",
+      acceptance: "failed",
+      acceptance_error_code: "credential_refresh_failed",
+    }));
 
     render(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
     fireEvent.click(await screen.findByTestId("account-add-primary"));
@@ -960,24 +893,19 @@ describe("AccountCenter", () => {
     const before = [overviewEntry("profile-login-1", "登录账号甲")];
     const after = [...before, overviewEntry("profile-login-2", "登录账号乙")];
     let loginStarted = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return loginStarted ? after : before;
-      if (command === "begin_checkin_login") {
-        loginStarted = true;
-        return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      }
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-login-2",
-          account_id: "account-profile-login-2",
-          screen_name: "登录账号乙",
-          avatar_url: "",
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
+    mockRoute("begin_checkin_login", () => {
+      loginStarted = true;
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
     });
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-login-2",
+      account_id: "account-profile-login-2",
+      screen_name: "登录账号乙",
+      avatar_url: "",
+    }));
 
     render(<AccountCenter active={true} />);
     await screen.findByText("登录账号甲");
@@ -1002,24 +930,19 @@ describe("AccountCenter", () => {
     const before = [overviewEntry("profile-login-1", "登录账号甲")];
     const after = [...before, overviewEntry("profile-login-2", "登录账号乙")];
     let loginStarted = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return loginStarted ? after : before;
-      if (command === "begin_checkin_login") {
-        loginStarted = true;
-        return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      }
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-login-2",
-          account_id: "account-profile-login-2",
-          screen_name: "登录账号乙",
-          avatar_url: "",
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
+    mockRoute("begin_checkin_login", () => {
+      loginStarted = true;
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
     });
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-login-2",
+      account_id: "account-profile-login-2",
+      screen_name: "登录账号乙",
+      avatar_url: "",
+    }));
 
     render(<AccountCenter active={true} />);
     await screen.findByText("登录账号甲");
@@ -1042,24 +965,19 @@ describe("AccountCenter", () => {
       overviewEntry("profile-login-2", "登录账号乙", { mobile_full: "13812340000" }),
     ];
     let loginStarted = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return loginStarted ? after : before;
-      if (command === "begin_checkin_login") {
-        loginStarted = true;
-        return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      }
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-login-2",
-          account_id: "account-profile-login-2",
-          screen_name: "登录账号乙",
-          avatar_url: "",
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
+    mockRoute("begin_checkin_login", () => {
+      loginStarted = true;
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
     });
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-login-2",
+      account_id: "account-profile-login-2",
+      screen_name: "登录账号乙",
+      avatar_url: "",
+    }));
 
     render(<AccountCenter active={true} />);
     await screen.findByText("登录账号甲");
@@ -1075,25 +993,20 @@ describe("AccountCenter", () => {
     const before = [overviewEntry("profile-login-1", "登录账号甲")];
     const after = [...before, overviewEntry("profile-login-2", "登录账号乙")];
     let loginStarted = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return loginStarted ? after : before;
-      if (command === "begin_checkin_login") {
-        loginStarted = true;
-        return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      }
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-login-2",
-          account_id: "account-profile-login-2",
-          screen_name: "登录账号乙",
-          avatar_url: "",
-        };
-      }
-      if (command === "set_account_mobile") return null;
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
+    mockRoute("begin_checkin_login", () => {
+      loginStarted = true;
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
     });
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-login-2",
+      account_id: "account-profile-login-2",
+      screen_name: "登录账号乙",
+      avatar_url: "",
+    }));
+    mockRoute("set_account_mobile", () => null);
 
     render(<AccountCenter active={true} />);
     await screen.findByText("登录账号甲");
@@ -1125,24 +1038,21 @@ describe("AccountCenter", () => {
     const before = [overviewEntry("profile-login-1", "登录账号甲")];
     const after = [...before, overviewEntry("profile-login-2", "登录账号乙")];
     let loginStarted = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return loginStarted ? after : before;
-      if (command === "begin_checkin_login") {
-        loginStarted = true;
-        return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      }
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-login-2",
-          account_id: "account-profile-login-2",
-          screen_name: "登录账号乙",
-          avatar_url: "",
-        };
-      }
-      if (command === "set_account_mobile") throw "mobile_masked_mismatch";
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
+    mockRoute("begin_checkin_login", () => {
+      loginStarted = true;
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+    });
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-login-2",
+      account_id: "account-profile-login-2",
+      screen_name: "登录账号乙",
+      avatar_url: "",
+    }));
+    mockRoute("set_account_mobile", () => {
+      throw "mobile_masked_mismatch";
     });
 
     render(<AccountCenter active={true} />);
@@ -1164,15 +1074,12 @@ describe("AccountCenter", () => {
     const saved = overviewEntry("profile-m-1", "手机号账号", { mobile_full: "13812340000" });
     const initial = { ...saved, mobile_full: null };
     let backfilled = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return backfilled ? [saved] : [initial];
-      if (command === "set_account_mobile") {
-        backfilled = true;
-        return null;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => (backfilled ? [saved] : [initial]));
+    mockRoute("set_account_mobile", () => {
+      backfilled = true;
+      return null;
     });
 
     render(<AccountCenter active={true} />);
@@ -1230,23 +1137,16 @@ describe("AccountCenter", () => {
 
   it("选择本机浏览器登录时向登录命令传递系统浏览器标记", async () => {
     // 覆盖登录命令：begin 返回登录页地址即可，本测试只断言浏览器模式传参。
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [];
-      if (command === "begin_checkin_login") {
-        return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      }
-      if (command === "complete_checkin_login") {
-        return {
-          profile_id: "profile-login-1",
-          account_id: "account-profile-login-1",
-          screen_name: "本机登录账号",
-          avatar_url: "",
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => []);
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    mockRoute("complete_checkin_login", () => ({
+      profile_id: "profile-login-1",
+      account_id: "account-profile-login-1",
+      screen_name: "本机登录账号",
+      avatar_url: "",
+    }));
 
     render(<AccountCenter active={true} />);
     await screen.findByText("还没有账号。通过浏览器登录添加第一个账号，登录成功后即可签到。");
@@ -1263,19 +1163,14 @@ describe("AccountCenter", () => {
     const entryA = overviewEntry("profile-login-state-a", "存档待登录账号");
     const entryB = overviewEntry("profile-login-state-b", "存档有效账号");
     const entryC = overviewEntry("profile-login-state-c", "存档未初始化账号");
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entryA, entryB, entryC];
-      if (command === "get_trae_instance_states") {
-        return [
-          { profile_id: entryA.profile_id, login_state: "logged_out", archive_available: false },
-          { profile_id: entryB.profile_id, login_state: "logged_in", archive_available: true },
-          { profile_id: entryC.profile_id, login_state: "uninitialized", archive_available: true },
-        ];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entryA, entryB, entryC]);
+    mockRoute("get_trae_instance_states", () => [
+      { profile_id: entryA.profile_id, login_state: "logged_out", archive_available: false },
+      { profile_id: entryB.profile_id, login_state: "logged_in", archive_available: true },
+      { profile_id: entryC.profile_id, login_state: "uninitialized", archive_available: true },
+    ]);
 
     render(<AccountCenter active={true} />);
     await screen.findByText("存档待登录账号");
@@ -1301,15 +1196,12 @@ describe("AccountCenter", () => {
 
   it("登录存档槽位：失效态（登录键在但会话过期）显示已过期，亮琥珀等待自动恢复", async () => {
     const entry = overviewEntry("profile-login-stale-1", "失效账号");
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry];
-      if (command === "get_trae_instance_states") {
-        // 模拟 LY 案例：登录键仍在但最近启动日志含服务端拒绝证据。
-        return [{ profile_id: entry.profile_id, login_state: "stale", archive_available: true }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry]);
+    mockRoute("get_trae_instance_states", () => {
+      // 模拟 LY 案例：登录键仍在但最近启动日志含服务端拒绝证据。
+      return [{ profile_id: entry.profile_id, login_state: "stale", archive_available: true }];
     });
 
     render(<AccountCenter active={true} />);
@@ -1320,15 +1212,12 @@ describe("AccountCenter", () => {
 
   it("旧通道凭据账号：实调通过也按需重登展示（本地判定，页面加载即生效）", async () => {
     const entry = overviewEntry("profile-legacy-1", "旧通道账号", { credential_legacy: true });
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry];
-      if (command === "get_trae_instance_states") {
-        // token 尚未过期：实调通过——这正是修复前“已失效仍显示登录有效”的失真场景。
-        return [{ profile_id: entry.profile_id, login_state: "logged_in", archive_available: false }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry]);
+    mockRoute("get_trae_instance_states", () => {
+      // token 尚未过期：实调通过——这正是修复前“已失效仍显示登录有效”的失真场景。
+      return [{ profile_id: entry.profile_id, login_state: "logged_in", archive_available: false }];
     });
 
     render(<AccountCenter active={true} />);
@@ -1344,15 +1233,12 @@ describe("AccountCenter", () => {
     const entry = overviewEntry("profile-renew-dead-1", "续期死亡账号", {
       refresh_error_code: "credential_refresh_failed",
     });
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry];
-      if (command === "get_trae_instance_states") {
-        return [{ profile_id: entry.profile_id, login_state: "logged_in", archive_available: false }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry]);
+    mockRoute("get_trae_instance_states", () => [
+      { profile_id: entry.profile_id, login_state: "logged_in", archive_available: false },
+    ]);
 
     render(<AccountCenter active={true} />);
     expect(await screen.findByText("需重登")).toBeInTheDocument();
@@ -1363,31 +1249,28 @@ describe("AccountCenter", () => {
     const entryA = overviewEntry("profile-refresh-a", "刷新成功账号");
     const entryB = overviewEntry("profile-refresh-b", "刷新失败账号");
     let refreshed = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        // 刷新后总览带回持久化失败标记（后端已写入额度缓存）。
-        return refreshed
-          ? [entryA, overviewEntry("profile-refresh-b", "刷新失败账号", { refresh_error_code: "credential_refresh_failed" })]
-          : [entryA, entryB];
-      }
-      if (command === "refresh_checkin_credits") {
-        refreshed = true;
-        return [
-          { profile_id: entryA.profile_id, screen_name: entryA.screen_name, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
-          { profile_id: entryB.profile_id, screen_name: entryB.screen_name, credits: null, checked_in: null, usage_remaining_credits: null, error_code: "credential_refresh_failed" },
-        ];
-      }
-      if (command === "get_trae_instance_states") {
-        return [entryA, entryB].map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: "logged_in",
-          archive_available: false,
-        }));
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => {
+      // 刷新后总览带回持久化失败标记（后端已写入额度缓存）。
+      return refreshed
+        ? [entryA, overviewEntry("profile-refresh-b", "刷新失败账号", { refresh_error_code: "credential_refresh_failed" })]
+        : [entryA, entryB];
     });
+    mockRoute("refresh_checkin_credits", () => {
+      refreshed = true;
+      return [
+        { profile_id: entryA.profile_id, screen_name: entryA.screen_name, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
+        { profile_id: entryB.profile_id, screen_name: entryB.screen_name, credits: null, checked_in: null, usage_remaining_credits: null, error_code: "credential_refresh_failed" },
+      ];
+    });
+    mockRoute("get_trae_instance_states", () =>
+      [entryA, entryB].map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: "logged_in",
+        archive_available: false,
+      })),
+    );
 
     render(<AccountCenter active={true} />);
     await screen.findByText("刷新成功账号");
@@ -1416,15 +1299,12 @@ describe("AccountCenter", () => {
       refresh_error_code: "credential_refresh_failed",
       credential_legacy: true,
     });
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry];
-      if (command === "get_trae_instance_states") {
-        return [{ profile_id: entry.profile_id, login_state: "logged_in", archive_available: false }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry]);
+    mockRoute("get_trae_instance_states", () => [
+      { profile_id: entry.profile_id, login_state: "logged_in", archive_available: false },
+    ]);
 
     render(<AccountCenter active={true} />);
     fireEvent.click(await screen.findByTestId("account-card-profile-detail-fail-1"));
@@ -1445,25 +1325,22 @@ describe("AccountCenter", () => {
       [entryA.profile_id]: "logged_in",
       [entryB.profile_id]: "logged_in",
     };
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entryA, entryB];
-      if (command === "get_trae_instance_states") {
-        return [entryA, entryB].map((entry) => ({
-          profile_id: entry.profile_id,
-          login_state: statesLogin[entry.profile_id],
-          archive_available: false,
-        }));
-      }
-      if (command === "refresh_checkin_credits") {
-        // 网络探测：甲正常，乙签到会话异常。
-        return [
-          { profile_id: entryA.profile_id, screen_name: entryA.screen_name, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
-          { profile_id: entryB.profile_id, screen_name: entryB.screen_name, credits: null, checked_in: null, usage_remaining_credits: null, error_code: "credential_expired" },
-        ];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entryA, entryB]);
+    mockRoute("get_trae_instance_states", () =>
+      [entryA, entryB].map((entry) => ({
+        profile_id: entry.profile_id,
+        login_state: statesLogin[entry.profile_id],
+        archive_available: false,
+      })),
+    );
+    mockRoute("refresh_checkin_credits", () => {
+      // 网络探测：甲正常，乙签到会话异常。
+      return [
+        { profile_id: entryA.profile_id, screen_name: entryA.screen_name, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
+        { profile_id: entryB.profile_id, screen_name: entryB.screen_name, credits: null, checked_in: null, usage_remaining_credits: null, error_code: "credential_expired" },
+      ];
     });
 
     render(<AccountCenter active={true} />);
@@ -1490,18 +1367,15 @@ describe("AccountCenter", () => {
 
   it("健康检测：未登录（从未保存凭据）不计为需处理（灰=中性，与 G14 口径一致）", async () => {
     const entry = overviewEntry("profile-silent", "未登录账号");
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry];
-      if (command === "get_trae_instance_states") {
-        return [{ profile_id: entry.profile_id, login_state: "uninitialized", archive_available: false }];
-      }
-      if (command === "refresh_checkin_credits") {
-        // 探测本身成功：该账号无任何需处理项。
-        return [{ profile_id: entry.profile_id, screen_name: entry.screen_name, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry]);
+    mockRoute("get_trae_instance_states", () => [
+      { profile_id: entry.profile_id, login_state: "uninitialized", archive_available: false },
+    ]);
+    mockRoute("refresh_checkin_credits", () => {
+      // 探测本身成功：该账号无任何需处理项。
+      return [{ profile_id: entry.profile_id, screen_name: entry.screen_name, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null }];
     });
 
     render(<AccountCenter active={true} />);
@@ -1524,14 +1398,13 @@ describe("AccountCenter", () => {
   });
 
   it("登录失败显示稳定错误提示，不出现底层错误正文", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [];
-      if (command === "begin_checkin_login") return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      // 后端登录失败以稳定错误码返回；UI 只映射为固定文案。
-      if (command === "complete_checkin_login") throw "login_callback_invalid";
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => []);
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    // 后端登录失败以稳定错误码返回；UI 只映射为固定文案。
+    mockRoute("complete_checkin_login", () => {
+      throw "login_callback_invalid";
     });
 
     render(<AccountCenter active={true} />);
@@ -1549,21 +1422,17 @@ describe("AccountCenter", () => {
     // complete 挂起模拟等待浏览器回调；cancel 命令置位后 complete 以
     // login_cancelled 收尾（后端一个轮询周期内完成，此处同步触发）。
     let rejectLogin: ((reason: string) => void) | null = null;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [];
-      if (command === "begin_checkin_login") return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
-      if (command === "complete_checkin_login") {
-        return new Promise<never>((_resolve, reject) => {
-          rejectLogin = reject;
-        });
-      }
-      if (command === "cancel_checkin_login") {
-        rejectLogin?.("login_cancelled");
-        return null;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => []);
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    mockRoute("complete_checkin_login", () =>
+      new Promise<never>((_resolve, reject) => {
+        rejectLogin = reject;
+      }));
+    mockRoute("cancel_checkin_login", () => {
+      rejectLogin?.("login_cancelled");
+      return null;
     });
 
     render(<AccountCenter active={true} />);
@@ -1586,11 +1455,10 @@ describe("AccountCenter", () => {
   });
 
   it("账号总览读取失败时错误可见，不静默伪装成空账号", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") throw "checkin_registry_invalid";
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => {
+      throw "checkin_registry_invalid";
     });
 
     render(<AccountCenter active={true} />);
@@ -1693,15 +1561,12 @@ describe("AccountCenter", () => {
 
   it("G14 需处理过滤：登录槽琥珀（存档过期）也计入；过滤后无异常时给空态提示", async () => {
     const entry = overviewEntry("profile-stale-1", "存档过期账号", { checked_in: true });
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry];
-      if (command === "get_trae_instance_states") {
-        return [{ profile_id: entry.profile_id, login_state: "stale", archive_available: true }];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry]);
+    mockRoute("get_trae_instance_states", () => [
+      { profile_id: entry.profile_id, login_state: "stale", archive_available: true },
+    ]);
 
     render(<AccountCenter active={true} />);
     await screen.findByText("已过期");
@@ -1774,41 +1639,34 @@ describe("AccountCenter", () => {
   });
 
   it("Work 详情页内嵌登录设备模块：默认折叠不触网，展开才按该账号拉取（P10-5）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_managed_account_state") return state();
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [overviewEntry("profile-detail-1", "详情账号甲")];
-      }
-      if (command === "get_trae_instance_states") return [];
-      if (command === "list_remote_devices") {
-        return {
-          profile_id: "profile-detail-1",
-          account_label: "详情账号甲",
-          used_count: 2,
-          max_count: 10,
-          devices: [
-            {
-              device_id: "dev-local",
-              device_type: "IDE_PC",
-              device_name: "本机电脑",
-              bound_products: ["TRAE Work CN"],
-              last_active_at: null,
-              is_local: true,
-            },
-            {
-              device_id: "dev-remote-1",
-              device_type: "MOBILE",
-              device_name: "出差的手机",
-              bound_products: [],
-              last_active_at: null,
-              is_local: false,
-            },
-          ],
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [overviewEntry("profile-detail-1", "详情账号甲")]);
+    mockRoute("get_trae_instance_states", () => []);
+    mockRoute("list_remote_devices", () => ({
+      profile_id: "profile-detail-1",
+      account_label: "详情账号甲",
+      used_count: 2,
+      max_count: 10,
+      devices: [
+        {
+          device_id: "dev-local",
+          device_type: "IDE_PC",
+          device_name: "本机电脑",
+          bound_products: ["TRAE Work CN"],
+          last_active_at: null,
+          is_local: true,
+        },
+        {
+          device_id: "dev-remote-1",
+          device_type: "MOBILE",
+          device_name: "出差的手机",
+          bound_products: [],
+          last_active_at: null,
+          is_local: false,
+        },
+      ],
+    }));
 
     render(<AccountCenter active={true} />);
 
@@ -1839,46 +1697,39 @@ describe("AccountCenter", () => {
   });
 
   it("Trae CN 适配器：卡片点击进入账号详情，设备模块内嵌详情页且展开才触网（P10-5）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_product_identity_state") return [];
-      if (command === "list_trae_cn_accounts") {
-        return [{
-          profile_id: "cn-a",
-          display_name: "CN 主账号",
-          avatar_url: "",
-          last_verified_at: null,
-          status: "active",
-          is_current: true,
-        }];
-      }
-      if (command === "list_remote_devices") {
-        return {
-          profile_id: "cn-a",
-          account_label: "CN 主账号",
-          used_count: 2,
-          max_count: 10,
-          devices: [
-            {
-              device_id: "dev-local",
-              device_type: "IDE_PC",
-              device_name: "本机电脑",
-              bound_products: ["Trae CN"],
-              last_active_at: null,
-              is_local: true,
-            },
-            {
-              device_id: "dev-remote-1",
-              device_type: "MOBILE",
-              device_name: "出差的手机",
-              bound_products: [],
-              last_active_at: null,
-              is_local: false,
-            },
-          ],
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-a",
+      display_name: "CN 主账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+    mockRoute("list_remote_devices", () => ({
+      profile_id: "cn-a",
+      account_label: "CN 主账号",
+      used_count: 2,
+      max_count: 10,
+      devices: [
+        {
+          device_id: "dev-local",
+          device_type: "IDE_PC",
+          device_name: "本机电脑",
+          bound_products: ["Trae CN"],
+          last_active_at: null,
+          is_local: true,
+        },
+        {
+          device_id: "dev-remote-1",
+          device_type: "MOBILE",
+          device_name: "出差的手机",
+          bound_products: [],
+          last_active_at: null,
+          is_local: false,
+        },
+      ],
+    }));
 
     render(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
 

@@ -6,8 +6,13 @@ import type {
   MasterAccountSwitchDto,
   MasterSwitchPluginPreviewDto,
 } from "../src/types/account_switch";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 // 事件插件 mock：捕获 listen 回调，供阶段推进测试手动触发（模式同 CheckinPage.test）。
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
@@ -67,11 +72,12 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
   beforeEach(() => {
     vi.clearAllMocks();
     mockListen.mockResolvedValue(() => undefined);
+    // 等价于原 mockInvoke.mockImplementation(...)：清调用历史 + 重装路由分发。
+    resetRoutes();
+    installFakeInvoke();
     // 默认路由：预检 aborted（静默直过）→ 切换挂起（模拟进行中）。
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins") return preview();
-      return new Promise(() => undefined);
-    });
+    mockRoute("preview_master_switch_plugins", () => preview());
+    mockRoute("switch_master_account", () => new Promise(() => undefined));
   });
 
   it("预检无差异时静默直过切号（force=false）并展示五步与目标账号", async () => {
@@ -96,11 +102,9 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
   });
 
   it("纯新增差异不弹确认（ADR-0026 决策 3：零确认静默应用）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins")
-        return preview({ aborted: false, install_names: ["飞书协作", "视频生成"] });
-      return receipt();
-    });
+    mockRoute("preview_master_switch_plugins", () =>
+      preview({ aborted: false, install_names: ["飞书协作", "视频生成"] }));
+    mockRoute("switch_master_account", () => receipt());
     renderDialog();
     // 无移除 → 不弹确认，直接切换。
     await waitFor(() => {
@@ -116,9 +120,8 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
   });
 
   it("预检失败不阻断切号（fail-soft：直接发起切换）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins") throw new Error("network");
-      return new Promise(() => undefined);
+    mockRoute("preview_master_switch_plugins", () => {
+      throw new Error("network");
     });
     renderDialog();
     await waitFor(() => {
@@ -131,12 +134,10 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
 
   it("进度事件推进步骤；回执到达展示完成态与随行统计", async () => {
     let resolveSwitch: (value: MasterAccountSwitchDto) => void = () => undefined;
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins") return preview();
-      return new Promise<MasterAccountSwitchDto>((resolve) => {
+    mockRoute("switch_master_account", () =>
+      new Promise<MasterAccountSwitchDto>((resolve) => {
         resolveSwitch = resolve;
-      });
-    });
+      }));
     const handlers = new Map<string, (event: { payload: unknown }) => void>();
     mockListen.mockImplementation(async (event: string, cb: (event: { payload: unknown }) => void) => {
       handlers.set(event, cb);
@@ -171,8 +172,7 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
 
   it("master_switch_busy 走「等待完成 / 强制切换」分支，强制后带 force=true 重发", async () => {
     // args 用 unknown 收窄（invoke 签名的 InvokeArgs 含 number[]，不能只声明对象形态）
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "preview_master_switch_plugins") return preview();
+    mockRoute("switch_master_account", (args) => {
       const force = (args as { force?: boolean } | undefined)?.force === true;
       if (!force) throw "master_switch_busy";
       return receipt();
@@ -197,8 +197,7 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
   });
 
   it("已知错误码展示独立文案（如 switch_donor_login_missing）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins") return preview();
+    mockRoute("switch_master_account", () => {
       throw "switch_donor_login_missing";
     });
     renderDialog();
@@ -206,9 +205,8 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
   });
 
   it("G18：主库登录数据异常时提供单次确认的强制重置通道", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins") return preview();
-      if (command === "force_reset_master_current_account") return true;
+    mockRoute("force_reset_master_current_account", () => true);
+    mockRoute("switch_master_account", () => {
       throw "master_login_missing";
     });
     const { onClose } = renderDialog();
@@ -229,12 +227,10 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
   it("P7-2：失败前收到回滚事件 → 失败文案附「已自动还原，可安全重试」", async () => {
     // 模拟后端时序：rolled-back 事件先到，invoke 拒绝后到。
     let rejectSwitch: (reason: unknown) => void = () => undefined;
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins") return preview();
-      return new Promise((_resolve, reject) => {
+    mockRoute("switch_master_account", () =>
+      new Promise((_resolve, reject) => {
         rejectSwitch = reject;
-      });
-    });
+      }));
     const handlers = new Map<string, (event: { payload: unknown }) => void>();
     mockListen.mockImplementation(async (event: string, cb: (event: { payload: unknown }) => void) => {
       handlers.set(event, cb);
@@ -258,10 +254,6 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
   });
 
   it("P7-3：handing_over 事件带细粒度进度 → 展示项目名与序号", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "preview_master_switch_plugins") return preview();
-      return new Promise(() => undefined);
-    });
     const handlers = new Map<string, (event: { payload: unknown }) => void>();
     mockListen.mockImplementation(async (event: string, cb: (event: { payload: unknown }) => void) => {
       handlers.set(event, cb);
@@ -316,10 +308,8 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
     }
 
     it("预检含移除弹确认：列明移除插件名与新装数量，确认后继续切换", async () => {
-      mockInvoke.mockImplementation(async (command: string) => {
-        if (command === "preview_master_switch_plugins") return removalPreview();
-        return receipt();
-      });
+      mockRoute("preview_master_switch_plugins", () => removalPreview());
+      mockRoute("switch_master_account", () => receipt());
       renderDialog();
 
       // 确认分支：移除清单 + 新装数量（纯新增零风险，只带数量）。
@@ -344,10 +334,7 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
     });
 
     it("取消切换：关闭弹层，不发起切换命令", async () => {
-      mockInvoke.mockImplementation(async (command: string) => {
-        if (command === "preview_master_switch_plugins") return removalPreview();
-        return new Promise(() => undefined);
-      });
+      mockRoute("preview_master_switch_plugins", () => removalPreview());
       const { onClose } = renderDialog();
 
       expect(await screen.findByTestId("master-switch-plugin-diff")).toBeInTheDocument();

@@ -3,8 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { EnvironmentPage } from "../src/components/EnvironmentPage";
 import type { EnvironmentListItemDto, EnvironmentStateDto } from "../src/types/environment";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 // 事件插件 mock：捕获 listen 回调，供收编进度测试手动触发（模式同 CheckinPage.test）。
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
@@ -65,12 +70,12 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     vi.clearAllMocks();
     // 收编进度监听默认立即注册成功（unlisten 为空函数）。
     mockListen.mockResolvedValue(() => undefined);
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "launch_master_library") return { outcome: "launched", login_state: "logged_in" };
-      if (command === "list_environments") return [envListItem()];
-      return undefined;
-    });
+    // 等价于原 mockInvoke.mockImplementation(...)：清历史 + 重装路由分发 + 默认路由。
+    resetRoutes();
+    installFakeInvoke();
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("launch_master_library", () => ({ outcome: "launched", login_state: "logged_in" }));
+    mockRoute("list_environments", () => [envListItem()]);
   });
 
   it("渲染主库卡：当前账号 + 运行态 + data_dir + 无辅助环境时空态提示", async () => {
@@ -94,12 +99,8 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("未登录账号时提示首次登录引导，且不显示当前账号块", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") {
-        return envState({ current_profile_id: null, current_account_name: null, running: false, login_state: "uninitialized" });
-      }
-      return undefined;
-    });
+    mockRoute("get_environment_state", () =>
+      envState({ current_profile_id: null, current_account_name: null, running: false, login_state: "uninitialized" }));
     render(<EnvironmentPage active />);
     expect(await screen.findByText(/首次启动后请在 TRAE 窗口内登录一次/)).toBeInTheDocument();
     expect(screen.queryByTestId("env-current-name")).not.toBeInTheDocument();
@@ -133,20 +134,15 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("G5：环境页主库卡不再渲染统计数字，统计职责留在详情页", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_library_stats") {
-        return {
-          status: "ready",
-          current_user_id: "user-a",
-          project_count: 4,
-          session_count: 7,
-          participating_account_count: 3,
-          last_active_unix_seconds: null,
-        };
-      }
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_library_stats", () => ({
+      status: "ready",
+      current_user_id: "user-a",
+      project_count: 4,
+      session_count: 7,
+      participating_account_count: 3,
+      last_active_unix_seconds: null,
+    }));
     render(<EnvironmentPage active />);
     await screen.findByTestId("env-master-card");
     expect(screen.queryByTestId("env-master-stats")).not.toBeInTheDocument();
@@ -154,25 +150,20 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P11-5：主库体检整合区块自动渲染登录健康四项，可纠正缓存", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_self_check") {
-        return {
-          level: "self_healable",
-          checks: [
-            { key: "read", status: "passed", summary: "登录数据可读取" },
-            { key: "consistency", status: "attention", summary: "检测到实际登录账号与工具记录不一致" },
-            { key: "switchability", status: "passed", summary: "主库已关闭，可进行切换" },
-            { key: "deep", status: "passed", summary: "接力记录可读取" },
-          ],
-          current_account_name: "账号甲",
-          observed_account_name: "账号乙",
-          can_repair: true,
-        };
-      }
-      if (command === "repair_master_current_account") return true;
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_self_check", () => ({
+      level: "self_healable",
+      checks: [
+        { key: "read", status: "passed", summary: "登录数据可读取" },
+        { key: "consistency", status: "attention", summary: "检测到实际登录账号与工具记录不一致" },
+        { key: "switchability", status: "passed", summary: "主库已关闭，可进行切换" },
+        { key: "deep", status: "passed", summary: "接力记录可读取" },
+      ],
+      current_account_name: "账号甲",
+      observed_account_name: "账号乙",
+      can_repair: true,
+    }));
+    mockRoute("repair_master_current_account", () => true);
     render(<EnvironmentPage active />);
 
     // 自检报告随体检自动读取（原独立「自检」按钮已移除）。
@@ -196,14 +187,17 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P11-5：独立「自检」入口已移除，报告读取失败时登录健康分组降级", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") {
-        return { status: "ready", current_account_name: "账号甲", accounts: [], orphan_project_count: 0, orphan_session_count: 0 };
-      }
-      // 自检读取失败（reject）→ 降级为 null，不阻塞库内容分组。
-      if (command === "get_master_self_check") throw new Error("trae_real_mode_required");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => ({
+      status: "ready",
+      current_account_name: "账号甲",
+      accounts: [],
+      orphan_project_count: 0,
+      orphan_session_count: 0,
+    }));
+    // 自检读取失败（reject）→ 降级为 null，不阻塞库内容分组。
+    mockRoute("get_master_self_check", () => {
+      throw new Error("trae_real_mode_required");
     });
     render(<EnvironmentPage active />);
     await screen.findByTestId("env-checkup");
@@ -218,10 +212,9 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   it("P5-4：主库统计读取失败时统计格整体不渲染（可插拔降级）", async () => {
     // beforeEach 默认 mock 未实现 get_master_library_stats → undefined / reject 之外的
     // 降级路径：显式 reject 覆盖为失败，统计格应静默消失而非报错。
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_library_stats") throw new Error("trae_real_mode_required");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_library_stats", () => {
+      throw new Error("trae_real_mode_required");
     });
     render(<EnvironmentPage active />);
     await screen.findByTestId("env-master-card");
@@ -248,11 +241,8 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   }
 
   it("P11-5：体检库内容分组——滞留账号诊断行 + 收编入口（数量表述 + 账号名主信息）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") return checkupReport();
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => checkupReport());
     render(<EnvironmentPage active />);
     const checkup = await screen.findByTestId("env-checkup");
     // 规模主信息：2 个滞留账号、合计 5 个会话（4 + 1）。
@@ -270,13 +260,11 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
 
   it("P11-5：库内容无滞留时显示正常态提示，读取失败且无自检报告时区块静默", async () => {
     // 场景 1：分布里只有当前账号（无滞留）→ 库内容分组显示正常态。
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") {
-        return { ...checkupReport(), accounts: checkupReport().accounts.filter((a) => a.current) };
-      }
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => ({
+      ...checkupReport(),
+      accounts: checkupReport().accounts.filter((a) => a.current),
+    }));
     const { unmount } = render(<EnvironmentPage active />);
     await screen.findByTestId("env-checkup-content-ok");
     expect(screen.getByTestId("env-checkup-content-ok")).toHaveTextContent(
@@ -285,10 +273,9 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     unmount();
 
     // 场景 2：体检读取失败（reject）且无自检报告 → 区块整体静默，环境页不受影响。
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") throw new Error("trae_real_mode_required");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => {
+      throw new Error("trae_real_mode_required");
     });
     render(<EnvironmentPage active />);
     expect(await screen.findByTestId("env-master-card")).toBeInTheDocument();
@@ -305,11 +292,8 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
         { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 1 },
       ],
     };
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") return report;
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => report);
 
     render(<EnvironmentPage active />);
     const checkup = await screen.findByTestId("env-checkup");
@@ -329,20 +313,17 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
         { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 2 },
       ],
     });
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") {
-        checkupCalls += 1;
-        // 清理完成后刷新：空项目清零（体检区块自然消失）。
-        return cleanupCalls > 0
-          ? { ...checkupReport(), accounts: checkupReport().accounts.filter((a) => a.current) }
-          : reportWithEmpty();
-      }
-      if (command === "cleanup_master_empty_projects") {
-        cleanupCalls += 1;
-        return { deleted_projects: 2, backup_path: "C:\\bak\\switch-bak-456", relaunch_outcome: "launched" };
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => {
+      checkupCalls += 1;
+      // 清理完成后刷新：空项目清零（体检区块自然消失）。
+      return cleanupCalls > 0
+        ? { ...checkupReport(), accounts: checkupReport().accounts.filter((a) => a.current) }
+        : reportWithEmpty();
+    });
+    mockRoute("cleanup_master_empty_projects", () => {
+      cleanupCalls += 1;
+      return { deleted_projects: 2, backup_path: "C:\\bak\\switch-bak-456", relaunch_outcome: "launched" };
     });
     render(<EnvironmentPage active />);
 
@@ -391,11 +372,10 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
         { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 1 },
       ],
     });
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") return reportWithEmpty();
-      if (command === "cleanup_master_empty_projects") throw new Error("cleanup_master_busy");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => reportWithEmpty());
+    mockRoute("cleanup_master_empty_projects", () => {
+      throw new Error("cleanup_master_busy");
     });
     render(<EnvironmentPage active />);
     await screen.findByTestId("env-checkup");
@@ -419,11 +399,8 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
         { user_id: "user-b", account_name: "账号乙", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 0 },
       ],
     });
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") return reportCurrentOnlyEmpty();
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => reportCurrentOnlyEmpty());
     render(<EnvironmentPage active />);
 
     // 体检区块出现，提示行按全库口径计数；诊断列表只列非当前账号（此处无）。
@@ -443,14 +420,11 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
         { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 1 },
       ],
     });
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") return reportWithEmpty();
-      if (command === "cleanup_master_empty_projects") {
-        // 删除已提交但重启失败：relaunch_outcome=failed 的成功回执。
-        return { deleted_projects: 1, backup_path: "C:\\bak\\switch-bak-789", relaunch_outcome: "failed" };
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => reportWithEmpty());
+    mockRoute("cleanup_master_empty_projects", () => {
+      // 删除已提交但重启失败：relaunch_outcome=failed 的成功回执。
+      return { deleted_projects: 1, backup_path: "C:\\bak\\switch-bak-789", relaunch_outcome: "failed" };
     });
     render(<EnvironmentPage active />);
     await screen.findByTestId("env-checkup");
@@ -469,20 +443,17 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   it("P5-5：一键收编全流程（确认规模 → 进度事件 → 完成回执 → 刷新体检）", async () => {
     let resolveIncorporate: (value: unknown) => void = () => undefined;
     let checkupCalls = 0;
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") {
-        // 收编完成后刷新：第二次起返回无滞留报告（区块自然消失）。
-        checkupCalls += 1;
-        return checkupCalls <= 1
-          ? checkupReport()
-          : { ...checkupReport(), accounts: checkupReport().accounts.filter((a) => a.current), orphan_project_count: 0 };
-      }
-      if (command === "incorporate_master_records") {
-        // 挂起回执：先推进进度事件再 resolve，验证运行中步骤状态。
-        return new Promise((resolve) => { resolveIncorporate = resolve; });
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => {
+      // 收编完成后刷新：第二次起返回无滞留报告（区块自然消失）。
+      checkupCalls += 1;
+      return checkupCalls <= 1
+        ? checkupReport()
+        : { ...checkupReport(), accounts: checkupReport().accounts.filter((a) => a.current), orphan_project_count: 0 };
+    });
+    mockRoute("incorporate_master_records", () => {
+      // 挂起回执：先推进进度事件再 resolve，验证运行中步骤状态。
+      return new Promise((resolve) => { resolveIncorporate = resolve; });
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-incorporate-entry"));
@@ -550,11 +521,10 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P5-5：收编失败显示错误文案（错误码映射），可关闭弹层", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "get_master_checkup") return checkupReport();
-      if (command === "incorporate_master_records") throw new Error("incorporate_nothing_to_do");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("get_master_checkup", () => checkupReport());
+    mockRoute("incorporate_master_records", () => {
+      throw new Error("incorporate_nothing_to_do");
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-incorporate-entry"));
@@ -616,11 +586,8 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   }
 
   it("P6-4：辅助环境卡渲染（名称/当前账号/体积/四项操作）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv()];
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv()]);
     render(<EnvironmentPage active />);
     const card = await screen.findByTestId("env-card-env-x1");
     expect(card).toHaveTextContent("测试环境");
@@ -652,26 +619,23 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       orphan_project_count: 1,
       orphan_session_count: 0,
     };
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv()];
-      if (command === "get_master_checkup") {
-        // 带副环境 libraryId 的体检 → 副环境报告；缺省 → 主库报告。
-        return (args as { libraryId?: string } | undefined)?.libraryId === "env-x1"
-          ? secondaryCheckup
-          : checkupReport();
-      }
-      if (command === "incorporate_master_records") return {
-        merged_accounts: 1,
-        transferred_projects: 2,
-        removed_mirror_rows: 0,
-        switched_sessions: 3,
-        backup_path: "C:\\bak\\switch-bak-42",
-        relay_ledger_written: true,
-        relaunch_outcome: "launched",
-      };
-      return undefined;
+    // 带副环境 libraryId 的体检 → 副环境报告；缺省 → 主库报告。
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv()]);
+    mockRoute("get_master_checkup", (args) => {
+      return (args as { libraryId?: string } | undefined)?.libraryId === "env-x1"
+        ? secondaryCheckup
+        : checkupReport();
     });
+    mockRoute("incorporate_master_records", () => ({
+      merged_accounts: 1,
+      transferred_projects: 2,
+      removed_mirror_rows: 0,
+      switched_sessions: 3,
+      backup_path: "C:\\bak\\switch-bak-42",
+      relay_ledger_written: true,
+      relaunch_outcome: "launched",
+    }));
     const onOpenLibraryDetail = vi.fn();
     render(<EnvironmentPage active onOpenLibraryDetail={onOpenLibraryDetail} />);
     // 体检区块（有差异）：登录健康只显示注册表账号（不出自检四项）。
@@ -703,15 +667,12 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       orphan_project_count: 0,
       orphan_session_count: 0,
     };
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv()];
-      if (command === "get_master_checkup") {
-        return (args as { libraryId?: string } | undefined)?.libraryId === "env-x1"
-          ? cleanSecondaryCheckup
-          : checkupReport();
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv()]);
+    mockRoute("get_master_checkup", (args) => {
+      return (args as { libraryId?: string } | undefined)?.libraryId === "env-x1"
+        ? cleanSecondaryCheckup
+        : checkupReport();
     });
     render(<EnvironmentPage active />);
     await screen.findByTestId("env-card-env-x1");
@@ -722,20 +683,17 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
 
   it("P6-4：创建环境全流程（输入名称 → 确认 → invoke create_environment）", async () => {
     const created: string[] = [];
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") {
-        // 创建后列表含新环境（第二次读取起，env_id 与创建回执一致）。
-        return created.length > 0
-          ? [envListItem(), secondaryEnv({ env_id: "env-x2", name: created[0] })]
-          : [envListItem()];
-      }
-      if (command === "create_environment" && args) {
-        const payload = args as Record<string, unknown>;
-        created.push(String(payload.name));
-        return { env_id: "env-x2", name: String(payload.name), created_at_unix_seconds: 1750000200 };
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => {
+      // 创建后列表含新环境（第二次读取起，env_id 与创建回执一致）。
+      return created.length > 0
+        ? [envListItem(), secondaryEnv({ env_id: "env-x2", name: created[0] })]
+        : [envListItem()];
+    });
+    mockRoute("create_environment", (args) => {
+      const payload = args as Record<string, unknown>;
+      created.push(String(payload.name));
+      return { env_id: "env-x2", name: String(payload.name), created_at_unix_seconds: 1750000200 };
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-create-entry"));
@@ -752,11 +710,10 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P6-4：创建失败（重名）在弹层内显示映射文案，不泄露错误码", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem()];
-      if (command === "create_environment") throw new Error("environment_name_taken");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem()]);
+    mockRoute("create_environment", () => {
+      throw new Error("environment_name_taken");
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-create-entry"));
@@ -773,14 +730,13 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P6-4：重命名环境（预填原名 → 保存 → invoke rename_environment）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv()];
-      if (command === "rename_environment") {
-        return { env_id: "env-x1", name: "新名字", created_at_unix_seconds: 1750000100 };
-      }
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv()]);
+    mockRoute("rename_environment", () => ({
+      env_id: "env-x1",
+      name: "新名字",
+      created_at_unix_seconds: 1750000100,
+    }));
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-rename-env-x1"));
     // 弹层预填原名。
@@ -798,30 +754,27 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   it("P6-4：环境登录账号全流程（选账号 → 登录 → 回执 → 刷新列表）", async () => {
     const logins: { envId: string; profileId: string }[] = [];
     let loginCalls = 0;
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") {
-        // 登录后当前账号翻为账号甲（第二次读取起）。
-        return loginCalls > 0
-          ? [envListItem(), secondaryEnv({ current_profile_id: "profile-a", current_account_name: "账号甲" })]
-          : [envListItem(), secondaryEnv()];
-      }
-      if (command === "get_managed_account_state") return accountView();
-      if (command === "login_environment" && args) {
-        const payload = args as Record<string, unknown>;
-        loginCalls += 1;
-        logins.push({ envId: String(payload.envId), profileId: String(payload.profileId) });
-        // 空环境首登回执（播种形态）。
-        return {
-          env_id: String(payload.envId),
-          profile_id: String(payload.profileId),
-          seeded: true,
-          transferred_projects: 0,
-          switched_sessions: 0,
-          removed_mirror_rows: 0,
-        };
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => {
+      // 登录后当前账号翻为账号甲（第二次读取起）。
+      return loginCalls > 0
+        ? [envListItem(), secondaryEnv({ current_profile_id: "profile-a", current_account_name: "账号甲" })]
+        : [envListItem(), secondaryEnv()];
+    });
+    mockRoute("get_managed_account_state", () => accountView());
+    mockRoute("login_environment", (args) => {
+      const payload = args as Record<string, unknown>;
+      loginCalls += 1;
+      logins.push({ envId: String(payload.envId), profileId: String(payload.profileId) });
+      // 空环境首登回执（播种形态）。
+      return {
+        env_id: String(payload.envId),
+        profile_id: String(payload.profileId),
+        seeded: true,
+        transferred_projects: 0,
+        switched_sessions: 0,
+        removed_mirror_rows: 0,
+      };
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-login-env-x1"));
@@ -851,12 +804,11 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P6-4：环境登录失败显示映射文案（错误码不泄露）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv()];
-      if (command === "get_managed_account_state") return accountView();
-      if (command === "login_environment") throw new Error("environment_login_busy");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv()]);
+    mockRoute("get_managed_account_state", () => accountView());
+    mockRoute("login_environment", () => {
+      throw new Error("environment_login_busy");
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-login-env-x1"));
@@ -873,21 +825,19 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   it("P6-4：删除环境确认弹层列明规模，确认后删除并刷新列表", async () => {
     const deletes: string[] = [];
     let deleteCalls = 0;
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") {
-        return deleteCalls > 0 ? [envListItem()] : [envListItem(), secondaryEnv()];
-      }
-      if (command === "get_environment_delete_preview") {
-        return { status: "ready", project_count: 3, session_count: 5, size_bytes: 2097152 };
-      }
-      if (command === "delete_environment" && args) {
-        const payload = args as Record<string, unknown>;
-        deleteCalls += 1;
-        deletes.push(String(payload.envId));
-        return true;
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => (deleteCalls > 0 ? [envListItem()] : [envListItem(), secondaryEnv()]));
+    mockRoute("get_environment_delete_preview", () => ({
+      status: "ready",
+      project_count: 3,
+      session_count: 5,
+      size_bytes: 2097152,
+    }));
+    mockRoute("delete_environment", (args) => {
+      const payload = args as Record<string, unknown>;
+      deleteCalls += 1;
+      deletes.push(String(payload.envId));
+      return true;
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-delete-env-x1"));
@@ -912,14 +862,16 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P6-4：删除运行中环境被拒（错误码映射后显示可执行提示）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv()];
-      if (command === "get_environment_delete_preview") {
-        return { status: "ready", project_count: 0, session_count: 0, size_bytes: 1024 };
-      }
-      if (command === "delete_environment") throw new Error("environment_delete_running");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv()]);
+    mockRoute("get_environment_delete_preview", () => ({
+      status: "ready",
+      project_count: 0,
+      session_count: 0,
+      size_bytes: 1024,
+    }));
+    mockRoute("delete_environment", () => {
+      throw new Error("environment_delete_running");
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-delete-env-x1"));
@@ -936,16 +888,13 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
 
   it("P11-5：主库运行中显示关闭按钮，确认弹层后调用关闭命令并刷新状态", async () => {
     let closeCalls = 0;
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") {
-        // 关闭成功后重读：运行态翻转为停止（5 秒轮询之外的主动校准）。
-        return envState({ running: closeCalls > 0 ? false : true });
-      }
-      if (command === "close_environment_instance") {
-        closeCalls += 1;
-        return { outcome: "closed" };
-      }
-      return undefined;
+    mockRoute("get_environment_state", () => {
+      // 关闭成功后重读：运行态翻转为停止（5 秒轮询之外的主动校准）。
+      return envState({ running: closeCalls > 0 ? false : true });
+    });
+    mockRoute("close_environment_instance", () => {
+      closeCalls += 1;
+      return { outcome: "closed" };
     });
     render(<EnvironmentPage active />);
     // 运行中 → 关闭按钮出现（与启动/聚焦同区）。
@@ -974,23 +923,17 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
 
   it("P11-5：副环境关闭按钮仅运行中显示，强制结束与未运行回执各自反馈", async () => {
     // 场景 1：未运行 → 关闭按钮不出现。
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: false })];
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv({ running: false })]);
     const first = render(<EnvironmentPage active />);
     await screen.findByTestId("env-card-env-x1");
     expect(screen.queryByTestId("env-close-env-x1")).not.toBeInTheDocument();
     first.unmount();
 
     // 场景 2：运行中 → 确认后强制结束回执（force_closed）反馈。
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: true })];
-      if (command === "close_environment_instance") return { outcome: "force_closed" };
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv({ running: true })]);
+    mockRoute("close_environment_instance", () => ({ outcome: "force_closed" }));
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-close-env-x1"));
     const dialog = await screen.findByTestId("env-close-dialog");
@@ -1005,12 +948,9 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P11-5：关闭时环境已自行退出按幂等提示，不报错", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: true })];
-      if (command === "close_environment_instance") return { outcome: "not_running" };
-      return undefined;
-    });
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv({ running: true })]);
+    mockRoute("close_environment_instance", () => ({ outcome: "not_running" }));
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-close-env-x1"));
     fireEvent.click(await screen.findByTestId("env-close-dialog-confirm"));
@@ -1021,11 +961,10 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
   });
 
   it("P11-5：关闭失败走错误码映射（notify.error）", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") return envState();
-      if (command === "list_environments") return [envListItem(), secondaryEnv({ running: true })];
-      if (command === "close_environment_instance") throw new Error("environment_close_failed");
-      return undefined;
+    mockRoute("get_environment_state", () => envState());
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv({ running: true })]);
+    mockRoute("close_environment_instance", () => {
+      throw new Error("environment_close_failed");
     });
     render(<EnvironmentPage active />);
     fireEvent.click(await screen.findByTestId("env-close-env-x1"));

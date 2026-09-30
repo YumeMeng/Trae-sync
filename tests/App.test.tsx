@@ -3,11 +3,14 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { invoke } from "@tauri-apps/api/core";
 import type { WorkspaceStateDto } from "../src/types/workspace";
 import App from "../src/App";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
 // App 测试只模拟 Tauri command，确保测试不会访问真实 TRAE 数据。
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
-}));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 // 事件插件 mock：捕获 listen 回调，供自动签到跨页摘要测试手动触发。
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
@@ -68,48 +71,42 @@ describe("应用工作区入口", () => {
     vi.clearAllMocks();
     // 事件监听默认立即注册成功（unlisten 为空函数）。
     mockListen.mockResolvedValue(() => undefined);
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_workspace_state") return workspace;
-      if (command === "get_environment_state") {
-        return {
-          env_id: "master",
-          current_profile_id: "profile-a",
-          current_account_name: "主库账号",
-          data_dir: "C:\\TRAE\\master",
-          running: false,
-          login_state: "logged_in",
-          created_at_unix_seconds: 1,
-        };
-      }
-      if (command === "get_checkin_capability") {
-        return {
-          enabled: false,
-          transport: "disabled",
-          real_http_enabled: false,
-          message: "签到能力当前不可读取。",
-        };
-      }
-      if (command === "get_product_identity_state") {
-        return [
-          {
-            product_id: "work_cn",
-            display_name: "TRAE Work CN",
-            identity_status: "recognized",
-            credential_status: "managed_by_work",
-            relation_to_work: "current_product",
-          },
-          {
-            product_id: "trae_cn",
-            display_name: "Trae CN",
-            identity_status: "recognized",
-            credential_status: "need_authorization",
-            relation_to_work: "different_identity",
-          },
-        ];
-      }
-      if (command === "list_trae_cn_accounts") return [];
-      throw new Error(`未模拟的命令: ${command}`);
-    });
+    // 等价于原 mockInvoke.mockImplementation(...)：清历史 + 重装路由分发 + 默认路由。
+    resetRoutes();
+    installFakeInvoke();
+    mockRoute("get_workspace_state", () => workspace);
+    mockRoute("get_environment_state", () => ({
+      env_id: "master",
+      current_profile_id: "profile-a",
+      current_account_name: "主库账号",
+      data_dir: "C:\\TRAE\\master",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 1,
+    }));
+    mockRoute("get_checkin_capability", () => ({
+      enabled: false,
+      transport: "disabled",
+      real_http_enabled: false,
+      message: "签到能力当前不可读取。",
+    }));
+    mockRoute("get_product_identity_state", () => [
+      {
+        product_id: "work_cn",
+        display_name: "TRAE Work CN",
+        identity_status: "recognized",
+        credential_status: "managed_by_work",
+        relation_to_work: "current_product",
+      },
+      {
+        product_id: "trae_cn",
+        display_name: "Trae CN",
+        identity_status: "recognized",
+        credential_status: "need_authorization",
+        relation_to_work: "different_identity",
+      },
+    ]);
+    mockRoute("list_trae_cn_accounts", () => []);
   });
 
   it("P11-1：App 级监听自动签到完成事件，跨页发布 notify.summary 摘要", async () => {
@@ -175,21 +172,16 @@ describe("应用工作区入口", () => {
       },
       honest_status: "真实只读 Preview；等待用户授权后发现 TRAE 数据位置；TRAE 写入保持禁用。",
     };
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_workspace_state") return unauthorizedWorkspace;
-      if (command === "get_environment_state") {
-        return {
-          env_id: "master",
-          current_profile_id: null,
-          current_account_name: null,
-          data_dir: "C:\\TRAE\\master",
-          running: false,
-          login_state: "logged_out",
-          created_at_unix_seconds: 1,
-        };
-      }
-      throw new Error(`未模拟的命令: ${command}`);
-    });
+    mockRoute("get_workspace_state", () => unauthorizedWorkspace);
+    mockRoute("get_environment_state", () => ({
+      env_id: "master",
+      current_profile_id: null,
+      current_account_name: null,
+      data_dir: "C:\\TRAE\\master",
+      running: false,
+      login_state: "logged_out",
+      created_at_unix_seconds: 1,
+    }));
 
     render(<App />);
 
@@ -200,14 +192,11 @@ describe("应用工作区入口", () => {
 
   it("初始化状态读取失败时提供可重试的工作台恢复动作", async () => {
     let shouldFail = true;
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_workspace_state") {
-        if (shouldFail) {
-          throw new Error("IPC 暂时不可用");
-        }
-        return workspace;
+    mockRoute("get_workspace_state", () => {
+      if (shouldFail) {
+        throw new Error("IPC 暂时不可用");
       }
-      throw new Error(`未模拟的命令: ${command}`);
+      return workspace;
     });
 
     render(<App />);
@@ -228,30 +217,23 @@ describe("应用工作区入口", () => {
   });
 
   it("总览页有主库数据时显示统计卡，不同屏出现空态引导", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_workspace_state") return workspace;
-      if (command === "get_checkin_capability") {
-        return {
-          enabled: false,
-          transport: "disabled",
-          real_http_enabled: false,
-          message: "签到能力当前不可读取。",
-        };
-      }
-      if (command === "get_master_library_stats") {
-        return {
-          status: "ready",
-          current_user_id: "u-1",
-          project_count: 4,
-          session_count: 16,
-          message_count: 128,
-          participating_account_count: 3,
-          last_active_unix_seconds: null,
-          size_bytes: 0,
-        };
-      }
-      throw new Error(`未模拟的命令: ${command}`);
-    });
+    mockRoute("get_workspace_state", () => workspace);
+    mockRoute("get_checkin_capability", () => ({
+      enabled: false,
+      transport: "disabled",
+      real_http_enabled: false,
+      message: "签到能力当前不可读取。",
+    }));
+    mockRoute("get_master_library_stats", () => ({
+      status: "ready",
+      current_user_id: "u-1",
+      project_count: 4,
+      session_count: 16,
+      message_count: 128,
+      participating_account_count: 3,
+      last_active_unix_seconds: null,
+      size_bytes: 0,
+    }));
 
     render(<App />);
 
@@ -289,18 +271,13 @@ describe("应用工作区入口", () => {
         unavailable_reason: "not_selected",
       },
     };
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_workspace_state") return noLocationWorkspace;
-      if (command === "get_checkin_capability") {
-        return {
-          enabled: false,
-          transport: "disabled",
-          real_http_enabled: false,
-          message: "签到能力当前不可读取。",
-        };
-      }
-      throw new Error(`未模拟的命令: ${command}`);
-    });
+    mockRoute("get_workspace_state", () => noLocationWorkspace);
+    mockRoute("get_checkin_capability", () => ({
+      enabled: false,
+      transport: "disabled",
+      real_http_enabled: false,
+      message: "签到能力当前不可读取。",
+    }));
 
     render(<App />);
 
@@ -349,96 +326,91 @@ describe("应用工作区入口", () => {
 
   it("P11-6（ADR-0032）：导航五页全产品开放，Trae CN 各页按区块三态呈现", async () => {
     // 全量 mock：ready 页激活所需命令；pending/absent 页不发起读取。
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+    // 原 catch-all 实现按 libraryId 分支的命令改为在各自 handler 内分支。
+    mockRoute("get_workspace_state", () => workspace);
+    mockRoute("get_environment_state", () => ({
+      env_id: "master",
+      current_profile_id: "profile-a",
+      current_account_name: "主库账号",
+      data_dir: "C:\\TRAE\\master",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 1,
+    }));
+    mockRoute("get_checkin_capability", () => ({
+      enabled: false,
+      transport: "disabled",
+      real_http_enabled: false,
+      message: "",
+    }));
+    mockRoute("get_product_identity_state", () => [
+      {
+        product_id: "work_cn",
+        display_name: "TRAE Work CN",
+        identity_status: "recognized",
+        credential_status: "managed_by_work",
+        relation_to_work: "current_product",
+      },
+      {
+        product_id: "trae_cn",
+        display_name: "Trae CN",
+        identity_status: "recognized",
+        credential_status: "need_authorization",
+        relation_to_work: "different_identity",
+      },
+    ]);
+    mockRoute("list_trae_cn_accounts", () => []);
+    mockRoute("get_master_library_stats", (args) => {
       const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
-      if (command === "get_workspace_state") return workspace;
-      if (command === "get_environment_state") {
+      if (libraryId === "trae_cn") {
         return {
-          env_id: "master",
-          current_profile_id: "profile-a",
-          current_account_name: "主库账号",
-          data_dir: "C:\\TRAE\\master",
-          running: false,
-          login_state: "logged_in",
-          created_at_unix_seconds: 1,
+          status: "ready",
+          current_user_id: "u-t1",
+          project_count: 1,
+          session_count: 2,
+          message_count: 5,
+          participating_account_count: 1,
+          last_active_unix_seconds: null,
+          size_bytes: 0,
         };
       }
-      if (command === "get_checkin_capability") {
-        return { enabled: false, transport: "disabled", real_http_enabled: false, message: "" };
-      }
-      if (command === "get_product_identity_state") {
-        return [
-          {
-            product_id: "work_cn",
-            display_name: "TRAE Work CN",
-            identity_status: "recognized",
-            credential_status: "managed_by_work",
-            relation_to_work: "current_product",
-          },
-          {
-            product_id: "trae_cn",
-            display_name: "Trae CN",
-            identity_status: "recognized",
-            credential_status: "need_authorization",
-            relation_to_work: "different_identity",
-          },
-        ];
-      }
-      if (command === "list_trae_cn_accounts") return [];
-      if (command === "get_master_library_stats") {
-        if (libraryId === "trae_cn") {
-          return {
-            status: "ready",
-            current_user_id: "u-t1",
-            project_count: 1,
-            session_count: 2,
-            message_count: 5,
-            participating_account_count: 1,
-            last_active_unix_seconds: null,
-            size_bytes: 0,
-          };
-        }
-        throw new Error("未模拟的命令: get_master_library_stats");
-      }
-      if (command === "get_master_backup_chain") {
-        if (libraryId === "trae_cn") {
-          return { backups: [], backup_dir: "C:\\trae-cn", keep_policy: 5 };
-        }
-        return { backups: [], backup_dir: "C:\\bak", keep_policy: 5 };
-      }
-      if (command === "get_master_history") {
-        if (libraryId === "trae_cn") {
-          return {
-            status: "ready",
-            current_user_id: "u-t1",
-            projects: [{ project_id: "p-t1", name: "Trae 项目", absolute_path: null }],
-            sessions: [
-              {
-                session_id: "s-t1",
-                project_id: "p-t1",
-                title: "Trae 会话",
-                message_count: 5,
-                updated_at_unix_seconds: 1750000000,
-                deleted: false,
-                hidden_status: null,
-                work_mode: null,
-              },
-            ],
-            fingerprint: { db: { mtime_secs: 1, mtime_nanos: 0, size: 1 }, wal: null, shm: null },
-          };
-        }
-        throw new Error("未模拟的命令: get_master_history");
-      }
-      if (command === "get_relay_ledger") return [];
-      if (command === "get_master_session_messages") {
-        return { session_id: "s-t1", status: "ready", messages: [] };
-      }
-      if (command === "get_backup_retention") return { enabled: true, keep: 5 };
-      if (command === "get_auto_checkin_settings") {
-        return { enabled: false, daily_time_hhmm: "09:00", ledger: null };
-      }
-      throw new Error(`未模拟的命令: ${command}`);
+      throw new Error("未模拟的命令: get_master_library_stats");
     });
+    mockRoute("get_master_backup_chain", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId === "trae_cn") {
+        return { backups: [], backup_dir: "C:\\trae-cn", keep_policy: 5 };
+      }
+      return { backups: [], backup_dir: "C:\\bak", keep_policy: 5 };
+    });
+    mockRoute("get_master_history", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId === "trae_cn") {
+        return {
+          status: "ready",
+          current_user_id: "u-t1",
+          projects: [{ project_id: "p-t1", name: "Trae 项目", absolute_path: null }],
+          sessions: [
+            {
+              session_id: "s-t1",
+              project_id: "p-t1",
+              title: "Trae 会话",
+              message_count: 5,
+              updated_at_unix_seconds: 1750000000,
+              deleted: false,
+              hidden_status: null,
+              work_mode: null,
+            },
+          ],
+          fingerprint: { db: { mtime_secs: 1, mtime_nanos: 0, size: 1 }, wal: null, shm: null },
+        };
+      }
+      throw new Error("未模拟的命令: get_master_history");
+    });
+    mockRoute("get_relay_ledger", () => []);
+    mockRoute("get_master_session_messages", () => ({ session_id: "s-t1", status: "ready", messages: [] }));
+    mockRoute("get_backup_retention", () => ({ enabled: true, keep: 5 }));
+    mockRoute("get_auto_checkin_settings", () => ({ enabled: false, daily_time_hhmm: "09:00", ledger: null }));
 
     render(<App />);
     await screen.findByTestId("current-account-context");

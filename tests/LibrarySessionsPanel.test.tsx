@@ -7,11 +7,13 @@ import type {
   RelayLedgerEntryDto,
   TraeCnForeignProjectDto,
 } from "../src/types/history";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-// mock Tauri invoke——前端测试不依赖真实后端
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
-}));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 // 事件插件 mock（P13-2 归并进度事件消费）：捕获 listen 回调供测试手动触发。
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
@@ -233,20 +235,18 @@ function sessionMessages(sessionId: string, offset = 0) {
 }
 
 function setupHistory(history: MasterHistoryDto) {
-  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-    if (command === "get_master_history") return history;
-    if (command === "get_relay_ledger") return ledgerEntries();
-    if (command === "get_master_session_messages") {
-      const typedArgs = args as { sessionId: string; offset?: number };
-      return sessionMessages(typedArgs.sessionId, typedArgs.offset);
-    }
-    // P11-5：草稿正本在工具管理数据；默认空草稿（读取/写入都成功）。
-    if (command === "get_archive_draft") {
-      return { archive_session_ids: [], restore_session_ids: [] };
-    }
-    if (command === "set_archive_draft") return true;
-    return undefined;
+  mockRoute("get_master_history", () => history);
+  mockRoute("get_relay_ledger", () => ledgerEntries());
+  mockRoute("get_master_session_messages", (args) => {
+    const typedArgs = args as { sessionId: string; offset?: number };
+    return sessionMessages(typedArgs.sessionId, typedArgs.offset);
   });
+  // P11-5：草稿正本在工具管理数据；默认空草稿（读取/写入都成功）。
+  mockRoute("get_archive_draft", () => ({
+    archive_session_ids: [],
+    restore_session_ids: [],
+  }));
+  mockRoute("set_archive_draft", () => true);
 }
 
 /** 展开项目树分支（会话子级按需渲染）。 */
@@ -258,6 +258,9 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+    // 等价于原 mockImplementation 每用例重设：清调用历史 + 重装路由分发。
+    resetRoutes();
+    installFakeInvoke();
   });
 
   it("树结构：项目行 + 会话子级按需展开 + 未关联文件夹末位 + 库注入参数", async () => {
@@ -424,12 +427,15 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
   });
 
   it("读取失败显示错误与重试入口；active=false 不发起读取", async () => {
-    mockInvoke.mockRejectedValue(new Error("boom"));
+    mockRoute("get_master_history", () => {
+      throw new Error("boom");
+    });
     render(<LibrarySessionsPanel active />);
     expect(await screen.findByTestId("history-error")).toHaveTextContent("库记录暂时不可读取");
 
-    mockInvoke.mockClear();
-    mockInvoke.mockResolvedValue(undefined);
+    // 重置为干净路由：active=false 不应发起任何调用。
+    resetRoutes();
+    installFakeInvoke();
     render(<LibrarySessionsPanel active={false} />);
     expect(mockInvoke).not.toHaveBeenCalled();
   });
@@ -446,14 +452,11 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
         fingerprint: dto.fingerprint,
       };
       let calls = 0;
-      mockInvoke.mockImplementation(async (command: string) => {
-        if (command === "get_master_history") {
-          calls += 1;
-          return calls === 1 ? dto : unchanged;
-        }
-        if (command === "get_relay_ledger") return ledgerEntries();
-        return undefined;
+      mockRoute("get_master_history", () => {
+        calls += 1;
+        return calls === 1 ? dto : unchanged;
       });
+      mockRoute("get_relay_ledger", () => ledgerEntries());
 
       render(<LibrarySessionsPanel active />);
       // 初次加载完成（fake timers 下用 act 冲洗微任务）
@@ -513,106 +516,102 @@ function setupMutableHistory(options: {
   let archiveApplyCount = 0;
   let historyLoaded = false;
   let refreshFailuresRemaining = options.refreshFailures ?? 0;
-  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-    if (command === "get_master_history") {
-      if (historyLoaded && refreshFailuresRemaining > 0) {
-        refreshFailuresRemaining -= 1;
-        throw new Error("history_refresh_failed");
+  mockRoute("get_master_history", () => {
+    if (historyLoaded && refreshFailuresRemaining > 0) {
+      refreshFailuresRemaining -= 1;
+      throw new Error("history_refresh_failed");
+    }
+    historyLoaded = true;
+    return { ...dto, sessions: [...sessions] };
+  });
+  mockRoute("get_relay_ledger", () => ledgerEntries());
+  mockRoute("get_master_session_messages", (args) =>
+    sessionMessages((args as { sessionId: string }).sessionId));
+  mockRoute("launch_master_library", () => ({ outcome: "launched", login_state: "logged_in" }));
+  // P11-5：草稿正本在工具管理数据；默认空草稿（读取/写入都成功），
+  // 传入 drafts Map 时模拟真实持久化。
+  mockRoute("get_archive_draft", (args) => {
+    const libraryId = (args as { libraryId: string }).libraryId;
+    return options.drafts?.get(libraryId) ?? { archive_session_ids: [], restore_session_ids: [] };
+  });
+  mockRoute("set_archive_draft", (args) => {
+    const payload = args as {
+      libraryId: string;
+      archiveSessionIds: string[];
+      restoreSessionIds: string[];
+    };
+    if (options.drafts) {
+      if (payload.archiveSessionIds.length === 0 && payload.restoreSessionIds.length === 0) {
+        options.drafts.delete(payload.libraryId);
+      } else {
+        options.drafts.set(payload.libraryId, {
+          archive_session_ids: [...payload.archiveSessionIds],
+          restore_session_ids: [...payload.restoreSessionIds],
+        });
       }
-      historyLoaded = true;
-      return { ...dto, sessions: [...sessions] };
     }
-    if (command === "get_relay_ledger") return ledgerEntries();
-    if (command === "get_master_session_messages") {
-      return sessionMessages((args as { sessionId: string }).sessionId);
-    }
-    if (command === "launch_master_library") return { outcome: "launched", login_state: "logged_in" };
-    // P11-5：草稿正本在工具管理数据；默认空草稿（读取/写入都成功），
-    // 传入 drafts Map 时模拟真实持久化。
-    if (command === "get_archive_draft") {
-      const libraryId = (args as { libraryId: string }).libraryId;
-      return options.drafts?.get(libraryId) ?? { archive_session_ids: [], restore_session_ids: [] };
-    }
-    if (command === "set_archive_draft") {
-      const payload = args as {
-        libraryId: string;
-        archiveSessionIds: string[];
-        restoreSessionIds: string[];
-      };
-      if (options.drafts) {
-        if (payload.archiveSessionIds.length === 0 && payload.restoreSessionIds.length === 0) {
-          options.drafts.delete(payload.libraryId);
-        } else {
-          options.drafts.set(payload.libraryId, {
-            archive_session_ids: [...payload.archiveSessionIds],
-            restore_session_ids: [...payload.restoreSessionIds],
-          });
-        }
+    return true;
+  });
+  mockRoute("apply_master_archive_changes", (args) => {
+    const { archiveSessionIds, restoreSessionIds } = args as {
+      archiveSessionIds: string[];
+      restoreSessionIds: string[];
+    };
+    const archiveIds = new Set(archiveSessionIds);
+    const restoreIds = new Set(restoreSessionIds);
+    let archived = 0;
+    let restored = 0;
+    for (const session of sessions) {
+      if (archiveIds.has(session.session_id) && session.hidden_status === null) {
+        session.hidden_status = "voice_discussion";
+        archived += 1;
+      } else if (restoreIds.has(session.session_id) && session.hidden_status === "voice_discussion") {
+        session.hidden_status = null;
+        restored += 1;
       }
-      return true;
     }
-    if (command === "apply_master_archive_changes") {
-      const { archiveSessionIds, restoreSessionIds } = args as {
-        archiveSessionIds: string[];
-        restoreSessionIds: string[];
-      };
-      const archiveIds = new Set(archiveSessionIds);
-      const restoreIds = new Set(restoreSessionIds);
-      let archived = 0;
-      let restored = 0;
-      for (const session of sessions) {
-        if (archiveIds.has(session.session_id) && session.hidden_status === null) {
-          session.hidden_status = "voice_discussion";
-          archived += 1;
-        } else if (restoreIds.has(session.session_id) && session.hidden_status === "voice_discussion") {
-          session.hidden_status = null;
-          restored += 1;
-        }
+    return {
+      archived_sessions: archived,
+      restored_sessions: restored,
+      relaunch_outcome:
+        relaunchOutcomes[Math.min(archiveApplyCount++, relaunchOutcomes.length - 1)] ?? "launched",
+    };
+  });
+  mockRoute("delete_master_sessions", (args) => {
+    const ids = new Set((args as { sessionIds: string[] }).sessionIds);
+    let messages = 0;
+    for (let index = sessions.length - 1; index >= 0; index -= 1) {
+      const session = sessions[index]!;
+      if (ids.has(session.session_id)) {
+        messages += session.message_count;
+        sessions.splice(index, 1);
       }
-      return {
-        archived_sessions: archived,
-        restored_sessions: restored,
-        relaunch_outcome:
-          relaunchOutcomes[Math.min(archiveApplyCount++, relaunchOutcomes.length - 1)] ?? "launched",
-      };
     }
-    if (command === "delete_master_sessions") {
-      const ids = new Set((args as { sessionIds: string[] }).sessionIds);
-      let messages = 0;
-      for (let index = sessions.length - 1; index >= 0; index -= 1) {
-        const session = sessions[index]!;
-        if (ids.has(session.session_id)) {
-          messages += session.message_count;
-          sessions.splice(index, 1);
-        }
+    return {
+      deleted_sessions: ids.size,
+      deleted_messages: messages,
+      removed_projects: 0,
+      backup_path: "backup-path",
+    };
+  });
+  mockRoute("merge_master_projects", (args) => {
+    // 源项目会话改挂目标项目（mock 与后端事务行为同构）。
+    const { sourceProjectIds, targetProjectId } = args as {
+      sourceProjectIds: string[];
+      targetProjectId: string;
+    };
+    let moved = 0;
+    for (const session of sessions) {
+      if (sourceProjectIds.includes(session.project_id)) {
+        session.project_id = targetProjectId;
+        moved += 1;
       }
-      return {
-        deleted_sessions: ids.size,
-        deleted_messages: messages,
-        removed_projects: 0,
-        backup_path: "backup-path",
-      };
     }
-    if (command === "merge_master_projects") {
-      // 源项目会话改挂目标项目（mock 与后端事务行为同构）。
-      const { sourceProjectIds, targetProjectId } = args as {
-        sourceProjectIds: string[];
-        targetProjectId: string;
-      };
-      let moved = 0;
-      for (const session of sessions) {
-        if (sourceProjectIds.includes(session.project_id)) {
-          session.project_id = targetProjectId;
-          moved += 1;
-        }
-      }
-      return {
-        moved_sessions: moved,
-        removed_projects: sourceProjectIds.length,
-        backup_path: "backup-path",
-      };
-    }
-    return undefined;
+    return {
+      moved_sessions: moved,
+      removed_projects: sourceProjectIds.length,
+      backup_path: "backup-path",
+    };
   });
   return sessions;
 }
@@ -621,6 +620,8 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+    resetRoutes();
+    installFakeInvoke();
   });
 
   it("批量归档：勾选会话只生成草稿，点击应用后一次性提交", async () => {
@@ -907,14 +908,9 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
   it("后端草稿写入失败时回退 localStorage 并显式告警，双失败显示页内错误", async () => {
     setupMutableHistory();
     // 场景 1：后端写入失败、localStorage 回退成功 → notify.warning，草稿不丢。
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_master_history") return historyDto();
-      if (command === "get_relay_ledger") return ledgerEntries();
-      if (command === "get_archive_draft") {
-        return { archive_session_ids: [], restore_session_ids: [] };
-      }
-      if (command === "set_archive_draft") throw new Error("archive_draft_store_unavailable");
-      return undefined;
+    // 覆盖 set_archive_draft 路由：写入命令抛错。
+    mockRoute("set_archive_draft", () => {
+      throw new Error("archive_draft_store_unavailable");
     });
     const first = render(<LibrarySessionsPanel active />);
     await expandProject("p1");
@@ -948,11 +944,10 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
   });
 
   it("后端草稿读取失败（命令不可用）按空草稿处理，不阻断历史列表", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_master_history") return historyDto();
-      if (command === "get_relay_ledger") return ledgerEntries();
-      if (command === "get_archive_draft") throw new Error("archive_draft_join_failed");
-      return undefined;
+    mockRoute("get_master_history", () => historyDto());
+    mockRoute("get_relay_ledger", () => ledgerEntries());
+    mockRoute("get_archive_draft", () => {
+      throw new Error("archive_draft_join_failed");
     });
     render(<LibrarySessionsPanel active />);
     // 列表正常渲染，无草稿条。
@@ -1199,17 +1194,12 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
 
   it("合并错误走安全文案：不吞失败、树维持", async () => {
     const sessions = setupMutableHistory();
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "merge_master_projects") {
-        // 模拟主库运行中拒绝合并（真实错误码走 safeUiError 映射）。
-        throw new Error("master_merge_running");
-      }
-      if (command === "get_master_history") {
-        return historyDto({ sessions: sessions.map((session) => ({ ...session })) });
-      }
-      if (command === "get_relay_ledger") return ledgerEntries();
-      return undefined;
+    // 覆盖合并路由：模拟主库运行中拒绝合并（真实错误码走 safeUiError 映射）。
+    mockRoute("merge_master_projects", () => {
+      throw new Error("master_merge_running");
     });
+    mockRoute("get_master_history", () =>
+      historyDto({ sessions: sessions.map((session) => ({ ...session })) }));
     render(<LibrarySessionsPanel active />);
     await screen.findByTestId("library-project-p1");
 
@@ -1239,6 +1229,8 @@ describe("LibrarySessionsPanel readOnly（全能力库降级为纯只读）", ()
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+    resetRoutes();
+    installFakeInvoke();
   });
 
   it("写控件隐藏：选择按钮与快捷归档不出；草稿命令不发起；归档内容仍可浏览", async () => {
@@ -1276,6 +1268,8 @@ describe("LibrarySessionsPanel P13-3（CN 库归档开放）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+    resetRoutes();
+    installFakeInvoke();
   });
 
   it("归档控件放行：选择入口与快捷归档可见，草稿机制按 CN 库键参与", async () => {
@@ -1356,44 +1350,42 @@ function foreignProjects(): TraeCnForeignProjectDto[] {
 
 /** CN 归并流 mock：预览/归并命令 + 可选错误注入（含基础读路径分支）。 */
 function setupTraeCnMerge(overrides: { previewError?: string; mergeError?: string } = {}) {
-  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
-    if (command === "get_master_history") return historyDto();
-    if (command === "get_relay_ledger") return ledgerEntries();
-    if (command === "get_master_session_messages") {
-      const typedArgs = args as { sessionId: string; offset?: number };
-      return sessionMessages(typedArgs.sessionId, typedArgs.offset);
-    }
-    if (command === "get_archive_draft") {
-      return { archive_session_ids: [], restore_session_ids: [] };
-    }
-    if (command === "set_archive_draft") return true;
-    if (command === "preview_trae_cn_project_merge") {
-      if (overrides.previewError) throw new Error(overrides.previewError);
-      return {
-        absolute_path: "d:\\work\\shared",
-        target_account_name: "账号B",
-        target_exists: false,
-        target_session_count: 0,
-        sources: [
-          { user_id: "u-a", account_name: "账号A", session_count: 2, message_count: 9 },
-          { user_id: "u-x", account_name: null, session_count: 0, message_count: 0 },
-        ],
-        total_sessions: 2,
-        total_messages: 9,
-      };
-    }
-    if (command === "merge_trae_cn_project") {
-      if (overrides.mergeError) throw new Error(overrides.mergeError);
-      return {
-        transferred_projects: 1,
-        removed_mirror_rows: 0,
-        switched_sessions: 2,
-        moved_messages: 9,
-        backup_path: "C:\\TraeSync\\data\\environments\\master\\.switch-bak-1",
-        relay_ledger_written: true,
-      };
-    }
-    return undefined;
+  mockRoute("get_master_history", () => historyDto());
+  mockRoute("get_relay_ledger", () => ledgerEntries());
+  mockRoute("get_master_session_messages", (args) => {
+    const typedArgs = args as { sessionId: string; offset?: number };
+    return sessionMessages(typedArgs.sessionId, typedArgs.offset);
+  });
+  mockRoute("get_archive_draft", () => ({
+    archive_session_ids: [],
+    restore_session_ids: [],
+  }));
+  mockRoute("set_archive_draft", () => true);
+  mockRoute("preview_trae_cn_project_merge", () => {
+    if (overrides.previewError) throw new Error(overrides.previewError);
+    return {
+      absolute_path: "d:\\work\\shared",
+      target_account_name: "账号B",
+      target_exists: false,
+      target_session_count: 0,
+      sources: [
+        { user_id: "u-a", account_name: "账号A", session_count: 2, message_count: 9 },
+        { user_id: "u-x", account_name: null, session_count: 0, message_count: 0 },
+      ],
+      total_sessions: 2,
+      total_messages: 9,
+    };
+  });
+  mockRoute("merge_trae_cn_project", () => {
+    if (overrides.mergeError) throw new Error(overrides.mergeError);
+    return {
+      transferred_projects: 1,
+      removed_mirror_rows: 0,
+      switched_sessions: 2,
+      moved_messages: 9,
+      backup_path: "C:\\TraeSync\\data\\environments\\master\\.switch-bak-1",
+      relay_ledger_written: true,
+    };
   });
 }
 
@@ -1403,6 +1395,8 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
     window.localStorage.clear();
     mockListen.mockReset();
     mockListen.mockResolvedValue(() => undefined);
+    resetRoutes();
+    installFakeInvoke();
   });
 
   it("入口条件：foreignProjects 注入时树末位渲染「其他账号的项目」组；未注入不渲染", async () => {
@@ -1470,27 +1464,20 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
   it("进度事件：确认后按钮文案随 trae-cn-merge-progress 阶段推进，完成后复原", async () => {
     setupTraeCnMerge();
     let resolveMerge: (value: unknown) => void = () => undefined;
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_master_history") return historyDto();
-      if (command === "get_relay_ledger") return ledgerEntries();
-      if (command === "preview_trae_cn_project_merge") {
-        return {
-          absolute_path: null,
-          target_account_name: "账号B",
-          target_exists: false,
-          target_session_count: 0,
-          sources: [{ user_id: "u-a", account_name: "账号A", session_count: 2, message_count: 9 }],
-          total_sessions: 2,
-          total_messages: 9,
-        };
-      }
-      if (command === "merge_trae_cn_project") {
-        return new Promise((resolve) => {
-          resolveMerge = resolve;
-        });
-      }
-      return undefined;
-    });
+    // 覆盖预览与归并路由：归并命令挂起，等待进度事件推进。
+    mockRoute("preview_trae_cn_project_merge", () => ({
+      absolute_path: null,
+      target_account_name: "账号B",
+      target_exists: false,
+      target_session_count: 0,
+      sources: [{ user_id: "u-a", account_name: "账号A", session_count: 2, message_count: 9 }],
+      total_sessions: 2,
+      total_messages: 9,
+    }));
+    mockRoute("merge_trae_cn_project", () =>
+      new Promise((resolve) => {
+        resolveMerge = resolve;
+      }));
     render(<LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />);
     fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
     fireEvent.click(await screen.findByTestId("trae-cn-merge-confirm-confirm"));

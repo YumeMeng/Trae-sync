@@ -9,8 +9,13 @@ import type {
   ManagedAccountsViewDto,
 } from "../src/types/account_switch";
 import type { TraeCnAccountDto } from "../src/types/product";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 // 事件插件 mock：捕获 listen 回调，供横幅测试手动触发。
 const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
@@ -148,7 +153,9 @@ function fixtureView(): ManagedAccountsViewDto {
 
 describe("CheckinPage", () => {
   beforeEach(() => {
-    mockInvoke.mockReset();
+    // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
+    resetRoutes();
+    installFakeInvoke();
     // 默认返回可用的 unlisten 句柄；需触发事件的测试自行覆写实现。
     mockListen.mockReset();
     mockListen.mockResolvedValue(() => undefined);
@@ -157,18 +164,13 @@ describe("CheckinPage", () => {
   afterEach(() => vi.clearAllMocks());
 
   it("状态行展示自动签到触发时间与今日台账进度", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry("profile-login-1", "登录账号甲")];
-      if (command === "get_auto_checkin_settings") {
-        return {
-          enabled: true,
-          daily_time_hhmm: "10:00",
-          ledger: { date: "2026-08-23", running: true, total: 3, completed: 1, failed: 0, skipped: 0 },
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
+    mockRoute("get_auto_checkin_settings", () => ({
+      enabled: true,
+      daily_time_hhmm: "10:00",
+      ledger: { date: "2026-08-23", running: true, total: 3, completed: 1, failed: 0, skipped: 0 },
+    }));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
@@ -178,14 +180,13 @@ describe("CheckinPage", () => {
   });
 
   it("自动签到关闭时状态行只显示关闭，不带台账", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry("profile-login-1", "登录账号甲")];
-      if (command === "get_auto_checkin_settings") {
-        return { enabled: false, daily_time_hhmm: "10:00", ledger: null };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
+    mockRoute("get_auto_checkin_settings", () => ({
+      enabled: false,
+      daily_time_hhmm: "10:00",
+      ledger: null,
+    }));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
@@ -201,18 +202,13 @@ describe("CheckinPage", () => {
       handlers.set(event, cb);
       return () => undefined;
     });
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry("profile-login-1", "登录账号甲")];
-      if (command === "get_auto_checkin_settings") {
-        return {
-          enabled: true,
-          daily_time_hhmm: "10:00",
-          ledger: { date: "2026-08-23", running: true, total: 3, completed: 1, failed: 0, skipped: 0 },
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
+    mockRoute("get_auto_checkin_settings", () => ({
+      enabled: true,
+      daily_time_hhmm: "10:00",
+      ledger: { date: "2026-08-23", running: true, total: 3, completed: 1, failed: 0, skipped: 0 },
+    }));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
@@ -233,16 +229,11 @@ describe("CheckinPage", () => {
   });
 
   it("真实模式加载总览并展示账号行：今日状态与缓存额度", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [
-          entry("profile-login-1", "登录账号甲"),
-          entry("profile-login-2", "登录账号乙", { checked_in: false, credits: null, credits_cached_at: null, usage_remaining_credits: null, usage_cached_at: null }),
-        ];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      entry("profile-login-1", "登录账号甲"),
+      entry("profile-login-2", "登录账号乙", { checked_in: false, credits: null, credits_cached_at: null, usage_remaining_credits: null, usage_cached_at: null }),
+    ]);
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
@@ -259,25 +250,20 @@ describe("CheckinPage", () => {
   });
 
   it("P8-3 G10 接入：今日失败账号渲染「签到失败」红徽章，不再显示「未签」", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [
-          entry("profile-login-1", "登录账号甲"),
-          // 今日业务性失败（last_attempt_* 来自后端同一日界过滤）。
-          entry("profile-login-2", "登录账号乙", {
-            checked_in: false,
-            credits: null,
-            credits_cached_at: null,
-            usage_remaining_credits: null,
-            usage_cached_at: null,
-            last_attempt_outcome: "business:9074",
-            last_attempt_date: todayLocalDate(),
-          }),
-        ];
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      entry("profile-login-1", "登录账号甲"),
+      // 今日业务性失败（last_attempt_* 来自后端同一日界过滤）。
+      entry("profile-login-2", "登录账号乙", {
+        checked_in: false,
+        credits: null,
+        credits_cached_at: null,
+        usage_remaining_credits: null,
+        usage_cached_at: null,
+        last_attempt_outcome: "business:9074",
+        last_attempt_date: todayLocalDate(),
+      }),
+    ]);
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
@@ -290,14 +276,12 @@ describe("CheckinPage", () => {
 
   it("可切换账号选择并只对选中账号执行签到（签到所选）", async () => {
     const runMock = vi.fn().mockResolvedValue(summary([result("profile-login-1")]));
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [entry("profile-login-1", "登录账号甲"), entry("profile-login-2", "登录账号乙")];
-      }
-      if (command === "run_checkin") return runMock();
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      entry("profile-login-1", "登录账号甲"),
+      entry("profile-login-2", "登录账号乙"),
+    ]);
+    mockRoute("run_checkin", () => runMock());
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -312,20 +296,13 @@ describe("CheckinPage", () => {
   });
 
   it("一键补签只对今日未签账号发起请求", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        // 甲已签、乙未签：补签应只发乙。
-        return [
-          entry("profile-login-1", "登录账号甲"),
-          entry("profile-login-2", "登录账号乙", { checked_in: false }),
-        ];
-      }
-      if (command === "run_checkin") {
-        return summary([result("profile-login-2")]);
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      // 甲已签、乙未签：补签应只发乙。
+      entry("profile-login-1", "登录账号甲"),
+      entry("profile-login-2", "登录账号乙", { checked_in: false }),
+    ]);
+    mockRoute("run_checkin", () => summary([result("profile-login-2")]));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -337,17 +314,12 @@ describe("CheckinPage", () => {
   });
 
   it("行内单账号签到只发送该账号（已签账号行内按钮禁用）", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [
-          entry("profile-login-1", "登录账号甲"),
-          entry("profile-login-2", "登录账号乙", { checked_in: false }),
-        ];
-      }
-      if (command === "run_checkin") return summary([result("profile-login-2")]);
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      entry("profile-login-1", "登录账号甲"),
+      entry("profile-login-2", "登录账号乙", { checked_in: false }),
+    ]);
+    mockRoute("run_checkin", () => summary([result("profile-login-2")]));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -365,26 +337,20 @@ describe("CheckinPage", () => {
   it("新设备首签过快（device_too_new）时给出等待引导文案", async () => {
     // v6：签到链路不再自动重铸/冷却；设备铸造后 5 分钟内被 9074 拒绝时，
     // 后端将 detail_code 标注为 device_too_new，前端引导"稍后重试"。
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [entry("profile-login-1", "登录账号甲", { checked_in: false })];
-      }
-      if (command === "run_checkin") {
-        return summary(
-          [
-            result("profile-login-1", {
-              outcome: "not_eligible",
-              state: "blocked",
-              claim_attempted: false,
-              detail_code: "device_too_new",
-            }),
-          ],
-          1,
-        );
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲", { checked_in: false })]);
+    mockRoute("run_checkin", () =>
+      summary(
+        [
+          result("profile-login-1", {
+            outcome: "not_eligible",
+            state: "blocked",
+            claim_attempted: false,
+            detail_code: "device_too_new",
+          }),
+        ],
+        1,
+      ));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -406,17 +372,12 @@ describe("CheckinPage", () => {
     });
     let resolveRun!: (value: CheckinBatchSummaryDto) => void;
     const runDeferred = new Promise<CheckinBatchSummaryDto>((resolve) => { resolveRun = resolve; });
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [
-          entry("profile-login-1", "登录账号甲", { checked_in: false }),
-          entry("profile-login-2", "登录账号乙", { checked_in: false }),
-        ];
-      }
-      if (command === "run_checkin") return runDeferred;
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      entry("profile-login-1", "登录账号甲", { checked_in: false }),
+      entry("profile-login-2", "登录账号乙", { checked_in: false }),
+    ]);
+    mockRoute("run_checkin", () => runDeferred);
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -451,23 +412,19 @@ describe("CheckinPage", () => {
 
   it("签到完成后展示逐账号结果、积分变化与完成消息，并刷新总览", async () => {
     let overviewReads = 0;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        overviewReads += 1;
-        return [
-          entry("profile-login-1", "登录账号甲", { checked_in: false }),
-          entry("profile-login-2", "登录账号乙", { checked_in: false }),
-        ];
-      }
-      if (command === "run_checkin") {
-        return summary([
-          result("profile-login-1", { outcome: "already_checked_in", state: "already_checked_in", claim_attempted: false }),
-          result("profile-login-2", { outcome: "claimed" }),
-        ]);
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => {
+      overviewReads += 1;
+      return [
+        entry("profile-login-1", "登录账号甲", { checked_in: false }),
+        entry("profile-login-2", "登录账号乙", { checked_in: false }),
+      ];
     });
+    mockRoute("run_checkin", () =>
+      summary([
+        result("profile-login-1", { outcome: "already_checked_in", state: "already_checked_in", claim_attempted: false }),
+        result("profile-login-2", { outcome: "claimed" }),
+      ]));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -486,27 +443,24 @@ describe("CheckinPage", () => {
   });
 
   it("部分账号失败时给出未完成消息并透出业务码", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") {
-        return [entry("profile-login-1", "登录账号甲"), entry("profile-login-2", "登录账号乙")];
-      }
-      if (command === "run_checkin") {
-        return summary(
-          [
-            result("profile-login-1"),
-            result("profile-login-2", {
-              outcome: "not_eligible",
-              state: "blocked",
-              claim_attempted: false,
-              detail_code: "business_9074",
-            }),
-          ],
-          1,
-        );
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [
+      entry("profile-login-1", "登录账号甲"),
+      entry("profile-login-2", "登录账号乙"),
+    ]);
+    mockRoute("run_checkin", () =>
+      summary(
+        [
+          result("profile-login-1"),
+          result("profile-login-2", {
+            outcome: "not_eligible",
+            state: "blocked",
+            claim_attempted: false,
+            detail_code: "business_9074",
+          }),
+        ],
+        1,
+      ));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -520,10 +474,9 @@ describe("CheckinPage", () => {
   });
 
   it("真实模式下总览读取失败必须可见，不静默伪装成空账号", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") throw new Error("checkin_storage_unavailable");
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => {
+      throw new Error("checkin_storage_unavailable");
     });
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
@@ -535,11 +488,8 @@ describe("CheckinPage", () => {
 
   it("没有可签到账号时显示空状态引导并可跳转账号页", async () => {
     const onNavigate = vi.fn();
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [];
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => []);
 
     render(<CheckinPage active={true} onNavigate={onNavigate} />);
 
@@ -549,11 +499,8 @@ describe("CheckinPage", () => {
   });
 
   it("fixture 模式回退到已保存账号池，不读取账号总览", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return fixtureCapability;
-      if (command === "get_managed_account_state") return fixtureView();
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => fixtureCapability);
+    mockRoute("get_managed_account_state", () => fixtureView());
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
@@ -565,14 +512,11 @@ describe("CheckinPage", () => {
   });
 
   it("签到能力未启用时禁用执行按钮", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") {
-        // 池来自 fixture 账号，能力开关关闭：按钮可见但禁用。
-        return { enabled: false, transport: "fixture", real_http_enabled: false, message: "签到能力当前未启用。" };
-      }
-      if (command === "get_managed_account_state") return fixtureView();
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_checkin_capability", () => {
+      // 池来自 fixture 账号，能力开关关闭：按钮可见但禁用。
+      return { enabled: false, transport: "fixture", real_http_enabled: false, message: "签到能力当前未启用。" };
     });
+    mockRoute("get_managed_account_state", () => fixtureView());
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
@@ -582,12 +526,9 @@ describe("CheckinPage", () => {
   });
 
   it("存储未就绪时显示异常提示，不显示演示模式横幅", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") {
-        // 后端真实形态：RealReadPreview 且存储根为空 → disabled，池请求不发出。
-        return { enabled: false, transport: "disabled", real_http_enabled: false, message: "存储根不可用，真实签到未启用。" };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_checkin_capability", () => {
+      // 后端真实形态：RealReadPreview 且存储根为空 → disabled，池请求不发出。
+      return { enabled: false, transport: "disabled", real_http_enabled: false, message: "存储根不可用，真实签到未启用。" };
     });
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
@@ -597,14 +538,13 @@ describe("CheckinPage", () => {
   });
 
   it("G15 纯本地刷新：重读账号总览，不发签到或额度查询网络命令", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_checkin_capability") return realCapability;
-      if (command === "get_checkin_overview") return [entry("profile-login-1", "登录账号甲")];
-      if (command === "get_auto_checkin_settings") {
-        return { enabled: false, daily_time_hhmm: "10:00", ledger: null };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
+    mockRoute("get_auto_checkin_settings", () => ({
+      enabled: false,
+      daily_time_hhmm: "10:00",
+      ledger: null,
+    }));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
@@ -656,7 +596,9 @@ describe("CheckinPage Trae CN 签到区块", () => {
   }
 
   beforeEach(() => {
-    mockInvoke.mockReset();
+    // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
+    resetRoutes();
+    installFakeInvoke();
     mockListen.mockReset();
     mockListen.mockResolvedValue(() => undefined);
   });
@@ -664,11 +606,8 @@ describe("CheckinPage Trae CN 签到区块", () => {
   afterEach(() => vi.clearAllMocks());
 
   it("渲染 CN 账号行：今日状态徽章、额外积分与可点签到按钮", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "list_trae_cn_accounts") return [cnAccount];
-      if (command === "get_trae_cn_checkin_status") return cnStatusUnchecked;
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
+    mockRoute("get_trae_cn_checkin_status", () => cnStatusUnchecked);
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
 
@@ -683,13 +622,8 @@ describe("CheckinPage Trae CN 签到区块", () => {
   });
 
   it("已签账号显示已签徽章并禁用签到按钮", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "list_trae_cn_accounts") return [cnAccount];
-      if (command === "get_trae_cn_checkin_status") {
-        return { ...cnStatusUnchecked, checked_in: true };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
+    mockRoute("get_trae_cn_checkin_status", () => ({ ...cnStatusUnchecked, checked_in: true }));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
 
@@ -699,15 +633,12 @@ describe("CheckinPage Trae CN 签到区块", () => {
 
   it("点击签到调用 run_trae_cn_checkin，成功后通知并重查该行状态", async () => {
     let statusCalls = 0;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "list_trae_cn_accounts") return [cnAccount];
-      if (command === "get_trae_cn_checkin_status") {
-        statusCalls += 1;
-        return cnStatusUnchecked;
-      }
-      if (command === "run_trae_cn_checkin") return cnResult();
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
+    mockRoute("get_trae_cn_checkin_status", () => {
+      statusCalls += 1;
+      return cnStatusUnchecked;
     });
+    mockRoute("run_trae_cn_checkin", () => cnResult());
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
     await screen.findByText("CN 账号甲");
@@ -723,14 +654,10 @@ describe("CheckinPage Trae CN 签到区块", () => {
   });
 
   it("claim 业务拒绝透传业务码（不压平）并显示失败通知", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "list_trae_cn_accounts") return [cnAccount];
-      if (command === "get_trae_cn_checkin_status") return cnStatusUnchecked;
-      if (command === "run_trae_cn_checkin") {
-        return cnResult({ outcome: "not_eligible", detail_code: "business_9095", credits: null, extra_credits: null });
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
+    mockRoute("get_trae_cn_checkin_status", () => cnStatusUnchecked);
+    mockRoute("run_trae_cn_checkin", () =>
+      cnResult({ outcome: "not_eligible", detail_code: "business_9095", credits: null, extra_credits: null }));
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
     await screen.findByText("CN 账号甲");
@@ -742,12 +669,9 @@ describe("CheckinPage Trae CN 签到区块", () => {
   });
 
   it("状态查询失败行内可见：业务码提取数值，未知码回退词表", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "list_trae_cn_accounts") return [cnAccount];
-      if (command === "get_trae_cn_checkin_status") {
-        throw new Error("trae_cn_checkin_business_20310");
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
+    mockRoute("get_trae_cn_checkin_status", () => {
+      throw new Error("trae_cn_checkin_business_20310");
     });
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
@@ -757,12 +681,9 @@ describe("CheckinPage Trae CN 签到区块", () => {
   });
 
   it("网络类失败走 safeUiError 词表", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "list_trae_cn_accounts") return [cnAccount];
-      if (command === "get_trae_cn_checkin_status") {
-        throw new Error("trae_cn_checkin_network");
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
+    mockRoute("get_trae_cn_checkin_status", () => {
+      throw new Error("trae_cn_checkin_network");
     });
 
     render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
@@ -772,10 +693,7 @@ describe("CheckinPage Trae CN 签到区块", () => {
 
   it("无账号时显示空状态引导并可跳转账号页", async () => {
     const onNavigate = vi.fn();
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "list_trae_cn_accounts") return [];
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("list_trae_cn_accounts", () => []);
 
     render(<CheckinPage active={true} onNavigate={onNavigate} product="trae_cn" />);
 

@@ -3,8 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { SettingsPanel } from "../src/components/SettingsPanel";
 import type { MasterBackupEntryDto } from "../src/types/masterLibrary";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 // P11-1 切片②：操作结果类提示已迁到 notify 适配层；断言 notify 调用而非页内文本。
 vi.mock("../src/platform/notify", async (importOriginal) => {
@@ -28,7 +33,9 @@ const notifyMock = vi.mocked(notify);
 
 describe("设置面板", () => {
   beforeEach(() => {
-    mockInvoke.mockReset();
+    // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
+    resetRoutes();
+    installFakeInvoke();
   });
 
   afterEach(() => vi.clearAllMocks());
@@ -52,12 +59,11 @@ describe("设置面板", () => {
   });
 
   it("G3：备份路径收进 details，创建入口可见", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_master_backup_chain") {
-        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [],
+      backup_dir: "D:\\bak",
+      keep_policy: 5,
+    }));
 
     render(<SettingsPanel active={true} />);
 
@@ -66,16 +72,11 @@ describe("设置面板", () => {
   });
 
   it("自动签到区块展示开关、触发时间与今日台账", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_auto_checkin_settings") {
-        return {
-          enabled: true,
-          daily_time_hhmm: "10:30",
-          ledger: { date: "2026-08-23", running: false, total: 5, completed: 4, failed: 1, skipped: 0 },
-        };
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_auto_checkin_settings", () => ({
+      enabled: true,
+      daily_time_hhmm: "10:30",
+      ledger: { date: "2026-08-23", running: false, total: 5, completed: 4, failed: 1, skipped: 0 },
+    }));
 
     render(<SettingsPanel active={true} />);
 
@@ -95,15 +96,14 @@ describe("设置面板", () => {
 
   it("关闭自动签到后提交设置命令并回填关闭状态", async () => {
     let enabled = true;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_auto_checkin_settings") {
-        return { enabled, daily_time_hhmm: "10:00", ledger: null };
-      }
-      if (command === "set_auto_checkin_settings") {
-        enabled = false;
-        return undefined;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_auto_checkin_settings", () => ({
+      enabled,
+      daily_time_hhmm: "10:00",
+      ledger: null,
+    }));
+    mockRoute("set_auto_checkin_settings", () => {
+      enabled = false;
+      return undefined;
     });
 
     render(<SettingsPanel active={true} />);
@@ -135,12 +135,9 @@ describe("设置面板", () => {
       keep_policy: 5,
     };
     let failChain = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_master_backup_chain") {
-        if (failChain) throw new Error("trae_real_mode_required");
-        return backupChain;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_master_backup_chain", () => {
+      if (failChain) throw new Error("trae_real_mode_required");
+      return backupChain;
     });
 
     const { rerender } = render(<SettingsPanel active={true} />);
@@ -167,16 +164,13 @@ describe("设置面板", () => {
 
   it("P5-4：点击立即备份提交命令并重读备份链", async () => {
     const backups: MasterBackupEntryDto[] = [];
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_master_backup_chain") {
-        // 每次返回新对象（后端语义）：mock 持有同一引用会让 React 状态不变、徽章不刷新。
-        return { backups: [...backups], backup_dir: "D:\\bak", keep_policy: 5 };
-      }
-      if (command === "create_master_backup") {
-        backups.push({ stamp_unix_seconds: 1756000000, total_bytes: 1024 * 1024, has_wal: false, has_credentials: false });
-        return "D:\\bak\\.switch-bak-1756000000";
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_master_backup_chain", () => {
+      // 每次返回新对象（后端语义）：mock 持有同一引用会让 React 状态不变、徽章不刷新。
+      return { backups: [...backups], backup_dir: "D:\\bak", keep_policy: 5 };
+    });
+    mockRoute("create_master_backup", () => {
+      backups.push({ stamp_unix_seconds: 1756000000, total_bytes: 1024 * 1024, has_wal: false, has_credentials: false });
+      return "D:\\bak\\.switch-bak-1756000000";
     });
 
     render(<SettingsPanel active={true} />);
@@ -196,19 +190,12 @@ describe("设置面板", () => {
   });
 
   it("P11-4②：勾选包含账号凭据后提交 includeCredentials 并提示含凭据", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_master_backup_chain") {
-        return {
-          backups: [{ stamp_unix_seconds: 1756000000, total_bytes: 1024, has_wal: false, has_credentials: true }],
-          backup_dir: "D:\\bak",
-          keep_policy: 5,
-        };
-      }
-      if (command === "create_master_backup") {
-        return "D:\\bak\\.switch-bak-1756000000";
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
-    });
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [{ stamp_unix_seconds: 1756000000, total_bytes: 1024, has_wal: false, has_credentials: true }],
+      backup_dir: "D:\\bak",
+      keep_policy: 5,
+    }));
+    mockRoute("create_master_backup", () => "D:\\bak\\.switch-bak-1756000000");
 
     render(<SettingsPanel active={true} />);
     await screen.findByTestId("master-backup-section");
@@ -225,16 +212,18 @@ describe("设置面板", () => {
 
   it("P11-4①：更改备份位置默认先迁移再切换并重读备份链", async () => {
     const calls: string[] = [];
-    mockInvoke.mockImplementation(async (command) => {
-      calls.push(command);
-      if (command === "get_master_backup_chain") {
-        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
-      }
-      if (command === "migrate_master_backups") {
-        return { migrated_files: 3, failures: [] };
-      }
-      if (command === "set_backup_dir") return undefined;
-      throw new Error(`unexpected command: ${String(command)}`);
+    // 旧实现逐调用 push(command)；路由器按命令注册，等价在各自 handler 记录。
+    mockRoute("get_master_backup_chain", () => {
+      calls.push("get_master_backup_chain");
+      return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
+    });
+    mockRoute("migrate_master_backups", () => {
+      calls.push("migrate_master_backups");
+      return { migrated_files: 3, failures: [] };
+    });
+    mockRoute("set_backup_dir", () => {
+      calls.push("set_backup_dir");
+      return undefined;
     });
 
     render(<SettingsPanel active={true} />);
@@ -263,19 +252,18 @@ describe("设置面板", () => {
 
   it("P11-4①：取消迁移时只切换位置；迁移部分失败中止切换并返回清单", async () => {
     let failMigration = false;
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_master_backup_chain") {
-        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [],
+      backup_dir: "D:\\bak",
+      keep_policy: 5,
+    }));
+    mockRoute("migrate_master_backups", () => {
+      if (failMigration) {
+        return { migrated_files: 1, failures: [{ file_name: "database.db.switch-bak-1000", reason: "目标已存在同名文件且内容不一致，未覆盖" }] };
       }
-      if (command === "migrate_master_backups") {
-        if (failMigration) {
-          return { migrated_files: 1, failures: [{ file_name: "database.db.switch-bak-1000", reason: "目标已存在同名文件且内容不一致，未覆盖" }] };
-        }
-        return { migrated_files: 2, failures: [] };
-      }
-      if (command === "set_backup_dir") return undefined;
-      throw new Error(`unexpected command: ${String(command)}`);
+      return { migrated_files: 2, failures: [] };
     });
+    mockRoute("set_backup_dir", () => undefined);
 
     render(<SettingsPanel active={true} />);
     await screen.findByTestId("master-backup-section");
@@ -314,14 +302,13 @@ describe("设置面板", () => {
   });
 
   it("P5-4：主库运行中创建备份被拒并给出稳定提示", async () => {
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_master_backup_chain") {
-        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
-      }
-      if (command === "create_master_backup") {
-        throw new Error("master_backup_running");
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [],
+      backup_dir: "D:\\bak",
+      keep_policy: 5,
+    }));
+    mockRoute("create_master_backup", () => {
+      throw new Error("master_backup_running");
     });
 
     render(<SettingsPanel active={true} />);
@@ -335,16 +322,15 @@ describe("设置面板", () => {
 
   it("P5-9：备份分区展示保留设置并随开关保存", async () => {
     let retention = { enabled: true, keep: 5 };
-    mockInvoke.mockImplementation(async (command) => {
-      if (command === "get_master_backup_chain") {
-        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
-      }
-      if (command === "get_backup_retention") return { ...retention };
-      if (command === "set_backup_retention") {
-        retention = { enabled: false, keep: retention.keep };
-        return undefined;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [],
+      backup_dir: "D:\\bak",
+      keep_policy: 5,
+    }));
+    mockRoute("get_backup_retention", () => ({ ...retention }));
+    mockRoute("set_backup_retention", () => {
+      retention = { enabled: false, keep: retention.keep };
+      return undefined;
     });
 
     render(<SettingsPanel active={true} />);
@@ -368,18 +354,17 @@ describe("设置面板", () => {
   it("P5-9：修改保留份数立即保存，越界值不提交", async () => {
     let retention = { enabled: true, keep: 5 };
     const calls: Array<{ enabled: boolean; keep: number }> = [];
-    mockInvoke.mockImplementation(async (command, args) => {
-      if (command === "get_master_backup_chain") {
-        return { backups: [], backup_dir: "D:\\bak", keep_policy: 5 };
-      }
-      if (command === "get_backup_retention") return { ...retention };
-      if (command === "set_backup_retention") {
-        const payload = args as { enabled: boolean; keep: number };
-        calls.push(payload);
-        retention = { ...payload };
-        return undefined;
-      }
-      throw new Error(`unexpected command: ${String(command)}`);
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [],
+      backup_dir: "D:\\bak",
+      keep_policy: 5,
+    }));
+    mockRoute("get_backup_retention", () => ({ ...retention }));
+    mockRoute("set_backup_retention", (args) => {
+      const payload = args as { enabled: boolean; keep: number };
+      calls.push(payload);
+      retention = { ...payload };
+      return undefined;
     });
 
     render(<SettingsPanel active={true} />);

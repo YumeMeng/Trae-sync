@@ -2,8 +2,13 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { useArchiveDraft } from "../src/hooks/useArchiveDraft";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 // 草稿迁移/回退路径经 notify 提示；断言调用而非真实 sonner。
 vi.mock("../src/platform/notify", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/platform/notify")>();
@@ -40,17 +45,14 @@ type LocalSeed = "local" | "none" | "bad";
 
 /** 配置 get/set_archive_draft mock（get 三态 × set 两态）。 */
 function mockBackend(get: BackendGet, set: BackendSet = "ok") {
-  mockInvoke.mockImplementation(async (command: string) => {
-    if (command === "get_archive_draft") {
-      if (get === "error") throw new Error("archive_draft_join_failed");
-      if (get === "stored") return BACKEND_DTO;
-      return EMPTY_DTO;
-    }
-    if (command === "set_archive_draft") {
-      if (set === "error") throw new Error("archive_draft_store_unavailable");
-      return true;
-    }
-    throw new Error(`unexpected command: ${command}`);
+  mockRoute("get_archive_draft", () => {
+    if (get === "error") throw new Error("archive_draft_join_failed");
+    if (get === "stored") return BACKEND_DTO;
+    return EMPTY_DTO;
+  });
+  mockRoute("set_archive_draft", () => {
+    if (set === "error") throw new Error("archive_draft_store_unavailable");
+    return true;
   });
 }
 
@@ -76,7 +78,9 @@ async function renderDraft() {
 
 beforeEach(() => {
   window.localStorage.clear();
-  mockInvoke.mockReset();
+  // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
+  resetRoutes();
+  installFakeInvoke();
 });
 
 afterEach(() => {

@@ -3,8 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { RemoteDevicesPanel } from "../src/components/RemoteDevicesPanel";
 import type { RemoteDeviceEntry, RemoteDeviceSnapshot } from "../src/types/product";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 // P1：退出成功通知已迁 notify 体系，测试断言 notify.success 调用而非页内横幅。
 vi.mock("../src/platform/notify", () => ({
   notify: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn(), summary: vi.fn() },
@@ -59,7 +64,9 @@ function expandOthers() {
 
 describe("RemoteDevicesPanel", () => {
   beforeEach(() => {
-    mockInvoke.mockReset();
+    // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
+    resetRoutes();
+    installFakeInvoke();
   });
 
   afterEach(() => {
@@ -67,7 +74,7 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("加载成功：归属标注、汇总行、设备行（产品标签 + 本机徽章）齐全", async () => {
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -95,7 +102,7 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("本机行无退出按钮（ADR-0031 决策 3 UI 防线）；其他设备默认折叠，展开后可见且有退出按钮", async () => {
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -125,18 +132,20 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("列表非空但无本机行时，本机区块显示未识别提示（中性，不报错）", async () => {
-    mockInvoke.mockResolvedValue(
-      snapshot({
-        devices: [
-          entry("dev-remote-1", {
-            device_type: "MOBILE",
-            device_name: "出差的手机",
-            bound_products: ["TRAE 移动端"],
-            last_active_at: Date.now() - 3 * 3_600_000,
-          }),
-        ],
-        used_count: 1,
-      }),
+    mockRoute(
+      "list_remote_devices",
+      () =>
+        snapshot({
+          devices: [
+            entry("dev-remote-1", {
+              device_type: "MOBILE",
+              device_name: "出差的手机",
+              bound_products: ["TRAE 移动端"],
+              last_active_at: Date.now() - 3 * 3_600_000,
+            }),
+          ],
+          used_count: 1,
+        }),
     );
     render(
       <RemoteDevicesPanel
@@ -159,7 +168,7 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("max_count 未知时汇总只显示已用台数", async () => {
-    mockInvoke.mockResolvedValue(snapshot({ max_count: null }));
+    mockRoute("list_remote_devices", () => snapshot({ max_count: null }));
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -175,15 +184,17 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("排序：最近活跃倒序，缺失或不可解析的时刻沉底（其他设备分组内生效）", async () => {
-    mockInvoke.mockResolvedValue(
-      snapshot({
-        devices: [
-          entry("dev-null", { last_active_at: null }),
-          entry("dev-bad", { last_active_at: "not-a-date" }),
-          entry("dev-old", { last_active_at: "2020-01-01 10:00:00" }),
-          entry("dev-new", { last_active_at: Date.now() - 60_000 }),
-        ],
-      }),
+    mockRoute(
+      "list_remote_devices",
+      () =>
+        snapshot({
+          devices: [
+            entry("dev-null", { last_active_at: null }),
+            entry("dev-bad", { last_active_at: "not-a-date" }),
+            entry("dev-old", { last_active_at: "2020-01-01 10:00:00" }),
+            entry("dev-new", { last_active_at: Date.now() - 60_000 }),
+          ],
+        }),
     );
     render(
       <RemoteDevicesPanel
@@ -210,13 +221,15 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("未知设备类型与缺失名称的降级展示：其他设备 / 未命名设备", async () => {
-    mockInvoke.mockResolvedValue(
-      snapshot({
-        devices: [
-          entry("dev-odd", { device_type: "SOMETHING_ELSE", device_name: null, is_local: true }),
-        ],
-        used_count: 1,
-      }),
+    mockRoute(
+      "list_remote_devices",
+      () =>
+        snapshot({
+          devices: [
+            entry("dev-odd", { device_type: "SOMETHING_ELSE", device_name: null, is_local: true }),
+          ],
+          used_count: 1,
+        }),
     );
     render(
       <RemoteDevicesPanel
@@ -236,7 +249,9 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("加载失败：映射为可理解文案并支持重试", async () => {
-    mockInvoke.mockRejectedValue("remote_device_network");
+    mockRoute("list_remote_devices", () => {
+      throw "remote_device_network";
+    });
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -251,13 +266,15 @@ describe("RemoteDevicesPanel", () => {
       "网络或服务暂时不可用，请稍后重试。",
     );
     // 重试成功后恢复列表。
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
     fireEvent.click(screen.getByTestId("remote-devices-retry"));
     expect(await screen.findByTestId("remote-devices-summary")).toHaveTextContent("已用 2 / 上限 10 台");
   });
 
   it("失败态提供官方设备管理页兜底入口（ADR-0031 决策 2）", async () => {
-    mockInvoke.mockRejectedValue("remote_device_network");
+    mockRoute("list_remote_devices", () => {
+      throw "remote_device_network";
+    });
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -279,7 +296,7 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("切换账号：面板重置为折叠并清空快照，再次展开按新账号重新拉取", async () => {
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
     const view = render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -304,7 +321,7 @@ describe("RemoteDevicesPanel", () => {
     expect(screen.getByTestId("remote-devices-toggle")).toHaveTextContent("查看设备");
 
     // 再次展开：以新 profileId 重新拉取，而不是复用旧账号快照。
-    mockInvoke.mockResolvedValue(snapshot({ account_label: "CN 备用账号" }));
+    mockRoute("list_remote_devices", () => snapshot({ account_label: "CN 备用账号" }));
     await expandPanel();
     expect(mockInvoke).toHaveBeenLastCalledWith("list_remote_devices", {
       productId: "trae_cn",
@@ -315,12 +332,17 @@ describe("RemoteDevicesPanel", () => {
 
   it("切换账号后飞行中的旧账号响应被丢弃，不滞留旧快照", async () => {
     let resolveStale!: (value: RemoteDeviceSnapshot) => void;
-    mockInvoke.mockImplementationOnce(
-      () =>
-        new Promise<RemoteDeviceSnapshot>((resolve) => {
+    // 旧 mockImplementationOnce 的等价写法：首次调用挂起，之后返回新账号快照。
+    let stalePending = true;
+    mockRoute("list_remote_devices", () => {
+      if (stalePending) {
+        stalePending = false;
+        return new Promise<RemoteDeviceSnapshot>((resolve) => {
           resolveStale = resolve;
-        }),
-    );
+        });
+      }
+      return snapshot({ account_label: "CN 备用账号" });
+    });
     const view = render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -345,7 +367,7 @@ describe("RemoteDevicesPanel", () => {
     });
 
     // 过期结果不写入：再次展开以新账号重新拉取，看不到旧账号数据。
-    mockInvoke.mockResolvedValue(snapshot({ account_label: "CN 备用账号" }));
+    mockRoute("list_remote_devices", () => snapshot({ account_label: "CN 备用账号" }));
     await expandPanel();
     expect(mockInvoke).toHaveBeenLastCalledWith("list_remote_devices", {
       productId: "trae_cn",
@@ -356,7 +378,7 @@ describe("RemoteDevicesPanel", () => {
 
   it("确认弹窗：文案含影响说明；取消不调用退出", async () => {
     const signOut = vi.fn().mockResolvedValue(undefined);
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -392,7 +414,7 @@ describe("RemoteDevicesPanel", () => {
         resolveSignOut = resolve;
       }),
     );
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -429,7 +451,9 @@ describe("RemoteDevicesPanel", () => {
   });
 
   it("默认退出实现调用 clear_remote_device 命令（切片 3 接入后端）", async () => {
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
+    // 默认退出链路：clear 成功无返回值（原 mockResolvedValue 通配语义的显式注册）。
+    mockRoute("clear_remote_device", () => undefined);
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -456,10 +480,8 @@ describe("RemoteDevicesPanel", () => {
   it("退出成功且列表重拉完成后 onSignedOut 触发一次（健康检查联动挂点）", async () => {
     const onSignedOut = vi.fn();
     // 默认 onSignOut 链路：clear_remote_device 成功返回后重拉列表。
-    mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "list_remote_devices") return snapshot();
-      return null; // clear_remote_device：服务端操作，成功无返回值
-    });
+    mockRoute("list_remote_devices", () => snapshot());
+    mockRoute("clear_remote_device", () => null); // 服务端操作，成功无返回值
     render(
       <RemoteDevicesPanel
         productId="trae_cn"
@@ -486,7 +508,7 @@ describe("RemoteDevicesPanel", () => {
 
   it("退出失败：弹层关闭后在面板展示映射文案，可重试", async () => {
     const signOut = vi.fn().mockRejectedValue("remote_device_local_device_targeted");
-    mockInvoke.mockResolvedValue(snapshot());
+    mockRoute("list_remote_devices", () => snapshot());
     render(
       <RemoteDevicesPanel
         productId="trae_cn"

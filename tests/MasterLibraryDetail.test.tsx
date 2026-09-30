@@ -5,11 +5,13 @@ import { MasterLibraryDetail } from "../src/pages/MasterLibraryDetail";
 import type { AppPage } from "../src/components/NavigationRail";
 import type { EnvironmentStateDto } from "../src/types/environment";
 import type { MasterHistoryDto } from "../src/types/history";
+import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
-// mock Tauri invoke——前端测试不依赖真实后端
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
-}));
+// P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
+vi.mock("@tauri-apps/api/core", async () => {
+  const fake = await import("./helpers/fakeInvoke");
+  return { invoke: fake.mockCoreInvoke };
+});
 
 // P11-1 切片②：读取失败原因已迁到 notify；断言 notify.error 调用。
 vi.mock("../src/platform/notify", async (importOriginal) => {
@@ -99,66 +101,64 @@ function setupDetail(overrides: {
   };
   const stats = "stats" in overrides ? overrides.stats : defaultStats;
   const backupChain = "backupChain" in overrides ? overrides.backupChain : defaultBackupChain;
-  mockInvoke.mockImplementation(async (command: string) => {
-    if (command === "get_environment_state") return envState();
-    if (command === "get_master_library_stats") {
-      if (stats === null) throw new Error("trae_real_mode_required");
-      return stats;
-    }
-    if (command === "get_master_backup_chain") {
-      if (backupChain === null) throw new Error("trae_real_mode_required");
-      return backupChain;
-    }
-    if (command === "get_master_history") return overrides.history ?? historyDto();
-    if (command === "get_relay_ledger") return [];
-    if (command === "get_master_verification") {
-      // G20 库信息 tab 的备份对比区块（backupOnly：ledger 不渲染但数据随回执返回）。
-      return {
-        ledger: { status: "ready", checked_count: 0, relayed_away_count: 0, issues: [] },
-        backup: {
-          status: "ready",
-          backup_stamp: NOW - 7200,
-          backup_stamps: [NOW - 7200, NOW - 86400],
-          common_count: 15,
-          added_count: 1,
-          relayed_away_count: 0,
-          missing: [],
-        },
-      };
-    }
-    if (command === "get_plugin_tab_state") {
-      return {
-        installed: [
-          {
-            record_id: "rec-1",
-            marketplace_plugin_id: "uuid-p1",
-            name: "plugin-one",
-            display_name: "插件一",
-            version: "1.0.0",
-            registry: "trae-remote-official",
-            builtin: false,
-            in_manifest: true,
-          },
-        ],
-        manifest: [
-          {
-            marketplace_plugin_id: "uuid-p1",
-            name: "plugin-one",
-            display_name: "插件一",
-            version: "1.0.0",
-            registry: "trae-remote-official",
-            installed_in_cloud: true,
-          },
-        ],
-      };
-    }
-    return undefined;
+  mockRoute("get_environment_state", () => envState());
+  mockRoute("get_master_library_stats", () => {
+    if (stats === null) throw new Error("trae_real_mode_required");
+    return stats;
   });
+  mockRoute("get_master_backup_chain", () => {
+    if (backupChain === null) throw new Error("trae_real_mode_required");
+    return backupChain;
+  });
+  mockRoute("get_master_history", () => overrides.history ?? historyDto());
+  mockRoute("get_relay_ledger", () => []);
+  mockRoute("get_master_verification", () => {
+    // G20 库信息 tab 的备份对比区块（backupOnly：ledger 不渲染但数据随回执返回）。
+    return {
+      ledger: { status: "ready", checked_count: 0, relayed_away_count: 0, issues: [] },
+      backup: {
+        status: "ready",
+        backup_stamp: NOW - 7200,
+        backup_stamps: [NOW - 7200, NOW - 86400],
+        common_count: 15,
+        added_count: 1,
+        relayed_away_count: 0,
+        missing: [],
+      },
+    };
+  });
+  mockRoute("get_plugin_tab_state", () => ({
+    installed: [
+      {
+        record_id: "rec-1",
+        marketplace_plugin_id: "uuid-p1",
+        name: "plugin-one",
+        display_name: "插件一",
+        version: "1.0.0",
+        registry: "trae-remote-official",
+        builtin: false,
+        in_manifest: true,
+      },
+    ],
+    manifest: [
+      {
+        marketplace_plugin_id: "uuid-p1",
+        name: "plugin-one",
+        display_name: "插件一",
+        version: "1.0.0",
+        registry: "trae-remote-official",
+        installed_in_cloud: true,
+      },
+    ],
+  }));
 }
 
 describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // 等价于原 mockImplementation 每用例重设：清调用历史 + 重装路由分发。
+    resetRoutes();
+    installFakeInvoke();
   });
 
   it("库信息 tab：账号/大小/路径/最近活跃/最近备份 + 计数 + 备份对比（G20 三 tab）", async () => {
@@ -263,9 +263,8 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
   });
 
   it("环境状态读取失败显示错误提示", async () => {
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "get_environment_state") throw new Error("environment_registry_invalid");
-      return undefined;
+    mockRoute("get_environment_state", () => {
+      throw new Error("environment_registry_invalid");
     });
     render(<MasterLibraryDetail active onNavigate={() => undefined} />);
     // 读取失败原因走 notify.error（P11-1 切片②），不再渲染页内错误条。
@@ -287,40 +286,41 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
       created_at_unix_seconds: 1750000100,
       size_bytes: 2097152,
     };
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+    // 带 libraryId 校验的命令在各自 handler 内分支（原 catch-all 实现的等价改写）。
+    mockRoute("list_environments", () => [secondaryListItem]);
+    mockRoute("get_master_library_stats", (args) => {
       const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
-      if (command === "list_environments") return [secondaryListItem];
-      if (command === "get_master_library_stats") {
-        // 副库必须显式带 libraryId（缺省主库兼容口径不被误用）。
-        if (libraryId !== "env-x1") throw new Error("missing libraryId");
-        return {
-          status: "ready",
-          current_user_id: "user-b",
-          project_count: 2,
-          session_count: 5,
-          message_count: 40,
-          participating_account_count: 1,
-          last_active_unix_seconds: NOW - 60,
-          size_bytes: 1024 * 1024,
-        };
-      }
-      if (command === "get_master_backup_chain") {
-        if (libraryId !== "env-x1") throw new Error("missing libraryId");
-        return { backups: [], backup_dir: "D:\\store\\environments\\env-x1\\ModularData\\ai-agent", keep_policy: 5 };
-      }
-      if (command === "get_master_history") {
-        if (libraryId !== "env-x1") throw new Error("missing libraryId");
-        return historyDto();
-      }
-      if (command === "get_relay_ledger") return [];
-      if (command === "get_master_verification") {
-        if (libraryId !== "env-x1") throw new Error("missing libraryId");
-        return {
-          ledger: { status: "ready", checked_count: 0, relayed_away_count: 0, issues: [] },
-          backup: { status: "no_backups", backup_stamp: null, backup_stamps: [], common_count: 0, relayed_away_count: 0, added_count: 0, missing: [] },
-        };
-      }
-      return undefined;
+      // 副库必须显式带 libraryId（缺省主库兼容口径不被误用）。
+      if (libraryId !== "env-x1") throw new Error("missing libraryId");
+      return {
+        status: "ready",
+        current_user_id: "user-b",
+        project_count: 2,
+        session_count: 5,
+        message_count: 40,
+        participating_account_count: 1,
+        last_active_unix_seconds: NOW - 60,
+        size_bytes: 1024 * 1024,
+      };
+    });
+    mockRoute("get_master_backup_chain", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId !== "env-x1") throw new Error("missing libraryId");
+      return { backups: [], backup_dir: "D:\\store\\environments\\env-x1\\ModularData\\ai-agent", keep_policy: 5 };
+    });
+    mockRoute("get_master_history", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId !== "env-x1") throw new Error("missing libraryId");
+      return historyDto();
+    });
+    mockRoute("get_relay_ledger", () => []);
+    mockRoute("get_master_verification", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId !== "env-x1") throw new Error("missing libraryId");
+      return {
+        ledger: { status: "ready", checked_count: 0, relayed_away_count: 0, issues: [] },
+        backup: { status: "no_backups", backup_stamp: null, backup_stamps: [], common_count: 0, relayed_away_count: 0, added_count: 0, missing: [] },
+      };
     });
     render(
       <MasterLibraryDetail
@@ -358,17 +358,20 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
       created_at_unix_seconds: 1750000100,
       size_bytes: 0,
     };
-    mockInvoke.mockImplementation(async (command: string) => {
-      if (command === "list_environments") return [secondaryListItem];
-      if (command === "get_master_library_stats") {
-        return { status: "no_master_data", current_user_id: null, project_count: 0, session_count: 0, message_count: 0, participating_account_count: 0, last_active_unix_seconds: null, size_bytes: 0 };
-      }
-      if (command === "get_master_backup_chain") {
-        return { backups: [], backup_dir: "D:\\store", keep_policy: 5 };
-      }
-      if (command === "get_master_history") return historyDto({ status: "no_master_data", current_user_id: null, projects: [], sessions: [] });
-      return undefined;
-    });
+    mockRoute("list_environments", () => [secondaryListItem]);
+    mockRoute("get_master_library_stats", () => ({
+      status: "no_master_data",
+      current_user_id: null,
+      project_count: 0,
+      session_count: 0,
+      message_count: 0,
+      participating_account_count: 0,
+      last_active_unix_seconds: null,
+      size_bytes: 0,
+    }));
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: "D:\\store", keep_policy: 5 }));
+    mockRoute("get_master_history", () =>
+      historyDto({ status: "no_master_data", current_user_id: null, projects: [], sessions: [] }));
     render(
       <MasterLibraryDetail
         active
@@ -392,66 +395,68 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
 
   /** trae_cn 只读库的完整数据 mock（读命令带 libraryId=trae_cn；无环境档案查询）。 */
   function setupTraeCnDetail() {
-    mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+    // 带 libraryId 校验的命令在各自 handler 内分支（原 catch-all 实现的等价改写）。
+    mockRoute("list_trae_cn_foreign_projects", (args) => {
       const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
-      if (command === "list_trae_cn_foreign_projects") {
-        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
-        return [
-          {
-            project_id: "p-f1",
-            name: "其他账号目录",
-            absolute_path: "D:\\work\\shared",
-            session_count: 2,
-            message_count: 9,
-          },
-        ];
-      }
-      if (command === "get_master_library_stats") {
-        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
-        return {
-          status: "ready",
-          current_user_id: "u-t1",
-          project_count: 1,
+      if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+      return [
+        {
+          project_id: "p-f1",
+          name: "其他账号目录",
+          absolute_path: "D:\\work\\shared",
           session_count: 2,
-          message_count: 5,
-          participating_account_count: 1,
-          last_active_unix_seconds: NOW - 60,
-          size_bytes: 1024 * 1024,
-        };
-      }
-      if (command === "get_master_backup_chain") {
-        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
-        return { backups: [], backup_dir: "C:\\trae-cn\\bak", keep_policy: 5 };
-      }
-      if (command === "get_master_history") {
-        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
-        return historyDto({
-          current_user_id: "u-t1",
-          projects: [{ project_id: "p-t1", name: "Trae 项目", absolute_path: null }],
-          sessions: [
-            {
-              session_id: "s-t1",
-              project_id: "p-t1",
-              title: "Trae 会话",
-              message_count: 5,
-              updated_at_unix_seconds: NOW - 60,
-              deleted: false,
-              hidden_status: null,
-              work_mode: null,
-            },
-          ],
-        });
-      }
-      if (command === "get_relay_ledger") return [];
-      if (command === "get_master_verification") {
-        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
-        // 只读库自然降级：无台账无备份（面板只渲染备份对比区块）。
-        return {
-          ledger: { status: "no_ledger", checked_count: 0, relayed_away_count: 0, issues: [] },
-          backup: { status: "no_backups", backup_stamp: null, backup_stamps: [], common_count: 0, relayed_away_count: 0, added_count: 0, missing: [] },
-        };
-      }
-      return undefined;
+          message_count: 9,
+        },
+      ];
+    });
+    mockRoute("get_master_library_stats", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+      return {
+        status: "ready",
+        current_user_id: "u-t1",
+        project_count: 1,
+        session_count: 2,
+        message_count: 5,
+        participating_account_count: 1,
+        last_active_unix_seconds: NOW - 60,
+        size_bytes: 1024 * 1024,
+      };
+    });
+    mockRoute("get_master_backup_chain", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+      return { backups: [], backup_dir: "C:\\trae-cn\\bak", keep_policy: 5 };
+    });
+    mockRoute("get_master_history", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+      return historyDto({
+        current_user_id: "u-t1",
+        projects: [{ project_id: "p-t1", name: "Trae 项目", absolute_path: null }],
+        sessions: [
+          {
+            session_id: "s-t1",
+            project_id: "p-t1",
+            title: "Trae 会话",
+            message_count: 5,
+            updated_at_unix_seconds: NOW - 60,
+            deleted: false,
+            hidden_status: null,
+            work_mode: null,
+          },
+        ],
+      });
+    });
+    mockRoute("get_relay_ledger", () => []);
+    mockRoute("get_master_verification", (args) => {
+      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+      // 只读库自然降级：无台账无备份（面板只渲染备份对比区块）。
+      return {
+        ledger: { status: "no_ledger", checked_count: 0, relayed_away_count: 0, issues: [] },
+        backup: { status: "no_backups", backup_stamp: null, backup_stamps: [], common_count: 0, relayed_away_count: 0, added_count: 0, missing: [] },
+      };
     });
   }
 
