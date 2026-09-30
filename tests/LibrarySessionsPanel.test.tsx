@@ -2,12 +2,20 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { LibrarySessionsPanel } from "../src/components/LibrarySessionsPanel";
-import type { MasterHistoryDto, RelayLedgerEntryDto } from "../src/types/history";
+import type {
+  MasterHistoryDto,
+  RelayLedgerEntryDto,
+  TraeCnForeignProjectDto,
+} from "../src/types/history";
 
 // mock Tauri invoke——前端测试不依赖真实后端
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
+
+// 事件插件 mock（P13-2 归并进度事件消费）：捕获 listen 回调供测试手动触发。
+const { mockListen } = vi.hoisted(() => ({ mockListen: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 
 // P11-1 切片②：批量操作回执/失败原因已迁到 notify；断言 notify 调用。
 // 带「重试启动/刷新历史列表」按钮的就地恢复条（archive-recovery）仍在页内，保留 DOM 断言。
@@ -1254,5 +1262,228 @@ describe("LibrarySessionsPanel readOnly（Trae CN 只读浏览）", () => {
     const guide = await screen.findByTestId("history-guide");
     expect(guide).toHaveTextContent("还没有对话数据");
     expect(screen.queryByTestId("history-guide-launch")).not.toBeInTheDocument();
+  });
+});
+
+// ============================================================================
+// P13-2 Trae CN 归并入口（只读库唯一开放写，ADR-0033）：入口条件渲染、
+// 规模预览 → 单次确认 → 进度 → 回执全流程、失败路径。
+// ============================================================================
+
+/** 其他账号的可归并项目（详情页注入的 foreignProjects prop 形态）。 */
+function foreignProjects(): TraeCnForeignProjectDto[] {
+  return [
+    {
+      project_id: "p-f1",
+      name: "其他账号目录",
+      absolute_path: "d:\\work\\shared",
+      session_count: 2,
+      message_count: 9,
+    },
+  ];
+}
+
+/** CN 归并流 mock：预览/归并命令 + 可选错误注入（含基础读路径分支）。 */
+function setupTraeCnMerge(overrides: { previewError?: string; mergeError?: string } = {}) {
+  mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "get_master_history") return historyDto();
+    if (command === "get_relay_ledger") return ledgerEntries();
+    if (command === "get_master_session_messages") {
+      const typedArgs = args as { sessionId: string; offset?: number };
+      return sessionMessages(typedArgs.sessionId, typedArgs.offset);
+    }
+    if (command === "get_archive_draft") {
+      return { archive_session_ids: [], restore_session_ids: [] };
+    }
+    if (command === "set_archive_draft") return true;
+    if (command === "preview_trae_cn_project_merge") {
+      if (overrides.previewError) throw new Error(overrides.previewError);
+      return {
+        absolute_path: "d:\\work\\shared",
+        target_account_name: "账号B",
+        target_exists: false,
+        target_session_count: 0,
+        sources: [
+          { user_id: "u-a", account_name: "账号A", session_count: 2, message_count: 9 },
+          { user_id: "u-x", account_name: null, session_count: 0, message_count: 0 },
+        ],
+        total_sessions: 2,
+        total_messages: 9,
+      };
+    }
+    if (command === "merge_trae_cn_project") {
+      if (overrides.mergeError) throw new Error(overrides.mergeError);
+      return {
+        transferred_projects: 1,
+        removed_mirror_rows: 0,
+        switched_sessions: 2,
+        moved_messages: 9,
+        backup_path: "C:\\TraeSync\\data\\environments\\master\\.switch-bak-1",
+        relay_ledger_written: true,
+      };
+    }
+    return undefined;
+  });
+}
+
+describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    mockListen.mockReset();
+    mockListen.mockResolvedValue(() => undefined);
+  });
+
+  it("入口条件：foreignProjects 注入时树末位渲染「其他账号的项目」组；未注入不渲染", async () => {
+    setupTraeCnMerge();
+    const { rerender } = render(
+      <LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />,
+    );
+    const group = await screen.findByTestId("library-foreign-group");
+    expect(group).toHaveTextContent("其他账号的项目");
+    const row = screen.getByTestId("library-foreign-project-p-f1");
+    expect(row).toHaveTextContent("其他账号目录");
+    expect(screen.getByTestId("library-merge-entry-p-f1")).toHaveTextContent("归并到当前账号");
+
+    // 未注入（非 CN 库详情页）：分组与入口不存在。
+    rerender(<LibrarySessionsPanel active readOnly />);
+    await screen.findByTestId("library-project-p1");
+    expect(screen.queryByTestId("library-foreign-group")).not.toBeInTheDocument();
+    // 空清单同样不渲染分组。
+    rerender(<LibrarySessionsPanel active readOnly foreignProjects={[]} />);
+    expect(screen.queryByTestId("library-foreign-group")).not.toBeInTheDocument();
+  });
+
+  it("确认流：点击入口拉取规模预览 → 单次确认 → 归并命令 → 成功回执 + 强制刷新", async () => {
+    setupTraeCnMerge();
+    render(<LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />);
+    fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
+
+    // 预览命令带 projectId + libraryId；弹层列明逐账号规模（主信息 = 账号名）。
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("preview_trae_cn_project_merge", {
+        projectId: "p-f1",
+        libraryId: "master",
+      });
+    });
+    const dialog = await screen.findByTestId("trae-cn-merge-confirm");
+    expect(dialog).toHaveTextContent("归并「其他账号目录」到当前账号");
+    expect(dialog).toHaveTextContent("账号A · 2 个会话 · 9 条消息");
+    expect(dialog).toHaveTextContent("未登记账号");
+    expect(screen.getByTestId("trae-cn-merge-source-u-a")).toHaveAttribute("title", "u-a");
+
+    fireEvent.click(screen.getByTestId("trae-cn-merge-confirm-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("merge_trae_cn_project", {
+        projectId: "p-f1",
+        libraryId: "master",
+      });
+    });
+    // 回执走全局通知（会话数 + 消息数；无空项目清理时不拼清理句）。
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已把 2 个会话归并到当前账号（共 9 条消息）。",
+      );
+    });
+    // 弹层关闭 + 强制刷新（previous 传 null）。
+    await waitFor(() => {
+      expect(screen.queryByTestId("trae-cn-merge-confirm")).not.toBeInTheDocument();
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("get_master_history", {
+      previous: null,
+      previousCurrentUserId: null,
+      libraryId: "master",
+    });
+  });
+
+  it("进度事件：确认后按钮文案随 trae-cn-merge-progress 阶段推进，完成后复原", async () => {
+    setupTraeCnMerge();
+    let resolveMerge: (value: unknown) => void = () => undefined;
+    mockInvoke.mockImplementation(async (command: string) => {
+      if (command === "get_master_history") return historyDto();
+      if (command === "get_relay_ledger") return ledgerEntries();
+      if (command === "preview_trae_cn_project_merge") {
+        return {
+          absolute_path: null,
+          target_account_name: "账号B",
+          target_exists: false,
+          target_session_count: 0,
+          sources: [{ user_id: "u-a", account_name: "账号A", session_count: 2, message_count: 9 }],
+          total_sessions: 2,
+          total_messages: 9,
+        };
+      }
+      if (command === "merge_trae_cn_project") {
+        return new Promise((resolve) => {
+          resolveMerge = resolve;
+        });
+      }
+      return undefined;
+    });
+    render(<LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />);
+    fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
+    fireEvent.click(await screen.findByTestId("trae-cn-merge-confirm-confirm"));
+
+    // 归并命令执行中捕获进度订阅。
+    await waitFor(() => {
+      expect(mockListen).toHaveBeenCalledWith("trae-cn-merge-progress", expect.any(Function));
+    });
+    const handler = mockListen.mock.calls[0][1] as (event: { payload: unknown }) => void;
+    const confirmButton = screen.getByTestId("trae-cn-merge-confirm-confirm");
+    act(() => {
+      handler({ payload: { stage: "backing_up", current: 0, total: 0, label: "" } });
+    });
+    expect(confirmButton).toHaveTextContent("正在备份数据…");
+    act(() => {
+      handler({ payload: { stage: "executing", current: 1, total: 6, label: "消息" } });
+    });
+    expect(confirmButton).toHaveTextContent("正在归并：消息…");
+    act(() => {
+      handler({ payload: { stage: "verifying", current: 2, total: 2, label: "目录" } });
+    });
+    expect(confirmButton).toHaveTextContent("正在校验（2/2）…");
+
+    await act(async () => {
+      resolveMerge({
+        transferred_projects: 1,
+        removed_mirror_rows: 1,
+        switched_sessions: 2,
+        moved_messages: 9,
+        backup_path: "C:\\bak",
+        relay_ledger_written: true,
+      });
+    });
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已把 2 个会话归并到当前账号（共 9 条消息），并清理 1 个空项目。",
+      );
+    });
+    expect(screen.queryByTestId("trae-cn-merge-confirm")).not.toBeInTheDocument();
+  });
+
+  it("失败路径：预览失败/归并失败都走全局通知，弹层关闭且数据保持操作前状态", async () => {
+    setupTraeCnMerge({ previewError: "trae_cn_merge_client_running" });
+    const { rerender } = render(
+      <LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />,
+    );
+    fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith(
+        "Trae CN 正在运行，请先关闭 Trae CN 再归并（归并前会自动备份）。",
+      );
+    });
+    expect(screen.queryByTestId("trae-cn-merge-confirm")).not.toBeInTheDocument();
+
+    // 归并失败：弹层关闭 + 稳定错误码映射的通知。
+    setupTraeCnMerge({ mergeError: "trae_cn_merge_integrity_failed" });
+    rerender(<LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />);
+    fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
+    fireEvent.click(await screen.findByTestId("trae-cn-merge-confirm-confirm"));
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith(
+        "归并后数据校验未通过，已保留操作前备份；请用备份恢复并反馈。",
+      );
+    });
+    expect(screen.queryByTestId("trae-cn-merge-confirm")).not.toBeInTheDocument();
   });
 });

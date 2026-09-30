@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（93 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（96 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -60,8 +60,10 @@ export type CommandName =
   | "list_environments"
   | "list_remote_devices"
   | "list_trae_cn_accounts"
+  | "list_trae_cn_foreign_projects"
   | "login_environment"
   | "merge_master_projects"
+  | "merge_trae_cn_project"
   | "migrate_master_backups"
   | "migrate_storage_root_command"
   | "open_device_management_docs"
@@ -69,6 +71,7 @@ export type CommandName =
   | "prepare_handoff_intent"
   | "prepare_managed_account_switch"
   | "preview_master_switch_plugins"
+  | "preview_trae_cn_project_merge"
   | "purge_account_records"
   | "read_work_cn_state"
   | "refresh_checkin_credentials"

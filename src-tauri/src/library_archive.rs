@@ -28,7 +28,9 @@ use traesync_infrastructure::{
     delete_master_sessions as delete_master_sessions_inner, handover_master_records,
     list_master_backups_in, master_backup_db_name, master_database_path,
     master_db_activity_detected, merge_master_projects as merge_master_projects_inner,
-    restore_master_sessions as restore_master_sessions_inner,
+    merge_trae_cn_project_records_with_progress,
+    preview_trae_cn_project_merge as preview_trae_cn_project_merge_infra,
+    read_trae_cn_foreign_projects, restore_master_sessions as restore_master_sessions_inner,
 };
 use traesync_infrastructure::account_session_content::{
     read_master_session_messages_page, MAX_MESSAGES_PER_SESSION,
@@ -962,6 +964,391 @@ fn relay_ledger_root(storage_root: &Path, env_id: &str) -> PathBuf {
         .join("relay-ledgers")
         .join(env_id)
 }
+
+// ===== P13-2 Trae CN 项目归并（ADR-0033 选择性写：归并命令族）=====
+//
+// 写边界守卫矩阵（扩展而非破坏既有 ensure_writable 体系）：
+// - `merge_trae_cn_project` / `preview_trae_cn_project_merge` /
+//   `list_trae_cn_foreign_projects`：经 `ensure_project_merge_writable`
+//   仅对 trae_cn 库放行，其余库拒绝（`trae_cn_library_only`）；
+// - trae_cn 库的其余写命令（收编/清理/归档/恢复/删除/合并分组）仍被
+//   `ensure_writable`（read_only）拒绝（`library_read_only`）——归并可写
+//   不翻转只读边界，删除/合并项目在 CN 库依旧无入口。
+// 备份先行（家族铁律）：备份在命令编排层执行（与收编同款），写入 CN 库
+// 作用域活动备份目录（backup_dir 覆盖时隔离），保证备份链展示/恢复同源。
+// Trae CN 实例不经工具托管（无自动关启与重启能力）：客户端运行中拒绝
+// （fail-closed），由用户关闭后重试；故无 close/relaunch 编排步骤。
+
+/// P13-2 CN 详情页「其他账号的项目」行（list_trae_cn_foreign_projects 返回）。
+#[derive(Clone, Serialize)]
+pub(crate) struct TraeCnForeignProjectDto {
+    project_id: String,
+    name: String,
+    absolute_path: Option<String>,
+    session_count: u32,
+    message_count: u32,
+}
+
+/// P13-2 归并预览的来源账号行（规模确认弹层逐账号规模）。
+#[derive(Clone, Debug, Serialize)]
+struct TraeCnMergeSourceDto {
+    /// TRAE user_id（悬浮提示用，不作主信息；界面表达纪律）。
+    user_id: String,
+    /// 账号展示名（CN 产品注册表反查；未登记为 None，前端占位）。
+    account_name: Option<String>,
+    session_count: u32,
+    message_count: u32,
+}
+
+/// P13-2 归并规模预览（preview_trae_cn_project_merge 返回，只读）。
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct TraeCnMergePreviewDto {
+    /// 项目文件夹绝对路径（弹层悬浮提示，主视野用尾段）。
+    absolute_path: Option<String>,
+    /// 归并目标账号展示名（当前指针账号，注册表权威）。
+    target_account_name: String,
+    /// 当前账号名下是否已有同目录行（false = 整体转入形态）。
+    target_exists: bool,
+    /// 目标行既有正常会话数（target_exists 时展示）。
+    target_session_count: u32,
+    /// 其他账号的行规模（逐行）。
+    sources: Vec<TraeCnMergeSourceDto>,
+    /// 将并入的会话总数 / 消息总数。
+    total_sessions: u32,
+    total_messages: u32,
+}
+
+/// P13-2 归并回执（merge_trae_cn_project 返回）。
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct TraeCnMergeResultDto {
+    /// 归属随行 / 并走的 project 行数。
+    transferred_projects: u32,
+    /// 自动清理的空镜像行数。
+    removed_mirror_rows: u32,
+    /// 换腿（交接）的会话数。
+    switched_sessions: u32,
+    /// 换腿会话的消息总数。
+    moved_messages: u32,
+    /// 归并前自动创建的备份路径（人工恢复定位）。
+    backup_path: String,
+    /// 接力台账写入结果（false = 归并完成但台账失败，只影响轨迹展示）。
+    relay_ledger_written: bool,
+}
+
+/// 归并进度事件（`trae-cn-merge-progress`；CN 详情页确认弹层消费）。
+/// 阶段：backing_up → mapping → executing → verifying → done。
+#[derive(Clone, Serialize)]
+struct TraeCnMergeProgressEvent {
+    stage: &'static str,
+    current: usize,
+    total: usize,
+    label: String,
+}
+
+/// P13-2 归并错误码映射（稳定错误码，前端 safeUiError 词表承接）。
+fn map_trae_cn_merge_error(error: MasterHandoverError) -> String {
+    match error {
+        MasterHandoverError::DbUnavailable => "trae_cn_merge_db_missing".to_string(),
+        MasterHandoverError::ProjectNotFound => "trae_cn_merge_project_not_found".to_string(),
+        MasterHandoverError::ProjectNotMergeable => "trae_cn_merge_not_mergeable".to_string(),
+        MasterHandoverError::NothingToMerge => "trae_cn_merge_nothing_to_do".to_string(),
+        MasterHandoverError::IntegrityFailed => "trae_cn_merge_integrity_failed".to_string(),
+        _ => "trae_cn_merge_db_open_failed".to_string(),
+    }
+}
+
+/// P13-2 CN 归并命令共用前置：库守卫（仅 trae_cn）+ 当前指针账号解析。
+/// 非法库 / 指针为空 / 指针悬空都以稳定错误码拒绝。
+fn resolve_trae_cn_merge_context(
+    material_root: &Path,
+    storage_root: &Path,
+    library_id: Option<&str>,
+) -> Result<(LibraryContext, traesync_infrastructure::account_registry::AccountRecord), String> {
+    let ctx = resolve_library_context(library_id, storage_root)?;
+    ctx.ensure_project_merge_writable()?;
+    let account = library_account::resolve_library_account(material_root, storage_root, &ctx)?
+        .and_then(LibraryAccountResolution::into_account)
+        .ok_or_else(|| "trae_cn_merge_no_current_account".to_string())?;
+    Ok((ctx, account))
+}
+
+/// CN 产品注册表 user_id → 展示名（备注名优先，与账号页口径一致）。
+fn trae_cn_account_name_by_user_id(trae_cn_root: &Path, user_id: &str) -> Option<String> {
+    let records = AccountRegistry::new(trae_cn_root).load().ok()?;
+    let record = records.iter().find(|record| record.account_id == user_id)?;
+    Some(
+        record
+            .display_name
+            .clone()
+            .unwrap_or_else(|| record.screen_name.clone()),
+    )
+}
+
+/// P13-2：列出其他账号名下的可归并项目行（CN 详情页入口数据源，只读）。
+/// 无当前指针账号时返回空列表（归并入口自然消失，不报错打断浏览）。
+#[tauri::command]
+pub(crate) async fn list_trae_cn_foreign_projects(
+    library_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<TraeCnForeignProjectDto>, String> {
+    ensure_real_preview(&state)?;
+    if state.source_raw_key.is_empty() {
+        return Err("source_key_unavailable".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    let raw_key = state.source_raw_key.clone();
+    run_blocking("trae_cn_merge_join_failed", move || {
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        ctx.ensure_project_merge_writable()?;
+        let Some(account) = library_account::resolve_library_account(
+            &material_root,
+            &storage_root,
+            &ctx,
+        )?
+        .and_then(LibraryAccountResolution::into_account)
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(read_trae_cn_foreign_projects(&ctx.dir, &raw_key, &account.account_id)
+            .into_iter()
+            .map(|entry| TraeCnForeignProjectDto {
+                project_id: entry.project_id,
+                name: entry.name,
+                absolute_path: entry.absolute_path,
+                session_count: entry.session_count,
+                message_count: entry.message_count,
+            })
+            .collect())
+    })
+    .await
+}
+
+/// P13-2：归并规模预览（只读；同目录各账号行/会话数/消息数）。
+#[tauri::command]
+pub(crate) async fn preview_trae_cn_project_merge(
+    project_id: String,
+    library_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<TraeCnMergePreviewDto, String> {
+    ensure_real_preview(&state)?;
+    if state.source_raw_key.is_empty() {
+        return Err("source_key_unavailable".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    let raw_key = state.source_raw_key.clone();
+    run_blocking("trae_cn_merge_join_failed", move || {
+        let (ctx, account) =
+            resolve_trae_cn_merge_context(&material_root, &storage_root, library_id.as_deref())?;
+        preview_trae_cn_project_merge_inner(&storage_root, &raw_key, &ctx, &account, &project_id)
+    })
+    .await
+}
+
+/// 归并预览主体（阻塞上下文，可注入测试）。
+fn preview_trae_cn_project_merge_inner(
+    storage_root: &Path,
+    raw_key: &str,
+    ctx: &LibraryContext,
+    account: &traesync_infrastructure::account_registry::AccountRecord,
+    project_id: &str,
+) -> Result<TraeCnMergePreviewDto, String> {
+    let db_path = master_database_path(&ctx.dir);
+    let preview =
+        preview_trae_cn_project_merge_infra(&db_path, raw_key, &account.account_id, project_id)
+            .map_err(map_trae_cn_merge_error)?;
+    let trae_cn_root = library_account::trae_cn_material_root_from(storage_root);
+    let sources = preview
+        .source_rows
+        .iter()
+        .map(|row| TraeCnMergeSourceDto {
+            user_id: row.user_id.clone(),
+            account_name: trae_cn_account_name_by_user_id(&trae_cn_root, &row.user_id),
+            session_count: row.normal_sessions.max(0) as u32,
+            message_count: row.messages.max(0) as u32,
+        })
+        .collect();
+    Ok(TraeCnMergePreviewDto {
+        absolute_path: preview.absolute_path,
+        target_account_name: account
+            .display_name
+            .clone()
+            .unwrap_or_else(|| account.screen_name.clone()),
+        target_exists: preview.target_row.is_some(),
+        target_session_count: preview
+            .target_row
+            .as_ref()
+            .map(|row| row.normal_sessions.max(0) as u32)
+            .unwrap_or(0),
+        total_sessions: preview
+            .source_rows
+            .iter()
+            .map(|row| row.normal_sessions)
+            .sum::<i64>()
+            .max(0) as u32,
+        total_messages: preview
+            .source_rows
+            .iter()
+            .map(|row| row.messages)
+            .sum::<i64>()
+            .max(0) as u32,
+        sources,
+    })
+}
+
+/// P13-2：CN 项目归并（目标 = 当前指针账号，注册表权威解析）。
+/// 单次确认由前端编排；后端负责预检 → 客户端运行/生成中拒绝 → 备份先行
+/// → 单事务归并 → 台账 → 回执，进度经 `trae-cn-merge-progress` 上报。
+#[tauri::command]
+pub(crate) async fn merge_trae_cn_project(
+    app: tauri::AppHandle,
+    project_id: String,
+    library_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<TraeCnMergeResultDto, String> {
+    ensure_real_preview(&state)?;
+    if state.source_raw_key.is_empty() {
+        return Err("source_key_unavailable".to_string());
+    }
+    let material_root = checkin_material_root(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    let raw_key = state.source_raw_key.clone();
+    run_blocking("trae_cn_merge_join_failed", move || {
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        let (_, account) =
+            resolve_trae_cn_merge_context(&material_root, &storage_root, library_id.as_deref())?;
+        // Trae CN 客户端运行检测（真实进程枚举；单测注入替身）。
+        let is_client_running = || {
+            list_trae_processes()
+                .map(|processes| {
+                    processes.iter().any(|process| {
+                        process
+                            .exe_path
+                            .as_deref()
+                            .is_some_and(|exe| TraeProduct::TraeCn.matches_executable(Path::new(exe)))
+                    })
+                })
+                .unwrap_or(false)
+        };
+        run_trae_cn_project_merge(
+            &storage_root,
+            &raw_key,
+            &ctx,
+            &account,
+            &project_id,
+            &is_client_running,
+            &|event| {
+                let _ = app.emit("trae-cn-merge-progress", event);
+            },
+        )
+    })
+    .await
+}
+
+/// CN 项目归并编排主体（阻塞上下文；客户端运行检测与进度回调可注入，
+/// 供单测覆盖守卫矩阵与回执）。
+fn run_trae_cn_project_merge(
+    storage_root: &Path,
+    raw_key: &str,
+    ctx: &LibraryContext,
+    account: &traesync_infrastructure::account_registry::AccountRecord,
+    project_id: &str,
+    is_client_running: &dyn Fn() -> bool,
+    on_progress: &dyn Fn(TraeCnMergeProgressEvent),
+) -> Result<TraeCnMergeResultDto, String> {
+    // 双重守卫：命令层已校验，此处保持 inner 可独立调用（fail-closed）。
+    ctx.ensure_project_merge_writable()?;
+    let target_user_id = account.account_id.clone();
+    let db_path = master_database_path(&ctx.dir);
+    if !db_path.is_file() {
+        return Err("trae_cn_merge_db_missing".to_string());
+    }
+
+    // 预检（只读）：门槛与规模（无路径/无可并内容在这里 fail-fast，
+    // 不产生备份与任何写）。
+    let preview =
+        preview_trae_cn_project_merge_infra(&db_path, raw_key, &target_user_id, project_id)
+            .map_err(map_trae_cn_merge_error)?;
+    if preview.source_rows.iter().map(|row| row.normal_sessions).sum::<i64>() == 0 {
+        return Err("trae_cn_merge_nothing_to_do".to_string());
+    }
+
+    // Trae CN 客户端运行中拒绝：归并需要静止一致的库做备份与事务写；
+    // CN 实例不经工具托管，由用户关闭后重试。
+    if is_client_running() {
+        return Err("trae_cn_merge_client_running".to_string());
+    }
+    // 生成中拒绝（WAL 活动 = 官方客户端正在写库）。
+    if master_db_activity_detected(&db_path, std::time::Duration::from_millis(800)) {
+        return Err("trae_cn_merge_busy".to_string());
+    }
+
+    // 备份先行（ADR-0018 家族铁律；写入 CN 库作用域活动备份目录）。
+    on_progress(TraeCnMergeProgressEvent {
+        stage: "backing_up",
+        current: 0,
+        total: 0,
+        label: String::new(),
+    });
+    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
+    let backup_path =
+        backup_master_trio_to(&db_path, Some(&backup_dir)).map_err(|error| match error {
+            MasterHandoverError::DbUnavailable => "trae_cn_merge_db_missing".to_string(),
+            _ => "trae_cn_merge_backup_failed".to_string(),
+        })?;
+    // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前库的链）。
+    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
+
+    // 单事务归并（mapping/executing/verifying 进度逐项转发）。
+    let handover = merge_trae_cn_project_records_with_progress(
+        &db_path,
+        raw_key,
+        &target_user_id,
+        project_id,
+        &|progress| {
+            on_progress(TraeCnMergeProgressEvent {
+                stage: progress.phase,
+                current: progress.current,
+                total: progress.total,
+                label: progress.label,
+            });
+        },
+    )
+    .map_err(map_trae_cn_merge_error)?;
+
+    // 接力台账（CN 库作用域独立文件 environments/relay-ledgers/trae_cn；
+    // 复用收编台账追加：逐会话 from = 交接前归属。fail-soft 不阻断归并）。
+    let relay_ledger_written = append_incorporate_ledger(
+        storage_root,
+        &ctx.env_id,
+        &handover,
+        &target_user_id,
+        &account.profile_id,
+    );
+
+    on_progress(TraeCnMergeProgressEvent {
+        stage: "done",
+        current: 0,
+        total: 0,
+        label: String::new(),
+    });
+
+    Ok(TraeCnMergeResultDto {
+        transferred_projects: handover.transferred_projects as u32,
+        removed_mirror_rows: handover.removed_mirror_rows as u32,
+        switched_sessions: handover.switched_sessions.len() as u32,
+        moved_messages: handover
+            .switched_sessions
+            .iter()
+            .map(|session| session.message_count)
+            .sum::<i64>()
+            .max(0) as u32,
+        backup_path: backup_path.display().to_string(),
+        relay_ledger_written,
+    })
+}
+
 
 /// P5-5 清理空项目回执（cleanup_master_empty_projects 返回）。
 #[derive(Clone, Serialize)]
@@ -2711,5 +3098,357 @@ mod backup_policy_tests {
             copy_credentials_backup(&root.path().join("checkin"), &backup_dir, 7).unwrap();
         assert!(!created);
         assert!(!backup_dir.join("credentials-7").exists());
+    }
+}
+
+// ============================================================================
+// P13-2 Trae CN 项目归并命令层单测：守卫矩阵 / 编排回执 / 台账与备份证据。
+// 库读写语义由 infrastructure 层覆盖（master_handover::tests cn_merge_*）；
+// 此处只测组合根编排接缝（守卫、备份先行、台账路由、进度事件）。
+// ============================================================================
+
+#[cfg(test)]
+mod trae_cn_merge_tests {
+    use super::*;
+    use traesync_infrastructure::account_registry::AccountRecord;
+    use traesync_infrastructure::product_account_state::ProductAccountStateStore;
+
+    /// 测试账号档案（与 library_account 测试同款占位形态）。
+    fn account(profile_id: &str, account_id: &str, screen_name: &str) -> AccountRecord {
+        AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: account_id.to_string(),
+            screen_name: screen_name.to_string(),
+            avatar_url: String::new(),
+            device_id: format!("device-{profile_id}"),
+            device_public_key: format!("pub-{profile_id}"),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 1,
+            last_verified_at_unix_seconds: 1,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: false,
+            archived: false,
+        }
+    }
+
+    /// 测试夹具：storage_root + CN 数据根库（账号 111 的 p1 目录项目，
+    /// 两个正常会话 + 一个空镜像行）+ CN 产品池指针账号 222。
+    struct CnMergeFixture {
+        root: tempfile::TempDir,
+        cn_dir: PathBuf,
+        raw_key: String,
+        current: AccountRecord,
+    }
+
+    impl CnMergeFixture {
+        fn new() -> Self {
+            Self::with_sessions(true)
+        }
+
+        /// `with_sessions = false` 时不播种正常会话（无可并规模的守卫用例）。
+        fn with_sessions(with_sessions: bool) -> Self {
+            use rusqlite::{Connection, OpenFlags};
+
+            let root = tempfile::tempdir().unwrap();
+            let cn_dir = root.path().join("Trae CN");
+            let db_dir = cn_dir.join("ModularData").join("ai-agent");
+            std::fs::create_dir_all(&db_dir).unwrap();
+            let raw_key = "77".repeat(32);
+            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+            let conn = Connection::open_with_flags(db_dir.join("database.db"), flags).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", raw_key))
+                .unwrap();
+            // CN 形态最小 schema + 跨账号行集（语义覆盖在 infrastructure 层
+            // 测试完成；此处支撑命令编排全链路：预检 → 备份 → 事务 → 台账）。
+            let mut sql = String::from(
+                "CREATE TABLE project (
+                    project_id TEXT PRIMARY KEY, user_id TEXT,
+                    biz_project_id TEXT, name TEXT, absolute_path TEXT, deleted_at INTEGER);
+                 CREATE TABLE chat_session (
+                    session_id TEXT PRIMARY KEY, project_id TEXT,
+                    session_title TEXT, updated_at INTEGER, deleted_at INTEGER, hidden_status TEXT);
+                 CREATE TABLE chat_message (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, session_id TEXT,
+                    message_role TEXT, message_index INTEGER,
+                    reply_to_message_id TEXT, response_message_id TEXT, deleted_at INTEGER);
+                 CREATE TABLE chat_message_general (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, content TEXT, created_at TEXT);
+                 CREATE TABLE chat_message_task (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, content TEXT, created_at TEXT);
+                 CREATE TABLE chat_turn (turn_id TEXT PRIMARY KEY, session_id TEXT, deleted_at INTEGER);
+                 CREATE TABLE task (task_id TEXT PRIMARY KEY, session_id TEXT, deleted_at INTEGER);
+                 CREATE TABLE history_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, history_v2_id TEXT UNIQUE,
+                    session_id TEXT, messages TEXT, created_at TEXT);
+                 CREATE TABLE agent_run (agent_run_id TEXT PRIMARY KEY, session_id TEXT);
+                 CREATE TABLE session_project (session_id TEXT PRIMARY KEY, project_id TEXT);
+                 CREATE TABLE server_history_info (
+                    id INTEGER PRIMARY KEY, session_id TEXT, conversation_id TEXT,
+                    source TEXT, user_id TEXT);
+                 INSERT INTO project VALUES ('p1', '111', 'biz-a', '目录项目', 'D:\\work\\demo', NULL);
+                 INSERT INTO project VALUES ('p-m', '333', 'biz-a', '空镜像', 'D:\\work\\demo', NULL);
+                 INSERT INTO server_history_info (session_id, conversation_id, source, user_id)
+                    VALUES ('s1', 'conv-old', 'llm_default', NULL);",
+            );
+            if with_sessions {
+                sql.push_str(
+                    "INSERT INTO chat_session VALUES ('s1', 'p1', '会话一', 1, 0, NULL);
+                     INSERT INTO chat_session VALUES ('s2', 'p1', '会话二', 2, 0, NULL);
+                     INSERT INTO chat_message
+                        (message_id, session_id, message_role, message_index, deleted_at)
+                        VALUES ('m1', 's1', 'user', 0, NULL);
+                     INSERT INTO chat_message
+                        (message_id, session_id, message_role, message_index, deleted_at)
+                        VALUES ('m2', 's1', 'assistant', 1, NULL);
+                     INSERT INTO chat_message_general (message_id, content, created_at)
+                        VALUES ('m1', '正文', '2026-09-29');
+                     INSERT INTO chat_turn VALUES ('t1', 's1', NULL);
+                     INSERT INTO session_project VALUES ('s1', 'p1');
+                     INSERT INTO session_project VALUES ('s2', 'p1');",
+                );
+            }
+            conn.execute_batch(&sql).unwrap();
+            // CN 产品池：指针账号（归并目标）+ 来源账号档案（预览名称反查）。
+            let trae_cn_root = root.path().join("products").join("trae_cn");
+            AccountRegistry::new(&trae_cn_root)
+                .upsert(&account("profile-cn", "222", "指针账号"))
+                .unwrap();
+            AccountRegistry::new(&trae_cn_root)
+                .upsert(&account("profile-src", "111", "来源账号"))
+                .unwrap();
+            ProductAccountStateStore::new(&trae_cn_root)
+                .save("profile-cn")
+                .unwrap();
+            Self {
+                root,
+                cn_dir,
+                raw_key,
+                current: account("profile-cn", "222", "指针账号"),
+            }
+        }
+
+        fn ctx(&self) -> LibraryContext {
+            LibraryContext {
+                env_id: TRAE_CN_LIBRARY_ID.to_string(),
+                env_name: "Trae CN".to_string(),
+                dir: self.cn_dir.clone(),
+                read_only: true,
+            }
+        }
+    }
+
+    /// 归并编排回执：库归属改写 + 备份先行证据 + 台账路由 + 进度事件。
+    #[test]
+    fn run_trae_cn_merge_writes_receipt_backup_and_ledger() {
+        let fixture = CnMergeFixture::new();
+        let events = std::sync::Mutex::new(Vec::new());
+        let receipt = run_trae_cn_project_merge(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &fixture.ctx(),
+            &fixture.current,
+            "p1",
+            &|| false,
+            &|event| events.lock().unwrap().push(event),
+        )
+        .unwrap();
+
+        assert_eq!(receipt.transferred_projects, 1);
+        assert_eq!(receipt.removed_mirror_rows, 1, "来源侧空镜像行清理");
+        assert_eq!(receipt.switched_sessions, 2);
+        assert_eq!(receipt.moved_messages, 2);
+        assert!(receipt.relay_ledger_written);
+        // 备份先行：CN 库作用域活动目录（db 同目录）落了 .switch-bak-* 链。
+        let db_dir = fixture.cn_dir.join("ModularData").join("ai-agent");
+        let backups: Vec<_> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("database.db.switch-bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "归并前应生成一份三件套备份");
+        assert_eq!(Path::new(&receipt.backup_path).parent(), Some(db_dir.as_path()));
+        // 接力台账：CN 库作用域独立文件（environments/relay-ledgers/trae_cn）。
+        assert!(fixture
+            .root
+            .path()
+            .join("environments")
+            .join("relay-ledgers")
+            .join("trae_cn")
+            .join("relay-ledger.json")
+            .exists());
+        // 库状态：p1 归属 222。
+        let conn = rusqlite::Connection::open(db_dir.join("database.db")).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", fixture.raw_key))
+            .unwrap();
+        let owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(owner, "222");
+        // 进度事件：backing_up → mapping/executing/verifying → done 全链路。
+        let stages: Vec<&str> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.stage)
+            .collect();
+        assert_eq!(stages.first().copied(), Some("backing_up"));
+        assert!(stages.contains(&"mapping") && stages.contains(&"executing") && stages.contains(&"verifying"));
+        assert_eq!(stages.last().copied(), Some("done"));
+    }
+
+    /// 守卫矩阵：Trae CN 客户端运行中拒绝（fail-closed，不产生备份）。
+    #[test]
+    fn run_trae_cn_merge_rejects_while_client_running() {
+        let fixture = CnMergeFixture::new();
+        let error = run_trae_cn_project_merge(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &fixture.ctx(),
+            &fixture.current,
+            "p1",
+            &|| true,
+            &|_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error, "trae_cn_merge_client_running");
+        // 拒绝路径不产生备份（备份在守卫之后）。
+        let db_dir = fixture.cn_dir.join("ModularData").join("ai-agent");
+        let backups: Vec<_> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .into_string()
+                    .unwrap()
+                    .starts_with("database.db.switch-bak-")
+            })
+            .collect();
+        assert!(backups.is_empty());
+    }
+
+    /// 守卫矩阵：非 trae_cn 库的 ctx 直接拒绝（run inner 双重守卫）。
+    #[test]
+    fn run_trae_cn_merge_rejects_non_trae_cn_library() {
+        let fixture = CnMergeFixture::new();
+        let master_ctx = LibraryContext {
+            env_id: MASTER_ENV_ID.to_string(),
+            env_name: "主库".to_string(),
+            dir: fixture.cn_dir.clone(),
+            read_only: false,
+        };
+        let error = run_trae_cn_project_merge(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &master_ctx,
+            &fixture.current,
+            "p1",
+            &|| false,
+            &|_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error, "trae_cn_library_only");
+    }
+
+    /// 守卫矩阵：无并内容（无可并规模）→ nothing_to_do，不产生备份。
+    #[test]
+    fn run_trae_cn_merge_rejects_when_nothing_to_merge() {
+        let fixture = CnMergeFixture::with_sessions(false);
+        let error = run_trae_cn_project_merge(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &fixture.ctx(),
+            &fixture.current,
+            "p1",
+            &|| false,
+            &|_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error, "trae_cn_merge_nothing_to_do");
+        // 拒绝路径不产生备份。
+        let db_dir = fixture.cn_dir.join("ModularData").join("ai-agent");
+        let backups: Vec<_> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .into_string()
+                    .unwrap()
+                    .starts_with("database.db.switch-bak-")
+            })
+            .collect();
+        assert!(backups.is_empty());
+    }
+
+    /// 预览主体：规模聚合 + 注册表反查账号名（界面主信息用，user_id 只进悬浮）。
+    #[test]
+    fn preview_inner_aggregates_rows_and_maps_account_names() {
+        let fixture = CnMergeFixture::new();
+        let preview = preview_trae_cn_project_merge_inner(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &fixture.ctx(),
+            &fixture.current,
+            "p1",
+        )
+        .unwrap();
+        assert_eq!(preview.absolute_path.as_deref(), Some("D:\\work\\demo"));
+        assert_eq!(preview.target_account_name, "指针账号");
+        assert!(!preview.target_exists, "222 名下无同目录行 → 整体转入形态");
+        assert_eq!(preview.total_sessions, 2);
+        assert_eq!(preview.total_messages, 2);
+        // 两个来源账号行（111 有会话 + 333 空镜像）。
+        assert_eq!(preview.sources.len(), 2);
+        let named = preview
+            .sources
+            .iter()
+            .find(|source| source.user_id == "111")
+            .unwrap();
+        assert_eq!(named.account_name.as_deref(), Some("来源账号"));
+        assert_eq!(named.session_count, 2);
+        assert_eq!(named.message_count, 2);
+        let mirror = preview
+            .sources
+            .iter()
+            .find(|source| source.user_id == "333")
+            .unwrap();
+        assert_eq!(mirror.session_count, 0, "空镜像行 0 会话");
+        assert_eq!(mirror.account_name, None, "未登记账号展示降级");
+    }
+
+    /// 共用前置：trae_cn 库放行并解析指针账号；其他库拒绝（稳定错误码）。
+    #[test]
+    fn resolve_merge_context_guards_library_scope() {
+        let fixture = CnMergeFixture::new();
+        // trae_cn：放行，账号来自产品池指针。
+        let account = resolve_trae_cn_merge_context(
+            fixture.root.path().join("checkin").as_path(),
+            fixture.root.path(),
+            Some(TRAE_CN_LIBRARY_ID),
+        )
+        .map(|(_, account)| account.account_id)
+        .unwrap();
+        assert_eq!(account, "222");
+        // 已登记副环境：非 trae_cn 库 → 稳定错误码。
+        let env_id =
+            traesync_infrastructure::environment_registry::EnvironmentRegistry::new(
+                fixture.root.path(),
+            )
+            .create("副环境")
+            .unwrap()
+            .env_id;
+        let error = resolve_trae_cn_merge_context(
+            fixture.root.path().join("checkin").as_path(),
+            fixture.root.path(),
+            Some(&env_id),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(error, "trae_cn_library_only");
     }
 }

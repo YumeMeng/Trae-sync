@@ -7,6 +7,8 @@ import { PluginWorkbench } from "../components/PluginWorkbench";
 import { MasterVerificationPanel } from "../components/MasterVerificationPanel";
 import type { EnvironmentListItemDto, EnvironmentStateDto } from "../types/environment";
 import type { MasterBackupChainDto, MasterLibraryStatsDto } from "../types/masterLibrary";
+// P13-2 Trae CN 归并 DTO 与库对话面板类型同源（types/history）。
+import type { TraeCnForeignProjectDto } from "../types/history";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 // 统一通知适配层（P11-1 切片②）：读取失败等一次性原因走全局通知。
 import { notify } from "../platform/notify";
@@ -59,6 +61,8 @@ export function MasterLibraryDetail({ active, onNavigate, library }: MasterLibra
   // 统计与备份链读取失败时静默降级为 null（对应分区显示 —），不阻塞页面。
   const [stats, setStats] = useState<MasterLibraryStatsDto | null>(null);
   const [backupChain, setBackupChain] = useState<MasterBackupChainDto | null>(null);
+  // P13-2：其他账号的可归并项目（只读库专属；失败静默降级为空，入口消失）。
+  const [foreignProjects, setForeignProjects] = useState<readonly TraeCnForeignProjectDto[]>([]);
   const [tab, setTab] = useState<MasterDetailTab>("sessions");
   // 懒挂载：App 各页面常驻 DOM（[hidden] 切换），若详情页一启动就渲染内嵌
   // 库对话面板只在详情页首次激活后挂载，避免未访问详情时白白创建两栏视图；
@@ -94,7 +98,9 @@ export function MasterLibraryDetail({ active, onNavigate, library }: MasterLibra
     // 副库带 libraryId（缺省参数向后兼容：主库调用形态不变）。
     // 只读库读路径已放行（P11-6 后端契约），同参数读取。
     const scopedLibraryId = isMaster && !readOnly ? undefined : { libraryId };
-    const [nextStats, nextBackups] = await Promise.all([
+    // P13-2：只读库额外读取其他账号的可归并项目（归并入口数据源；
+    // 失败静默降级为空，不打断只读浏览）。
+    const [nextStats, nextBackups, nextForeign] = await Promise.all([
       invoke<MasterLibraryStatsDto>(
         "get_master_library_stats",
         scopedLibraryId,
@@ -103,9 +109,15 @@ export function MasterLibraryDetail({ active, onNavigate, library }: MasterLibra
         "get_master_backup_chain",
         scopedLibraryId,
       ).catch(() => null),
+      readOnly
+        ? invoke<TraeCnForeignProjectDto[]>("list_trae_cn_foreign_projects", {
+            libraryId,
+          }).catch(() => [])
+        : Promise.resolve([]),
     ]);
     setStats(nextStats);
     setBackupChain(nextBackups);
+    setForeignProjects(nextForeign);
   }, [isMaster, libraryId, readOnly]);
 
   useEffect(() => {
@@ -197,13 +209,16 @@ export function MasterLibraryDetail({ active, onNavigate, library }: MasterLibra
       <div className="master-detail__tabpanels">
         <div className="master-detail__tabpanel" hidden={tab !== "sessions"}>
           {/* ADR-0025：详情页注入库实例引用（副库同一组件零改动复用）。
-              P11-6：只读库传 readOnly——写操作控件隐藏（不是禁用）。 */}
+              P11-6：只读库传 readOnly——写操作控件隐藏（不是禁用）。
+              P13-2：只读库下发其他账号的可归并项目（归并入口数据源）。 */}
           <LibrarySessionsPanel
             active={active && tab === "sessions"}
             embedded
             onNavigate={onNavigate}
             library={{ id: libraryId, displayName: isMaster ? undefined : libraryTitle }}
             readOnly={readOnly}
+            foreignProjects={readOnly ? foreignProjects : undefined}
+            onTraeCnMerged={readOnly ? load : undefined}
           />
         </div>
         {/* 插件 tab（P5-8b）：主库 = 已装清单 + 对账 + 市场浏览 + 装/卸；

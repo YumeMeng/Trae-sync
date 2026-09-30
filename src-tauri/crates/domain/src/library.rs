@@ -34,6 +34,20 @@ impl LibraryContext {
         self.env_id == MASTER_ENV_ID
     }
 
+    /// P13-2（ADR-0033 决策 1）：项目归并对 Trae CN 库开放，其余库拒绝。
+    ///
+    /// 选择性写边界的第二类写（第一类 = 会话归档/恢复，P13-3）：CN 库的
+    /// 归并命令经本守卫放行；主库/副环境调用归并命令一律返回稳定错误码
+    /// `trae_cn_library_only`（归并语义 = 同目录跨账号行合并，只对 CN 库
+    /// 有意义）。与 `ensure_writable` 方向相反：本守卫只认 trae_cn。
+    pub fn ensure_project_merge_writable(&self) -> Result<(), String> {
+        if self.env_id == TRAE_CN_LIBRARY_ID {
+            Ok(())
+        } else {
+            Err("trae_cn_library_only".to_string())
+        }
+    }
+
     /// P11-6（ADR-0032 决策 5）：写库类能力不随 Trae CN 只读浏览开放。
     /// 归属改写/归档/删除/合并/清理对只读库一律返回稳定错误码
     /// `library_read_only`，在进入任何实例关闭或备份动作之前拒绝。
@@ -99,5 +113,42 @@ mod tests {
             read_only: true,
         };
         assert!(!trae_cn.is_master());
+    }
+
+    /// P13-2 归并守卫：仅 trae_cn 库放行（其余库返回稳定错误码
+    /// `trae_cn_library_only`）；与 ensure_writable 方向相反且互不替代——
+    /// CN 库归并可写，但其余写命令对 CN 库仍被 ensure_writable 拒绝。
+    #[test]
+    fn project_merge_guard_allows_trae_cn_only() {
+        let trae_cn = LibraryContext {
+            env_id: TRAE_CN_LIBRARY_ID.to_string(),
+            env_name: "Trae CN".to_string(),
+            dir: PathBuf::from("C:/fixture/Trae CN"),
+            read_only: true,
+        };
+        assert!(trae_cn.ensure_project_merge_writable().is_ok());
+        // 归并开放不翻转只读边界：CN 库其他写命令仍被拒（P13-3 前维持）。
+        assert_eq!(trae_cn.ensure_writable().unwrap_err(), "library_read_only");
+
+        let master = LibraryContext {
+            env_id: MASTER_ENV_ID.to_string(),
+            env_name: "主库".to_string(),
+            dir: PathBuf::from("C:/fixture/master"),
+            read_only: false,
+        };
+        assert_eq!(
+            master.ensure_project_merge_writable().unwrap_err(),
+            "trae_cn_library_only"
+        );
+        let secondary = LibraryContext {
+            env_id: "env-1-a".to_string(),
+            env_name: "副环境".to_string(),
+            dir: PathBuf::from("C:/fixture/env-1-a"),
+            read_only: false,
+        };
+        assert_eq!(
+            secondary.ensure_project_merge_writable().unwrap_err(),
+            "trae_cn_library_only"
+        );
     }
 }

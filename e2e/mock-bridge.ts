@@ -33,6 +33,8 @@ export interface MockScenario {
   sessionMessages?: "normal" | "bulk";
   // P10-5：Trae CN 已保存账号（默认无账号；登录设备 e2e 需要账号详情入口）。
   traeCnAccounts?: boolean;
+  // P13-2：Trae CN 归并入口 fixture（默认无其他账号项目；归并 e2e 开启）。
+  traeCnMergeEntry?: boolean;
 }
 
 /**
@@ -339,6 +341,45 @@ export async function installMockBridge(
       },
     };
 
+    // P13-2：Trae CN 库历史 fixture（详情页宿主读路径；与 master 分库独立）。
+    const TRAE_CN_HISTORY_READY: {
+      status: string;
+      current_user_id: string;
+      projects: Array<{ project_id: string; name: string; absolute_path: string | null }>;
+      sessions: Array<{
+        session_id: string;
+        project_id: string;
+        title: string;
+        message_count: number;
+        updated_at_unix_seconds: number;
+        deleted: boolean;
+        hidden_status: string | null;
+        work_mode: string | null;
+      }>;
+      fingerprint: object;
+    } = {
+      status: "ready",
+      current_user_id: "user-cn-current",
+      projects: [{ project_id: "p-t1", name: "Trae 项目", absolute_path: "C:\\work\\trae-demo" }],
+      sessions: [
+        {
+          session_id: "s-cn-1",
+          project_id: "p-t1",
+          title: "CN 会话一 项目树冒烟",
+          message_count: 3,
+          updated_at_unix_seconds: NOW_LOCAL - 3600,
+          deleted: false,
+          hidden_status: null,
+          work_mode: "code",
+        },
+      ],
+      fingerprint: {
+        db: { mtime_secs: NOW_LOCAL - 30, mtime_nanos: 0, size: 2048 },
+        wal: { mtime_secs: NOW_LOCAL - 30, mtime_nanos: 0, size: 256 },
+        shm: null,
+      },
+    };
+
     // 主库消息预览 fixture（s1 文本 + 任务轨迹两种形态；其余会话单条文本）。
     function makeMasterMessages(sessionId: string) {
       if (sessionId === "s1") {
@@ -501,6 +542,20 @@ export async function installMockBridge(
     // P13-1：Trae CN 签到可变状态（必须在 mockInvoke 外声明）——
     // run_trae_cn_checkin 成功后翻已签，供「领取后行内翻已签」断言。
     let traeCnCheckedIn = false;
+
+    // P13-2：Trae CN 归并可变状态（必须在 mockInvoke 外声明）——
+    // 归并成功后入口行从清单移除，详情页刷新后「其他账号的项目」消失。
+    let traeCnForeignProjects = initialScenario.traeCnMergeEntry
+      ? [
+          {
+            project_id: "p-cn-foreign",
+            name: "共享项目（来源账号）",
+            absolute_path: "C:\\work\\shared-demo",
+            session_count: 2,
+            message_count: 9,
+          },
+        ]
+      : [];
 
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
@@ -699,8 +754,37 @@ export async function installMockBridge(
       }
       // ===== 库对话面板（G21/G22，ADR-0025：命令带 libraryId）=====
       if (cmd === "get_master_history") {
-        assertMasterLibrary();
         const mode = scn.masterHistory ?? "ready";
+        // P13-2：Trae CN 库分流（详情页宿主读路径，独立 fixture）。
+        if (args?.libraryId === "trae_cn") {
+          if (
+            mode === "ready" &&
+            args?.previous &&
+            JSON.stringify(args.previous) === JSON.stringify(TRAE_CN_HISTORY_READY.fingerprint)
+          ) {
+            return {
+              status: "unchanged",
+              current_user_id: null,
+              projects: [],
+              sessions: [],
+              fingerprint: TRAE_CN_HISTORY_READY.fingerprint,
+            };
+          }
+          if (mode === "ready") {
+            return {
+              ...TRAE_CN_HISTORY_READY,
+              sessions: TRAE_CN_HISTORY_READY.sessions.map((session) => ({ ...session })),
+            };
+          }
+          return {
+            status: mode,
+            current_user_id: null,
+            projects: [],
+            sessions: [],
+            fingerprint: TRAE_CN_HISTORY_READY.fingerprint,
+          };
+        }
+        assertMasterLibrary();
         // 指纹预检：previous 与当前指纹一致 → unchanged（前端维持现有列表）。
         if (
           mode === "ready" &&
@@ -732,6 +816,8 @@ export async function installMockBridge(
         };
       }
       if (cmd === "get_relay_ledger") {
+        // P13-2：CN 详情页加载即随行拉台账——mock 返回空（只读浏览形态）。
+        if (args?.libraryId === "trae_cn") return [];
         assertMasterLibrary();
         return RELAY_LEDGER;
       }
@@ -1013,6 +1099,58 @@ export async function installMockBridge(
           extra_credits: 5,
         };
       }
+      // ===== P13-2 Trae CN 项目归并：入口清单/规模预览/归并（仅 trae_cn 库） =====
+      // 后端守卫在 mock 侧同构：非 trae_cn libraryId 直接拒绝。
+      const assertTraeCnLibrary = () => {
+        if (args?.libraryId !== "trae_cn") {
+          throw new Error("mock bridge: 非法库实例（归并仅开放 trae_cn）");
+        }
+      };
+      if (cmd === "list_trae_cn_foreign_projects") {
+        assertTraeCnLibrary();
+        return traeCnForeignProjects;
+      }
+      if (cmd === "preview_trae_cn_project_merge") {
+        assertTraeCnLibrary();
+        const foreign = traeCnForeignProjects.find(
+          (project: { project_id: string }) => project.project_id === String(args?.projectId ?? ""),
+        );
+        if (!foreign) throw new Error("trae_cn_merge_project_not_found");
+        return {
+          absolute_path: foreign.absolute_path,
+          target_account_name: "Trae CN 测试账号",
+          target_exists: false,
+          target_session_count: 0,
+          sources: [
+            {
+              user_id: "u-cn-source",
+              account_name: "其他来源账号",
+              session_count: foreign.session_count,
+              message_count: foreign.message_count,
+            },
+          ],
+          total_sessions: foreign.session_count,
+          total_messages: foreign.message_count,
+        };
+      }
+      if (cmd === "merge_trae_cn_project") {
+        assertTraeCnLibrary();
+        const projectId = String(args?.projectId ?? "");
+        if (!traeCnForeignProjects.some((project: { project_id: string }) => project.project_id === projectId)) {
+          throw new Error("trae_cn_merge_project_not_found");
+        }
+        traeCnForeignProjects = traeCnForeignProjects.filter(
+          (project: { project_id: string }) => project.project_id !== projectId,
+        );
+        return {
+          transferred_projects: 1,
+          removed_mirror_rows: 0,
+          switched_sessions: 2,
+          moved_messages: 9,
+          backup_path: "C:\\Trae CN\\ModularData\\ai-agent\\.switch-bak-p13",
+          relay_ledger_written: true,
+        };
+      }
       if (cmd === "refresh_managed_current_account") return MANAGED_ACCOUNT_STATE;
       // ===== P11-5 主库体检整合区块（环境页）：只读报告，静态健康数据 =====
       if (cmd === "get_master_checkup") {
@@ -1083,8 +1221,22 @@ export async function installMockBridge(
     }
 
     // 安装 Tauri internals mock——Tauri 2 invoke 通过此入口
+    const tauriEventCallbacks = new Map<number, (event: unknown) => void>();
+    let tauriCallbackId = 0;
     (window as any).__TAURI_INTERNALS__ = {
       invoke: mockInvoke,
+      // @tauri-apps/api/event 的 listen 在 invoke('plugin:event|listen') 前求值
+      // transformCallback 注册事件回调——缺失会使 await listen 整体拒绝（P13-2）。
+      transformCallback: (callback: (event: unknown) => void, once?: boolean) => {
+        const id = ++tauriCallbackId;
+        tauriEventCallbacks.set(id, once
+          ? (event: unknown) => {
+              tauriEventCallbacks.delete(id);
+              callback(event);
+            }
+          : callback);
+        return id;
+      },
       // 其他可能被 @tauri-apps/api 调用的入口
       convertFileSrc: (p: string) => p,
     };

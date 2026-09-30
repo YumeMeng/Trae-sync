@@ -56,6 +56,13 @@ pub enum MasterHandoverError {
     IntegrityFailed,
     /// 文件读写失败。
     Io,
+    /// P13-2：定位的项目行不存在（已被清理或 id 失效）。
+    ProjectNotFound,
+    /// P13-2：项目行不满足归并条件（无路径/无 biz/归属目标账号/已软删，
+    /// ADR-0033 决策 3）。
+    ProjectNotMergeable,
+    /// P13-2：同目录其他账号没有可并入的正常会话（只有冻结内容）。
+    NothingToMerge,
 }
 
 impl std::fmt::Display for MasterHandoverError {
@@ -66,6 +73,9 @@ impl std::fmt::Display for MasterHandoverError {
             Self::TargetConflict(_) => "目标账号名下存在同名项目的非空记录，需人工决策",
             Self::IntegrityFailed => "换腿后正文完整性校验失败（已回滚）",
             Self::Io => "交接文件读写失败",
+            Self::ProjectNotFound => "项目记录不存在或已被清理",
+            Self::ProjectNotMergeable => "该项目没有关联文件夹路径，不能参与归并",
+            Self::NothingToMerge => "同目录其他账号没有可并入的会话",
         };
         formatter.write_str(message)
     }
@@ -349,6 +359,20 @@ impl IdGenerator {
 
 // ===== 交接事务 =====
 
+/// 换腿身份组（身份表 → 展示标签与引用列）：交接核心与 P13-2 CN 归并
+/// 变体共用同一组清单（五类身份，重写顺序一致）。
+const IDENTITY_GROUPS: [(&str, &str, &[&str]); 5] = [
+    (
+        "消息",
+        "id_map_message",
+        &["message_id", "reply_to_message_id", "response_message_id"],
+    ),
+    ("对话轮次", "id_map_turn", &["turn_id"]),
+    ("任务", "id_map_task", &["task_id"]),
+    ("历史记录", "id_map_history", &["history_v2_id"]),
+    ("运行记录", "id_map_agent_run", &["agent_run_id"]),
+];
+
 fn columns(conn: &Connection, table: &str) -> Result<Vec<String>, MasterHandoverError> {
     let mut statement = conn
         .prepare(&format!("PRAGMA table_info(\"{table}\")"))
@@ -461,6 +485,502 @@ pub fn handover_master_records_from_merge_with_progress(
         true,
         on_progress,
     )
+}
+
+// ===== P13-2 Trae CN 项目归并（ADR-0033 选择性写，同目录跨账号行合并）=====
+//
+// 定位键抉择（评审定案，报告理由）：**biz_project_id**（经用户点击的
+// project 行解析），而非 absolute_path——
+// ① 交接原语的镜像清理/冲突/合并机制全部以 biz 为键，且 UNIQUE
+//    (biz_project_id, user_id) 正是「同目录跨账号天然多行」的成因，
+//    biz 就是官方客户端维护的目录身份；
+// ② absolute_path 是可空自由文本（CN 探针 6/17 为空），分隔符/大小写
+//    无约束，相等匹配不稳；CN 实测 biz 全部非空（project_biz_nonnull=17）；
+// ③ 无路径（含无 biz）项目按 ADR-0033 决策 3 不参与目录匹配，fail-closed。
+//
+// 归并语义（收窄自 from_merge 原语，单事务）：
+// 空镜像清理（目标空镜像 + 来源空镜像）→ 来源正常会话并入承接行
+// （chat_session.project_id + session_project 改挂）→ 移空来源行清理
+// （残留归档/软删会话的行保留为原账号名下的冻结内容）→ 承接行归属
+// 改写 → 全量换腿重写（IDENTITY_GROUPS 同款五类身份 + 会话本体）→
+// 完整性校验。承接行 = 目标名下同目录真实行（UNIQUE 冲突分支）；
+// 目标无真实行时 = 用户点击的来源行（整体转入，身份与路径保留）。
+
+/// 同目录一侧的 project 行 + 规模计数（预览与归并共用的行形态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraeCnMergeRow {
+    pub project_id: String,
+    pub user_id: String,
+    /// 原始项目名（可能为空；展示回退由命令层处理）。
+    pub project_name: String,
+    /// 将被并入的正常会话数（未删除且未归档）。
+    pub normal_sessions: i64,
+    /// 全部会话行数（含归档/软删，空镜像判定依据）。
+    pub all_sessions: i64,
+    /// 正常会话的消息总数（规模确认用）。
+    pub messages: i64,
+}
+
+/// Trae CN 项目归并预览：同目录跨账号行集合（只读，确认弹层数据源）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraeCnProjectMergePreview {
+    pub biz_project_id: String,
+    pub absolute_path: Option<String>,
+    /// 当前账号名下的同目录行（None = 该目录只有其他账号的记录，整体转入）。
+    pub target_row: Option<TraeCnMergeRow>,
+    /// 其他账号名下的同目录行（归并来源，按 rowid 序）。
+    pub source_rows: Vec<TraeCnMergeRow>,
+}
+
+/// 打开带 key 的库连接（busy_timeout + PRAGMA key；行为与交接核心的
+/// 内联打开一致，CN 归并两入口共用）。
+fn open_keyed_connection(db_path: &Path, raw_key: &str) -> Result<Connection, MasterHandoverError> {
+    let conn = Connection::open(db_path).map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    conn.busy_timeout(Duration::from_millis(5000))
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    conn.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    Ok(conn)
+}
+
+/// 归并来源定位与门槛校验：项目行必须存在、未软删、有非空 biz 与
+/// 非空 absolute_path、归属非目标账号（ADR-0033 决策 3 fail-closed）。
+/// 通过后返回目录身份 biz。
+fn locate_trae_cn_merge_source(
+    conn: &Connection,
+    target_user_id: &str,
+    source_project_id: &str,
+) -> Result<String, MasterHandoverError> {
+    // 列防御：无 absolute_path 列的库没有任何可归并对象（fail-closed）。
+    let project_columns = columns(conn, "project")?;
+    if !project_columns.iter().any(|name| name == "absolute_path") {
+        return Err(MasterHandoverError::ProjectNotMergeable);
+    }
+    let has_deleted = project_columns.iter().any(|name| name == "deleted_at");
+    let deleted_expr = if has_deleted { ", deleted_at" } else { "" };
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<i64>)> = {
+        let sql = format!(
+            "SELECT biz_project_id, absolute_path, user_id{deleted_expr} FROM project WHERE project_id = ?1"
+        );
+        let mut statement = conn
+            .prepare(&sql)
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        statement
+            .query_row([source_project_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(MasterHandoverError::DbOpenFailed),
+            })?
+    };
+    let Some((biz, path, user, deleted)) = row else {
+        return Err(MasterHandoverError::ProjectNotFound);
+    };
+    let mergeable = biz.as_deref().is_some_and(|biz| !biz.trim().is_empty())
+        && path.as_deref().is_some_and(|path| !path.trim().is_empty())
+        && user.as_deref().is_some_and(|user| user != target_user_id)
+        && deleted.unwrap_or(0) == 0;
+    if !mergeable {
+        return Err(MasterHandoverError::ProjectNotMergeable);
+    }
+    Ok(biz.expect("mergeable 已校验 biz 非空"))
+}
+
+/// 定位同目录跨账号行集合（行计数一次聚合查询；预览与归并共用）。
+/// 返回（biz, 目标行, 来源行）；已软删项目行不参与。
+fn trae_cn_merge_scope(
+    conn: &Connection,
+    target_user_id: &str,
+    source_project_id: &str,
+) -> Result<(String, Option<TraeCnMergeRow>, Vec<TraeCnMergeRow>), MasterHandoverError> {
+    let biz = locate_trae_cn_merge_source(conn, target_user_id, source_project_id)?;
+    let has_hidden_status = columns(conn, "chat_session")?
+        .iter()
+        .any(|name| name == "hidden_status");
+    let has_msg_deleted = columns(conn, "chat_message")?
+        .iter()
+        .any(|name| name == "deleted_at");
+    let hidden_cs = if has_hidden_status {
+        " AND COALESCE(cs.hidden_status, '') != 'voice_discussion'"
+    } else {
+        ""
+    };
+    let msg_deleted = if has_msg_deleted {
+        " AND COALESCE(m.deleted_at, 0) = 0"
+    } else {
+        ""
+    };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT p.project_id, p.user_id, COALESCE(p.name, ''),
+                    (SELECT COUNT(*) FROM chat_session cs WHERE cs.project_id = p.project_id
+                       AND COALESCE(cs.deleted_at, 0) = 0{hidden_cs}),
+                    (SELECT COUNT(*) FROM chat_session cs WHERE cs.project_id = p.project_id),
+                    (SELECT COUNT(*) FROM chat_message m
+                       JOIN chat_session cs ON cs.session_id = m.session_id
+                     WHERE cs.project_id = p.project_id
+                       AND COALESCE(cs.deleted_at, 0) = 0{hidden_cs}{msg_deleted})
+             FROM project p
+             WHERE p.biz_project_id = ?1 AND p.user_id IS NOT NULL
+               AND COALESCE(p.deleted_at, 0) = 0
+             ORDER BY p.rowid"
+        ))
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    let rows = statement
+        .query_map([&biz], |row| {
+            Ok(TraeCnMergeRow {
+                project_id: row.get(0)?,
+                user_id: row.get(1)?,
+                project_name: row.get(2)?,
+                normal_sessions: row.get(3)?,
+                all_sessions: row.get(4)?,
+                messages: row.get(5)?,
+            })
+        })
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    let target_row = rows
+        .iter()
+        .find(|row| row.user_id == target_user_id)
+        .cloned();
+    let source_rows = rows
+        .into_iter()
+        .filter(|row| row.user_id != target_user_id)
+        .collect();
+    Ok((biz, target_row, source_rows))
+}
+
+/// 归并预览（只读）：同目录各账号行 / 会话数 / 消息数，供确认弹层
+/// 展示规模。定位失败（无路径/未知 id 等）与归并同门槛。
+pub fn preview_trae_cn_project_merge(
+    db_path: &Path,
+    raw_key: &str,
+    target_user_id: &str,
+    source_project_id: &str,
+) -> Result<TraeCnProjectMergePreview, MasterHandoverError> {
+    if !db_path.is_file() {
+        return Err(MasterHandoverError::DbUnavailable);
+    }
+    let conn = open_keyed_connection(db_path, raw_key)?;
+    let (biz_project_id, target_row, source_rows) =
+        trae_cn_merge_scope(&conn, target_user_id, source_project_id)?;
+    let absolute_path: Option<String> = conn
+        .query_row(
+            "SELECT absolute_path FROM project WHERE project_id = ?1",
+            [source_project_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    Ok(TraeCnProjectMergePreview {
+        biz_project_id,
+        absolute_path,
+        target_row,
+        source_rows,
+    })
+}
+
+/// Trae CN 项目归并（单事务，带进度回调）：把同目录（同 biz）其他账号
+/// 的 project 行并入当前指针账号——空镜像清理 → 会话并入承接行 +
+/// session_project 改挂 → 换腿重写 → 完整性校验。任一步失败整体回滚。
+pub fn merge_trae_cn_project_records_with_progress(
+    db_path: &Path,
+    raw_key: &str,
+    target_user_id: &str,
+    source_project_id: &str,
+    on_progress: &dyn Fn(HandoverProgress),
+) -> Result<MasterHandover, MasterHandoverError> {
+    if !db_path.is_file() {
+        return Err(MasterHandoverError::DbUnavailable);
+    }
+    let conn = open_keyed_connection(db_path, raw_key)?;
+
+    // ===== 事务外定位与规模预检（任一拒绝路径库零改动）=====
+    let (biz, target_row, source_rows) =
+        trae_cn_merge_scope(&conn, target_user_id, source_project_id)?;
+    if source_rows.iter().map(|row| row.normal_sessions).sum::<i64>() == 0 {
+        return Err(MasterHandoverError::NothingToMerge);
+    }
+
+    // 承接行：目标名下同目录真实行（UNIQUE 冲突分支，目标身份保留）；
+    // 否则为用户点击的来源行（整体转入/多账号并入都以点击行承接）。
+    let mut mirrors_to_delete: Vec<String> = Vec::new();
+    let survivor_id = match &target_row {
+        Some(row) if row.all_sessions > 0 => row.project_id.clone(),
+        Some(row) => {
+            // 目标名下的空镜像行：与来源空镜像同样清理（E5 语义），
+            // 让位给转入的承接行（UNIQUE(biz, target) 唯一键）。
+            mirrors_to_delete.push(row.project_id.clone());
+            source_project_id.to_string()
+        }
+        None => source_project_id.to_string(),
+    };
+    // 来源空镜像行（0 会话的历史镜像残留）：清理。
+    for row in &source_rows {
+        if row.all_sessions == 0 && row.project_id != survivor_id {
+            mirrors_to_delete.push(row.project_id.clone());
+        }
+    }
+
+    // ===== 待换腿会话集合：来源行的全部正常会话 =====
+    let has_hidden_status = columns(&conn, "chat_session")?
+        .iter()
+        .any(|name| name == "hidden_status");
+    let hidden_s = if has_hidden_status {
+        " AND COALESCE(s.hidden_status, '') != 'voice_discussion'"
+    } else {
+        ""
+    };
+    let sessions_to_switch: Vec<(String, String, String)> = {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT s.session_id, s.project_id, p.user_id FROM chat_session s
+                 JOIN project p ON p.project_id = s.project_id
+                 WHERE p.biz_project_id = ?1 AND p.user_id IS NOT NULL AND p.user_id != ?2
+                   AND COALESCE(s.deleted_at, 0) = 0{hidden_s}
+                 ORDER BY s.session_id"
+            ))
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        let rows = statement
+            .query_map(rusqlite::params![biz, target_user_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        rows
+    };
+    let session_ids: Vec<String> = sessions_to_switch
+        .iter()
+        .map(|(session, _, _)| session.clone())
+        .collect();
+    let before_digests = text_digests(&conn, &session_ids)?;
+    let before_counts = session_counts(&conn, &session_ids)?;
+
+    // 进度 label（来源行项目名；空名回退「未命名项目」）。
+    let project_names: HashMap<String, String> = source_rows
+        .iter()
+        .map(|row| (row.project_id.clone(), row.project_name.clone()))
+        .collect();
+    let session_labels: Vec<String> = sessions_to_switch
+        .iter()
+        .map(|(_, project_id, _)| {
+            project_names
+                .get(project_id)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "未命名项目".to_string())
+        })
+        .collect();
+
+    // ===== 换腿身份映射（e5-r2 同款五类身份 + 会话本体）=====
+    let total_sessions = sessions_to_switch.len();
+    let mut ids = IdGenerator::new();
+    let mut leg_maps: Vec<(String, String)> = Vec::new();
+    for (index, (session, _, _)) in sessions_to_switch.iter().enumerate() {
+        on_progress(HandoverProgress {
+            phase: "mapping",
+            current: index + 1,
+            total: total_sessions,
+            label: session_labels[index].clone(),
+        });
+        leg_maps.push((session.clone(), ids.next()));
+    }
+    let message_map =
+        map_column_batch(&conn, "chat_message", "message_id", &session_ids, &mut ids)?;
+    let turn_map = map_column_batch(&conn, "chat_turn", "turn_id", &session_ids, &mut ids)?;
+    let task_map = map_column_batch(&conn, "task", "task_id", &session_ids, &mut ids)?;
+    let history_map =
+        map_column_batch(&conn, "history_v2", "history_v2_id", &session_ids, &mut ids)?;
+    let agent_run_map =
+        map_column_batch(&conn, "agent_run", "agent_run_id", &session_ids, &mut ids)?;
+
+    // ===== 单事务：镜像清理 → 会话并入 → 行清理 → 归属改写 → 换腿 =====
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    for mirror in &mirrors_to_delete {
+        tx.execute("DELETE FROM session_project WHERE project_id = ?1", [mirror])
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        tx.execute("DELETE FROM project WHERE project_id = ?1", [mirror])
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    }
+    // 会话并入承接行：逐来源行改挂（承接行自身的会话不动）。
+    let mut merged_away = 0usize;
+    for row in &source_rows {
+        if row.project_id == survivor_id || row.normal_sessions == 0 {
+            continue;
+        }
+        let merge_sessions: Vec<&str> = sessions_to_switch
+            .iter()
+            .filter(|(_, project_id, _)| project_id == &row.project_id)
+            .map(|(session_id, _, _)| session_id.as_str())
+            .collect();
+        if merge_sessions.is_empty() {
+            continue;
+        }
+        let clause = placeholders(merge_sessions.len());
+        let params = || {
+            rusqlite::params_from_iter(
+                std::iter::once(survivor_id.as_str())
+                    .chain(std::iter::once(row.project_id.as_str()))
+                    .chain(merge_sessions.iter().copied()),
+            )
+        };
+        tx.execute(
+            &format!(
+                "UPDATE chat_session SET project_id = ?1
+                 WHERE project_id = ?2 AND session_id IN ({clause})"
+            ),
+            params(),
+        )
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        tx.execute(
+            &format!(
+                "UPDATE session_project SET project_id = ?1
+                 WHERE project_id = ?2 AND session_id IN ({clause})"
+            ),
+            params(),
+        )
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        // 移空来源行清理；残留归档/软删会话的行保留为冻结内容（原账号名下）。
+        let deleted = tx
+            .execute(
+                "DELETE FROM project WHERE project_id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM chat_session WHERE project_id = ?1)
+                 AND NOT EXISTS (SELECT 1 FROM session_project WHERE project_id = ?1)",
+                [row.project_id.as_str()],
+            )
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        merged_away += deleted;
+    }
+    // 承接行归属改写：承接行 = 点击的来源行时改挂到目标账号；UNIQUE 由
+    // 目标空镜像清理保证不撞。承接行 = 目标真实行时无需改写。
+    let mut survivor_transferred = 0usize;
+    if survivor_id == source_project_id {
+        survivor_transferred += tx
+            .execute(
+                "UPDATE project SET user_id = ?1 WHERE project_id = ?2",
+                rusqlite::params![target_user_id, survivor_id],
+            )
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    }
+
+    // temp 映射表（内存态，随连接销毁；ID 明文不落盘）。
+    tx.execute_batch(
+        "PRAGMA temp_store = MEMORY;
+         CREATE TEMP TABLE id_map_session (old_id TEXT PRIMARY KEY, new_id TEXT);
+         CREATE TEMP TABLE id_map_message (old_id TEXT PRIMARY KEY, new_id TEXT);
+         CREATE TEMP TABLE id_map_turn (old_id TEXT PRIMARY KEY, new_id TEXT);
+         CREATE TEMP TABLE id_map_task (old_id TEXT PRIMARY KEY, new_id TEXT);
+         CREATE TEMP TABLE id_map_history (old_id TEXT PRIMARY KEY, new_id TEXT);
+         CREATE TEMP TABLE id_map_agent_run (old_id TEXT PRIMARY KEY, new_id TEXT);",
+    )
+    .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    insert_map_entries(&tx, "id_map_session", &leg_maps)?;
+    insert_map_entries(&tx, "id_map_message", &message_map)?;
+    insert_map_entries(&tx, "id_map_turn", &turn_map)?;
+    insert_map_entries(&tx, "id_map_task", &task_map)?;
+    insert_map_entries(&tx, "id_map_history", &history_map)?;
+    insert_map_entries(&tx, "id_map_agent_run", &agent_run_map)?;
+
+    // 集合重写（executing 阶段按身份组上报）：五类身份引用列 → 会话引用
+    // 列 → chat_session 主键；server_history_info 永不改写（§19 铁律）。
+    let group_total = IDENTITY_GROUPS.len() + 1;
+    for (index, (label, map_table, columns_to_update)) in IDENTITY_GROUPS.iter().enumerate() {
+        on_progress(HandoverProgress {
+            phase: "executing",
+            current: index + 1,
+            total: group_total,
+            label: (*label).to_string(),
+        });
+        apply_map_batch(&tx, map_table, columns_to_update, &["server_history_info"])?;
+    }
+    on_progress(HandoverProgress {
+        phase: "executing",
+        current: group_total,
+        total: group_total,
+        label: "会话".to_string(),
+    });
+    apply_map_batch(
+        &tx,
+        "id_map_session",
+        &[
+            "session_id",
+            "chat_session_id",
+            "creator_session_id",
+            "writer_session_id",
+        ],
+        &["server_history_info", "chat_session"],
+    )?;
+    tx.execute(
+        "UPDATE chat_session SET session_id = \
+         (SELECT new_id FROM id_map_session WHERE old_id = chat_session.session_id) \
+         WHERE session_id IN (SELECT old_id FROM id_map_session)",
+        [],
+    )
+    .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    tx.commit().map_err(|_| MasterHandoverError::DbOpenFailed)?;
+
+    // ===== 写后完整性校验（正文指纹 + 行数守恒 + 新腿无旧镜像）=====
+    let new_session_ids: Vec<String> = leg_maps
+        .iter()
+        .map(|(_, new_session)| new_session.clone())
+        .collect();
+    let after_digests = text_digests(&conn, &new_session_ids)?;
+    let after_counts = session_counts(&conn, &new_session_ids)?;
+    let after_server_counts = session_server_counts(&conn, &new_session_ids)?;
+    for (index, (old_session, _, _)) in sessions_to_switch.iter().enumerate() {
+        let new_session = &leg_maps[index].1;
+        on_progress(HandoverProgress {
+            phase: "verifying",
+            current: index + 1,
+            total: total_sessions,
+            label: session_labels[index].clone(),
+        });
+        if after_digests.get(new_session) != before_digests.get(old_session) {
+            return Err(MasterHandoverError::IntegrityFailed);
+        }
+        if after_counts.get(new_session) != before_counts.get(old_session) {
+            return Err(MasterHandoverError::IntegrityFailed);
+        }
+        if after_server_counts.get(new_session).copied().unwrap_or(0) != 0 {
+            return Err(MasterHandoverError::IntegrityFailed);
+        }
+    }
+
+    // 前归属账号：换腿会话最多的来源账号（并列取 user_id 升序，稳定输出）。
+    let mut owner_counts: HashMap<String, usize> = HashMap::new();
+    for (_, _, user) in &sessions_to_switch {
+        *owner_counts.entry(user.clone()).or_insert(0) += 1;
+    }
+    let previous_owner = owner_counts
+        .into_iter()
+        .min_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)))
+        .map(|(user, _)| user);
+
+    Ok(MasterHandover {
+        previous_owner_user_id: previous_owner,
+        transferred_projects: merged_away + survivor_transferred,
+        removed_mirror_rows: mirrors_to_delete.len(),
+        switched_sessions: sessions_to_switch
+            .iter()
+            .enumerate()
+            .map(|(index, (source_session, _, previous_user_id))| HandoverSession {
+                session_id: leg_maps[index].1.clone(),
+                previous_session_id: source_session.clone(),
+                // 全部换腿会话的落点都是承接行（并入或原地）。
+                project_id: survivor_id.clone(),
+                previous_user_id: previous_user_id.clone(),
+                message_count: before_counts
+                    .get(source_session)
+                    .map(|(count, _)| *count)
+                    .unwrap_or(0),
+            })
+            .collect(),
+    })
 }
 
 /// 交接核心实现；`source_user_id` 为 None 时保持全量随行语义；
@@ -854,19 +1374,8 @@ fn handover_master_records_core(
     // 集合重写（进度：executing 阶段按身份组上报）。
     // 重写顺序与逐会话版一致：五类身份引用列 → 会话引用列 → chat_session
     // 主键；server_history_info 永不改写（云端镜像证据，§19 铁律）。
-    let identity_groups: [(&str, &str, &[&str]); 5] = [
-        (
-            "消息",
-            "id_map_message",
-            &["message_id", "reply_to_message_id", "response_message_id"],
-        ),
-        ("对话轮次", "id_map_turn", &["turn_id"]),
-        ("任务", "id_map_task", &["task_id"]),
-        ("历史记录", "id_map_history", &["history_v2_id"]),
-        ("运行记录", "id_map_agent_run", &["agent_run_id"]),
-    ];
-    let group_total = identity_groups.len() + 1; // 五类身份 + 会话本体
-    for (index, (label, map_table, columns_to_update)) in identity_groups.iter().enumerate() {
+    let group_total = IDENTITY_GROUPS.len() + 1; // 五类身份 + 会话本体
+    for (index, (label, map_table, columns_to_update)) in IDENTITY_GROUPS.iter().enumerate() {
         on_progress(HandoverProgress {
             phase: "executing",
             current: index + 1,
@@ -2245,5 +2754,653 @@ mod tests {
         assert_eq!(chain[1].stamp_unix_seconds, 900);
         assert!(!chain[1].has_credentials);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ======================================================================
+    // P13-2 Trae CN 项目归并（ADR-0033 选择性写：同目录跨账号行合并）
+    // ======================================================================
+    //
+    // CN 库语义（探针 trae-cn-project-schema-probe 实测）：项目 = 目录
+    // （absolute_path），同目录跨账号因 UNIQUE(biz_project_id, user_id)
+    // 天然多行；归并 = 把同目录其他账号的行并入当前指针账号的同目录行。
+
+    /// CN 形态 fixture：project 带 absolute_path（Work 旧 fixture 无此列，
+    /// 定位复用会破坏既有位置化 INSERT，故独立建库）；chat_session 自带
+    /// hidden_status（CN 探针 schema 同款）。
+    /// 预置：账号 111 的 p1（biz-a，D:\\work\\demo，两个正常会话）。
+    fn create_trae_cn_fixture_db(path: &Path, raw_key: &str) {
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+        let conn = Connection::open_with_flags(path, flags).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (
+                project_id TEXT PRIMARY KEY, user_id TEXT,
+                biz_project_id TEXT, name TEXT, absolute_path TEXT, deleted_at INTEGER);
+             CREATE TABLE chat_session (
+                session_id TEXT PRIMARY KEY, project_id TEXT,
+                session_title TEXT, updated_at INTEGER, deleted_at INTEGER, hidden_status TEXT);
+             CREATE TABLE chat_message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, session_id TEXT,
+                message_role TEXT, message_index INTEGER,
+                reply_to_message_id TEXT, response_message_id TEXT, deleted_at INTEGER);
+             CREATE TABLE chat_message_general (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, content TEXT, created_at TEXT);
+             CREATE TABLE chat_message_task (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, content TEXT, created_at TEXT);
+             CREATE TABLE chat_turn (
+                turn_id TEXT PRIMARY KEY, session_id TEXT, deleted_at INTEGER);
+             CREATE TABLE task (
+                task_id TEXT PRIMARY KEY, session_id TEXT, deleted_at INTEGER);
+             CREATE TABLE history_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, history_v2_id TEXT UNIQUE, session_id TEXT,
+                messages TEXT, created_at TEXT);
+             CREATE TABLE agent_run (
+                agent_run_id TEXT PRIMARY KEY, session_id TEXT);
+             CREATE TABLE session_project (
+                session_id TEXT PRIMARY KEY, project_id TEXT);
+             CREATE TABLE server_history_info (
+                id INTEGER PRIMARY KEY, session_id TEXT, conversation_id TEXT,
+                source TEXT, user_id TEXT);",
+        )
+        .unwrap();
+    }
+
+    /// 播种一条完整会话（2 条消息 + general 正文 + turn/task/history/
+    /// agent_run/session_project；hidden 传 Some("voice_discussion") 即归档，
+    /// deleted=true 即软删）。消息 id 形如 m-{session}-0/1，正文各 1 条。
+    fn seed_cn_session(
+        conn: &Connection,
+        session_id: &str,
+        project_id: &str,
+        title: &str,
+        hidden: Option<&str>,
+        deleted: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO chat_session VALUES (?1, ?2, ?3, 1770000000, ?4, ?5)",
+            rusqlite::params![
+                session_id,
+                project_id,
+                title,
+                if deleted { 1 } else { 0 },
+                hidden,
+            ],
+        )
+        .unwrap();
+        for index in 0..2 {
+            let message_id = format!("m-{session_id}-{index}");
+            conn.execute(
+                "INSERT INTO chat_message
+                 (message_id, session_id, message_role, message_index, reply_to_message_id, response_message_id, deleted_at)
+                 VALUES (?1, ?2, 'user', ?3, NULL, NULL, NULL)",
+                rusqlite::params![message_id, session_id, index],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_message_general (message_id, content, created_at)
+                 VALUES (?1, ?2, '2026-09-29')",
+                rusqlite::params![message_id, format!("正文-{message_id}")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO chat_turn (turn_id, session_id, deleted_at) VALUES (?1, ?2, NULL)",
+            rusqlite::params![format!("t-{session_id}"), session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task (task_id, session_id, deleted_at) VALUES (?1, ?2, NULL)",
+            rusqlite::params![format!("k-{session_id}"), session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history_v2 (history_v2_id, session_id, messages, created_at)
+             VALUES (?1, ?2, '[]', '2026-09-29')",
+            rusqlite::params![format!("h-{session_id}"), session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_run (agent_run_id, session_id) VALUES (?1, ?2)",
+            rusqlite::params![format!("ar-{session_id}"), session_id],
+        )
+        .unwrap();
+        if !deleted {
+            conn.execute(
+                "INSERT INTO session_project VALUES (?1, ?2)",
+                rusqlite::params![session_id, project_id],
+            )
+            .unwrap();
+        }
+    }
+
+    /// 播种项目行。
+    fn seed_cn_project(
+        conn: &Connection,
+        project_id: &str,
+        user_id: &str,
+        biz: Option<&str>,
+        name: &str,
+        absolute_path: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO project VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            rusqlite::params![project_id, user_id, biz, name, absolute_path],
+        )
+        .unwrap();
+    }
+
+    /// 标准场景：账号 111 的 p1（biz-a / D:\work\demo）挂两个正常会话。
+    fn seed_standard_source(conn: &Connection) {
+        seed_cn_project(conn, "p1", "111", Some("biz-a"), "演示项目", Some("D:\\work\\demo"));
+        seed_cn_session(conn, "s1", "p1", "会话一", None, false);
+        seed_cn_session(conn, "s2", "p1", "会话二", None, false);
+        // 云端镜像证据（E5/e5-r2：永不改写、新腿不携带）。
+        conn.execute(
+            "INSERT INTO server_history_info (session_id, conversation_id, source, user_id)
+             VALUES ('s1', 'conv-old', 'llm_default', NULL)",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// 归并整体转入：目标账号名下无同目录行，来源行连人带会话转到目标。
+    #[test]
+    fn cn_merge_transfers_foreign_directory_row_to_target_account() {
+        let db_path = temp_db_path("cn-merge-transfer");
+        let raw_key = "aa".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+        }
+
+        let outcome =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p1", &|_| {})
+                .unwrap();
+
+        assert_eq!(outcome.transferred_projects, 1, "来源行整体转入目标账号");
+        assert_eq!(outcome.removed_mirror_rows, 0);
+        assert_eq!(outcome.switched_sessions.len(), 2);
+        assert_eq!(outcome.previous_owner_user_id.as_deref(), Some("111"));
+
+        let conn = open_fixture(&db_path, &raw_key);
+        let owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(owner, "222", "来源行归属改写为当前指针账号");
+        // 会话全部换腿：旧 ID 消失，身份表跟随新腿。
+        let new_sessions: Vec<String> = outcome
+            .switched_sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect();
+        for (table, column) in [
+            ("chat_message", "message_id"),
+            ("chat_turn", "turn_id"),
+            ("task", "task_id"),
+            ("history_v2", "history_v2_id"),
+            ("agent_run", "agent_run_id"),
+        ] {
+            let old_count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM \"{table}\" WHERE session_id IN ('s1','s2')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(old_count, 0, "{table} 旧 session 引用应清零");
+            let _ = column;
+        }
+        let old_sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_session WHERE session_id IN ('s1','s2')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(old_sessions, 0);
+        // 会话仍挂在 p1 上（项目身份保留，只换归属与腿）。
+        for new_session in &new_sessions {
+            let project: String = conn
+                .query_row(
+                    "SELECT project_id FROM chat_session WHERE session_id = ?1",
+                    [new_session],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(project, "p1");
+            let pivot: String = conn
+                .query_row(
+                    "SELECT project_id FROM session_project WHERE session_id = ?1",
+                    [new_session],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pivot, "p1", "session_project 改挂跟随");
+        }
+        // 云端镜像证据原样保留（旧行永不改写）。
+        let mirror: String = conn
+            .query_row(
+                "SELECT conversation_id FROM server_history_info WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mirror, "conv-old");
+        // 正文内容原样保留。
+        let content_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_message_general", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content_count, 4);
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// UNIQUE 冲突走合并分支：目标名下已有同目录真实行时，来源正常会话
+    /// 并入目标行，目标身份与其既有会话不改写，来源行移空清理。
+    #[test]
+    fn cn_merge_moves_sessions_into_existing_target_row() {
+        let db_path = temp_db_path("cn-merge-conflict");
+        let raw_key = "bb".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的演示项目", Some("D:\\work\\demo"));
+            seed_cn_session(&conn, "s-t", "p-t", "目标既有会话", None, false);
+        }
+
+        let outcome =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p1", &|_| {})
+                .unwrap();
+
+        assert_eq!(outcome.switched_sessions.len(), 2);
+        let conn = open_fixture(&db_path, &raw_key);
+        // 来源行移空清理；目标行身份保留。
+        let source_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_rows, 0, "并入后的空来源行应被清理");
+        let target_owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p-t'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(target_owner, "222");
+        // 目标既有会话身份不改写。
+        let target_session: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_session WHERE session_id = 's-t'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(target_session, 1, "目标既有会话不换腿");
+        // 来源会话全部改挂目标行且换腿。
+        let moved_on_target: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE project_id = 'p-t'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_on_target, 3, "目标行应挂 1 既有 + 2 并入会话");
+        let moved_by_pivot: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_project WHERE project_id = 'p-t'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_by_pivot, 3, "session_project 同步改挂");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// ADR-0033 决策 3：无路径 / 无 biz 的项目不参与归并（fail-closed，
+    /// 库零改动）；未知项目 id 报 ProjectNotFound。
+    #[test]
+    fn cn_merge_rejects_pathless_unbiz_and_unknown_projects() {
+        let db_path = temp_db_path("cn-merge-guard");
+        let raw_key = "cc".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+            // 无路径项目（挂会话）：不可被转移。
+            seed_cn_project(&conn, "p-nopath", "333", Some("biz-x"), "无路径项目", None);
+            seed_cn_session(&conn, "s-np", "p-nopath", "无路径会话", None, false);
+            // biz 为 NULL 的项目：没有目录身份，同样不可归并。
+            seed_cn_project(&conn, "p-nobiz", "333", None, "无 biz 项目", Some("D:\\work\\x"));
+            seed_cn_session(&conn, "s-nb", "p-nobiz", "无 biz 会话", None, false);
+        }
+
+        let error =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-nopath", &|_| {})
+                .unwrap_err();
+        assert!(matches!(error, MasterHandoverError::ProjectNotMergeable));
+        let error =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-nobiz", &|_| {})
+                .unwrap_err();
+        assert!(matches!(error, MasterHandoverError::ProjectNotMergeable));
+        let error =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-gone", &|_| {})
+                .unwrap_err();
+        assert!(matches!(error, MasterHandoverError::ProjectNotFound));
+
+        // 归属目标账号自己的行：不满足「归属非当前账号」门槛。
+        seed_cn_project(
+            &open_fixture(&db_path, &raw_key),
+            "p-own",
+            "222",
+            Some("biz-own"),
+            "自己的项目",
+            Some("D:\\work\\own"),
+        );
+        let error =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-own", &|_| {})
+                .unwrap_err();
+        assert!(matches!(error, MasterHandoverError::ProjectNotMergeable));
+
+        // 全部拒绝路径库零改动：无路径项目归属不变、会话原样。
+        let conn = open_fixture(&db_path, &raw_key);
+        let owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p-nopath'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(owner, "333");
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_session", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 4, "拒绝路径不产生任何写（p1 两会话 + 无路径/无 biz 各一）");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// 软删与归档会话是冻结内容：留在来源行、不并入、不换腿，来源行因有
+    /// 残留会话而保留在原账号名下（与 Work 合并语义一致）。
+    #[test]
+    fn cn_merge_leaves_archived_and_soft_deleted_sessions_in_source_row() {
+        let db_path = temp_db_path("cn-merge-frozen");
+        let raw_key = "dd".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+            seed_cn_session(&conn, "s-arch", "p1", "归档会话", Some("voice_discussion"), false);
+            seed_cn_session(&conn, "s-del", "p1", "软删会话", None, true);
+            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的演示项目", Some("D:\\work\\demo"));
+            seed_cn_session(&conn, "s-t", "p-t", "目标既有会话", None, false);
+        }
+
+        let outcome =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p1", &|_| {})
+                .unwrap();
+
+        assert_eq!(outcome.switched_sessions.len(), 2, "只有正常会话参与换腿");
+        let switched_old: Vec<&str> = outcome
+            .switched_sessions
+            .iter()
+            .map(|session| session.previous_session_id.as_str())
+            .collect();
+        assert!(switched_old.contains(&"s1") && switched_old.contains(&"s2"));
+        assert!(
+            !switched_old.contains(&"s-arch") && !switched_old.contains(&"s-del"),
+            "归档/软删会话不进入换腿"
+        );
+        let conn = open_fixture(&db_path, &raw_key);
+        // 来源行保留（残留冻结会话），归属不变。
+        let source_owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_owner, "111", "带冻结内容的来源行不得改归属");
+        // 归档会话原身份、原挂接、原状态。
+        let archived: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT session_id, project_id, hidden_status FROM chat_session WHERE session_id = 's-arch'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(archived.0, "s-arch");
+        assert_eq!(archived.1, "p1");
+        assert_eq!(archived.2.as_deref(), Some("voice_discussion"));
+        let archived_pivot: String = conn
+            .query_row(
+                "SELECT project_id FROM session_project WHERE session_id = 's-arch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived_pivot, "p1");
+        // 软删会话原样。
+        let soft_deleted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id = 's-del' AND deleted_at = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(soft_deleted, 1);
+        // 正常会话已并入目标行。
+        let target_total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE project_id = 'p-t'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_total, 3, "目标既有 + 2 条并入");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// 空镜像清理：同目录其他账号的 0 会话行删除；目标名下的空镜像行
+    /// 同样清理（E5 坑位语义同款）。
+    #[test]
+    fn cn_merge_cleans_empty_mirror_rows_in_same_directory() {
+        let db_path = temp_db_path("cn-merge-mirror");
+        let raw_key = "ee".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+            // 第三账号的同目录空镜像行。
+            seed_cn_project(&conn, "p-m", "333", Some("biz-a"), "空镜像", Some("D:\\work\\demo"));
+            // 目标账号名下的同目录空镜像行（目标无真实行）。
+            seed_cn_project(&conn, "p-t2", "222", Some("biz-a"), "目标镜像", Some("D:\\work\\demo"));
+        }
+
+        let outcome =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p1", &|_| {})
+                .unwrap();
+
+        assert_eq!(outcome.removed_mirror_rows, 2, "两个空镜像行都应清理");
+        assert_eq!(outcome.transferred_projects, 1, "来源行转入目标账号");
+        let conn = open_fixture(&db_path, &raw_key);
+        for mirror in ["p-m", "p-t2"] {
+            let rows: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM project WHERE project_id = '{mirror}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{mirror} 空镜像应被清理");
+        }
+        let owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(owner, "222");
+        // 目标镜像行删除后 (biz-a, 222) 唯一键由转入的 p1 承接。
+        let biz_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE biz_project_id = 'biz-a' AND user_id = '222'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(biz_rows, 1);
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// 多账号同目录一次归并：两个来源账号 + 目标空镜像，单事务全部并入
+    /// 用户点击的来源行（承接行 = 点击行，身份与路径保留）。
+    #[test]
+    fn cn_merge_merges_multiple_foreign_accounts_in_one_transaction() {
+        let db_path = temp_db_path("cn-merge-multi");
+        let raw_key = "ef".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+            // 第二来源账号（同目录、有会话）。
+            seed_cn_project(&conn, "p3", "333", Some("biz-a"), "第三账号项目", Some("D:\\work\\demo"));
+            seed_cn_session(&conn, "s3", "p3", "第三账号会话", None, false);
+            // 目标账号的空镜像行。
+            seed_cn_project(&conn, "p-t2", "222", Some("biz-a"), "目标镜像", Some("D:\\work\\demo"));
+        }
+
+        let outcome =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p1", &|_| {})
+                .unwrap();
+
+        assert_eq!(outcome.switched_sessions.len(), 3, "三个来源会话全部换腿");
+        assert_eq!(outcome.removed_mirror_rows, 1, "目标空镜像清理");
+        assert_eq!(outcome.transferred_projects, 2, "p3 并走 + p1 转入");
+        assert_eq!(outcome.previous_owner_user_id.as_deref(), Some("111"), "会话最多者为前归属");
+        let conn = open_fixture(&db_path, &raw_key);
+        // 承接行 = 点击的 p1，归属 222，三会话都在。
+        let owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(owner, "222");
+        let path: String = conn
+            .query_row("SELECT absolute_path FROM project WHERE project_id = 'p1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(path, "D:\\work\\demo", "承接行身份与路径保留");
+        let p3_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p3'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(p3_rows, 0, "移空的第三账号行清理");
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE project_id = 'p1' AND COALESCE(deleted_at,0)=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 3);
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// 同目录来源只有归档/软删内容：无正常会话可并入 → NothingToMerge，
+    /// 库零改动。
+    #[test]
+    fn cn_merge_nothing_to_merge_when_only_frozen_content() {
+        let db_path = temp_db_path("cn-merge-nothing");
+        let raw_key = "fe".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_cn_project(&conn, "p1", "111", Some("biz-a"), "冻结项目", Some("D:\\work\\demo"));
+            seed_cn_session(&conn, "s-arch", "p1", "归档会话", Some("voice_discussion"), false);
+            seed_cn_session(&conn, "s-del", "p1", "软删会话", None, true);
+            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的项目", Some("D:\\work\\demo"));
+            seed_cn_session(&conn, "s-t", "p-t", "目标会话", None, false);
+        }
+
+        let error =
+            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p1", &|_| {})
+                .unwrap_err();
+        assert!(matches!(error, MasterHandoverError::NothingToMerge));
+
+        let conn = open_fixture(&db_path, &raw_key);
+        let source_owner: String = conn
+            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_owner, "111", "无可并内容时库零改动");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// 预览：同目录各账号行 / 会话数 / 消息数（规模确认弹层数据源）；
+    /// 目标账号无同目录行时 target_row 为 None。
+    #[test]
+    fn cn_merge_preview_reports_rows_and_counts() {
+        let db_path = temp_db_path("cn-merge-preview");
+        let raw_key = "ff".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+            seed_cn_session(&conn, "s-arch", "p1", "归档会话", Some("voice_discussion"), false);
+            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的项目", Some("D:\\work\\demo"));
+            seed_cn_session(&conn, "s-t", "p-t", "目标会话", None, false);
+            // 无关目录，不应出现在预览里。
+            seed_cn_project(&conn, "p-other", "333", Some("biz-z"), "别的目录", Some("D:\\elsewhere"));
+            seed_cn_session(&conn, "s-o", "p-other", "别的会话", None, false);
+        }
+
+        let preview = preview_trae_cn_project_merge(&db_path, &raw_key, "222", "p1").unwrap();
+        assert_eq!(preview.biz_project_id, "biz-a");
+        assert_eq!(preview.absolute_path.as_deref(), Some("D:\\work\\demo"));
+        let target = preview.target_row.as_ref().unwrap();
+        assert_eq!(target.project_id, "p-t");
+        assert_eq!(target.user_id, "222");
+        assert_eq!(target.normal_sessions, 1);
+        assert_eq!(target.all_sessions, 1);
+        assert_eq!(target.messages, 2);
+        assert_eq!(preview.source_rows.len(), 1, "只含同目录来源行");
+        let source = &preview.source_rows[0];
+        assert_eq!(source.project_id, "p1");
+        assert_eq!(source.user_id, "111");
+        assert_eq!(source.normal_sessions, 2, "归档会话不计入待并入规模");
+        assert_eq!(source.all_sessions, 3);
+        assert_eq!(source.messages, 4);
+
+        // 目标账号名下无同目录行：整体转入形态（对 999 而言 p1 与 p-t
+        // 都是其他账号的行，全部是来源）。
+        let preview = preview_trae_cn_project_merge(&db_path, &raw_key, "999", "p1").unwrap();
+        assert!(preview.target_row.is_none());
+        assert_eq!(preview.source_rows.len(), 2);
+
+        // 无路径项目不可预览（与归并同门槛）。
+        let error = preview_trae_cn_project_merge(&db_path, &raw_key, "222", "p-gone").unwrap_err();
+        assert!(matches!(error, MasterHandoverError::ProjectNotFound));
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// 进度回调：mapping/executing/verifying 三阶段逐项上报（与交接原语
+    /// 同一 HandoverProgress 契约，前端进度事件直接转发）。
+    #[test]
+    fn cn_merge_reports_three_phase_progress() {
+        let db_path = temp_db_path("cn-merge-progress");
+        let raw_key = "ba".repeat(32);
+        create_trae_cn_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            seed_standard_source(&conn);
+        }
+
+        let events = std::sync::Mutex::new(Vec::new());
+        let outcome = merge_trae_cn_project_records_with_progress(
+            &db_path,
+            &raw_key,
+            "222",
+            "p1",
+            &|progress| events.lock().unwrap().push(progress),
+        )
+        .unwrap();
+        assert_eq!(outcome.switched_sessions.len(), 2);
+
+        let events = events.into_inner().unwrap();
+        let mapping: Vec<&HandoverProgress> =
+            events.iter().filter(|event| event.phase == "mapping").collect();
+        assert_eq!(mapping.len(), 2, "mapping 逐会话上报");
+        assert_eq!(mapping[0].total, 2);
+        assert_eq!(mapping[0].label, "演示项目", "label 用项目名");
+        let executing: Vec<&HandoverProgress> =
+            events.iter().filter(|event| event.phase == "executing").collect();
+        assert!(!executing.is_empty(), "executing 按身份组上报");
+        let verifying: Vec<&HandoverProgress> =
+            events.iter().filter(|event| event.phase == "verifying").collect();
+        assert_eq!(verifying.len(), 2, "verifying 逐会话上报");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
     }
 }

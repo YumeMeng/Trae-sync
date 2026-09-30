@@ -576,6 +576,39 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /trae_cn_account_not_found|trae_cn_registry_invalid/i,
     "Trae CN 账号信息不可读取，请在「账号」页确认登录状态后重试。",
   ],
+  // ===== P13-2 Trae CN 项目归并：稳定原因码映射（ADR-0033 选择性写） =====
+  [
+    /trae_cn_library_only/i,
+    "项目归并只对 Trae CN 数据根开放。",
+  ],
+  [
+    /trae_cn_merge_client_running/i,
+    "Trae CN 正在运行，请先关闭 Trae CN 再归并（归并前会自动备份）。",
+  ],
+  [
+    /trae_cn_merge_busy/i,
+    "Trae CN 正在写入数据，归并需等它完成；稍后重试即可。",
+  ],
+  [
+    /trae_cn_merge_nothing_to_do/i,
+    "这个目录下其他账号没有可并入的会话，无需操作。",
+  ],
+  [
+    /trae_cn_merge_not_mergeable|trae_cn_merge_project_not_found/i,
+    "该项目没有关联文件夹或记录已变化，不能参与归并；请刷新列表后重试。",
+  ],
+  [
+    /trae_cn_merge_no_current_account/i,
+    "当前账号信息不可用，请先在「账号」页登录 Trae CN 后重试。",
+  ],
+  [
+    /trae_cn_merge_integrity_failed/i,
+    "归并后数据校验未通过，已保留操作前备份；请用备份恢复并反馈。",
+  ],
+  [
+    /trae_cn_merge_backup_failed|trae_cn_merge_db_missing|trae_cn_merge_db_open_failed|trae_cn_merge_join_failed/i,
+    "归并未完成，数据保持操作前状态；请稍后重试。",
+  ],
 ];
 
 function errorText(error: unknown): string {

@@ -186,8 +186,14 @@ pub use master_handover::{
     handover_master_records, handover_master_records_from_merge_with_progress,
     handover_master_records_from_with_progress, handover_master_records_with_progress,
     list_master_backups, list_master_backups_in, master_backup_db_name, master_database_path,
-    master_db_activity_detected, HandoverProgress, HandoverSession, MasterBackupEntry,
-    MasterHandover, MasterHandoverError,
+    master_db_activity_detected, merge_trae_cn_project_records_with_progress,
+    preview_trae_cn_project_merge, HandoverProgress, HandoverSession, MasterBackupEntry,
+    MasterHandover, MasterHandoverError, TraeCnMergeRow, TraeCnProjectMergePreview,
+};
+#[cfg(feature = "sqlcipher")]
+pub use master_history::{
+    read_master_history, read_trae_cn_foreign_projects, stat_master_fingerprint,
+    MasterHistoryStatus, TraeCnForeignProjectEntry,
 };
 pub use operation_lease::{
     inspect_lock_status, OperationLease, OperationLeaseError, OperationLockStatus,

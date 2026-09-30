@@ -221,6 +221,36 @@
   color: var(--accent);
 }
 
+/* —— P13-2 其他账号的项目（Trae CN 归并入口）：分组标题 + 行内归并按钮 —— */
+.lib-foreign__head {
+  padding: 10px 8px 4px;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--text-3);
+}
+
+.lib-project--foreign {
+  cursor: default;
+}
+
+.lib-project__merge {
+  flex: none;
+  padding: 3px 9px;
+  border: none;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: filter 0.13s;
+}
+
+.lib-project__merge:hover {
+  filter: brightness(1.08);
+}
+
 /* 会话子级：缩进一级（标题 + 相对时间） */
 .lib-sessions {
   display: flex;

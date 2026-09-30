@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Archive,
   ArrowLeft,
@@ -28,6 +29,10 @@ import type {
   MasterProjectEntryDto,
   MasterSessionEntryDto,
   RelayLedgerEntryDto,
+  TraeCnForeignProjectDto,
+  TraeCnMergePreviewDto,
+  TraeCnMergeProgressEvent,
+  TraeCnMergeResultDto,
 } from "../types/history";
 import type { SessionMessageDto } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
@@ -74,6 +79,17 @@ interface LibrarySessionsPanelProps {
    * 与草稿机制整体隐藏（不是禁用）；读路径与归档内容浏览保留。
    */
   readOnly?: boolean;
+  /**
+   * P13-2（ADR-0033）：其他账号的可归并项目行（Trae CN 详情页注入，
+   * 归并入口数据源；其余库不传 → 不渲染入口）。行内「归并到当前账号」
+   * 是只读库唯一开放的写操作（归并可写、删除合并仍禁）。
+   */
+  foreignProjects?: readonly TraeCnForeignProjectDto[];
+  /**
+   * P13-2：归并成功后的宿主回调（重取其他账号项目清单，入口随归并消失）；
+   * 未传时跳过（宿主无清单可刷）。
+   */
+  onTraeCnMerged?: () => void;
 }
 
 /** 一段接力轨迹：某账号持有该会话的时间段与其间新增消息数。 */
@@ -115,6 +131,8 @@ export function LibrarySessionsPanel({
   embedded = false,
   library = { id: "master" },
   readOnly = false,
+  foreignProjects,
+  onTraeCnMerged,
 }: LibrarySessionsPanelProps) {
   // 库显示名（文案随库实例变化，ADR-0025；缺省主库）。
   const libName = library.displayName?.trim() || "主库";
@@ -157,6 +175,13 @@ export function LibrarySessionsPanel({
   const [deleteConfirm, setDeleteConfirm] = useState<readonly MasterSessionEntryDto[] | null>(null);
   // 合并确认弹层（两步：选保留目标 → 确认页）。
   const [mergeConfirm, setMergeConfirm] = useState<readonly MasterProjectEntryDto[] | null>(null);
+  // ===== P13-2 Trae CN 归并（只读库唯一开放写）：预览弹层 + 执行进度 =====
+  const [traeCnMerge, setTraeCnMerge] = useState<{
+    projectId: string;
+    preview: TraeCnMergePreviewDto;
+  } | null>(null);
+  const [traeCnMergeBusy, setTraeCnMergeBusy] = useState(false);
+  const [traeCnMergeStage, setTraeCnMergeStage] = useState("");
   // 轮询指纹基线（上一轮读取成功的三件套指纹；unchanged 预检依据）。
   const fingerprintRef = useRef<MasterHistoryDto["fingerprint"] | null>(null);
   // 指纹相同但主库切号时文件可能未变，身份也必须参与 unchanged 判定。
@@ -885,17 +910,78 @@ export function LibrarySessionsPanel({
     exitSelectMode();
   }, [exitSelectMode]);
 
+  // ===== P13-2 Trae CN 归并（只读库唯一开放写，ADR-0033）=====
+
+  /** 点击「归并到当前账号」：拉取同目录跨账号规模预览（单次确认前奏）。 */
+  const openTraeCnMergePreview = useCallback(
+    async (project: TraeCnForeignProjectDto) => {
+      try {
+        const preview = await invoke<TraeCnMergePreviewDto>(
+          "preview_trae_cn_project_merge",
+          { projectId: project.project_id, libraryId: library.id },
+        );
+        setTraeCnMerge({ projectId: project.project_id, preview });
+      } catch (reason: unknown) {
+        notify.error(safeUiErrorMessage(reason, "归并预览暂时不可用，请稍后重试。"));
+      }
+    },
+    [library.id],
+  );
+
+  /**
+   * 确认归并：单次确认后执行（备份先行 + 单事务在后端编排）；
+   * 进度经 trae-cn-merge-progress 事件驱动确认弹层按钮文案，回执走全局
+   * 通知并强制刷新两栏（归并直接改库文件）。
+   */
+  const confirmTraeCnMerge = useCallback(async () => {
+    if (!traeCnMerge || traeCnMergeBusy) return;
+    setTraeCnMergeBusy(true);
+    setTraeCnMergeStage("正在准备…");
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await listen<TraeCnMergeProgressEvent>(
+        "trae-cn-merge-progress",
+        (event) => {
+          setTraeCnMergeStage(traeCnMergeStageText(event.payload));
+        },
+      );
+      const receipt = await invoke<TraeCnMergeResultDto>("merge_trae_cn_project", {
+        projectId: traeCnMerge.projectId,
+        libraryId: library.id,
+      });
+      setTraeCnMerge(null);
+      notify.success(
+        `已把 ${receipt.switched_sessions} 个会话归并到当前账号（共 ${receipt.moved_messages} 条消息）` +
+          (receipt.removed_mirror_rows > 0
+            ? `，并清理 ${receipt.removed_mirror_rows} 个空项目。`
+            : "。"),
+      );
+      // 归并直接改库文件：强制重读让两栏立即反映新状态（失败静默，
+      // 指纹轮询会自然追上）。宿主侧其他账号项目清单同步重取（入口随归并消失）。
+      await load(true).catch(() => undefined);
+      onTraeCnMerged?.();
+    } catch (reason: unknown) {
+      setTraeCnMerge(null);
+      notify.error(safeUiErrorMessage(reason, "归并未完成，数据保持操作前状态；请稍后重试。"));
+    } finally {
+      unlisten?.();
+      setTraeCnMergeBusy(false);
+      setTraeCnMergeStage("");
+    }
+  }, [traeCnMerge, traeCnMergeBusy, library.id, load, onTraeCnMerged]);
+
   // Esc 关闭确认弹层 / 退出选择模式（Gmail 式操作习惯）。
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       if (deleteConfirm) setDeleteConfirm(null);
       else if (mergeConfirm) setMergeConfirm(null);
+      else if (traeCnMerge && !traeCnMergeBusy) setTraeCnMerge(null);
       else if (selectMode) exitSelectMode();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [deleteConfirm, mergeConfirm, selectMode, exitSelectMode]);
+  }, [deleteConfirm, mergeConfirm, traeCnMerge, traeCnMergeBusy, selectMode, exitSelectMode]);
 
   // ===== 渲染 =====
 
@@ -1057,6 +1143,39 @@ export function LibrarySessionsPanel({
       </div>
     );
   };
+
+  /** P13-2「其他账号的项目」分组（树末位；行内归并入口，只读库唯一写）。 */
+  const renderForeignGroup = (projects: readonly TraeCnForeignProjectDto[]) => (
+    <div className="lib-branch" key="__foreign__" data-testid="library-foreign-group">
+      <div className="lib-foreign__head">其他账号的项目</div>
+      {projects.map((project) => (
+        <div
+          className="lib-project lib-project--foreign"
+          key={project.project_id}
+          // 项目文件夹路径收进悬浮提示，不占主视野（界面表达纪律）。
+          title={project.absolute_path?.trim() || undefined}
+          data-testid={`library-foreign-project-${project.project_id}`}
+        >
+          <span className="lib-project__icon" aria-hidden="true">
+            <FolderClosed size={15} strokeWidth={1.8} />
+          </span>
+          <span className="lib-project__name">
+            {project.name?.trim() || "未关联文件夹"}
+          </span>
+          <span className="lib-project__count">{project.session_count}</span>
+          <button
+            className="lib-project__merge"
+            type="button"
+            onClick={() => void openTraeCnMergePreview(project)}
+            title={`把这些会话归并到当前账号（共 ${project.message_count} 条消息）`}
+            data-testid={`library-merge-entry-${project.project_id}`}
+          >
+            归并到当前账号
+          </button>
+        </div>
+      ))}
+    </div>
+  );
 
   const body = () => {
     if (loadError) {
@@ -1304,11 +1423,14 @@ export function LibrarySessionsPanel({
                     })}
                   </div>
                 ))
-              : // 正常视图：项目树（原地展开会话子级）。
+              : // 正常视图：项目树（原地展开会话子级）+ 其他账号的项目（P13-2）。
                 [
                   ...treeGroups.named.map((group) => renderBranch(group)),
                   ...(treeGroups.unlinked.length > 0
                     ? [renderUnlinkedBranch(treeGroups.unlinked)]
+                    : []),
+                  ...(foreignProjects && foreignProjects.length > 0
+                    ? [renderForeignGroup(foreignProjects)]
                     : []),
                 ]}
             {!archiveView && keyword && treeSessions.length === 0 && (
@@ -1529,6 +1651,21 @@ export function LibrarySessionsPanel({
           sessionCounts={mergeSessionCounts}
           onCancel={() => setMergeConfirm(null)}
           onConfirm={confirmMerge}
+        />
+      )}
+
+      {/* P13-2 Trae CN 归并确认弹层：规模预览 + 单次确认（执行中按钮显示进度阶段） */}
+      {traeCnMerge && (
+        <TraeCnMergeConfirmDialog
+          projectName={
+            foreignProjects?.find((project) => project.project_id === traeCnMerge.projectId)?.name?.trim() ||
+            "未关联文件夹"
+          }
+          preview={traeCnMerge.preview}
+          busy={traeCnMergeBusy}
+          busyLabel={traeCnMergeStage || "归并中…"}
+          onCancel={() => setTraeCnMerge(null)}
+          onConfirm={() => void confirmTraeCnMerge()}
         />
       )}
     </section>
@@ -1960,6 +2097,67 @@ function MergeConfirmDialog({
 }
 
 // ============================================================================
+// Trae CN 归并确认弹窗（P13-2，ADR-0033）：规模预览逐账号行 + 单次确认。
+// 界面表达纪律：主信息 = 账号名/数量/动作结果；user_id 收进悬浮提示。
+// ============================================================================
+
+function TraeCnMergeConfirmDialog({
+  projectName,
+  preview,
+  busy,
+  busyLabel,
+  onCancel,
+  onConfirm,
+}: {
+  /** 点击的来源项目显示名（弹层标题主信息）。 */
+  projectName: string;
+  preview: TraeCnMergePreviewDto;
+  /** 执行中：禁用两侧按钮，确认按钮显示进度阶段文案。 */
+  busy: boolean;
+  busyLabel: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <ConfirmDialog
+      title={`归并「${projectName}」到当前账号`}
+      confirmLabel="确认归并"
+      confirmIcon={<Merge size={15} aria-hidden="true" />}
+      busyLabel={busyLabel}
+      busy={busy}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+      testId="trae-cn-merge-confirm"
+    >
+      <p className="confirm-dialog__text">
+        将把其他账号在这个文件夹下的 {preview.total_sessions} 个会话（共 {preview.total_messages}{" "}
+        条消息）归并给 {preview.target_account_name}，归并前会自动备份。
+      </p>
+      <ul className="confirm-dialog__list">
+        {preview.sources.map((source) => (
+          <li
+            key={source.user_id}
+            title={source.user_id}
+            data-testid={`trae-cn-merge-source-${source.user_id}`}
+          >
+            {source.account_name ?? "未登记账号"}
+            <span>
+              {" "}
+              · {source.session_count} 个会话 · {source.message_count} 条消息
+            </span>
+          </li>
+        ))}
+        {preview.target_exists && (
+          <li data-testid="trae-cn-merge-target-note">
+            当前账号在这个文件夹已有 {preview.target_session_count} 个会话，将合并在一起。
+          </li>
+        )}
+      </ul>
+    </ConfirmDialog>
+  );
+}
+
+// ============================================================================
 // 工具：账号着色、消息归属、时间格式化
 // ============================================================================
 
@@ -2054,4 +2252,20 @@ function formatLegSpan(leg: RelayLeg): string {
   const from = leg.fromUnixSeconds === null ? "最早" : formatSessionTime(leg.fromUnixSeconds);
   const to = leg.toUnixSeconds === null ? "至今" : formatSessionTime(leg.toUnixSeconds);
   return `${from} → ${to}`;
+}
+
+/** P13-2 归并进度阶段 → 确认弹层按钮文案（backing_up/mapping/executing/verifying/done）。 */
+function traeCnMergeStageText(event: TraeCnMergeProgressEvent): string {
+  switch (event.stage) {
+    case "backing_up":
+      return "正在备份数据…";
+    case "mapping":
+      return `正在整理（${event.current}/${event.total}）…`;
+    case "executing":
+      return `正在归并：${event.label || "会话"}…`;
+    case "verifying":
+      return `正在校验（${event.current}/${event.total}）…`;
+    case "done":
+      return "完成";
+  }
 }

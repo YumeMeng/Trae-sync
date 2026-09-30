@@ -117,3 +117,66 @@ export interface RelayLedgerEntryDto {
   readonly message_count_at_switch: number;
   readonly switched_at_unix_seconds: number;
 }
+
+// ============================================================================
+// P13-2 Trae CN 项目归并（ADR-0033 选择性写）：只对 trae_cn 库开放。
+// ============================================================================
+
+/** list_trae_cn_foreign_projects 逐行（其他账号的可归并项目，入口数据源）。 */
+export interface TraeCnForeignProjectDto {
+  readonly project_id: string;
+  /** 项目展示名（哈希/空名已回退路径尾段，仍不可读为空串）。 */
+  readonly name: string;
+  /** 项目文件夹绝对路径（悬浮提示展示）；缺失为 null。 */
+  readonly absolute_path: string | null;
+  /** 该行挂有的正常会话数（归并将并入的规模）。 */
+  readonly session_count: number;
+  readonly message_count: number;
+}
+
+/** preview_trae_cn_project_merge 逐账号规模行（规模确认弹层）。 */
+export interface TraeCnMergeSourceDto {
+  /** TRAE user_id（悬浮提示用，不作主信息）。 */
+  readonly user_id: string;
+  /** 账号显示名（注册表反查）；未登记为 null（前端占位）。 */
+  readonly account_name: string | null;
+  readonly session_count: number;
+  readonly message_count: number;
+}
+
+/** preview_trae_cn_project_merge 返回（归并规模预览，只读）。 */
+export interface TraeCnMergePreviewDto {
+  /** 项目文件夹绝对路径（弹层悬浮提示，主视野用尾段）。 */
+  readonly absolute_path: string | null;
+  /** 归并目标账号显示名（当前指针账号）。 */
+  readonly target_account_name: string;
+  /** 当前账号名下是否已有同目录行（false = 整体转入形态）。 */
+  readonly target_exists: boolean;
+  /** 目标行既有正常会话数（target_exists 时展示）。 */
+  readonly target_session_count: number;
+  readonly sources: readonly TraeCnMergeSourceDto[];
+  /** 将并入的会话总数 / 消息总数。 */
+  readonly total_sessions: number;
+  readonly total_messages: number;
+}
+
+/** merge_trae_cn_project 返回（归并回执）。 */
+export interface TraeCnMergeResultDto {
+  readonly transferred_projects: number;
+  readonly removed_mirror_rows: number;
+  readonly switched_sessions: number;
+  readonly moved_messages: number;
+  /** 归并前自动创建的备份路径（人工恢复定位）。 */
+  readonly backup_path: string;
+  /** 接力台账写入结果（false 只影响轨迹展示）。 */
+  readonly relay_ledger_written: boolean;
+}
+
+/** 归并进度事件负载（`trae-cn-merge-progress`）。 */
+export interface TraeCnMergeProgressEvent {
+  /** backing_up → mapping → executing → verifying → done。 */
+  readonly stage: "backing_up" | "mapping" | "executing" | "verifying" | "done";
+  readonly current: number;
+  readonly total: number;
+  readonly label: string;
+}

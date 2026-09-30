@@ -1625,6 +1625,10 @@ pub fn run() {
             environment::login_environment,
             // P11-5：环境实例关闭（主库/副环境通用，界面「关闭」按钮）。
             environment::close_environment_instance,
+            // P13-2：Trae CN 项目归并（ADR-0033 选择性写：仅 trae_cn 库放行）。
+            library_archive::list_trae_cn_foreign_projects,
+            library_archive::preview_trae_cn_project_merge,
+            library_archive::merge_trae_cn_project,
             // P5-1：主库切号五步事务（关实例→备份→凭据互换→交接→重启）。
             // P12-R3：随凭据域迁 credential_handover。
             credential_handover::switch_master_account,

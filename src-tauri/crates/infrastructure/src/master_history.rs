@@ -105,6 +105,106 @@ fn path_last_segment(path: &str) -> Option<&str> {
     (!segment.is_empty()).then_some(segment)
 }
 
+/// P13-2 其他账号的可归并项目行（trae_cn 详情页「归并到当前账号」入口
+/// 数据源）：有路径、有目录身份（biz）、挂有正常会话的跨账号行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraeCnForeignProjectEntry {
+    pub project_id: String,
+    /// 项目展示名（与主列表同口径：哈希/空名回退路径尾段）。
+    pub name: String,
+    /// 项目文件夹绝对路径（悬浮提示与归并预览定位用）。
+    pub absolute_path: Option<String>,
+    /// 该行挂有的正常会话数（归并将并入的规模）。
+    pub session_count: u32,
+    /// 正常会话的消息总数（规模预览用）。
+    pub message_count: u32,
+}
+
+/// 读取其他账号名下的可归并项目行（trae_cn 库专用读，`current_user_id`
+/// = 当前指针账号）。收录门槛与归并变体一致：有路径、biz 非空、未软删、
+/// 至少 1 个正常会话（0 会话行是空镜像，只有冻结内容的行无可并规模）。
+/// db 缺失或读取失败返回空列表——详情页归并入口自然消失，不阻塞只读浏览。
+pub fn read_trae_cn_foreign_projects(
+    master_data_dir: &Path,
+    raw_key: &str,
+    current_user_id: &str,
+) -> Vec<TraeCnForeignProjectEntry> {
+    let db_path = master_database_path(master_data_dir);
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let Ok(conn) = open_with_key_readonly(&db_path, raw_key) else {
+        return Vec::new();
+    };
+    // 列防御（与 read_master_history 同口径）；缺 biz 或路径列时无对象。
+    for (table, column) in [
+        ("project", "biz_project_id"),
+        ("project", "absolute_path"),
+    ] {
+        if !column_exists(&conn, table, column) {
+            return Vec::new();
+        }
+    }
+    let has_project_name = column_exists(&conn, "project", "name");
+    let has_project_deleted = column_exists(&conn, "project", "deleted_at");
+    let has_session_deleted = column_exists(&conn, "chat_session", "deleted_at");
+    let has_hidden_status = column_exists(&conn, "chat_session", "hidden_status");
+    let has_message_deleted = column_exists(&conn, "chat_message", "deleted_at");
+    let name_expr = if has_project_name { "COALESCE(p.name, '')" } else { "''" };
+    let project_deleted_expr = if has_project_deleted { "COALESCE(p.deleted_at, 0) = 0" } else { "1 = 1" };
+    let session_visible_expr = if has_session_deleted {
+        "COALESCE(s.deleted_at, 0) = 0"
+    } else {
+        "1 = 1"
+    };
+    let hidden_expr = if has_hidden_status {
+        " AND COALESCE(cs.hidden_status, '') != 'voice_discussion'"
+    } else {
+        ""
+    };
+    let message_visible_expr = if has_message_deleted {
+        " AND COALESCE(m.deleted_at, 0) = 0"
+    } else {
+        ""
+    };
+    let mut statement = match conn.prepare(&format!(
+        "SELECT p.project_id, {name_expr}, p.absolute_path,
+                (SELECT COUNT(*) FROM chat_session cs
+                 WHERE cs.project_id = p.project_id{hidden_expr}
+                   AND {session_visible_expr}),
+                (SELECT COUNT(*) FROM chat_message m
+                   JOIN chat_session cs ON cs.session_id = m.session_id
+                 WHERE cs.project_id = p.project_id{hidden_expr}{message_visible_expr}
+                   AND {session_visible_expr})
+         FROM project p
+         WHERE p.user_id IS NOT NULL AND p.user_id != ?1
+           AND {project_deleted_expr}
+           AND COALESCE(p.absolute_path, '') != ''
+           AND COALESCE(p.biz_project_id, '') != ''
+           AND EXISTS (SELECT 1 FROM chat_session s
+                       WHERE s.project_id = p.project_id{hidden_expr}
+                         AND {session_visible_expr})
+         ORDER BY p.rowid"
+    )) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let query_result = statement.query_map([current_user_id], |row| {
+        let absolute_path: Option<String> = row.get(2)?;
+        Ok(TraeCnForeignProjectEntry {
+            project_id: row.get(0)?,
+            name: project_display_name(&row.get::<_, String>(1)?, absolute_path.as_deref()),
+            absolute_path,
+            session_count: row.get::<_, i64>(3)?.max(0) as u32,
+            message_count: row.get::<_, i64>(4)?.max(0) as u32,
+        })
+    });
+    match query_result {
+        Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// 项目展示名：name 可读优先；哈希/空名回退 absolute_path 尾段；
 /// 两者皆不可读为空串（前端统一占位「未关联文件夹」并按名合并展示）。
 fn project_display_name(name: &str, absolute_path: Option<&str>) -> String {

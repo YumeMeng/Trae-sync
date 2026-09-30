@@ -39,6 +39,9 @@ traesync-commands = { path = "crates/commands" }
 [dev-dependencies]
 tempfile = "3"
 trybuild = "1"
+# P13-2 命令层测试需要构造真实 SQLCipher fixture 库（归并编排回执/预检）；
+# 版本与 feature 与 infrastructure 一致，cargo 合并后共享同一份编译产物。
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [workspace]
 members = ["crates/*"]

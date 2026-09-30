@@ -392,6 +392,18 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
   function setupTraeCnDetail() {
     mockInvoke.mockImplementation(async (command: string, args?: unknown) => {
       const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
+      if (command === "list_trae_cn_foreign_projects") {
+        if (libraryId !== "trae_cn") throw new Error("missing libraryId");
+        return [
+          {
+            project_id: "p-f1",
+            name: "其他账号目录",
+            absolute_path: "D:\\work\\shared",
+            session_count: 2,
+            message_count: 9,
+          },
+        ];
+      }
       if (command === "get_master_library_stats") {
         if (libraryId !== "trae_cn") throw new Error("missing libraryId");
         return {
@@ -480,5 +492,29 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     fireEvent.click(await screen.findByTestId("master-tab-plugins"));
     expect(screen.getByTestId("master-plugins-readonly-note")).toHaveTextContent("Trae CN 为只读浏览");
     expect(screen.queryByTestId("plugin-workbench")).not.toBeInTheDocument();
+  });
+
+  it("P13-2：trae_cn 归并入口——其他账号项目组随读路径下发，主库不发归并清单读取", async () => {
+    setupTraeCnDetail();
+    render(<MasterLibraryDetail active onNavigate={() => undefined} library={{ id: "trae_cn" }} />);
+
+    // 其他账号的可归并项目树末位成组（归并入口数据源按库解析）。
+    const group = await screen.findByTestId("library-foreign-group");
+    expect(group).toHaveTextContent("其他账号的项目");
+    expect(screen.getByTestId("library-foreign-project-p-f1")).toHaveTextContent("其他账号目录");
+    expect(screen.getByTestId("library-merge-entry-p-f1")).toHaveTextContent("归并到当前账号");
+    expect(mockInvoke).toHaveBeenCalledWith("list_trae_cn_foreign_projects", {
+      libraryId: "trae_cn",
+    });
+
+    // 主库详情不发归并清单读取（归并只对 trae_cn 开放）；清调用历史后重挂。
+    setupDetail();
+    mockInvoke.mockClear();
+    render(<MasterLibraryDetail active onNavigate={() => undefined} />);
+    await screen.findByTestId("library-project-p1");
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "list_trae_cn_foreign_projects",
+      expect.anything(),
+    );
   });
 });

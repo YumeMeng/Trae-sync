@@ -788,6 +788,11 @@ fn login_environment_inner(
                             MasterHandoverError::IntegrityFailed => {
                                 "environment_login_integrity_failed"
                             }
+                            // P13-2 新增变体只在 CN 归并路径产生，环境登录
+                            // 不会遇到；归入统一失败码保持穷尽匹配。
+                            MasterHandoverError::ProjectNotFound
+                            | MasterHandoverError::ProjectNotMergeable
+                            | MasterHandoverError::NothingToMerge => "environment_login_failed",
                             MasterHandoverError::Io => "environment_login_failed",
                         };
                         return Err(rollback(code));
