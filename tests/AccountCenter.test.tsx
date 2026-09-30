@@ -10,6 +10,7 @@ import type {
   CheckinResultDto,
 } from "../src/types/account_switch";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
+import type { CommandName } from "../src/types/commandNames";
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
 vi.mock("@tauri-apps/api/core", async () => {
@@ -1430,7 +1431,7 @@ describe("AccountCenter", () => {
       new Promise<never>((_resolve, reject) => {
         rejectLogin = reject;
       }));
-    mockRoute("cancel_checkin_login", () => {
+    mockRoute("cancel_checkin_login" as CommandName, () => {
       rejectLogin?.("login_cancelled");
       return null;
     });
