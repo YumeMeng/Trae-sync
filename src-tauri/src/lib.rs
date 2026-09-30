@@ -802,31 +802,10 @@ fn resolve_actual_master_account(
     )
 }
 
-/// 需要执行主库归属操作时的强制账号解析；未确认实测账号即拒绝操作。
-/// P11-5⑤：库泛化入口（主库/副环境同义，env_id 由 LibraryContext 提供）。
-/// P12-R1b：转发下沉后的实测分支。
-fn require_actual_env_account(
-    material_root: &Path,
-    storage_root: &Path,
-    instance_dir: &Path,
-    env_id: &str,
-) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
-    library_account::resolve_measured_env_account(material_root, storage_root, instance_dir, env_id)?
-        .ok_or_else(|| "master_current_account_unavailable".to_string())
-}
-
-fn require_actual_master_account(
-    material_root: &Path,
-    storage_root: &Path,
-    master_instance_dir: &Path,
-) -> Result<traesync_infrastructure::account_registry::AccountRecord, String> {
-    require_actual_env_account(
-        material_root,
-        storage_root,
-        master_instance_dir,
-        MASTER_ENV_ID,
-    )
-}
+// P13-5：require_actual_env_account / require_actual_master_account 已删除——
+// 主库切号收编进五步事务后组合根无调用点（grep 全仓确认，无测试引用）；
+// 实测解析统一走 resolve_actual_master_account（薄转发）与
+// library_account::resolve_measured_env_account。
 
 /// `read_work_cn_state` Tauri command：返回 Work CN 只读工作台状态。
 /// 前端通过 `invoke("read_work_cn_state", { fixtureRoot, dbRelativePath })` 调用。

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
-use crate::master_handover::{list_master_backups_in, MasterBackupEntry};
+use crate::master_handover::list_master_backups_in;
 
 const STORE_FILE: &str = "backup-retention.json";
 const MAX_STORE_BYTES: u64 = 64 * 1024;

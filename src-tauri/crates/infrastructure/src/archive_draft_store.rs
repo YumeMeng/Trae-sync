@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +159,8 @@ impl ArchiveDraftStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Path 仅测试辅助签名使用（非测试构建的 lib 目标不需要）。
+    use std::path::Path;
 
     fn store(root: &Path) -> ArchiveDraftStore {
         ArchiveDraftStore::new(root)

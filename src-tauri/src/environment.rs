@@ -1053,10 +1053,6 @@ mod environment_commands_tests {
             }
         }
 
-        fn storage_root(&self) -> PathBuf {
-            self.root.path().to_path_buf()
-        }
-
         fn create_env(&self, name: &str) -> traesync_infrastructure::environment_registry::EnvironmentRecord {
             EnvironmentRegistry::new(self.root.path()).create(name).unwrap()
         }
