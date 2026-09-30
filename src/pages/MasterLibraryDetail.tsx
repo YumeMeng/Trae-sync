@@ -209,8 +209,9 @@ export function MasterLibraryDetail({ active, onNavigate, library }: MasterLibra
       <div className="master-detail__tabpanels">
         <div className="master-detail__tabpanel" hidden={tab !== "sessions"}>
           {/* ADR-0025：详情页注入库实例引用（副库同一组件零改动复用）。
-              P11-6：只读库传 readOnly——写操作控件隐藏（不是禁用）。
-              P13-2：只读库下发其他账号的可归并项目（归并入口数据源）。 */}
+              P11-6：只读库传 readOnly——面板内部按库写能力判定（P13-3）：
+              CN 开放归档/恢复，删除/合并项目控件仍隐藏。 P13-2：只读库下发
+              其他账号的可归并项目（归并入口数据源）。 */}
           <LibrarySessionsPanel
             active={active && tab === "sessions"}
             embedded

@@ -1,5 +1,5 @@
 // ============================================================================
-// Trae CN 项目归并 e2e（P13-2，ADR-0033 选择性写：只读库唯一开放写）
+// Trae CN 项目归并 e2e（P13-2，ADR-0033 选择性写：CN 库开放写之一）
 // ============================================================================
 //
 // 覆盖：
@@ -8,6 +8,8 @@
 // - 确认流：入口 → 规模预览弹层（逐账号规模，主信息 = 账号名）→
 //   单次确认 → 归并命令 → 全局通知回执 → 入口消失（清单刷新）
 // - 守卫镜像：mock bridge 对非 trae_cn libraryId 拒绝（与后端同构）
+// - P13-3 断言随迁：CN 库归档开放后批量选择入口出现（archive-only），
+//   原 P11-6「选择入口隐藏」断言反转（归档形态详见 trae-cn-archive.spec.ts）
 //
 // 全程走 mock 命令边界，绝不启动 Tauri 或访问真实 TRAE 数据。
 // 宿主 = Trae CN 数据根详情页（总览页「浏览 Trae CN 数据」入口）。
@@ -37,7 +39,7 @@ async function setup(page: Page, scenario: MockScenario = {}) {
 }
 
 test.describe("Trae CN 项目归并（P13-2）", () => {
-  test("无其他账号项目时归并入口不渲染（只读浏览形态不变）", async ({ page }) => {
+  test("无其他账号项目时归并入口不渲染（读路径不变；选择入口按 P13-3 开放）", async ({ page }) => {
     await setup(page);
     const panel = detail(page);
 
@@ -45,8 +47,10 @@ test.describe("Trae CN 项目归并（P13-2）", () => {
     await expect(panel.getByTestId("library-project-p-t1")).toContainText("Trae 项目");
     // 默认场景无其他账号项目 → 分组与入口不存在。
     await expect(panel.getByTestId("library-foreign-group")).toHaveCount(0);
-    // 只读形态下批量选择入口依旧隐藏（P11-6 断言随迁确认）。
-    await expect(panel.getByTestId("library-select-mode")).toHaveCount(0);
+    // P13-3：CN 库归档开放（archive-only），批量选择入口出现；
+    // 删除/合并入口仍无（不渲染入口的守卫形态不变）。
+    await expect(panel.getByTestId("library-select-mode")).toBeVisible();
+    await expect(panel.getByTestId("library-archive-entry")).toHaveCount(0);
   });
 
   test("入口 → 规模预览弹层 → 单次确认 → 回执通知 → 入口消失", async ({ page }) => {

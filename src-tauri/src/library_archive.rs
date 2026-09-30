@@ -967,12 +967,15 @@ fn relay_ledger_root(storage_root: &Path, env_id: &str) -> PathBuf {
 
 // ===== P13-2 Trae CN 项目归并（ADR-0033 选择性写：归并命令族）=====
 //
-// 写边界守卫矩阵（扩展而非破坏既有 ensure_writable 体系）：
+// 写边界守卫矩阵（扩展而非破坏既有 ensure_writable 体系；P13-3 起归档
+// 类写经 ensure_archive_writable 对 trae_cn 放行）：
 // - `merge_trae_cn_project` / `preview_trae_cn_project_merge` /
 //   `list_trae_cn_foreign_projects`：经 `ensure_project_merge_writable`
 //   仅对 trae_cn 库放行，其余库拒绝（`trae_cn_library_only`）；
-// - trae_cn 库的其余写命令（收编/清理/归档/恢复/删除/合并分组）仍被
-//   `ensure_writable`（read_only）拒绝（`library_read_only`）——归并可写
+// - `apply_master_archive_changes`（P13-3）：经 `ensure_archive_writable`
+//   对 trae_cn 库放行归档/恢复（hidden_status 通道）；
+// - trae_cn 库的其余写命令（收编/清理/删除/合并分组）仍被
+//   `ensure_writable`（read_only）拒绝（`library_read_only`）——选择性写
 //   不翻转只读边界，删除/合并项目在 CN 库依旧无入口。
 // 备份先行（家族铁律）：备份在命令编排层执行（与收编同款），写入 CN 库
 // 作用域活动备份目录（backup_dir 覆盖时隔离），保证备份链展示/恢复同源。
@@ -2258,7 +2261,7 @@ pub(crate) async fn restore_master_sessions(
 
 /// 归档草稿一次性提交回执；`relaunch_outcome=failed` 表示主库已更新，
 /// 但实例待用户重试启动，不会再次重复写数据库。
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct MasterArchiveApplyResultDto {
     archived_sessions: u32,
     restored_sessions: u32,
@@ -2270,6 +2273,9 @@ pub(crate) struct MasterArchiveApplyResultDto {
 /// 前端可以连续调整归档/恢复集合，只有点击“应用”才进入这里；提交失败时
 /// 旧草稿由前端保留。数据库事务已提交但重启失败时返回成功回执与 failed
 /// 状态，避免用户再次点击造成重复改写。
+/// P13-3（ADR-0033）：归档/恢复经 `ensure_archive_writable` 对 trae_cn 库
+/// 放行（CN 分支无实例托管编排）；删除/合并项目等其余写命令仍走
+/// `ensure_writable` 被拒（`library_read_only`）。
 #[tauri::command]
 pub(crate) async fn apply_master_archive_changes(
     archive_session_ids: Vec<String>,
@@ -2287,8 +2293,36 @@ pub(crate) async fn apply_master_archive_changes(
     let storage_root_for_prune = state.storage_root.clone();
     run_blocking("master_archive_join_failed", move || {
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
-        ctx.ensure_writable()?;
+        ctx.ensure_archive_writable()?;
         let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
+        // P13-3：CN 库分支——Trae CN 实例不经工具托管（P13-2 同款纪律），
+        // 无 close/relaunch 编排；客户端运行中拒绝（可执行文件口径），
+        // 由用户关闭后重试。
+        if ctx.env_id == TRAE_CN_LIBRARY_ID {
+            let is_client_running = || {
+                list_trae_processes()
+                    .map(|processes| {
+                        processes.iter().any(|process| {
+                            process
+                                .exe_path
+                                .as_deref()
+                                .is_some_and(|exe| {
+                                    TraeProduct::TraeCn.matches_executable(Path::new(exe))
+                                })
+                        })
+                    })
+                    .unwrap_or(false)
+            };
+            return run_trae_cn_archive_apply(
+                Path::new(&storage_root_for_prune),
+                &raw_key,
+                &ctx,
+                &current_account.account_id,
+                &archive_session_ids,
+                &restore_session_ids,
+                &is_client_running,
+            );
+        }
         let db_path = master_database_path(&ctx.dir);
         // 重启窗口标题：主库 = 当前账号名（P5-8a 口径）；副环境 = 环境名。
         let window_title = if ctx.is_master() {
@@ -2352,6 +2386,63 @@ pub(crate) async fn apply_master_archive_changes(
         })
     })
     .await
+}
+
+/// P13-3 CN 归档/恢复编排主体（阻塞上下文；客户端运行检测可注入供单测）。
+///
+/// 与主库/副环境路径的差异：CN 实例不经工具托管——无 close/relaunch 编排，
+/// 客户端运行中拒绝（fail-closed，P13-2 归并同款），由用户关闭后重试。
+/// 备份先行（家族铁律）：备份源 = 活动库路径（ctx.dir 派生，不写死主库），
+/// 写入 CN 库作用域活动备份目录（backup_dir 覆盖时经 env_id 隔离）。
+/// DB 层错误沿用既有 `master_archive_*` 族（同一事务原语与词表共享）；
+/// CN 生命周期拒绝使用 `trae_cn_archive_*` 专属码。
+fn run_trae_cn_archive_apply(
+    storage_root: &Path,
+    raw_key: &str,
+    ctx: &LibraryContext,
+    account_id: &str,
+    archive_session_ids: &[String],
+    restore_session_ids: &[String],
+    is_client_running: &dyn Fn() -> bool,
+) -> Result<MasterArchiveApplyResultDto, String> {
+    // 双重守卫：命令层已校验，此处保持 inner 可独立调用（fail-closed）。
+    ctx.ensure_archive_writable()?;
+    let db_path = master_database_path(&ctx.dir);
+    if !db_path.is_file() {
+        return Err("master_archive_no_data".to_string());
+    }
+    // Trae CN 客户端运行中拒绝：归档写入需要静止一致的库做备份与事务。
+    if is_client_running() {
+        return Err("trae_cn_archive_client_running".to_string());
+    }
+    // 生成中拒绝（WAL 活动 = 官方客户端正在写库）。
+    if master_db_activity_detected(&db_path, std::time::Duration::from_millis(800)) {
+        return Err("trae_cn_archive_busy".to_string());
+    }
+    // 备份先行（ADR-0018 家族铁律；写入 CN 库作用域活动备份目录）。
+    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
+    if let Err(error) = backup_master_trio_to(&db_path, Some(&backup_dir)) {
+        return Err(match error {
+            MasterHandoverError::DbUnavailable => "master_archive_no_data".to_string(),
+            _ => "master_archive_backup_failed".to_string(),
+        });
+    }
+    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
+    let outcome = apply_master_archive_changes_inner(
+        &ctx.dir,
+        raw_key,
+        archive_session_ids,
+        restore_session_ids,
+        account_id,
+    )
+    .map_err(map_master_archive_error)?;
+    // CN 无重启编排：实例启动交还用户。回执恒为 launched（前端仅在
+    // failed 时显示恢复入口，CN 路径不会出现该分支）。
+    Ok(MasterArchiveApplyResultDto {
+        archived_sessions: outcome.archived_sessions as u32,
+        restored_sessions: outcome.restored_sessions as u32,
+        relaunch_outcome: "launched".to_string(),
+    })
 }
 
 /// P5-8a 真实删除回执（规模供 UI 二次确认与结果展示）。
@@ -3450,5 +3541,202 @@ mod trae_cn_merge_tests {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(error, "trae_cn_library_only");
+    }
+}
+
+// ============================================================================
+// P13-3 Trae CN 归档/恢复命令层单测（ADR-0033 决策 1 第二类写）：
+// hidden_status 写入属首例——CN fixture 覆盖归档/恢复往返、备份先行证据、
+// 客户端运行拒绝与「归档放行 / 删除合并仍拒」三态边界。库读写原语本体由
+// infrastructure 层（master_archive::tests）覆盖，此处只测组合根编排接缝。
+// ============================================================================
+
+#[cfg(test)]
+mod trae_cn_archive_tests {
+    use super::*;
+    use traesync_infrastructure::ARCHIVE_HIDDEN_STATUS;
+
+    /// 测试夹具：CN 数据根库——账号 111 的项目 p1 挂两个正常会话；
+    /// 账号 222 的项目 p2 挂一条归档会话（恢复用例的跨账号行）。
+    struct CnArchiveFixture {
+        root: tempfile::TempDir,
+        cn_dir: PathBuf,
+        raw_key: String,
+    }
+
+    impl CnArchiveFixture {
+        fn new() -> Self {
+            use rusqlite::{Connection, OpenFlags};
+
+            let root = tempfile::tempdir().unwrap();
+            let cn_dir = root.path().join("Trae CN");
+            let db_dir = cn_dir.join("ModularData").join("ai-agent");
+            std::fs::create_dir_all(&db_dir).unwrap();
+            let raw_key = "88".repeat(32);
+            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+            let conn = Connection::open_with_flags(db_dir.join("database.db"), flags).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", raw_key))
+                .unwrap();
+            // CN 形态最小 schema（hidden_status 通道：project 归属 +
+            // chat_session.hidden_status；与 infrastructure 层往返测试同构）。
+            conn.execute_batch(
+                "CREATE TABLE project (
+                    project_id TEXT PRIMARY KEY, user_id TEXT,
+                    biz_project_id TEXT, name TEXT, absolute_path TEXT, deleted_at INTEGER);
+                 CREATE TABLE chat_session (
+                    session_id TEXT PRIMARY KEY, project_id TEXT,
+                    session_title TEXT, updated_at INTEGER, deleted_at INTEGER, hidden_status TEXT);
+                 INSERT INTO project VALUES ('p1', '111', 'biz-a', '目录项目', 'D:\\work\\demo', NULL);
+                 INSERT INTO project VALUES ('p2', '222', 'biz-b', '归档项目', 'D:\\work\\arch', NULL);
+                 INSERT INTO chat_session VALUES ('s1', 'p1', '会话一', 1, 0, NULL);
+                 INSERT INTO chat_session VALUES ('s2', 'p1', '会话二', 2, 0, NULL);
+                 INSERT INTO chat_session VALUES ('s3', 'p2', '已归档会话', 3, 0, 'voice_discussion');",
+            )
+            .unwrap();
+            Self {
+                root,
+                cn_dir,
+                raw_key,
+            }
+        }
+
+        fn ctx(&self) -> LibraryContext {
+            LibraryContext {
+                env_id: TRAE_CN_LIBRARY_ID.to_string(),
+                env_name: "Trae CN".to_string(),
+                dir: self.cn_dir.clone(),
+                read_only: true,
+            }
+        }
+
+        fn open_db(&self) -> rusqlite::Connection {
+            use rusqlite::{Connection, OpenFlags};
+
+            let conn = Connection::open_with_flags(
+                self.cn_dir
+                    .join("ModularData")
+                    .join("ai-agent")
+                    .join("database.db"),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", self.raw_key))
+                .unwrap();
+            conn
+        }
+
+        /// CN 库作用域活动目录内的备份链份数（备份先行证据）。
+        fn backup_count(&self) -> usize {
+            let db_dir = self.cn_dir.join("ModularData").join("ai-agent");
+            std::fs::read_dir(&db_dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .into_string()
+                        .unwrap()
+                        .starts_with("database.db.switch-bak-")
+                })
+                .count()
+        }
+    }
+
+    /// CN fixture 归档/恢复往返（hidden_status 首例写）：归档当前指针账号
+    /// 名下会话 → 备份先行证据 → 恢复跨账号归档行并切归属。
+    #[test]
+    fn cn_archive_apply_roundtrip_writes_hidden_status_with_backup() {
+        let fixture = CnArchiveFixture::new();
+        // 归档：s1（111 名下，NULL → voice_discussion）。
+        let receipt = run_trae_cn_archive_apply(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &fixture.ctx(),
+            "111",
+            &["s1".to_string()],
+            &[],
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(receipt.archived_sessions, 1);
+        assert_eq!(receipt.restored_sessions, 0);
+        assert_eq!(receipt.relaunch_outcome, "launched");
+        // 备份先行：CN 库作用域活动目录（db 同目录）落了 .switch-bak-* 链。
+        assert_eq!(fixture.backup_count(), 1, "归档应用前应生成一份三件套备份");
+        {
+            let conn = fixture.open_db();
+            let hidden: String = conn
+                .query_row(
+                    "SELECT hidden_status FROM chat_session WHERE session_id = 's1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hidden, ARCHIVE_HIDDEN_STATUS);
+        }
+
+        // 恢复：跨账号归档行 s3 还原 NULL，项目归属随恢复切到当前账号
+        //（apply 原语既有语义：恢复 = 归位当前账号的正常会话范围）。
+        // 备份链命名按秒级时间戳且 create_new 永不覆盖：两次应用须跨秒，
+        // 否则同戳备份冲突（与生产同款约束，等待 1.1s 错开）。
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let receipt = run_trae_cn_archive_apply(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &fixture.ctx(),
+            "111",
+            &[],
+            &["s3".to_string()],
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(receipt.restored_sessions, 1);
+        {
+            let conn = fixture.open_db();
+            let hidden: Option<String> = conn
+                .query_row(
+                    "SELECT hidden_status FROM chat_session WHERE session_id = 's3'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hidden, None);
+            let owner: String = conn
+                .query_row(
+                    "SELECT user_id FROM project WHERE project_id = 'p2'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(owner, "111", "恢复的会话项目归属切到当前账号");
+        }
+    }
+
+    /// 守卫矩阵：Trae CN 客户端运行中拒绝（fail-closed，不产生备份）。
+    #[test]
+    fn cn_archive_apply_rejects_while_client_running() {
+        let fixture = CnArchiveFixture::new();
+        let error = run_trae_cn_archive_apply(
+            fixture.root.path(),
+            &fixture.raw_key,
+            &fixture.ctx(),
+            "111",
+            &["s1".to_string()],
+            &[],
+            &|| true,
+        )
+        .unwrap_err();
+        assert_eq!(error, "trae_cn_archive_client_running");
+        assert_eq!(fixture.backup_count(), 0, "拒绝路径不产生备份");
+    }
+
+    /// 三态边界：CN 库归档/恢复放行（P13-3），删除/合并项目命令走的原写
+    /// 边界守卫仍拒绝（library_read_only）——归档开放不翻转只读边界。
+    #[test]
+    fn cn_archive_context_allows_archive_but_blocks_delete_and_merge() {
+        let fixture = CnArchiveFixture::new();
+        let ctx = fixture.ctx();
+        assert!(ctx.ensure_archive_writable().is_ok());
+        assert_eq!(ctx.ensure_writable().unwrap_err(), "library_read_only");
     }
 }

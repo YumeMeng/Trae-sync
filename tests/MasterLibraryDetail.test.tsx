@@ -383,9 +383,11 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
   });
 
   // ==========================================================================
-  // P11-6（ADR-0032 决策 5）：Trae CN 只读数据根详情。
-  // 后端契约：trae_cn 库读放行（历史/消息/统计），写命令报 library_read_only，
-  // 体检 not_applicable——前端以只读浏览形态呈现，写控件隐藏（不是禁用）。
+  // P11-6（ADR-0032 决策 5）+ P13-3（ADR-0033）：Trae CN 数据根详情。
+  // 后端契约：trae_cn 库读放行（历史/消息/统计），选择性写开放（归档/恢复
+  // 经 ensure_archive_writable；删除/合并项目仍 library_read_only），体检
+  // not_applicable——前端按 archive-only 能力呈现：归档控件开放，删除/合并
+  // 控件隐藏。
   // ==========================================================================
 
   /** trae_cn 只读库的完整数据 mock（读命令带 libraryId=trae_cn；无环境档案查询）。 */
@@ -453,17 +455,17 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     });
   }
 
-  it("P11-6：trae_cn 只读详情——标题取注册表口径，写控件隐藏，历史列表挂载", async () => {
+  it("P11-6→P13-3：trae_cn 详情——标题取注册表口径，归档控件按能力开放，历史列表挂载", async () => {
     setupTraeCnDetail();
     render(<MasterLibraryDetail active onNavigate={() => undefined} library={{ id: "trae_cn" }} />);
 
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Trae CN 数据根");
-    // 只读边界：批量操作入口（选择按钮）与悬浮快捷归档隐藏。
-    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("library-quick-archive-s-t1")).not.toBeInTheDocument();
     // 历史列表正常挂载（读路径放行）。
     fireEvent.click(await screen.findByTestId("library-project-p-t1"));
     await screen.findByTestId("library-session-s-t1");
+    // P13-3：CN 库 archive-only——批量选择入口与悬浮快捷归档按能力开放。
+    expect(screen.getByTestId("library-select-mode")).toBeInTheDocument();
+    expect(screen.getByTestId("library-quick-archive-s-t1")).toBeInTheDocument();
     // 只读库不做环境档案查询（工具不管理 Trae CN 登录态）。
     expect(mockInvoke).not.toHaveBeenCalledWith("get_environment_state", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith("list_environments", expect.anything());

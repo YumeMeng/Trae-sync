@@ -1229,12 +1229,13 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
 });
 
 // ============================================================================
-// P11-6（ADR-0032 决策 5）：只读库形态（trae_cn 数据根）。
-// 写操作控件隐藏（不是禁用）；草稿机制整体不参与；引导去环境页的 CTA 不出现
-//（Trae CN 环境能力 absent，不能把用户引向一个 absent 页面）。
+// P11-6（ADR-0032 决策 5）形态随 P13-3 语义迁移：全能力库（缺省主库）被
+// readOnly 标记时降级为 none——写操作控件隐藏（不是禁用）；草稿机制整体
+// 不参与；引导去环境页的 CTA 不出现（Trae CN 环境能力 absent，不能把用户
+// 引向一个 absent 页面）。
 // ============================================================================
 
-describe("LibrarySessionsPanel readOnly（Trae CN 只读浏览）", () => {
+describe("LibrarySessionsPanel readOnly（全能力库降级为纯只读）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
@@ -1266,7 +1267,77 @@ describe("LibrarySessionsPanel readOnly（Trae CN 只读浏览）", () => {
 });
 
 // ============================================================================
-// P13-2 Trae CN 归并入口（只读库唯一开放写，ADR-0033）：入口条件渲染、
+// P13-3（ADR-0033 决策 1）：CN 库 archive-only 形态——trae_cn 库按写能力
+// 开放归档/恢复（选择入口、快捷归档、草稿机制、批量归档、归档视图恢复），
+// 删除/合并项目控件仍隐藏（不是禁用）。
+// ============================================================================
+
+describe("LibrarySessionsPanel P13-3（CN 库归档开放）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+  });
+
+  it("归档控件放行：选择入口与快捷归档可见，草稿机制按 CN 库键参与", async () => {
+    setupHistory(historyDto());
+    render(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} />);
+
+    await screen.findByTestId("library-project-p1");
+    // 草稿正本按库隔离：读取带 CN 库 id。
+    expect(mockInvoke).toHaveBeenCalledWith("get_archive_draft", { libraryId: "trae_cn" });
+    expect(screen.getByTestId("library-select-mode")).toBeInTheDocument();
+    await expandProject("p1");
+    expect(screen.getByTestId("library-quick-archive-s1")).toBeInTheDocument();
+    // 归档内容浏览入口保留。
+    expect(screen.getByTestId("library-archive-entry")).toBeInTheDocument();
+  });
+
+  it("批量归档可提交（libraryId=trae_cn），删除/合并项目控件不渲染", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    // archive-only：归档动作在，删除/合并动作整体不渲染。
+    expect(screen.getByTestId("batch-archive")).toBeInTheDocument();
+    expect(screen.queryByTestId("batch-delete")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("batch-merge")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    fireEvent.click(screen.getByTestId("batch-archive"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: ["s1"],
+        restoreSessionIds: [],
+        libraryId: "trae_cn",
+      });
+    });
+  });
+
+  it("归档视图恢复：选择归档会话 → 恢复草稿 → 应用带 CN 库 id", async () => {
+    setupMutableHistory();
+    render(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} />);
+    await screen.findByTestId("library-project-p1");
+
+    fireEvent.click(screen.getByTestId("library-archive-entry"));
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-session-s3"));
+    fireEvent.click(screen.getByTestId("batch-restore"));
+    expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("恢复 1 个");
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: [],
+        restoreSessionIds: ["s3"],
+        libraryId: "trae_cn",
+      });
+    });
+  });
+});
+
+// ============================================================================
+// P13-2 Trae CN 归并入口（CN 库开放写之一，ADR-0033）：入口条件渲染、
 // 规模预览 → 单次确认 → 进度 → 回执全流程、失败路径。
 // ============================================================================
 

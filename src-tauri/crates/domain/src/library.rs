@@ -49,13 +49,26 @@ impl LibraryContext {
     }
 
     /// P11-6（ADR-0032 决策 5）：写库类能力不随 Trae CN 只读浏览开放。
-    /// 归属改写/归档/删除/合并/清理对只读库一律返回稳定错误码
+    /// 归属改写/删除/合并/清理对只读库一律返回稳定错误码
     /// `library_read_only`，在进入任何实例关闭或备份动作之前拒绝。
     pub fn ensure_writable(&self) -> Result<(), String> {
         if self.read_only {
             Err("library_read_only".to_string())
         } else {
             Ok(())
+        }
+    }
+
+    /// P13-3（ADR-0033 决策 1）：会话归档/恢复（hidden_status 通道）的
+    /// 写边界守卫——主库与副环境（非只读）照常放行；trae_cn 库凭选择性写
+    /// 放行；其余只读库（未来可能新增）沿用既有族错误码 `library_read_only`
+    /// fail-closed。删除/合并项目等其余写命令不走本守卫，继续被
+    /// `ensure_writable` 拒绝（CN 库归档开放不翻转只读边界）。
+    pub fn ensure_archive_writable(&self) -> Result<(), String> {
+        if !self.read_only || self.env_id == TRAE_CN_LIBRARY_ID {
+            Ok(())
+        } else {
+            Err("library_read_only".to_string())
         }
     }
 }
@@ -93,6 +106,49 @@ mod tests {
         };
         assert!(master.ensure_writable().is_ok());
         assert!(secondary.ensure_writable().is_ok());
+    }
+
+    /// P13-3 归档守卫：主库/副环境/trae_cn 全放行；假想的其他只读库沿用
+    /// `library_read_only` 拒绝。CN 库归档放行不翻转只读边界——删除/合并
+    /// 等其余写命令走的 ensure_writable 在 CN 库仍被拒（三态边界）。
+    #[test]
+    fn archive_guard_allows_master_secondary_and_trae_cn() {
+        let trae_cn = LibraryContext {
+            env_id: TRAE_CN_LIBRARY_ID.to_string(),
+            env_name: "Trae CN".to_string(),
+            dir: PathBuf::from("C:/fixture/Trae CN"),
+            read_only: true,
+        };
+        assert!(trae_cn.ensure_archive_writable().is_ok());
+        // 三态边界：归档放行 ≠ 其余写放行（删除/合并项目仍拒）。
+        assert_eq!(trae_cn.ensure_writable().unwrap_err(), "library_read_only");
+
+        let master = LibraryContext {
+            env_id: MASTER_ENV_ID.to_string(),
+            env_name: "主库".to_string(),
+            dir: PathBuf::from("C:/fixture/master"),
+            read_only: false,
+        };
+        let secondary = LibraryContext {
+            env_id: "env-1-a".to_string(),
+            env_name: "副环境".to_string(),
+            dir: PathBuf::from("C:/fixture/env-1-a"),
+            read_only: false,
+        };
+        assert!(master.ensure_archive_writable().is_ok());
+        assert!(secondary.ensure_archive_writable().is_ok());
+
+        // 假想的其他只读库：不带 trae_cn 标识 → fail-closed 拒绝。
+        let other_read_only = LibraryContext {
+            env_id: "future-readonly-lib".to_string(),
+            env_name: "未来只读库".to_string(),
+            dir: PathBuf::from("C:/fixture/future"),
+            read_only: true,
+        };
+        assert_eq!(
+            other_read_only.ensure_archive_writable().unwrap_err(),
+            "library_read_only"
+        );
     }
 
     /// is_master 仅对主库环境标识为真；trae_cn 与副环境均不算主库。

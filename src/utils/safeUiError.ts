@@ -609,6 +609,16 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /trae_cn_merge_backup_failed|trae_cn_merge_db_missing|trae_cn_merge_db_open_failed|trae_cn_merge_join_failed/i,
     "归并未完成，数据保持操作前状态；请稍后重试。",
   ],
+  // ===== P13-3 Trae CN 归档/恢复：CN 实例生命周期专属拒绝码 =====
+  //（DB 层错误沿用上方 master_archive_* 既有族，同一事务原语共用词表）
+  [
+    /trae_cn_archive_client_running/i,
+    "Trae CN 正在运行，请先关闭 Trae CN 再应用归档设置（应用前会自动备份）。",
+  ],
+  [
+    /trae_cn_archive_busy/i,
+    "Trae CN 正在写入数据，归档设置需等它完成；稍后重试即可。",
+  ],
 ];
 
 function errorText(error: unknown): string {

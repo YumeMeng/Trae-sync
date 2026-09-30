@@ -486,18 +486,19 @@ describe("应用工作区入口", () => {
     fireEvent.click(screen.getByTestId("navigation-settings"));
     expect(await screen.findByRole("region", { name: "设置" })).toBeVisible();
 
-    // master-library = ready：Trae CN 只读数据根详情（总览浏览入口进入）。
+    // master-library = ready：Trae CN 数据根详情（总览浏览入口进入）。
     fireEvent.click(screen.getByTestId("navigation-overview"));
     fireEvent.click(await screen.findByTestId("overview-library-cta"));
     const detailRegion = await screen.findByRole("region", { name: "Trae CN 数据根详情" });
     expect(within(detailRegion).getByRole("heading", { level: 1 })).toHaveTextContent(
       "Trae CN 数据根",
     );
-    // 只读边界：选择/批量写操作入口隐藏（不是禁用），历史列表正常挂载。
-    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("library-quick-archive-s-t1")).not.toBeInTheDocument();
+    // P13-3 archive-only：选择入口与快捷归档按库能力开放（原 P11-6 断言反转），
+    // 历史列表正常挂载。
+    expect(screen.getByTestId("library-select-mode")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("library-project-p-t1"));
     expect(await screen.findByTestId("library-session-s-t1")).toBeVisible();
+    expect(screen.getByTestId("library-quick-archive-s-t1")).toBeInTheDocument();
 
     // 切回 Work CN：签到页恢复 ready 形态（pending 卡消失）。
     fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {

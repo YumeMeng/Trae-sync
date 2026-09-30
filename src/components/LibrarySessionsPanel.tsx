@@ -65,6 +65,21 @@ export interface LibraryRef {
   readonly displayName?: string;
 }
 
+/**
+ * 库写能力（P13-3，ADR-0033 选择性写）：取代旧布尔 readOnly 的内部判定。
+ * full = 归档/恢复/删除/合并全开放（主库、副环境）；archive-only = 仅会话
+ * 归档/恢复开放（Trae CN）；none = 纯只读（其余未知库，fail-closed）。
+ */
+export type LibraryWriteCapability = "full" | "archive-only" | "none";
+
+/** 按库 id 派生写能力（与后端 LibraryContext 守卫同源）：trae_cn 开放
+ *  归档/恢复；主库与副环境（env-*）全开放；其余库保持纯只读。 */
+function deriveWriteCapability(libraryId: string): LibraryWriteCapability {
+  if (libraryId === "trae_cn") return "archive-only";
+  if (libraryId === "master" || libraryId.startsWith("env-")) return "full";
+  return "none";
+}
+
 interface LibrarySessionsPanelProps {
   /** 页面可见时才读取库记录，避免后台 IPC；隐藏时停止轮询。 */
   active: boolean;
@@ -75,14 +90,15 @@ interface LibrarySessionsPanelProps {
   /** 库实例（缺省主库；副库落地时同一组件零改动复用）。 */
   library?: LibraryRef;
   /**
-   * 只读库形态（P11-6，ADR-0032 决策 5）：归档/删除/合并等写操作控件
-   * 与草稿机制整体隐藏（不是禁用）；读路径与归档内容浏览保留。
+   * 只读库标志（P11-6 宿主形态，CN 详情页仍传）。P13-3 起内部判定改为
+   * libraryWriteCapability（按库 id 派生）：本标志只能降级不能升级——
+   * 全能力库被标记只读时维持 none，CN 库虽传 readOnly 仍按能力开放归档。
    */
   readOnly?: boolean;
   /**
    * P13-2（ADR-0033）：其他账号的可归并项目行（Trae CN 详情页注入，
    * 归并入口数据源；其余库不传 → 不渲染入口）。行内「归并到当前账号」
-   * 是只读库唯一开放的写操作（归并可写、删除合并仍禁）。
+   * 与归档/恢复同为 CN 库的开放写（P13-3；删除/合并项目仍禁）。
    */
   foreignProjects?: readonly TraeCnForeignProjectDto[];
   /**
@@ -137,6 +153,13 @@ export function LibrarySessionsPanel({
   // 库显示名（文案随库实例变化，ADR-0025；缺省主库）。
   const libName = library.displayName?.trim() || "主库";
 
+  // P13-3：内部写判定统一走库写能力（按库 id 派生）。宿主 readOnly 标志
+  // 只降级不升级：全能力库被标记只读时维持 none（P11-6 旧形态兼容）；
+  // trae_cn 虽传 readOnly，仍按能力开放归档/恢复。
+  const derivedCapability = deriveWriteCapability(library.id);
+  const writeCapability: LibraryWriteCapability =
+    readOnly && derivedCapability === "full" ? "none" : derivedCapability;
+
   const [history, setHistory] = useState<MasterHistoryDto | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [ledger, setLedger] = useState<readonly RelayLedgerEntryDto[]>([]);
@@ -167,7 +190,7 @@ export function LibrarySessionsPanel({
     hasChanges: archiveDraftHasChanges,
     storageError: archiveDraftStorageError,
     reset: resetArchiveDraft,
-  } = useArchiveDraft(library.id, { active, readOnly });
+  } = useArchiveDraft(library.id, { active, readOnly: writeCapability === "none" });
   // 数据库已更新但实例启动或列表刷新失败时，保留带重试按钮的就地恢复入口
   // （正常完成的回执走全局通知，不再保留页内横幅）。
   const [archiveRecovery, setArchiveRecovery] = useState<ArchiveRecovery | null>(null);
@@ -1062,7 +1085,7 @@ export function LibrarySessionsPanel({
                 session={session}
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
-                showQuickArchive={!selectMode && !readOnly}
+                showQuickArchive={!selectMode && writeCapability !== "none"}
                 onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
@@ -1132,7 +1155,7 @@ export function LibrarySessionsPanel({
                 session={session}
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
-                showQuickArchive={!selectMode && !readOnly}
+                showQuickArchive={!selectMode && writeCapability !== "none"}
                 onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
@@ -1215,15 +1238,15 @@ export function LibrarySessionsPanel({
           testId="history-guide"
           icon={<Layers size={26} strokeWidth={1.6} />}
           title={`${libName}还没有对话数据。`}
-          // 只读库（P11-6）：不出环境页引导——Trae CN 无环境能力，不能把
-          // 用户引向一个 absent 页面；数据将在 Trae CN 使用后自然出现。
+          // 非 full 能力库（P13-3）：不出环境页引导——Trae CN 无环境能力，
+          // 不能把用户引向一个 absent 页面；数据将在 Trae CN 使用后自然出现。
           description={
-            readOnly
-              ? undefined
-              : `到环境页启动${libName}并在 TRAE 内登录一次，对话记录会自动出现在这里。`
+            writeCapability === "full"
+              ? `到环境页启动${libName}并在 TRAE 内登录一次，对话记录会自动出现在这里。`
+              : undefined
           }
           action={
-            !readOnly && onNavigate ? (
+            writeCapability === "full" && onNavigate ? (
               <button
                 className="btn btn--primary"
                 type="button"
@@ -1246,10 +1269,12 @@ export function LibrarySessionsPanel({
           icon={<Layers size={26} strokeWidth={1.6} />}
           title={`${libName}尚未登记登录账号。`}
           description={
-            readOnly ? undefined : `在环境页确认${libName}已登录账号；切换账号后记录仍会保留。`
+            writeCapability === "full"
+              ? `在环境页确认${libName}已登录账号；切换账号后记录仍会保留。`
+              : undefined
           }
           action={
-            !readOnly && onNavigate ? (
+            writeCapability === "full" && onNavigate ? (
               <button
                 className="btn btn--primary"
                 type="button"
@@ -1449,7 +1474,8 @@ export function LibrarySessionsPanel({
           </div>
 
           {/* 底部固定区：已归档入口（有归档内容才显示）+ 选择/取消。
-              只读库（P11-6）无批量写操作，选择入口整体隐藏。 */}
+              无写能力库（P11-6）无批量写操作，选择入口整体隐藏；
+              CN 库（P13-3 archive-only）有选择入口但无删除/合并动作。 */}
           <div className="lib-foot">
             {!archiveView && archivedSessions.length > 0 && (
               <button
@@ -1463,7 +1489,7 @@ export function LibrarySessionsPanel({
                 <span className="lib-archive-entry__count">{archivedSessions.length}</span>
               </button>
             )}
-            {!readOnly && (
+            {writeCapability !== "none" && (
               <button
                 className="btn btn--quiet lib-select-btn"
                 type="button"
@@ -1554,15 +1580,18 @@ export function LibrarySessionsPanel({
                 >
                   <Undo2 size={15} aria-hidden="true" />恢复
                 </button>
-                <button
-                  className="btn btn--danger"
-                  type="button"
-                  onClick={openDeleteConfirm}
-                  disabled={batchBusy || selectedDeleteSessions.length === 0}
-                  data-testid="batch-delete"
-                >
-                  <Trash2 size={15} aria-hidden="true" />删除
-                </button>
+                {/* 删除属全能力库写（P13-3）：CN 库 archive-only 不渲染。 */}
+                {writeCapability === "full" && (
+                  <button
+                    className="btn btn--danger"
+                    type="button"
+                    onClick={openDeleteConfirm}
+                    disabled={batchBusy || selectedDeleteSessions.length === 0}
+                    data-testid="batch-delete"
+                  >
+                    <Trash2 size={15} aria-hidden="true" />删除
+                  </button>
+                )}
               </>
             ) : (
               <>
@@ -1575,27 +1604,32 @@ export function LibrarySessionsPanel({
                 >
                   <Archive size={15} aria-hidden="true" />归档
                 </button>
-                <button
-                  className="btn"
-                  type="button"
-                  onClick={openMergeConfirm}
-                  disabled={batchBusy || selectedMergeProjects.length < 2}
-                  title={
-                    selectedMergeProjects.length < 2 ? "至少选择 2 个有名称的项目才能合并" : undefined
-                  }
-                  data-testid="batch-merge"
-                >
-                  <Merge size={15} aria-hidden="true" />合并到…
-                </button>
-                <button
-                  className="btn btn--danger"
-                  type="button"
-                  onClick={openDeleteConfirm}
-                  disabled={batchBusy || selectedDeleteSessions.length === 0}
-                  data-testid="batch-delete"
-                >
-                  <Trash2 size={15} aria-hidden="true" />删除
-                </button>
+                {/* 合并项目与删除属全能力库写（P13-3）：CN 库不渲染。 */}
+                {writeCapability === "full" && (
+                  <>
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={openMergeConfirm}
+                      disabled={batchBusy || selectedMergeProjects.length < 2}
+                      title={
+                        selectedMergeProjects.length < 2 ? "至少选择 2 个有名称的项目才能合并" : undefined
+                      }
+                      data-testid="batch-merge"
+                    >
+                      <Merge size={15} aria-hidden="true" />合并到…
+                    </button>
+                    <button
+                      className="btn btn--danger"
+                      type="button"
+                      onClick={openDeleteConfirm}
+                      disabled={batchBusy || selectedDeleteSessions.length === 0}
+                      data-testid="batch-delete"
+                    >
+                      <Trash2 size={15} aria-hidden="true" />删除
+                    </button>
+                  </>
+                )}
               </>
             )}
           </div>

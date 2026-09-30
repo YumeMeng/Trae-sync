@@ -824,7 +824,12 @@ export async function installMockBridge(
       // ===== 会话批量操作（归档 / 恢复 / 删除 / 合并，均带 libraryId）=====
       // 可变副本：归档/恢复只在一次 apply 中改 hidden_status，刷新后两栏联动。
       if (cmd === "apply_master_archive_changes") {
-        assertMasterLibrary();
+        // P13-3：归档/恢复对 trae_cn 库放行（可变状态改 CN fixture 的
+        // hidden_status，与 master 先例同构）；其余非 master 库仍拒绝
+        // （守卫镜像与后端同构：CN 仅开放归档，删除/合并命令仍 master-only）。
+        const isTraeCn = args?.libraryId === "trae_cn";
+        if (!isTraeCn) assertMasterLibrary();
+        const target = isTraeCn ? TRAE_CN_HISTORY_READY : MASTER_HISTORY_READY;
         const archiveIds = new Set(
           Array.isArray(args?.archiveSessionIds) ? args.archiveSessionIds : [],
         );
@@ -833,7 +838,7 @@ export async function installMockBridge(
         );
         let archived = 0;
         let restored = 0;
-        for (const session of MASTER_HISTORY_READY.sessions) {
+        for (const session of target.sessions) {
           if (
             archiveIds.has(session.session_id) &&
             !session.deleted &&
