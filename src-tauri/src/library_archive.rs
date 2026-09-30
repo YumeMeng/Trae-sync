@@ -59,8 +59,10 @@ use traesync_infrastructure::trae_instance::{
 
 use crate::{
     checkin_material_root, ensure_real_preview, error_mapping::map_master_archive_error,
-    launch_instance_common, run_blocking, AppState, RuntimeMode, TraeInstanceLaunchDto,
+    run_blocking, AppState, RuntimeMode,
 };
+// P13-5：实例工具族随迁 instance_tools。
+use crate::instance_tools::{launch_instance_common, TraeInstanceLaunchDto};
 
 /// P3-2/P5-3 共用：消息正文 DTO（只发送必要字段；不暴露原始 raw body）。
 #[derive(Debug, Clone, Serialize)]

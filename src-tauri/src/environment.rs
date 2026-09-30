@@ -29,12 +29,13 @@ use traesync_infrastructure::trae_instance::{
     seed_login_state_from_donor, CloseOutcome,
 };
 
-use crate::{
-    checkin_material_root, ensure_real_preview, launch_instance_common, run_blocking,
-    trae_instance_account_id, AppState, RuntimeMode, TraeInstanceLaunchDto,
-};
+use crate::{checkin_material_root, ensure_real_preview, run_blocking, AppState, RuntimeMode};
 // P12-R3：切号凭据互换双路径与回滚还原随凭据域迁 credential_handover。
 use crate::credential_handover::{rollback_master_login_bytes, switch_login_identity_dual_path};
+// P13-5：实例工具族随迁 instance_tools。
+use crate::instance_tools::{
+    launch_instance_common, trae_instance_account_id, TraeInstanceLaunchDto,
+};
 
 /// 主库环境状态 DTO（P5-0；环境页主库实例卡数据源，前端 P5-2 接线）。
 #[derive(Clone, Serialize)]

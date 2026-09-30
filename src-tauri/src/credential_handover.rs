@@ -53,17 +53,19 @@ use traesync_infrastructure::environment_registry::{
 };
 use traesync_infrastructure::library_account::{observed_profile_id, trae_cn_material_root_from};
 use traesync_infrastructure::trae_instance::{
-    close_master_instance, command_line_uses_data_dir, dir_size_recursive, instance_data_dir,
-    list_trae_processes, native_account_dir,
+    self as trae_instance_module, close_master_instance, command_line_uses_data_dir,
+    dir_size_recursive, instance_data_dir, list_trae_processes, native_account_dir,
 };
 
 use crate::{
     capture_authorized_read_context, checkin_material_root, checkin_overview,
     ensure_authorization_context_current, ensure_checkin_http_enabled, ensure_login_real_mode,
-    ensure_real_preview, launch_instance_common, recovery_root_path, resolve_actual_master_account,
-    resolve_authorized_read_target_for_context, run_blocking, trae_instance_account_id,
-    trae_instance_module, AppState, ManagedAccountRuntimeSlot, RuntimeMode,
+    ensure_real_preview, recovery_root_path, resolve_actual_master_account,
+    resolve_authorized_read_target_for_context, run_blocking, AppState,
+    ManagedAccountRuntimeSlot, RuntimeMode,
 };
+// P13-5：实例工具族随迁 instance_tools。
+use crate::instance_tools::{launch_instance_common, trae_instance_account_id};
 use crate::checkin_schedule::{run_serial_batch, BatchProgressEvent};
 use crate::error_mapping::{
     credential_error_text, credential_maintenance_error_code, fixture_path_command_error,
