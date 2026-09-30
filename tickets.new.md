@@ -805,12 +805,13 @@ CN 库与 Work 主库 61 表同名同列族；`chat_session` 无 user_id（归�
 
 ### 验收清单
 
-- [ ] CN 签到：status+claim 实装、真机验收通过、UI ready
-- [ ] CN 记录归并：ADR-0033 实现+守卫测试+真机三步验收通过
-- [ ] CN 归档：hidden_status 写入真机验证
-- [ ] 清理包：lib.rs 终行数、dead-code 清零、mock 迁移进度
-- [ ] CN 续期专项验收：✅ 证据链报告落档（3026628）；重启恢复证据小项待补
-- [ ] 相位门全量四套件（延续纪律）
+- [x] CN 签到：status+claim 实装、UI ready（7e3b368；claim 路径按 Work 同族推导已标注「真机验收校准点」；claim 共用 checkin_execution_lock；无调度无批量无缓存）
+- [x] CN 记录归并：ADR-0033 实现+守卫测试+e2e（9b7d9c4：domain ensure_project_merge_writable / infrastructure 归并变体 preview+merge / 三命令+进度事件 / CN 详情页入口+清单联动；同目录跨账号行合并 UNIQUE 冲突走合并分支；真机应用内归并待下次真实切号顺带验收——原语已有 4 次手动真机背书）
+- [x] CN 归档：hidden_status 写入实现+e2e（767d1de：domain ensure_archive_writable / run_trae_cn_archive_apply 客户端运行拒绝+备份先行+恢复切当前指针 / 面板 libraryWriteCapability 三态 full/archive-only/none；真机 hidden_status 写入验收待 P13-4）
+- [ ] P13-4 三步真机验收（用户配合，延后）：①应用内归档往返+官方客户端验证 ②重启官方客户端不复活 ③签到 claim+额度核对；归并项待下次真实切号顺带；完成后回写 ADR-0033 验收状态
+- [ ] P13-5 清理包：lib.rs 实例工具族收编 + dead-code/unused import 清零 + 旧测试文件 mock 渐进迁移（执行中）
+- [x] CN 续期专项验收：✅ 证据链报告落档（3026628）；重启恢复证据小项待补
+- [ ] 相位门全量四套件（延续纪律；P13-5 完成后终验）
 
 ### P12 验收清单
 
