@@ -7,9 +7,9 @@
 //!   语义——环境从未启动过 TRAE 时目录内没有登录态可实测，注册表值是
 //!   唯一的账号记忆）；注册表值指向未登记/已移除账号时返回 None
 //!   （无授权主体，防悬空引用）。
-//! - Trae CN 只读库：产品账号池当前指针（switch 命令写入的同一状态，
-//!   与 list_remote_devices 同源）→ Trae CN 账号注册表档案；未选择账号
-//!   或指针悬空时返回 None（前端引导先在账号页登录）。
+//! - Trae CN 只读库（融合版数据根，ADR-0035）：product-state 工具选择指针
+//!   （switch 命令写入的同一状态）→ Work 签到注册表档案（P15-7 迁出旧
+//!   产品池）；未选择账号或指针悬空时返回 None（前端引导先在账号页选择）。
 
 use std::path::{Path, PathBuf};
 
@@ -17,10 +17,8 @@ use traesync_domain::library::{LibraryContext, MASTER_ENV_ID, TRAE_CN_LIBRARY_ID
 
 use crate::account_registry::{AccountRecord, AccountRegistry};
 use crate::blob_keepalive::archive_login_user_id;
-use crate::environment_registry::{
-    environment_registry_error_code, EnvironmentRegistry,
-};
-use crate::product_account_state::ProductAccountStateStore;
+use crate::environment_registry::{environment_registry_error_code, EnvironmentRegistry};
+use crate::product_account_state::{product_state_root_from, ProductAccountStateStore};
 
 /// 产品×库 → 当前账号解析结果（Q1：直接 enum 锁定判别语义）。
 pub enum LibraryAccountResolution {
@@ -63,14 +61,17 @@ pub fn resolve_library_account(
     storage_root: &Path,
     ctx: &LibraryContext,
 ) -> Result<Option<LibraryAccountResolution>, String> {
-    // Trae CN 只读库：产品账号池当前指针 → 产品注册表档案（分支三）。
+    // Trae CN 只读库（融合版数据根）：product-state 工具选择指针 → Work
+    // 签到注册表档案（分支三；P15-7 迁出旧产品池，ADR-0035）。
     if ctx.env_id == TRAE_CN_LIBRARY_ID {
-        let trae_cn_root = trae_cn_material_root_from(storage_root);
-        return Ok(match resolve_trae_cn_pointer(&trae_cn_root, None)? {
+        return Ok(match resolve_trae_cn_pointer(
+            material_root,
+            &product_state_root_from(storage_root),
+        )? {
             TraeCnPointerLookup::Registered(account) => {
                 Some(LibraryAccountResolution::Registry { account })
             }
-            // 未选择与指针悬空在库作用域同为「无账号」：前端引导先登录。
+            // 未选择与指针悬空在库作用域同为「无账号」：前端引导先选择。
             TraeCnPointerLookup::NoSelection | TraeCnPointerLookup::Dangling => None,
         });
     }
@@ -85,8 +86,10 @@ pub fn resolve_library_account(
         .map(|account| LibraryAccountResolution::Measured { account }));
     }
     // 副环境：注册表 current_profile_id 即权威（分支二）。
-    Ok(resolve_secondary_registry_account(material_root, storage_root, &ctx.env_id)?
-        .map(|account| LibraryAccountResolution::Registry { account }))
+    Ok(
+        resolve_secondary_registry_account(material_root, storage_root, &ctx.env_id)?
+            .map(|account| LibraryAccountResolution::Registry { account }),
+    )
 }
 
 /// 分支一：主库/副环境目录登录态实测（原组合根 resolve_actual_env_account）。
@@ -150,23 +153,19 @@ fn resolve_secondary_registry_account(
     Ok(account)
 }
 
-/// 分支三：Trae CN 产品池指针 → 产品注册表档案（库作用域与远程设备
-/// 两条路径共用，消除逐行同构）。`explicit_profile_id` 优先于池指针
-/// （远程设备指定账号时跳过指针读取）。
+/// 分支三：product-state 工具选择指针 → Work 签到注册表档案（P15-7 迁出
+/// 旧产品池后：指针在 product-state 根，档案在 Work 签到注册表；融合版
+/// 16 账号即档案主体，ADR-0035）。
 pub fn resolve_trae_cn_pointer(
-    trae_cn_root: &Path,
-    explicit_profile_id: Option<&str>,
+    material_root: &Path,
+    state_root: &Path,
 ) -> Result<TraeCnPointerLookup, String> {
-    let target = if let Some(profile) = explicit_profile_id {
-        profile.to_string()
-    } else {
-        match ProductAccountStateStore::new(trae_cn_root).load() {
-            Ok(Some(profile_id)) => profile_id,
-            Ok(None) => return Ok(TraeCnPointerLookup::NoSelection),
-            Err(_) => return Err("trae_cn_account_state_invalid".to_string()),
-        }
+    let target = match ProductAccountStateStore::new(state_root).load() {
+        Ok(Some(profile_id)) => profile_id,
+        Ok(None) => return Ok(TraeCnPointerLookup::NoSelection),
+        Err(_) => return Err("trae_cn_account_state_invalid".to_string()),
     };
-    let account = AccountRegistry::new(trae_cn_root)
+    let account = AccountRegistry::new(material_root)
         .load()
         .map_err(|_| "trae_cn_registry_invalid".to_string())?
         .into_iter()
@@ -375,19 +374,19 @@ mod tests {
         assert!(resolved.is_none());
     }
 
-    // ===== 分支三：Trae CN 产品池指针 =====
+    // ===== 分支三：融合版 product-state 工具选择指针 =====
 
-    /// Trae CN 只读库当前账号 = 产品账号池当前指针 → 产品注册表档案
-    ///（与 switch_trae_cn_account / list_remote_devices 同源，不依赖
-    /// Work 主库注册表与登录态实测），返回 Registry 变体。
+    /// Trae CN 只读库（融合版数据根）当前账号 = product-state 工具选择指针
+    /// → Work 签到注册表档案（与 switch_trae_cn_account 同源；P15-7 迁出
+    /// 旧产品池），返回 Registry 变体。
     #[test]
-    fn resolve_library_account_uses_trae_cn_product_pool() {
+    fn resolve_library_account_uses_fused_product_pointer() {
         let root = tempdir().unwrap();
-        let trae_cn_root = trae_cn_material_root_from(root.path());
-        AccountRegistry::new(&trae_cn_root)
-            .upsert(&account("checkin-cn-1", "888", "Trae CN 账号"))
+        let checkin_root = root.path().join("checkin");
+        AccountRegistry::new(&checkin_root)
+            .upsert(&account("checkin-cn-1", "888", "融合版账号"))
             .unwrap();
-        ProductAccountStateStore::new(&trae_cn_root)
+        ProductAccountStateStore::new(product_state_root_from(root.path()))
             .save("checkin-cn-1")
             .unwrap();
         let ctx = LibraryContext {
@@ -397,21 +396,21 @@ mod tests {
             read_only: true,
         };
 
-        let resolved = resolve_library_account(&root.path().join("checkin"), root.path(), &ctx)
+        let resolved = resolve_library_account(&checkin_root, root.path(), &ctx)
             .unwrap()
-            .expect("产品池指针指向的注册表账号应直接解析");
+            .expect("指针指向的注册表账号应直接解析");
         match resolved {
             LibraryAccountResolution::Registry { account } => {
                 assert_eq!(account.profile_id, "checkin-cn-1");
                 assert_eq!(account.account_id, "888");
             }
             LibraryAccountResolution::Measured { .. } => {
-                panic!("Trae CN 产品池路径应返回 Registry 变体");
+                panic!("融合版指针路径应返回 Registry 变体");
             }
         }
     }
 
-    /// 未选择账号（产品池无指针）：None——前端引导先在账号页登录。
+    /// 未选择账号（product-state 无指针）：None——前端引导先在账号页选择。
     #[test]
     fn resolve_library_account_returns_none_for_unselected_trae_cn() {
         let root = tempdir().unwrap();
@@ -431,8 +430,7 @@ mod tests {
     #[test]
     fn resolve_library_account_returns_none_for_dangling_trae_cn_pointer() {
         let root = tempdir().unwrap();
-        let trae_cn_root = trae_cn_material_root_from(root.path());
-        ProductAccountStateStore::new(&trae_cn_root)
+        ProductAccountStateStore::new(product_state_root_from(root.path()))
             .save("checkin-gone")
             .unwrap();
         let ctx = LibraryContext {
@@ -447,31 +445,38 @@ mod tests {
         assert!(resolved.is_none());
     }
 
-    /// 共用指针查找的三态契约：远程设备路径依赖「未选择 ≠ 悬空」区分
-    /// 两个稳定错误码；显式 profile 优先于池指针。
+    /// 指针查找的三态契约：库作用域把「未选择」与「悬空」都映射为 None，
+    /// 但共用函数仍区分三态（稳定错误码口径保留）。
     #[test]
     fn trae_cn_pointer_lookup_distinguishes_unselected_registered_and_dangling() {
         let root = tempdir().unwrap();
-        let trae_cn_root = trae_cn_material_root_from(root.path());
-        AccountRegistry::new(&trae_cn_root)
-            .upsert(&account("checkin-cn-1", "888", "Trae CN 账号"))
+        let checkin_root = root.path().join("checkin");
+        AccountRegistry::new(&checkin_root)
+            .upsert(&account("checkin-cn-1", "888", "融合版账号"))
             .unwrap();
+        let state_root = product_state_root_from(root.path());
 
-        // 未选择：池内无指针 → NoSelection。
+        // 未选择：product-state 无指针 → NoSelection。
         assert!(matches!(
-            resolve_trae_cn_pointer(&trae_cn_root, None).unwrap(),
+            resolve_trae_cn_pointer(&checkin_root, &state_root).unwrap(),
             TraeCnPointerLookup::NoSelection
         ));
-        // 显式指定已登记 profile：跳过指针读取 → Registered。
-        match resolve_trae_cn_pointer(&trae_cn_root, Some("checkin-cn-1")).unwrap() {
+        // 指针指向已登记账号 → Registered。
+        ProductAccountStateStore::new(&state_root)
+            .save("checkin-cn-1")
+            .unwrap();
+        match resolve_trae_cn_pointer(&checkin_root, &state_root).unwrap() {
             TraeCnPointerLookup::Registered(record) => {
                 assert_eq!(record.profile_id, "checkin-cn-1");
             }
-            _ => panic!("显式指定已登记账号应返回 Registered"),
+            _ => panic!("指针指向已登记账号应返回 Registered"),
         }
-        // 悬空：显式 profile 未登记 → Dangling。
+        // 悬空：指针指向未登记 profile → Dangling。
+        ProductAccountStateStore::new(&state_root)
+            .save("checkin-gone")
+            .unwrap();
         assert!(matches!(
-            resolve_trae_cn_pointer(&trae_cn_root, Some("checkin-gone")).unwrap(),
+            resolve_trae_cn_pointer(&checkin_root, &state_root).unwrap(),
             TraeCnPointerLookup::Dangling
         ));
     }

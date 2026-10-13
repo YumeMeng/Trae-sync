@@ -43,6 +43,7 @@ function receipt(): MasterAccountSwitchDto {
     switched_sessions: 7,
     backup_path: "C:\\bak",
     relay_ledger_written: true,
+    current_profile_saved: true,
     plugin_sync: {
       source_count: 5,
       installed: 0,
@@ -117,6 +118,29 @@ describe("MasterSwitchDialog（P5-2 切号弹层 + ADR-0026 插件静默同步�
     await waitFor(() => {
       expect(screen.getByText(/已切换到 账号乙/)).toBeInTheDocument();
     });
+  });
+
+  it("切换已提交但后续启动、档案写回或账号页刷新失败时保留成功回执", async () => {
+    mockRoute("preview_master_switch_plugins", () => preview());
+    mockRoute("switch_master_account", () => ({
+      ...receipt(),
+      current_profile_saved: false,
+      relaunch_outcome: "failed",
+    }));
+    const onFinished = vi.fn(async () => {
+      throw new Error("account_page_refresh_failed");
+    });
+    renderDialog({ onFinished });
+
+    expect(await screen.findByText(/已切换到 账号乙/)).toBeInTheDocument();
+    const warning = await screen.findByRole("alert");
+    expect(warning).toHaveTextContent("应用未能记住当前账号");
+    expect(warning).toHaveTextContent("TRAE 未能自动启动");
+    expect(warning).toHaveTextContent("账号页刷新失败");
+    expect(screen.getByTestId("master-switch-dialog").querySelector('[data-stage="restarting"]'))
+      .toHaveClass("switch-step--failed");
+    expect(screen.queryByText(/切换未完成/)).not.toBeInTheDocument();
+    expect(onFinished).toHaveBeenCalledTimes(1);
   });
 
   it("预检失败不阻断切号（fail-soft：直接发起切换）", async () => {

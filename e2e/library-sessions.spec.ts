@@ -240,6 +240,11 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await expect(notifyToast(page, "已加入待归档设置")).toBeVisible();
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 2 个");
     await panel.getByTestId("archive-draft-apply").click();
+    // Work 主库写入前必须确认关闭客户端，避免在活动进程中改库。
+    await page
+      .getByTestId("work-archive-confirm")
+      .getByRole("button", { name: "关闭并应用" })
+      .click();
     await expect(notifyToast(page, "已应用归档设置：归档 2 个")).toBeVisible();
     // 应用后 p1 移空后行消失；未涉及的 p2 仍在；入口计数 3（s3 + 新归档 2）。
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
@@ -264,6 +269,10 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 2 个");
     await panel.getByTestId("archive-draft-apply").click();
+    await page
+      .getByTestId("work-archive-confirm")
+      .getByRole("button", { name: "关闭并应用" })
+      .click();
     await expect(notifyToast(page, "已应用归档设置：归档 2 个")).toBeVisible();
     await expect(panel.getByTestId("library-project-p1")).toHaveCount(0);
     await expect(panel.getByTestId("library-archive-entry")).toContainText("3");
@@ -297,6 +306,10 @@ test.describe("G22 统一选择模式与批量操作", () => {
 
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("归档 1 个");
     await panel.getByTestId("archive-draft-apply").click();
+    await page
+      .getByTestId("work-archive-confirm")
+      .getByRole("button", { name: "关闭并应用" })
+      .click();
     await expect(notifyToast(page, "已应用归档设置：归档 1 个")).toBeVisible();
     await expect(panel.getByTestId("library-session-s1")).toHaveCount(0);
     await expect(panel.getByTestId("library-archive-entry")).toContainText("2");
@@ -374,6 +387,10 @@ test.describe("G22 统一选择模式与批量操作", () => {
     await panel.getByTestId("batch-restore").click();
     await expect(panel.getByTestId("archive-draft-bar")).toContainText("恢复 1 个");
     await panel.getByTestId("archive-draft-apply").click();
+    await page
+      .getByTestId("work-archive-confirm")
+      .getByRole("button", { name: "关闭并应用" })
+      .click();
     await expect(notifyToast(page, "已应用归档设置：归档 0 个、恢复 1 个")).toBeVisible();
     await expect(panel.getByTestId("library-archive-empty")).toContainText("没有已归档的会话");
 

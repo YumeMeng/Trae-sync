@@ -37,6 +37,10 @@ pub enum MasterArchiveError {
     ArchiveUnsupported,
     /// 写入失败（事务已回滚，库保持操作前状态）。
     WriteFailed,
+    /// SQLite 返回提交错误，无法证明事务最终持久状态。
+    CommitOutcomeUnknown,
+    /// 事务已提交，但提交后读回校验未通过。
+    CommittedNeedsAttention,
     /// 删除前备份失败（删除未执行，库保持原状）。
     BackupFailed,
     /// 分组合并参数无效（无来源分组，或目标分组在来源集合中/不存在）。
@@ -51,7 +55,9 @@ impl std::fmt::Display for MasterArchiveError {
             Self::DbUnavailable => "主库对话库不存在",
             Self::DbOpenFailed => "主库对话库打开或解密失败",
             Self::ArchiveUnsupported => "当前主库版本不支持会话归档",
-            Self::WriteFailed => "会话操作写入失败（已回滚）",
+            Self::WriteFailed => "会话操作在提交前写入失败",
+            Self::CommitOutcomeUnknown => "会话操作提交结果无法确认，需检查主库",
+            Self::CommittedNeedsAttention => "会话操作已提交，但写后校验未通过，需检查主库",
             Self::BackupFailed => "删除前主库备份失败（未执行删除）",
             Self::MergeInvalid => "分组合并参数无效",
             Self::ArchiveConflict => "归档批次中同一会话同时要求归档和恢复",
@@ -61,6 +67,72 @@ impl std::fmt::Display for MasterArchiveError {
 }
 
 impl std::error::Error for MasterArchiveError {}
+
+/// 统一标记提交错误，避免把未知持久状态误报为已回滚。
+fn commit_archive_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), MasterArchiveError> {
+    tx.commit()
+        .map_err(|_| MasterArchiveError::CommitOutcomeUnknown)
+}
+
+/// 统计当前账号下处于指定归档状态的目标会话，提交前后使用同一条件核对。
+fn count_owned_sessions_with_status(
+    conn: &Connection,
+    session_ids: &[String],
+    current_user_id: &str,
+    hidden_status: Option<&str>,
+) -> Result<usize, MasterArchiveError> {
+    if session_ids.is_empty() {
+        return Ok(0);
+    }
+    let owner_param = session_ids.len() + 1;
+    let status_param = session_ids.len() + 2;
+    let sql = format!(
+        "SELECT COUNT(*) FROM chat_session s JOIN project p ON p.project_id = s.project_id \
+         WHERE s.session_id IN ({}) AND p.user_id = ?{owner_param} \
+         AND s.hidden_status IS ?{status_param}",
+        placeholders(session_ids.len())
+    );
+    let mut params: Vec<rusqlite::types::Value> = session_ids
+        .iter()
+        .cloned()
+        .map(rusqlite::types::Value::Text)
+        .collect();
+    params.push(rusqlite::types::Value::Text(current_user_id.to_string()));
+    params.push(
+        hidden_status
+            .map(|status| rusqlite::types::Value::Text(status.to_string()))
+            .unwrap_or(rusqlite::types::Value::Null),
+    );
+    let count: i64 = conn
+        .query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))
+        .map_err(|_| MasterArchiveError::WriteFailed)?;
+    usize::try_from(count).map_err(|_| MasterArchiveError::WriteFailed)
+}
+
+/// 持久化读回失败或与提交前预期不符时，明确保留“已提交需处理”状态。
+fn verify_archive_after_commit(
+    conn: &Connection,
+    archive_session_ids: &[String],
+    restore_session_ids: &[String],
+    current_user_id: &str,
+    expected_archived: usize,
+    expected_restored: usize,
+) -> Result<(), MasterArchiveError> {
+    let actual_archived = count_owned_sessions_with_status(
+        conn,
+        archive_session_ids,
+        current_user_id,
+        Some(ARCHIVE_HIDDEN_STATUS),
+    )
+    .map_err(|_| MasterArchiveError::CommittedNeedsAttention)?;
+    let actual_restored =
+        count_owned_sessions_with_status(conn, restore_session_ids, current_user_id, None)
+            .map_err(|_| MasterArchiveError::CommittedNeedsAttention)?;
+    if actual_archived != expected_archived || actual_restored != expected_restored {
+        return Err(MasterArchiveError::CommittedNeedsAttention);
+    }
+    Ok(())
+}
 
 /// 真实删除回执（单事务提交成功后返回；规模供 UI 展示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,84 +220,6 @@ fn authorized_session_ids(
     Ok(rows)
 }
 
-/// 归档会话（在线写）：hidden_status → 'voice_discussion'。
-///
-/// 只动集合内 `hidden_status IS NULL` 的行（原生已隐藏的会话不重复触碰）；
-/// 返回实际受影响行数。归档可逆（restore 还原 NULL），不改变记录归属。
-pub fn archive_master_sessions(
-    master_data_dir: &Path,
-    raw_key: &str,
-    session_ids: &[String],
-    current_user_id: &str,
-) -> Result<usize, MasterArchiveError> {
-    if session_ids.is_empty() {
-        return Ok(0);
-    }
-    let db_path = master_database_path(master_data_dir);
-    if !db_path.is_file() {
-        return Err(MasterArchiveError::DbUnavailable);
-    }
-    let conn = open_with_key_readwrite(&db_path, raw_key)?;
-    verify_key_readable(&conn)?;
-    if !hidden_status_column_exists(&conn) {
-        return Err(MasterArchiveError::ArchiveUnsupported);
-    }
-    let sql = format!(
-        "UPDATE chat_session SET hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
-         WHERE hidden_status IS NULL AND session_id IN ({}) \
-         AND EXISTS (SELECT 1 FROM project p \
-                    WHERE p.project_id = chat_session.project_id \
-                      AND p.user_id = ?{})",
-        placeholders(session_ids.len()),
-        session_ids.len() + 1
-    );
-    let mut params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
-    params.push(current_user_id);
-    let changed = conn
-        .execute(&sql, rusqlite::params_from_iter(params))
-        .map_err(|_| MasterArchiveError::WriteFailed)?;
-    Ok(changed)
-}
-
-/// 恢复归档会话（在线写）：hidden_status 还原为 NULL。
-///
-/// 只动集合内 `hidden_status = 'voice_discussion'` 的行；恢复即归位
-/// （侧栏按 work_mode 原生聚合，恢复的会话自动并入当前同类型分组）。
-pub fn restore_master_sessions(
-    master_data_dir: &Path,
-    raw_key: &str,
-    session_ids: &[String],
-    current_user_id: &str,
-) -> Result<usize, MasterArchiveError> {
-    if session_ids.is_empty() {
-        return Ok(0);
-    }
-    let db_path = master_database_path(master_data_dir);
-    if !db_path.is_file() {
-        return Err(MasterArchiveError::DbUnavailable);
-    }
-    let conn = open_with_key_readwrite(&db_path, raw_key)?;
-    verify_key_readable(&conn)?;
-    if !hidden_status_column_exists(&conn) {
-        return Err(MasterArchiveError::ArchiveUnsupported);
-    }
-    let sql = format!(
-        "UPDATE chat_session SET hidden_status = NULL \
-         WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' AND session_id IN ({}) \
-         AND EXISTS (SELECT 1 FROM project p \
-                    WHERE p.project_id = chat_session.project_id \
-                      AND p.user_id = ?{})",
-        placeholders(session_ids.len()),
-        session_ids.len() + 1
-    );
-    let mut params: Vec<&str> = session_ids.iter().map(String::as_str).collect();
-    params.push(current_user_id);
-    let changed = conn
-        .execute(&sql, rusqlite::params_from_iter(params))
-        .map_err(|_| MasterArchiveError::WriteFailed)?;
-    Ok(changed)
-}
-
 /// 归档批次提交回执：一次事务内完成归档、恢复和恢复后的项目归属更新。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterArchiveApplyOutcome {
@@ -237,7 +231,8 @@ pub struct MasterArchiveApplyOutcome {
 ///
 /// 归档只允许当前主库账号名下的正常会话；恢复允许从全局归档视图选择，
 /// 并把其项目归属切到当前账号。归档状态和项目归属在同一个事务里提交，
-/// 任一步失败都由 SQLite 回滚，调用方可保留原草稿等待重试。
+/// 提交前失败由 SQLite 回滚；提交错误或提交后读回不符使用专用状态，
+/// 调用方不得把它们显示为未提交并直接鼓励重试。
 pub fn apply_master_archive_changes(
     master_data_dir: &Path,
     raw_key: &str,
@@ -270,7 +265,15 @@ pub fn apply_master_archive_changes(
     let tx = conn
         .unchecked_transaction()
         .map_err(|_| MasterArchiveError::WriteFailed)?;
-    let result = (|| -> Result<(usize, usize), MasterArchiveError> {
+    let result = (|| -> Result<(usize, usize, usize, usize), MasterArchiveError> {
+        let archived_before = count_owned_sessions_with_status(
+            &tx,
+            archive_session_ids,
+            current_user_id,
+            Some(ARCHIVE_HIDDEN_STATUS),
+        )?;
+        let restored_before =
+            count_owned_sessions_with_status(&tx, restore_session_ids, current_user_id, None)?;
         let archived_sessions = if archive_session_ids.is_empty() {
             0
         } else {
@@ -323,12 +326,25 @@ pub fn apply_master_archive_changes(
             .map_err(|_| MasterArchiveError::WriteFailed)?
         };
 
-        Ok((archived_sessions, restored_sessions))
+        Ok((
+            archived_sessions,
+            restored_sessions,
+            archived_before + archived_sessions,
+            restored_before + restored_sessions,
+        ))
     })();
 
     match result {
-        Ok((archived_sessions, restored_sessions)) => {
-            tx.commit().map_err(|_| MasterArchiveError::WriteFailed)?;
+        Ok((archived_sessions, restored_sessions, expected_archived, expected_restored)) => {
+            commit_archive_transaction(tx)?;
+            verify_archive_after_commit(
+                &conn,
+                archive_session_ids,
+                restore_session_ids,
+                current_user_id,
+                expected_archived,
+                expected_restored,
+            )?;
             Ok(MasterArchiveApplyOutcome {
                 archived_sessions,
                 restored_sessions,
@@ -464,7 +480,7 @@ pub fn delete_master_sessions(
 
     match result {
         Ok((deleted_sessions, deleted_messages, removed_projects)) => {
-            tx.commit().map_err(|_| MasterArchiveError::WriteFailed)?;
+            commit_archive_transaction(tx)?;
             Ok(MasterDeleteOutcome {
                 deleted_sessions,
                 deleted_messages,
@@ -582,7 +598,7 @@ pub fn merge_master_projects(
 
     match result {
         Ok((moved_sessions, removed_projects)) => {
-            tx.commit().map_err(|_| MasterArchiveError::WriteFailed)?;
+            commit_archive_transaction(tx)?;
             Ok(MasterMergeOutcome {
                 moved_sessions,
                 removed_projects,
@@ -655,15 +671,56 @@ mod tests {
     }
 
     #[test]
+    fn archive_post_commit_readback_error_is_reported_as_committed_attention() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            verify_archive_after_commit(&conn, &["s1".into()], &[], "111", 1, 0),
+            Err(MasterArchiveError::CommittedNeedsAttention)
+        );
+    }
+
+    /// 用延迟外键制造真实 COMMIT 错误，并确认事务释放后写入没有残留。
+    #[test]
+    fn failed_archive_commit_is_unknown_and_rolls_back_fixture_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        let raw_key = "aa".repeat(32);
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{raw_key}'\";
+             PRAGMA foreign_keys = ON;
+             CREATE TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE child (
+                parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+             );",
+        ))
+        .unwrap();
+        let foreign_keys_enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys_enabled, 1);
+
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("INSERT INTO child VALUES (1)", []).unwrap();
+        assert_eq!(
+            commit_archive_transaction(tx),
+            Err(MasterArchiveError::CommitOutcomeUnknown)
+        );
+        let child_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM child", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(child_count, 0);
+    }
+
+    #[test]
     fn archive_and_restore_roundtrip() {
         let dir = temp_dir("roundtrip");
         let key = "aa".repeat(32);
         create_archive_fixture(&master_database_path(&dir), &key);
 
         // 归档：s1（NULL → voice_discussion）；s3 原生已隐藏不动。
-        let affected =
-            archive_master_sessions(&dir, &key, &["s1".into(), "s3".into()], "111").unwrap();
-        assert_eq!(affected, 1);
+        let applied =
+            apply_master_archive_changes(&dir, &key, &["s1".into(), "s3".into()], &[], "111")
+                .unwrap();
+        assert_eq!(applied.archived_sessions, 1);
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
         let conn = Connection::open_with_flags(master_database_path(&dir), flags).unwrap();
         conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
@@ -674,8 +731,49 @@ mod tests {
         );
 
         // 恢复：s1 还原 NULL。
-        let affected = restore_master_sessions(&dir, &key, &["s1".into()], "111").unwrap();
-        assert_eq!(affected, 1);
+        let applied = apply_master_archive_changes(&dir, &key, &[], &["s1".into()], "111").unwrap();
+        assert_eq!(applied.restored_sessions, 1);
+        assert_eq!(hidden_status_of(&conn, "s1"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_commit_readback_mismatch_reports_attention_after_database_commit() {
+        let dir = temp_dir("post-commit-mismatch");
+        let key = "af".repeat(32);
+        create_archive_fixture(&master_database_path(&dir), &key);
+        {
+            let conn = Connection::open_with_flags(
+                master_database_path(&dir),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+                .unwrap();
+            // 合成提交后校验不符：归档更新执行后由触发器撤销其状态变更。
+            conn.execute_batch(
+                "CREATE TRIGGER revert_archive_status
+                 AFTER UPDATE OF hidden_status ON chat_session
+                 WHEN NEW.hidden_status = 'voice_discussion'
+                 BEGIN
+                   UPDATE chat_session SET hidden_status = NULL
+                   WHERE session_id = NEW.session_id;
+                 END;",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            apply_master_archive_changes(&dir, &key, &["s1".into()], &[], "111"),
+            Err(MasterArchiveError::CommittedNeedsAttention)
+        );
+        let conn = Connection::open_with_flags(
+            master_database_path(&dir),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
         assert_eq!(hidden_status_of(&conn, "s1"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -760,14 +858,12 @@ mod tests {
         create_archive_fixture(&master_database_path(&dir), &key);
 
         // 当前账号 111 不能通过过期/伪造的 ID 操作账号 222 的会话。
-        assert_eq!(
-            archive_master_sessions(&dir, &key, &["s4".into()], "111").unwrap(),
-            0
-        );
-        assert_eq!(
-            restore_master_sessions(&dir, &key, &["s4".into()], "111").unwrap(),
-            0
-        );
+        let archived =
+            apply_master_archive_changes(&dir, &key, &["s4".into()], &[], "111").unwrap();
+        assert_eq!(archived.archived_sessions, 0);
+        let restored =
+            apply_master_archive_changes(&dir, &key, &[], &["s4".into()], "111").unwrap();
+        assert_eq!(restored.restored_sessions, 0);
         let outcome = delete_master_sessions(&dir, &key, &["s4".into()], "111").unwrap();
         assert_eq!(outcome.deleted_sessions, 0);
         assert!(outcome.backup_path.is_empty(), "无授权目标不应创建备份");
@@ -794,7 +890,7 @@ mod tests {
     fn archive_missing_db_reports_unavailable() {
         let dir = temp_dir("missing");
         assert_eq!(
-            archive_master_sessions(&dir, &"bb".repeat(32), &["s1".into()], "111"),
+            apply_master_archive_changes(&dir, &"bb".repeat(32), &["s1".into()], &[], "111"),
             Err(MasterArchiveError::DbUnavailable)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -805,7 +901,7 @@ mod tests {
         let dir = temp_dir("wrongkey");
         create_archive_fixture(&master_database_path(&dir), &"cc".repeat(32));
         assert_eq!(
-            archive_master_sessions(&dir, &"dd".repeat(32), &["s1".into()], "111"),
+            apply_master_archive_changes(&dir, &"dd".repeat(32), &["s1".into()], &[], "111"),
             Err(MasterArchiveError::DbOpenFailed)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -827,7 +923,7 @@ mod tests {
         .unwrap();
         drop(conn);
         assert_eq!(
-            archive_master_sessions(&dir, &key, &["s1".into()], "111"),
+            apply_master_archive_changes(&dir, &key, &["s1".into()], &[], "111"),
             Err(MasterArchiveError::ArchiveUnsupported)
         );
         let _ = std::fs::remove_dir_all(&dir);

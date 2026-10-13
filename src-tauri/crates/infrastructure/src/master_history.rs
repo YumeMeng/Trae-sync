@@ -137,10 +137,7 @@ pub fn read_trae_cn_foreign_projects(
         return Vec::new();
     };
     // 列防御（与 read_master_history 同口径）；缺 biz 或路径列时无对象。
-    for (table, column) in [
-        ("project", "biz_project_id"),
-        ("project", "absolute_path"),
-    ] {
+    for (table, column) in [("project", "biz_project_id"), ("project", "absolute_path")] {
         if !column_exists(&conn, table, column) {
             return Vec::new();
         }
@@ -150,8 +147,16 @@ pub fn read_trae_cn_foreign_projects(
     let has_session_deleted = column_exists(&conn, "chat_session", "deleted_at");
     let has_hidden_status = column_exists(&conn, "chat_session", "hidden_status");
     let has_message_deleted = column_exists(&conn, "chat_message", "deleted_at");
-    let name_expr = if has_project_name { "COALESCE(p.name, '')" } else { "''" };
-    let project_deleted_expr = if has_project_deleted { "COALESCE(p.deleted_at, 0) = 0" } else { "1 = 1" };
+    let name_expr = if has_project_name {
+        "COALESCE(p.name, '')"
+    } else {
+        "''"
+    };
+    let project_deleted_expr = if has_project_deleted {
+        "COALESCE(p.deleted_at, 0) = 0"
+    } else {
+        "1 = 1"
+    };
     let session_visible_expr = if has_session_deleted {
         "COALESCE(s.deleted_at, 0) = 0"
     } else {

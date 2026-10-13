@@ -20,7 +20,7 @@ import { installMockBridge } from "./mock-bridge";
 
 // CN 详情页 region（LibrarySessionsPanel 的 embedded 宿主）。
 function detail(page: Page): Locator {
-  return page.getByRole("region", { name: "Trae CN 数据根详情" });
+  return page.getByRole("region", { name: "TRAE 数据根详情" });
 }
 
 // 全局通知 toast（sonner）：回执类提示的统一断言目标。
@@ -30,7 +30,10 @@ function notifyToast(page: Page, text: string | RegExp): Locator {
 
 // 安装 mock bridge → 切到 Trae CN → 总览页「浏览 Trae CN 数据」进详情页。
 async function setup(page: Page) {
-  await installMockBridge(page, { traeCnAccounts: true });
+  await installMockBridge(page, {
+    traeCnAccounts: true,
+    operationReadiness: { "library.archive": "ready" },
+  });
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
   await page.getByRole("combobox", { name: "当前产品" }).selectOption("trae_cn");

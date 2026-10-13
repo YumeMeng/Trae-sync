@@ -15,8 +15,6 @@ use crate::{
     checkin_material_root, ensure_login_real_mode, resolve_remote_device_account, run_blocking,
     AppState,
 };
-// P12-R3：Trae CN 材料根随凭据域迁 credential_handover。
-use crate::credential_handover::trae_cn_material_root;
 #[cfg(windows)]
 use crate::oauth_login::open_login_url_in_browser;
 
@@ -54,11 +52,9 @@ pub(crate) async fn list_remote_devices(
     state: tauri::State<'_, AppState>,
 ) -> Result<RemoteDeviceSnapshotDto, String> {
     ensure_login_real_mode(&state)?;
-    let material_root = match product_id.as_str() {
-        "work_cn" => checkin_material_root(&state)?,
-        "trae_cn" => trae_cn_material_root(&state)?,
-        _ => return Err("unknown_product".to_string()),
-    };
+    // P15-7：融合版账号档案同源 Work 签到注册表（旧 CN 产品池已移除）；
+    // 通道差异在 resolve_remote_device_account 内按 product_id 收口。
+    let material_root = checkin_material_root(&state)?;
     let storage_root = state.storage_root.clone();
     run_blocking("remote_devices_join_failed", move || {
         list_remote_devices_inner(&material_root, &storage_root, &product_id, profile_id)
@@ -133,11 +129,8 @@ pub(crate) async fn clear_remote_device(
     if device_id.is_empty() {
         return Err("remote_device_empty_target".to_string());
     }
-    let material_root = match product_id.as_str() {
-        "work_cn" => checkin_material_root(&state)?,
-        "trae_cn" => trae_cn_material_root(&state)?,
-        _ => return Err("unknown_product".to_string()),
-    };
+    // P15-7：融合版账号档案同源 Work 签到注册表（旧 CN 产品池已移除）。
+    let material_root = checkin_material_root(&state)?;
     let storage_root = state.storage_root.clone();
     run_blocking("remote_device_join_failed", move || {
         clear_remote_device_inner(

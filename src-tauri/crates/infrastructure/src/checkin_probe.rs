@@ -110,12 +110,7 @@ fn shape_summary(body: &str) -> (Vec<String>, Vec<String>, String, usize) {
         Ok(value) => {
             let keys = value
                 .as_object()
-                .map(|object| {
-                    object
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
+                .map(|object| object.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             let presence = focus_fields
                 .iter()
@@ -133,14 +128,12 @@ fn shape_summary(body: &str) -> (Vec<String>, Vec<String>, String, usize) {
 /// 其次 `ResponseMetadata.Error.Code`（ExchangeToken 信封口径）。
 fn extract_business_code(body: &str) -> Option<i64> {
     let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    let code = value
-        .get("code")
-        .or_else(|| {
-            value
-                .get("ResponseMetadata")
-                .and_then(|metadata| metadata.get("Error"))
-                .and_then(|error| error.get("Code"))
-        })?;
+    let code = value.get("code").or_else(|| {
+        value
+            .get("ResponseMetadata")
+            .and_then(|metadata| metadata.get("Error"))
+            .and_then(|error| error.get("Code"))
+    })?;
     code.as_i64()
         .or_else(|| code.as_str().and_then(|text| text.parse().ok()))
 }
@@ -175,8 +168,7 @@ fn probe_one(
     let url = format!("{API_BASE}{path}");
     let request = client
         .request(
-            reqwest::Method::from_bytes(method.as_bytes())
-                .unwrap_or(reqwest::Method::GET),
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
             &url,
         )
         .header("Authorization", format!("Cloud-IDE-JWT {access_token}"))
@@ -228,7 +220,9 @@ fn probe_one(
             }
         }
     };
-    if finding.outcome == "ok" && finding.body_top_level_keys.is_empty() && finding.body_byte_len > 0
+    if finding.outcome == "ok"
+        && finding.body_top_level_keys.is_empty()
+        && finding.body_byte_len > 0
     {
         // 2xx 但响应体不是 JSON：协议形态与 Work 口径不符（如网关 HTML）。
         finding.outcome = "protocol_error".to_string();
@@ -290,7 +284,9 @@ pub fn probe_get_user_info_shape(client: &Client, access_token: &str) -> TraeCnP
             }
         }
     };
-    if finding.outcome == "ok" && finding.body_top_level_keys.is_empty() && finding.body_byte_len > 0
+    if finding.outcome == "ok"
+        && finding.body_top_level_keys.is_empty()
+        && finding.body_byte_len > 0
     {
         // 2xx 但响应体不是 JSON：协议形态与 GetUserInfo 信封口径不符。
         finding.outcome = "protocol_error".to_string();
@@ -466,9 +462,7 @@ mod tests {
         assert_eq!(extract_business_code(r#"{"code":9095}"#), Some(9095));
         assert_eq!(extract_business_code(r#"{"code":"20401"}"#), Some(20401));
         assert_eq!(
-            extract_business_code(
-                r#"{"ResponseMetadata":{"Error":{"Code":"20324"}}}"#
-            ),
+            extract_business_code(r#"{"ResponseMetadata":{"Error":{"Code":"20324"}}}"#),
             Some(20324)
         );
         assert_eq!(extract_business_code(r#"{"other":1}"#), None);
@@ -521,7 +515,9 @@ mod tests {
             body_sha256_8: String::new(),
             body_byte_len: 20,
         };
-        assert!(derive_probe_conclusion(&[control_ok, available.clone()]).contains("端点存在且可用"));
+        assert!(
+            derive_probe_conclusion(&[control_ok, available.clone()]).contains("端点存在且可用")
+        );
 
         // 2026-09-28 实测形态固化：status code=0 是「端点存在且凭据可用」
         // 的直接证据，对照组（GetUserInfo 401/20310）失败仅作附注不否决。

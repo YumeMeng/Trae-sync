@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 use crate::account_registry::AccountRecord;
 use crate::atomic_publish::publish_replacing;
 use crate::key_wrapper::{protect_secret, unprotect_secret};
+use crate::operation_lease::FileOperationLock;
 
 const BUNDLE_FORMAT_VERSION: u32 = 1;
 const BUNDLE_MAGIC: &[u8; 8] = b"TRVCKN01";
@@ -61,7 +62,7 @@ const MAX_DEVICE_KEY_PEM_BYTES: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckinCredentialError {
-    /// 当前平台没有 DPAPI（非 Windows），凭据包不可用。
+    /// 当前平台或凭据存储不可用。
     Unavailable,
     /// 凭据包不存在。
     Missing,
@@ -80,7 +81,7 @@ pub enum CheckinCredentialError {
 impl fmt::Display for CheckinCredentialError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::Unavailable => "签到凭据包在当前平台不可用",
+            Self::Unavailable => "签到凭据包暂时不可用",
             Self::Missing => "签到凭据包不存在",
             Self::Invalid => "签到凭据包无效",
             Self::BindingMismatch => "签到凭据绑定不匹配",
@@ -420,7 +421,8 @@ struct RenewalManifest {
 }
 
 /// refresh 救援尝试的非敏感证据；凭据代次指纹只用于防止同一代次重复触网。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RefreshRescueAttempt {
     format_version: u32,
     profile_id_sha256: String,
@@ -446,6 +448,19 @@ pub struct CheckinCredentialStore {
     root: PathBuf,
 }
 
+/// 单个账号凭据资源租约；同时绑定 profile_id 与规范化凭据锁资源路径。
+pub struct CheckinProfileOperationLease {
+    profile_id: String,
+    lock_resource: PathBuf,
+    _lock: FileOperationLock,
+}
+
+impl CheckinProfileOperationLease {
+    fn protects(&self, profile_id: &str, lock_resource: &Path) -> bool {
+        self.profile_id == profile_id && self.lock_resource == lock_resource
+    }
+}
+
 impl CheckinCredentialStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -457,9 +472,27 @@ impl CheckinCredentialStore {
 
     /// 加密保存凭据包（初始建档）。原子写入，不产生 journal。
     pub fn save(&self, bundle: &CheckinCredentialBundle) -> Result<(), CheckinCredentialError> {
+        let lease = self.lock_profile(&bundle.profile_id)?;
+        self.save_with_lease(&lease, bundle)
+    }
+
+    /// 在调用者持有同一凭据存储租约时保存凭据包，不重复加锁。
+    pub fn save_with_lease(
+        &self,
+        lease: &CheckinProfileOperationLease,
+        bundle: &CheckinCredentialBundle,
+    ) -> Result<(), CheckinCredentialError> {
+        let destination = self.require_profile_lease(lease, &bundle.profile_id)?;
         let payload = encode_bundle_payload(bundle)?;
-        let destination = self.credential_path(&bundle.profile_id)?;
-        write_file_atomically(&destination, &payload)
+        self.save_payload_unlocked(&payload, &destination)
+    }
+
+    fn save_payload_unlocked(
+        &self,
+        payload: &[u8],
+        destination: &Path,
+    ) -> Result<(), CheckinCredentialError> {
+        write_file_atomically(destination, payload)
     }
 
     /// 解密读取并校验绑定；任何失败都不产生写副作用。
@@ -485,9 +518,22 @@ impl CheckinCredentialStore {
         binding: &CheckinProfileBinding,
         mobile: Option<&str>,
     ) -> Result<(), CheckinCredentialError> {
+        let lease = self.lock_profile(&binding.profile_id)?;
+        self.set_mobile_full_with_lease(&lease, binding, mobile)
+    }
+
+    /// 在调用者持有同一凭据存储租约时更新手机号，不重复加锁。
+    pub fn set_mobile_full_with_lease(
+        &self,
+        lease: &CheckinProfileOperationLease,
+        binding: &CheckinProfileBinding,
+        mobile: Option<&str>,
+    ) -> Result<(), CheckinCredentialError> {
+        let destination = self.require_profile_lease(lease, &binding.profile_id)?;
         let mut bundle = self.load(binding)?;
         bundle.mobile_full = mobile.map(str::to_string);
-        self.save(&bundle)
+        let payload = encode_bundle_payload(&bundle)?;
+        self.save_payload_unlocked(&payload, &destination)
     }
 
     /// 是否存在未收口的中断写回。
@@ -521,8 +567,8 @@ impl CheckinCredentialStore {
         ));
         let marker = RefreshRescueAttempt {
             format_version: REFRESH_RESCUE_FORMAT_VERSION,
-            profile_id_sha256,
-            credential_generation_sha256,
+            profile_id_sha256: profile_id_sha256.clone(),
+            credential_generation_sha256: credential_generation_sha256.clone(),
             attempted_at_unix_seconds,
         };
         let payload = serde_json::to_vec_pretty(&marker)
@@ -544,6 +590,16 @@ impl CheckinCredentialStore {
                 let metadata = fs::symlink_metadata(&marker_path)
                     .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
                 if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+                    return Err(CheckinCredentialError::RecoveryRequired);
+                }
+                let existing =
+                    fs::read(&marker_path).map_err(|_| CheckinCredentialError::RecoveryRequired)?;
+                let existing: RefreshRescueAttempt = serde_json::from_slice(&existing)
+                    .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
+                if existing.format_version != REFRESH_RESCUE_FORMAT_VERSION
+                    || existing.profile_id_sha256 != profile_id_sha256
+                    || existing.credential_generation_sha256 != credential_generation_sha256
+                {
                     return Err(CheckinCredentialError::RecoveryRequired);
                 }
                 Ok(false)
@@ -609,9 +665,22 @@ impl CheckinCredentialStore {
         for record in self.pending_renewals()? {
             let journal_dir = self.root.join("renewals").join(&record.operation_id);
             let manifest_path = journal_dir.join("manifest.json");
+            let initial_manifest = read_manifest_if_present(&manifest_path)?
+                .ok_or(CheckinCredentialError::RecoveryRequired)?;
+            let credential_path = self.credential_path(&initial_manifest.profile_id)?;
+            let _lock = self.acquire_profile_write_lock(&credential_path)?;
             let manifest = read_manifest_if_present(&manifest_path)?
                 .ok_or(CheckinCredentialError::RecoveryRequired)?;
-            let credential_path = self.credential_path(&manifest.profile_id)?;
+            if manifest.operation_id != record.operation_id
+                || initial_manifest.operation_id != record.operation_id
+                || initial_manifest.profile_id != record.profile_id
+                || manifest.profile_id != initial_manifest.profile_id
+            {
+                return Err(CheckinCredentialError::RecoveryRequired);
+            }
+            if !is_pending_state(&manifest.state) {
+                continue;
+            }
             let current =
                 fs::read(&credential_path).map_err(|_| CheckinCredentialError::RecoveryRequired)?;
             let backup = fs::read(journal_dir.join("bundle.before"))
@@ -657,17 +726,15 @@ impl CheckinCredentialStore {
         Ok(())
     }
 
-    /// 写回轮换后的凭据，固定顺序：
-    /// 绑定校验 -> 旧凭据备份 -> 临时文件 -> 解密/绑定校验 -> 原子替换 ->
-    /// 重新读取验证；每一步失败都保留旧凭据并收口 journal。
-    ///
-    /// 仅限本 crate 的续期编排（fixture 与真实 HTTP）复用；不对 crate 外公开，
-    /// 避免绕过续期协议直接改写凭据。
-    pub(crate) fn write_back(
+    /// 在续期编排持有账号锁时写回凭据包；验证和发布失败均保留旧凭据。
+    /// 固定顺序为：备份、临时文件验证、原子替换、重新读取验证与 journal 收口。
+    pub fn write_back_with_lease(
         &self,
+        lease: &CheckinProfileOperationLease,
         binding: &CheckinProfileBinding,
         bundle: &CheckinCredentialBundle,
     ) -> Result<String, CheckinCredentialError> {
+        let credential_path = self.require_profile_lease(lease, &binding.profile_id)?;
         // 写回前的绑定校验：账号 ID、设备 ID、设备公钥与 Profile 期望
         // 不一致时零回写，不创建 journal，也不产生备份。
         if !bundle_matches_binding(bundle, binding) {
@@ -675,7 +742,6 @@ impl CheckinCredentialStore {
         }
         validate_bundle(bundle)?;
 
-        let credential_path = self.credential_path(&binding.profile_id)?;
         let original = read_credential_payload(&credential_path)?;
         let payload = encode_bundle_payload(bundle)?;
         let before_sha256 = sha256_hex(&original);
@@ -851,10 +917,99 @@ impl CheckinCredentialStore {
             .join(format!("{}.checkin", hex::encode(hasher.finalize()))))
     }
 
+    /// 锁住单个账号凭据包，允许不同账号的凭据更新并行进行。
+    fn acquire_profile_write_lock(
+        &self,
+        credential_path: &Path,
+    ) -> Result<FileOperationLock, CheckinCredentialError> {
+        let lock_resource = self.profile_lock_resource(credential_path)?;
+        FileOperationLock::acquire_sibling_resource(&lock_resource)
+            .map_err(|_| CheckinCredentialError::Unavailable)
+    }
+
+    fn profile_lock_resource(
+        &self,
+        credential_path: &Path,
+    ) -> Result<PathBuf, CheckinCredentialError> {
+        let parent = credential_path
+            .parent()
+            .ok_or(CheckinCredentialError::Invalid)?;
+        prepare_directory(parent)?;
+        let parent = parent
+            .canonicalize()
+            .map_err(|_| CheckinCredentialError::Unavailable)?;
+        let name = credential_path
+            .file_name()
+            .ok_or(CheckinCredentialError::Invalid)?;
+        Ok(parent.join(name))
+    }
+
+    fn existing_profile_lock_resource(
+        &self,
+        credential_path: &Path,
+    ) -> Result<PathBuf, CheckinCredentialError> {
+        let parent = credential_path
+            .parent()
+            .ok_or(CheckinCredentialError::Invalid)?
+            .canonicalize()
+            .map_err(|_| CheckinCredentialError::BindingMismatch)?;
+        let name = credential_path
+            .file_name()
+            .ok_or(CheckinCredentialError::Invalid)?;
+        Ok(parent.join(name))
+    }
+
+    fn require_profile_lease(
+        &self,
+        lease: &CheckinProfileOperationLease,
+        profile_id: &str,
+    ) -> Result<PathBuf, CheckinCredentialError> {
+        let credential_path = self.credential_path(profile_id)?;
+        let lock_resource = self.existing_profile_lock_resource(&credential_path)?;
+        if !lease.protects(profile_id, &lock_resource) {
+            return Err(CheckinCredentialError::BindingMismatch);
+        }
+        Ok(credential_path)
+    }
+
+    pub(crate) fn validate_profile_lease(
+        &self,
+        lease: &CheckinProfileOperationLease,
+        profile_id: &str,
+    ) -> Result<(), CheckinCredentialError> {
+        self.require_profile_lease(lease, profile_id).map(|_| ())
+    }
+
+    /// 获取账号凭据租约，供需要跨越多步读写的操作覆盖完整流程。
+    pub fn lock_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<CheckinProfileOperationLease, CheckinCredentialError> {
+        let credential_path = self.credential_path(profile_id)?;
+        let lock_resource = self.profile_lock_resource(&credential_path)?;
+        let lock = FileOperationLock::acquire_sibling_resource(&lock_resource)
+            .map_err(|_| CheckinCredentialError::Unavailable)?;
+        Ok(CheckinProfileOperationLease {
+            profile_id: profile_id.to_string(),
+            lock_resource,
+            _lock: lock,
+        })
+    }
+
     /// 删除指定账号的加密凭据包文件（账号删除流程）。
     /// 文件不存在视为已删除（幂等）；其余 IO 失败原样报错。
     pub fn remove(&self, profile_id: &str) -> Result<(), CheckinCredentialError> {
-        let path = self.credential_path(profile_id)?;
+        let lease = self.lock_profile(profile_id)?;
+        self.remove_with_lease(&lease, profile_id)
+    }
+
+    /// 在调用者持有同一凭据存储租约时删除凭据，不重复加锁。
+    pub fn remove_with_lease(
+        &self,
+        lease: &CheckinProfileOperationLease,
+        profile_id: &str,
+    ) -> Result<(), CheckinCredentialError> {
+        let path = self.require_profile_lease(lease, profile_id)?;
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -891,6 +1046,7 @@ impl<'a> FixtureRenewalService<'a> {
         timestamp_unix_seconds: u64,
         nonce: &str,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
+        let profile_lease = self.store.lock_profile(&binding.profile_id)?;
         // 中断现场未收口前禁止新的写回。
         if self.store.has_pending_renewal()? {
             return Err(CheckinCredentialError::RecoveryRequired);
@@ -929,7 +1085,9 @@ impl<'a> FixtureRenewalService<'a> {
         if let Some(refresh_token) = new_refresh_token {
             updated.refresh_token = refresh_token;
         }
-        let operation_id = self.store.write_back(binding, &updated)?;
+        let operation_id = self
+            .store
+            .write_back_with_lease(&profile_lease, binding, &updated)?;
         Ok(RenewalReceipt {
             profile_id: binding.profile_id.clone(),
             operation_id,
@@ -1411,6 +1569,10 @@ fn now_unix_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_lease::FileOperationLock;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     // fixture 假材料：只用于构造测试场景，不代表真实凭据。
@@ -1477,6 +1639,114 @@ mod tests {
             refresh_token_expires_at_unix_seconds: 1_800_000_000 + REFRESH_TOKEN_LIFETIME_SECONDS,
             mobile_full: None,
         }
+    }
+
+    #[test]
+    fn profile_lease_rejects_same_profile_from_another_store_root() {
+        let root = tempdir().unwrap();
+        let work_store = CheckinCredentialStore::new(root.path().join("work"));
+        let cn_store = CheckinCredentialStore::new(root.path().join("cn"));
+        let work_lease = work_store.lock_profile("same-profile").unwrap();
+        let cn_lease = cn_store.lock_profile("same-profile").unwrap();
+
+        assert_eq!(
+            work_store.validate_profile_lease(&cn_lease, "same-profile"),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+        assert_eq!(
+            cn_store.validate_profile_lease(&work_lease, "same-profile"),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+
+        let mut bundle = fixture_bundle("public-key", "private-key");
+        bundle.profile_id = "same-profile".to_string();
+        let binding = CheckinProfileBinding::new("same-profile", "account", "device", "key");
+        assert_eq!(
+            work_store.save_with_lease(&cn_lease, &bundle),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+        assert_eq!(
+            cn_store.remove_with_lease(&work_lease, "same-profile"),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+        assert_eq!(
+            work_store.set_mobile_full_with_lease(&cn_lease, &binding, None),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+        assert_eq!(
+            cn_store.write_back_with_lease(&work_lease, &binding, &bundle),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn matching_profile_lease_allows_all_writes_without_relocking() {
+        let root = tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path().join("profiles"));
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let mut bundle = fixture_bundle(&public_pem, &private_pem);
+        let binding = fixture_binding(&public_pem);
+        let lease = store.lock_profile(&bundle.profile_id).unwrap();
+
+        store.save_with_lease(&lease, &bundle).unwrap();
+        store
+            .set_mobile_full_with_lease(&lease, &binding, Some("13812345678"))
+            .unwrap();
+        bundle = store.load(&binding).unwrap();
+        bundle.access_token = "updated-access".to_string();
+        bundle.refresh_token = "updated-refresh".to_string();
+        store
+            .write_back_with_lease(&lease, &binding, &bundle)
+            .unwrap();
+        let updated = store.load(&binding).unwrap();
+        assert_eq!(updated.access_token, "updated-access");
+        assert_eq!(updated.refresh_token, "updated-refresh");
+        assert_eq!(updated.mobile_full.as_deref(), Some("13812345678"));
+
+        store.remove_with_lease(&lease, &bundle.profile_id).unwrap();
+        assert!(matches!(
+            store.load(&binding),
+            Err(CheckinCredentialError::Missing)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mobile_update_waits_for_profile_lock_and_preserves_the_credential() {
+        let root = tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path().join("profiles"));
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let binding = fixture_binding(&public_pem);
+        store
+            .save(&fixture_bundle(&public_pem, &private_pem))
+            .unwrap();
+
+        let lock = FileOperationLock::acquire_sibling_resource(&credential_path(&store)).unwrap();
+        let writer_store = store.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(writer_store.set_mobile_full(&binding, Some("13812345678")))
+                .unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(finished_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(lock);
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+
+        let loaded = store.load(&fixture_binding(&public_pem)).unwrap();
+        assert_eq!(loaded.mobile_full.as_deref(), Some("13812345678"));
+        assert_eq!(loaded.refresh_token, FIXTURE_REFRESH_TOKEN_A);
     }
 
     fn registered_exchange(device_public_key: &str) -> FixtureTokenEndpoint {
@@ -1748,6 +2018,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refresh_rescue_claim_is_at_most_once_under_concurrency() {
+        let root = tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path().join("profiles"));
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let binding = fixture_binding(&public_pem);
+        let bundle = fixture_bundle(&public_pem, &private_pem);
+        let barrier = Arc::new(Barrier::new(8));
+
+        let attempts: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let root = store.root().to_path_buf();
+                let binding = binding.clone();
+                let bundle = bundle.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    CheckinCredentialStore::new(root).claim_refresh_rescue_attempt(
+                        &binding,
+                        &bundle,
+                        1_800_000_000,
+                    )
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(true)))
+                .count(),
+            1,
+            "同一凭据代次至多一个调用者可获得触网资格"
+        );
+        assert!(results.into_iter().all(|result| match result {
+            Ok(true) | Ok(false) => true,
+            Err(error) => error == CheckinCredentialError::RecoveryRequired,
+        }));
+        assert_eq!(
+            fs::read_dir(store.root().join(REFRESH_RESCUE_DIRECTORY))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(!store
+            .claim_refresh_rescue_attempt(&binding, &bundle, 1_800_000_001)
+            .unwrap());
+    }
+
+    #[test]
+    fn refresh_rescue_rejects_invalid_existing_marker_without_modifying_it() {
+        let root = tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path().join("profiles"));
+        let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let binding = fixture_binding(&public_pem);
+        let bundle = fixture_bundle(&public_pem, &private_pem);
+        let rescue_root = store.root().join(REFRESH_RESCUE_DIRECTORY);
+        fs::create_dir_all(&rescue_root).unwrap();
+        let marker_path = rescue_root.join(format!(
+            "{}-{}.json",
+            sha256_hex(binding.profile_id.as_bytes()),
+            credential_generation_sha256(&bundle)
+        ));
+        let valid_marker = RefreshRescueAttempt {
+            format_version: REFRESH_RESCUE_FORMAT_VERSION,
+            profile_id_sha256: sha256_hex(binding.profile_id.as_bytes()),
+            credential_generation_sha256: credential_generation_sha256(&bundle),
+            attempted_at_unix_seconds: 1_800_000_000,
+        };
+        let mut wrong_profile = serde_json::to_value(&valid_marker).unwrap();
+        wrong_profile["profile_id_sha256"] = serde_json::Value::String("wrong".to_string());
+        let mut wrong_generation = serde_json::to_value(&valid_marker).unwrap();
+        wrong_generation["credential_generation_sha256"] =
+            serde_json::Value::String("wrong".to_string());
+
+        for bytes in [
+            b"".as_slice(),
+            b"{\"format_version\":1".as_slice(),
+            serde_json::to_vec(&wrong_profile).unwrap().as_slice(),
+            serde_json::to_vec(&wrong_generation).unwrap().as_slice(),
+        ] {
+            fs::write(&marker_path, bytes).unwrap();
+            assert_eq!(
+                store.claim_refresh_rescue_attempt(&binding, &bundle, 1_800_000_000),
+                Err(CheckinCredentialError::RecoveryRequired)
+            );
+            assert_eq!(fs::read(&marker_path).unwrap(), bytes);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn write_back_rejects_binding_mismatch_before_creating_journal() {
@@ -1763,10 +2127,11 @@ mod tests {
         let binding = fixture_binding(&other_public);
         let updated = fixture_bundle(&public_pem, &private_pem);
 
-        assert_eq!(
-            store.write_back(&binding, &updated),
-            Err(CheckinCredentialError::BindingMismatch)
-        );
+        let result = {
+            let lease = store.lock_profile(&binding.profile_id).unwrap();
+            store.write_back_with_lease(&lease, &binding, &updated)
+        };
+        assert_eq!(result, Err(CheckinCredentialError::BindingMismatch));
         assert_no_writeback(&store, &saved);
     }
 

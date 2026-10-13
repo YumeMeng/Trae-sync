@@ -9,8 +9,8 @@ import type {
   CheckinOverviewEntryDto,
   CheckinResultDto,
 } from "../src/types/account_switch";
+import type { EnvironmentStateDto } from "../src/types/environment";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
-import type { CommandName } from "../src/types/commandNames";
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
 vi.mock("@tauri-apps/api/core", async () => {
@@ -40,6 +40,13 @@ import { notify } from "../src/platform/notify";
 
 const mockInvoke = vi.mocked(invoke);
 const notifyMock = vi.mocked(notify);
+
+/** 创建可手动收尾的异步读取，用于复现跨产品迟到回执。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
 
 /** 取出组件挂载时注册的进度事件 handler，测试中手动推送事件载荷。 */
 function progressHandlerOf(eventName: string): (event: { payload: unknown }) => void {
@@ -197,7 +204,7 @@ describe("AccountCenter", () => {
     expect(screen.queryByTestId("account-add-primary")).not.toBeInTheDocument();
   });
 
-  it("真实模式条目展示要素：名称、模型额度、签到槽位徽章、凭据剩余时间", async () => {
+  it("真实模式条目展示要素：名称、模型额度、签到槽位徽章、最近验证与凭据剩余时间", async () => {
     mockRealMode([overviewEntry("profile-login-1", "登录账号甲", {
       usage_remaining_credits: 1240,
       usage_cached_at: "2026-08-22T01:00:00.000Z",
@@ -210,6 +217,7 @@ describe("AccountCenter", () => {
     expect(card).toHaveTextContent("模型积分");
     expect(card).toHaveTextContent("1240");
     expect(screen.getByText("已签")).toBeInTheDocument();
+    expect(card).toHaveTextContent("最近验证：");
     expect(screen.getByText("138****0000", { selector: ".account-item__meta" })).toBeInTheDocument();
     expect(screen.getByText(/登录凭据剩余 10 天/, { selector: ".account-item__token-expiry" })).toBeInTheDocument();
   });
@@ -258,13 +266,39 @@ describe("AccountCenter", () => {
       usage_remaining_credits: 1240,
       usage_cached_at: "2026-08-22T01:00:00.000Z",
     })]);
+    mockRoute("get_environment_state", () => ({
+      env_id: "master",
+      current_profile_id: "profile-login-1",
+      current_account_name: "登录账号甲",
+      observed_profile_id: null,
+      data_dir: "",
+      running: true,
+      login_state: "logged_out",
+      created_at_unix_seconds: 0,
+    }));
 
     render(<AccountCenter active={true} />);
-    fireEvent.click(await screen.findByTestId("account-card-profile-login-1"));
+    const accountCard = await screen.findByTestId("account-card-profile-login-1");
+    expect(accountCard).not.toHaveTextContent("使用中");
+    expect(screen.queryByTestId("account-current-profile-login-1")).not.toBeInTheDocument();
+    fireEvent.click(accountCard);
 
     // 详情区基础信息：模型额度、今日签到、设备尾号。
     expect(await screen.findByTestId("account-detail-usage")).toHaveTextContent(/1240/);
     expect(screen.getByTestId("account-detail-checked-in")).toHaveTextContent("已签到");
+    expect(await screen.findByTestId("account-detail-login-status")).toHaveTextContent("未登录");
+    expect(screen.getByTestId("account-detail-current-account")).toHaveTextContent("暂未确认");
+    expect(screen.getByTestId("account-detail-verified")).toHaveTextContent("2026/08/22");
+    const commonFields = [
+      screen.getByTestId("account-detail-login-status"),
+      screen.getByTestId("account-detail-current-account"),
+      screen.getByTestId("account-detail-verified"),
+    ];
+    for (let index = 0; index < commonFields.length - 1; index += 1) {
+      expect(
+        commonFields[index].compareDocumentPosition(commonFields[index + 1]) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+    }
     expect(screen.getByText(/…8502/)).toBeInTheDocument();
     // 技术细节默认折叠（jsdom 仍渲染折叠内容，断言 details 未展开）。
     const tech = screen.getByText("技术细节").closest("details");
@@ -273,6 +307,91 @@ describe("AccountCenter", () => {
 
     fireEvent.click(screen.getByTestId("account-detail-back"));
     expect(await screen.findByTestId("account-card-profile-login-1")).toBeInTheDocument();
+  });
+
+  it("Work 环境身份旧请求在切到 CN 再切回后不能覆盖新快照", async () => {
+    const olderEnvironment = deferred<EnvironmentStateDto>();
+    const newerEnvironment = deferred<EnvironmentStateDto>();
+    const makeEnvironment = (observedProfileId: string | null): EnvironmentStateDto => ({
+      env_id: "master",
+      current_profile_id: "profile-work-late",
+      current_account_name: "迟到的 Work 账号",
+      observed_profile_id: observedProfileId,
+      data_dir: "",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 0,
+    });
+    let environmentCalls = 0;
+    mockRealMode([overviewEntry("profile-work-late", "迟到的 Work 账号")]);
+    mockRoute("get_environment_state", () => {
+      environmentCalls += 1;
+      return environmentCalls === 1 ? olderEnvironment.promise : newerEnvironment.promise;
+    });
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-late",
+      display_name: "CN 账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+
+    const adapter = createTraeCnAccountAdapter();
+    const { rerender } = render(<AccountCenter active={true} />);
+    await screen.findByTestId("account-card-profile-work-late");
+    await waitFor(() => expect(environmentCalls).toBe(1));
+
+    rerender(<AccountCenter active={true} adapter={adapter} />);
+    await screen.findByTestId("account-adapter-card-cn-late");
+    rerender(<AccountCenter active={true} />);
+    await waitFor(() => expect(environmentCalls).toBe(2));
+
+    await act(async () => olderEnvironment.resolve(makeEnvironment("profile-work-late")));
+    expect(screen.getByTestId("account-card-profile-work-late")).not.toHaveTextContent("使用中");
+    expect(screen.queryByTestId("account-current-profile-work-late")).not.toBeInTheDocument();
+
+    await act(async () => newerEnvironment.resolve(makeEnvironment(null)));
+    expect(screen.queryByTestId("account-current-profile-work-late")).not.toBeInTheDocument();
+  });
+
+  it("账号页失活时清除 Work 实测身份并丢弃迟到环境回执", async () => {
+    const delayedRefresh = deferred<EnvironmentStateDto>();
+    const reactivatedRead = deferred<EnvironmentStateDto>();
+    const makeEnvironment = (observedProfileId: string | null): EnvironmentStateDto => ({
+      env_id: "master",
+      current_profile_id: "profile-work-hidden",
+      current_account_name: "Work 账号",
+      observed_profile_id: observedProfileId,
+      data_dir: "",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 0,
+    });
+    let environmentCalls = 0;
+    mockRealMode([overviewEntry("profile-work-hidden", "Work 账号")]);
+    mockRoute("get_environment_state", () => {
+      environmentCalls += 1;
+      if (environmentCalls === 1) return makeEnvironment("profile-work-hidden");
+      return environmentCalls === 2 ? delayedRefresh.promise : reactivatedRead.promise;
+    });
+
+    const { rerender } = render(<AccountCenter active={true} />);
+    await screen.findByTestId("account-current-profile-work-hidden");
+    fireEvent.click(screen.getByTestId("account-refresh-local"));
+    await waitFor(() => expect(environmentCalls).toBe(2));
+
+    rerender(<AccountCenter active={false} />);
+    expect(screen.queryByTestId("account-current-profile-work-hidden")).not.toBeInTheDocument();
+    await act(async () => delayedRefresh.resolve(makeEnvironment("profile-work-hidden")));
+    expect(screen.queryByTestId("account-current-profile-work-hidden")).not.toBeInTheDocument();
+
+    rerender(<AccountCenter active={true} />);
+    await waitFor(() => expect(environmentCalls).toBe(3));
+    expect(screen.queryByTestId("account-current-profile-work-hidden")).not.toBeInTheDocument();
+    await act(async () => reactivatedRead.resolve(makeEnvironment(null)));
+    expect(screen.queryByTestId("account-current-profile-work-hidden")).not.toBeInTheDocument();
   });
 
   it("详情页刷新额度调用单账号只读命令并回写提示", async () => {
@@ -390,6 +509,43 @@ describe("AccountCenter", () => {
     expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
   });
 
+  it("Work 的批量凭据确认切到 Trae CN 后失效，不转为 CN 刷新", async () => {
+    const workEntry = overviewEntry("profile-work-refresh", "Work 账号");
+    mockRealMode([workEntry]);
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-refresh",
+      display_name: "CN 账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+    mockRoute("refresh_checkin_credentials", () => [
+      { profile_id: workEntry.profile_id, screen_name: workEntry.screen_name, refreshed: true, error_code: null },
+    ]);
+
+    const cnAdapter = createTraeCnAccountAdapter();
+    const { rerender } = render(<AccountCenter active={true} />);
+    await screen.findByText("Work 账号");
+    fireEvent.click(screen.getByTestId("account-refresh-credentials"));
+    const workConfirm = screen.getByTestId("account-refresh-credentials-confirm-confirm");
+    expect(workConfirm).toBeInTheDocument();
+
+    rerender(<AccountCenter active={true} adapter={cnAdapter} />);
+    await screen.findByTestId("account-adapter-card-cn-refresh");
+    const confirmAfterSwitch = screen.queryByTestId("account-refresh-credentials-confirm-confirm");
+    const confirmationSurvivedSwitch = confirmAfterSwitch !== null;
+    if (confirmAfterSwitch) fireEvent.click(confirmAfterSwitch);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    // P15-7：refreshCredential 能力已从适配器移除（融合版登录代次由客户端
+    // 自动续期），切换后确认弹层失效且不会转为任何凭据刷新调用。
+    expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credentials", expect.anything());
+    expect(confirmationSurvivedSwitch).toBe(false);
+    expect(screen.queryByTestId("account-refresh-credentials-confirm-confirm")).not.toBeInTheDocument();
+  });
+
   it("批量刷新凭据期间逐账号进度上屏，收齐后走既有结果摘要（P11-3）", async () => {
     const entryA = overviewEntry("profile-credential-all-a", "凭据成功账号");
     const entryB = overviewEntry("profile-credential-all-b", "凭据失败账号");
@@ -418,14 +574,14 @@ describe("AccountCenter", () => {
     // 逐账号进度事件实时上屏：「正在处理 i/N：账号名」。
     act(() => {
       progressHandlerOf("credential-refresh-progress")({
-        payload: { profile_id: entryA.profile_id, screen_name: "凭据成功账号", completed: 1, total: 2, refreshed: true, error_code: null },
+        payload: { product_id: "work_cn", profile_id: entryA.profile_id, screen_name: "凭据成功账号", completed: 1, total: 2, refreshed: true, error_code: null },
       });
     });
     expect(screen.getByText("正在处理 1/2：凭据成功账号")).toBeInTheDocument();
 
     act(() => {
       progressHandlerOf("credential-refresh-progress")({
-        payload: { profile_id: entryB.profile_id, screen_name: "凭据失败账号", completed: 2, total: 2, refreshed: false, error_code: "credential_refresh_failed" },
+        payload: { product_id: "work_cn", profile_id: entryB.profile_id, screen_name: "凭据失败账号", completed: 2, total: 2, refreshed: false, error_code: "credential_refresh_failed" },
       });
     });
     expect(screen.getByText("正在处理 2/2：凭据失败账号")).toBeInTheDocument();
@@ -473,7 +629,7 @@ describe("AccountCenter", () => {
 
     act(() => {
       progressHandlerOf("health-check-progress")({
-        payload: { profile_id: entryA.profile_id, screen_name: "检测账号甲", completed: 1, total: 2, healthy: true, error_code: null },
+        payload: { product_id: "work_cn", profile_id: entryA.profile_id, screen_name: "检测账号甲", completed: 1, total: 2, healthy: true, error_code: null },
       });
     });
     expect(screen.getByText("正在处理 1/2：检测账号甲")).toBeInTheDocument();
@@ -524,7 +680,7 @@ describe("AccountCenter", () => {
     expect(screen.getByText("正在查询最新额度…")).toBeInTheDocument();
     act(() => {
       progressHandlerOf("credits-refresh-progress")({
-        payload: { profile_id: entryA.profile_id, screen_name: "额度账号甲", completed: 1, total: 2, ok: true, credits: 1250, checked_in: true, usage_remaining_credits: 100, error_code: null },
+        payload: { product_id: "work_cn", profile_id: entryA.profile_id, screen_name: "额度账号甲", completed: 1, total: 2, ok: true, credits: 1250, checked_in: true, usage_remaining_credits: 100, error_code: null },
       });
     });
     expect(screen.getByText("正在处理 1/2：额度账号甲")).toBeInTheDocument();
@@ -557,7 +713,7 @@ describe("AccountCenter", () => {
     // credits-refresh-progress 事件携带 health_check kind：链路不匹配，静默丢弃。
     act(() => {
       progressHandlerOf("credits-refresh-progress")({
-        payload: { kind: "health_check", profile_id: entry.profile_id, screen_name: "契约账号", completed: 1, total: 1, healthy: true, error_code: null },
+        payload: { product_id: "work_cn", kind: "health_check", profile_id: entry.profile_id, screen_name: "契约账号", completed: 1, total: 1, healthy: true, error_code: null },
       });
     });
     expect(screen.getByText("正在查询最新额度…")).toBeInTheDocument();
@@ -565,10 +721,300 @@ describe("AccountCenter", () => {
     // 携带匹配的 credits_refresh kind：正常上屏。
     act(() => {
       progressHandlerOf("credits-refresh-progress")({
-        payload: { kind: "credits_refresh", profile_id: entry.profile_id, screen_name: "契约账号", completed: 1, total: 1, ok: true, credits: 1250, checked_in: true, usage_remaining_credits: 100, error_code: null },
+        payload: { product_id: "work_cn", kind: "credits_refresh", profile_id: entry.profile_id, screen_name: "契约账号", completed: 1, total: 1, ok: true, credits: 1250, checked_in: true, usage_remaining_credits: 100, error_code: null },
       });
     });
     expect(screen.getByText("正在处理 1/1：契约账号")).toBeInTheDocument();
+  });
+
+  it("Trae CN 账号页拒绝 Work 或缺少产品来源的进度，并清理切换前进度", async () => {
+    let resolveHealth: (entries: unknown) => void = () => undefined;
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-progress-account",
+      display_name: "CN 进度账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+    mockRoute("check_trae_cn_account_health", () =>
+      new Promise((resolve) => { resolveHealth = resolve; }));
+
+    const view = render(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+    await screen.findByTestId("account-adapter-card-cn-progress-account");
+    fireEvent.click(screen.getByTestId("account-health-check"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("check_trae_cn_account_health", {
+        profileIds: ["cn-progress-account"],
+      });
+    });
+
+    act(() => {
+      progressHandlerOf("health-check-progress")({
+        payload: {
+          product_id: "work_cn",
+          kind: "health_check",
+          profile_id: "work-private-profile",
+          screen_name: "Work 私有账号名",
+          completed: 1,
+          total: 1,
+          healthy: true,
+          error_code: null,
+        },
+      });
+      progressHandlerOf("health-check-progress")({
+        payload: {
+          kind: "health_check",
+          profile_id: "missing-product-profile",
+          screen_name: "缺少产品来源的账号名",
+          completed: 1,
+          total: 1,
+          healthy: true,
+          error_code: null,
+        },
+      });
+    });
+    expect(screen.getByText("正在检测 TRAE 账号健康度…")).toBeInTheDocument();
+    expect(screen.queryByText(/Work 私有账号名|缺少产品来源的账号名/)).not.toBeInTheDocument();
+
+    act(() => {
+      progressHandlerOf("health-check-progress")({
+        payload: {
+          product_id: "trae_cn",
+          kind: "health_check",
+          profile_id: "cn-progress-account",
+          screen_name: "CN 当前进度",
+          completed: 1,
+          total: 1,
+          healthy: true,
+          error_code: null,
+        },
+      });
+    });
+    expect(screen.getByText("正在处理 1/1：CN 当前进度")).toBeInTheDocument();
+
+    view.rerender(<AccountCenter active={true} />);
+    await waitFor(() => {
+      expect(screen.queryByText("正在处理 1/1：CN 当前进度")).not.toBeInTheDocument();
+    });
+    await act(async () => {
+      resolveHealth?.([{
+        profile_id: "cn-progress-account",
+        screen_name: "CN 进度账号",
+        healthy: true,
+        error_code: null,
+      }]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(notifyMock.summary).toHaveBeenCalledWith("健康检测完成", [], 1);
+  });
+
+  it("Work 健康检测挂起时切换 Trae CN，显示中立等待状态且不泄露账号进度", async () => {
+    const workEntry = overviewEntry("work-pending-account", "Work 挂起账号");
+    let resolveWorkProbe: (entries: unknown[]) => void = () => undefined;
+    mockRealMode([workEntry]);
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-pending-account",
+      display_name: "CN 当前账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+    mockRoute("refresh_checkin_credits", () =>
+      new Promise((resolve) => { resolveWorkProbe = resolve; }));
+
+    const view = render(<AccountCenter active={true} />);
+    await screen.findByTestId("account-card-work-pending-account");
+    fireEvent.click(screen.getByTestId("account-health-check"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credits", {
+        profileIds: ["work-pending-account"],
+      });
+    });
+
+    act(() => {
+      progressHandlerOf("credits-refresh-progress")({
+        payload: {
+          product_id: "work_cn",
+          kind: "credits_refresh",
+          profile_id: "work-pending-account",
+          screen_name: "Work 私有进度名",
+          completed: 1,
+          total: 1,
+          ok: true,
+          credits: 200,
+          checked_in: true,
+          usage_remaining_credits: 100,
+          error_code: null,
+        },
+      });
+    });
+    expect(screen.getByText("正在处理 1/1：Work 私有进度名")).toBeInTheDocument();
+
+    view.rerender(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+    expect(await screen.findByTestId("account-adapter-card-cn-pending-account")).toBeInTheDocument();
+    expect(screen.queryByText("正在处理 1/1：Work 私有进度名")).not.toBeInTheDocument();
+    expect(screen.queryByText("正在检测 TRAE 账号健康度…")).not.toBeInTheDocument();
+    expect(screen.getByText("账号健康检测正在进行，完成后可继续。")).toBeInTheDocument();
+    expect(screen.getByTestId("account-health-check")).toBeDisabled();
+    expect(screen.getByTestId("account-health-check")).toHaveTextContent("等待检测完成…");
+
+    await act(async () => {
+      resolveWorkProbe?.([{
+        profile_id: "work-pending-account",
+        screen_name: "Work 挂起账号",
+        credits: 200,
+        checked_in: true,
+        usage_remaining_credits: 100,
+        error_code: null,
+      }]);
+    });
+    await waitFor(() => expect(notifyMock.summary).toHaveBeenCalledWith("健康检测完成", expect.anything(), 1));
+    await waitFor(() => {
+      expect(screen.queryByText("账号健康检测正在进行，完成后可继续。")).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("account-health-check")).toBeEnabled();
+    expect(screen.getByTestId("account-health-check")).toHaveTextContent("健康检测");
+    expect(screen.queryByText(/Work 私有进度名|Work 挂起账号/)).not.toBeInTheDocument();
+  });
+
+  it("Work 凭据刷新挂起时切换 Trae CN，显示中立等待状态且不泄露账号进度", async () => {
+    const workEntry = overviewEntry("work-credential-pending", "Work 凭据挂起账号");
+    let resolveWorkRefresh: (entries: unknown[]) => void = () => undefined;
+    mockRealMode([workEntry]);
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-credential-pending",
+      display_name: "CN 凭据当前账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+    mockRoute("refresh_checkin_credentials", () =>
+      new Promise((resolve) => { resolveWorkRefresh = resolve; }));
+
+    const view = render(<AccountCenter active={true} />);
+    await screen.findByTestId("account-card-work-credential-pending");
+    fireEvent.click(screen.getByTestId("account-refresh-credentials"));
+    fireEvent.click(await screen.findByTestId("account-refresh-credentials-confirm-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credentials", {
+        profileIds: ["work-credential-pending"],
+      });
+    });
+
+    act(() => {
+      progressHandlerOf("credential-refresh-progress")({
+        payload: {
+          product_id: "work_cn",
+          kind: "credential_refresh",
+          profile_id: "work-credential-pending",
+          screen_name: "Work 私有凭据进度名",
+          completed: 1,
+          total: 1,
+          refreshed: true,
+          error_code: null,
+        },
+      });
+    });
+    expect(screen.getByText("正在处理 1/1：Work 私有凭据进度名")).toBeInTheDocument();
+
+    view.rerender(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+    expect(await screen.findByTestId("account-adapter-card-cn-credential-pending")).toBeInTheDocument();
+    expect(screen.queryByText("正在处理 1/1：Work 私有凭据进度名")).not.toBeInTheDocument();
+    expect(screen.queryByText("正在刷新 Trae CN 登录凭据，不会打开新的 OAuth 登录…")).not.toBeInTheDocument();
+    expect(screen.getByText("账号凭据刷新正在进行，完成后可继续。")).toBeInTheDocument();
+    // P15-7：融合版页不提供凭据刷新入口（登录代次由客户端自动续期），
+    // Work 挂起刷新期间该按钮随能力门控整体隐藏。
+    expect(screen.queryByTestId("account-refresh-credentials")).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveWorkRefresh?.([{
+        profile_id: "work-credential-pending",
+        screen_name: "Work 凭据挂起账号",
+        refreshed: true,
+        error_code: null,
+      }]);
+    });
+    await waitFor(() => expect(notifyMock.summary).toHaveBeenCalledWith("凭据刷新完成", [], 1));
+    await waitFor(() => {
+      expect(screen.queryByText("账号凭据刷新正在进行，完成后可继续。")).not.toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("account-refresh-credentials")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Work 私有凭据进度名|Work 凭据挂起账号/)).not.toBeInTheDocument();
+  });
+
+  it("Work 额度查询挂起时切换 Trae CN，显示中立等待状态且不泄露账号进度", async () => {
+    const workEntry = overviewEntry("work-credits-pending", "Work 额度挂起账号");
+    let resolveWorkCredits: (entries: unknown[]) => void = () => undefined;
+    mockRealMode([workEntry]);
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-credits-pending",
+      display_name: "CN 额度当前账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+    mockRoute("refresh_checkin_credits", () =>
+      new Promise((resolve) => { resolveWorkCredits = resolve; }));
+
+    const view = render(<AccountCenter active={true} />);
+    await screen.findByTestId("account-card-work-credits-pending");
+    fireEvent.click(screen.getByTestId("account-refresh-credits"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("refresh_checkin_credits", {
+        profileIds: ["work-credits-pending"],
+      });
+    });
+
+    act(() => {
+      progressHandlerOf("credits-refresh-progress")({
+        payload: {
+          product_id: "work_cn",
+          kind: "credits_refresh",
+          profile_id: "work-credits-pending",
+          screen_name: "Work 私有额度进度名",
+          completed: 1,
+          total: 1,
+          ok: true,
+          credits: 200,
+          checked_in: true,
+          usage_remaining_credits: 100,
+          error_code: null,
+        },
+      });
+    });
+    expect(screen.getByText("正在处理 1/1：Work 私有额度进度名")).toBeInTheDocument();
+
+    view.rerender(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+    expect(await screen.findByTestId("account-adapter-card-cn-credits-pending")).toBeInTheDocument();
+    expect(screen.queryByText("正在处理 1/1：Work 私有额度进度名")).not.toBeInTheDocument();
+    expect(screen.queryByText("正在查询最新额度…")).not.toBeInTheDocument();
+    expect(screen.getByText("账号额度查询正在进行，完成后可继续。")).toBeInTheDocument();
+    expect(screen.getByTestId("account-health-check")).toBeDisabled();
+
+    await act(async () => {
+      resolveWorkCredits?.([{
+        profile_id: "work-credits-pending",
+        screen_name: "Work 额度挂起账号",
+        credits: 200,
+        checked_in: true,
+        usage_remaining_credits: 100,
+        error_code: null,
+      }]);
+    });
+    await waitFor(() => expect(notifyMock.summary).toHaveBeenCalledWith("额度刷新完成", [], 1));
+    await waitFor(() => {
+      expect(screen.queryByText("账号额度查询正在进行，完成后可继续。")).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("account-health-check")).toBeEnabled();
+    expect(screen.queryByText(/Work 私有额度进度名|Work 额度挂起账号/)).not.toBeInTheDocument();
   });
 
   it("Work 健康检测网络步骤由 credits-refresh-progress 驱动进度文案（P11-3）", async () => {
@@ -604,7 +1050,7 @@ describe("AccountCenter", () => {
     // 网络步骤逐账号事件到达：进度文案驱动（与本地检测并存，由事件接管）。
     act(() => {
       progressHandlerOf("credits-refresh-progress")({
-        payload: { profile_id: entryA.profile_id, screen_name: "探测账号甲", completed: 1, total: 2, ok: true, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
+        payload: { product_id: "work_cn", profile_id: entryA.profile_id, screen_name: "探测账号甲", completed: 1, total: 2, ok: true, credits: 200, checked_in: true, usage_remaining_credits: 100, error_code: null },
       });
     });
     expect(screen.getByText("正在处理 1/2：探测账号甲")).toBeInTheDocument();
@@ -800,7 +1246,7 @@ describe("AccountCenter", () => {
     mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
     mockRoute("begin_checkin_login", () => {
       loginStarted = true;
-      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 };
     });
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-login-2",
@@ -817,7 +1263,7 @@ describe("AccountCenter", () => {
     await waitFor(() =>
       expect(mockInvoke).toHaveBeenCalledWith("begin_checkin_login", { useSystemBrowser: false })
     );
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("complete_checkin_login"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("complete_checkin_login", { attemptId: 17 }));
     await waitFor(() => {
       expect(notifyMock.success).toHaveBeenCalledWith("账号“登录账号乙”登录成功，已可用于签到。");
     });
@@ -835,7 +1281,7 @@ describe("AccountCenter", () => {
     mockRoute("get_managed_account_state", () => state());
     mockRoute("get_checkin_capability", () => realCapability);
     mockRoute("get_checkin_overview", () => []);
-    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 }));
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-accept-1",
       account_id: "account-profile-accept-1",
@@ -870,7 +1316,7 @@ describe("AccountCenter", () => {
       status: "active",
       is_current: true,
     }]);
-    mockRoute("begin_trae_cn_login", () => ({ login_url: "https://example.test/login" }));
+    mockRoute("begin_trae_cn_login", () => ({ login_url: "https://example.test/login", attempt_id: 17 }));
     mockRoute("complete_trae_cn_login", () => ({
       profile_id: "cn-accept",
       screen_name: "CN 验收账号",
@@ -899,7 +1345,7 @@ describe("AccountCenter", () => {
     mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
     mockRoute("begin_checkin_login", () => {
       loginStarted = true;
-      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 };
     });
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-login-2",
@@ -936,7 +1382,7 @@ describe("AccountCenter", () => {
     mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
     mockRoute("begin_checkin_login", () => {
       loginStarted = true;
-      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 };
     });
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-login-2",
@@ -971,7 +1417,7 @@ describe("AccountCenter", () => {
     mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
     mockRoute("begin_checkin_login", () => {
       loginStarted = true;
-      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 };
     });
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-login-2",
@@ -983,7 +1429,7 @@ describe("AccountCenter", () => {
     render(<AccountCenter active={true} />);
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByTestId("account-add-primary"));
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("complete_checkin_login"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("complete_checkin_login", { attemptId: 17 }));
     // 已补录账号重复登录：不再打扰，不弹补录层。
     await waitFor(() =>
       expect(screen.queryByTestId("mobile-backfill-dialog")).not.toBeInTheDocument()
@@ -999,7 +1445,7 @@ describe("AccountCenter", () => {
     mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
     mockRoute("begin_checkin_login", () => {
       loginStarted = true;
-      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 };
     });
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-login-2",
@@ -1044,7 +1490,7 @@ describe("AccountCenter", () => {
     mockRoute("get_checkin_overview", () => (loginStarted ? after : before));
     mockRoute("begin_checkin_login", () => {
       loginStarted = true;
-      return { login_url: "https://www.trae.cn/authorization?challenge=abc" };
+      return { login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 };
     });
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-login-2",
@@ -1141,7 +1587,7 @@ describe("AccountCenter", () => {
     mockRoute("get_managed_account_state", () => state());
     mockRoute("get_checkin_capability", () => realCapability);
     mockRoute("get_checkin_overview", () => []);
-    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 }));
     mockRoute("complete_checkin_login", () => ({
       profile_id: "profile-login-1",
       account_id: "account-profile-login-1",
@@ -1402,7 +1848,7 @@ describe("AccountCenter", () => {
     mockRoute("get_managed_account_state", () => state());
     mockRoute("get_checkin_capability", () => realCapability);
     mockRoute("get_checkin_overview", () => []);
-    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 }));
     // 后端登录失败以稳定错误码返回；UI 只映射为固定文案。
     mockRoute("complete_checkin_login", () => {
       throw "login_callback_invalid";
@@ -1426,12 +1872,12 @@ describe("AccountCenter", () => {
     mockRoute("get_managed_account_state", () => state());
     mockRoute("get_checkin_capability", () => realCapability);
     mockRoute("get_checkin_overview", () => []);
-    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc" }));
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 }));
     mockRoute("complete_checkin_login", () =>
       new Promise<never>((_resolve, reject) => {
         rejectLogin = reject;
       }));
-    mockRoute("cancel_checkin_login" as CommandName, () => {
+    mockRoute("cancel_checkin_login", () => {
       rejectLogin?.("login_cancelled");
       return null;
     });
@@ -1444,7 +1890,7 @@ describe("AccountCenter", () => {
     expect(screen.getByTestId("account-add-primary")).toHaveTextContent("等待浏览器登录完成…");
 
     fireEvent.click(screen.getByTestId("account-cancel-login"));
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("cancel_checkin_login"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("cancel_checkin_login", { attemptId: 17 }));
     // 取消走中性通知（notify.info），不进错误通道（notify.error）。
     await waitFor(() => {
       expect(notifyMock.info).toHaveBeenCalledWith("登录已取消；若浏览器已关闭或未完成授权，可重新发起登录。");
@@ -1454,6 +1900,69 @@ describe("AccountCenter", () => {
     await waitFor(() => expect(screen.getByTestId("account-add-primary")).toBeEnabled());
     expect(screen.getByTestId("account-add-primary")).toHaveTextContent("添加账号");
   });
+
+  it("发布阶段取消太晚时继续等待真实登录回执", async () => {
+    const pendingLogin: { resolve?: (value: { profile_id: string; account_id: string; screen_name: string; avatar_url: string }) => void } = {};
+    mockRoute("get_managed_account_state", () => state());
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => []);
+    mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 }));
+    mockRoute("complete_checkin_login", () => new Promise((resolve) => { pendingLogin.resolve = resolve; }));
+    mockRoute("cancel_checkin_login", () => { throw "login_cancel_too_late"; });
+
+    render(<AccountCenter active={true} />);
+    fireEvent.click(await screen.findByTestId("account-add-primary"));
+    await screen.findByTestId("account-cancel-login");
+    fireEvent.click(screen.getByTestId("account-cancel-login"));
+
+    await waitFor(() => expect(notifyMock.info).toHaveBeenCalledWith("登录已进入收尾阶段，正在等待真实结果。"));
+    expect(notifyMock.warning).not.toHaveBeenCalled();
+    expect(screen.getByTestId("account-add-primary")).toHaveTextContent("等待浏览器登录完成…");
+
+    pendingLogin.resolve?.({ profile_id: "p", account_id: "a", screen_name: "完成账号", avatar_url: "" });
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("账号“完成账号”登录成功，已可用于签到。"));
+  });
+
+  it.each(["login_already_finished", "login_not_started"])(
+    "登录完成后账号刷新期间收到 %s 时显示收尾提示",
+    async (cancelError) => {
+      let completionReturned = false;
+      let releaseOverview: ((entries: CheckinOverviewEntryDto[]) => void) | undefined;
+      mockRoute("get_managed_account_state", () => state());
+      mockRoute("get_checkin_capability", () => realCapability);
+      mockRoute("get_checkin_overview", () =>
+        completionReturned
+          ? new Promise<CheckinOverviewEntryDto[]>((resolve) => {
+              releaseOverview = resolve;
+            })
+          : [],
+      );
+      mockRoute("begin_checkin_login", () => ({ login_url: "https://www.trae.cn/authorization?challenge=abc", attempt_id: 17 }));
+      mockRoute("complete_checkin_login", () => {
+        completionReturned = true;
+        return { profile_id: "p", account_id: "a", screen_name: "完成账号", avatar_url: "" };
+      });
+      mockRoute("cancel_checkin_login", () => {
+        throw cancelError;
+      });
+
+      render(<AccountCenter active={true} />);
+      fireEvent.click(await screen.findByTestId("account-add-primary"));
+      const cancelButton = await screen.findByTestId("account-cancel-login");
+      await waitFor(() => expect(releaseOverview).toBeDefined());
+
+      fireEvent.click(cancelButton);
+      await waitFor(() =>
+        expect(notifyMock.info).toHaveBeenCalledWith("登录已结束或正在收尾，请等待页面结果更新。"),
+      );
+      expect(notifyMock.warning).not.toHaveBeenCalled();
+      expect(screen.getByTestId("account-add-primary")).toHaveTextContent("等待浏览器登录完成…");
+
+      await act(async () => releaseOverview?.([]));
+      await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("账号“完成账号”登录成功，已可用于签到。"));
+      await waitFor(() => expect(screen.getByTestId("account-add-primary")).toBeEnabled());
+    },
+  );
 
   it("账号总览读取失败时错误可见，不静默伪装成空账号", async () => {
     mockRoute("get_managed_account_state", () => state());
@@ -1639,11 +2148,86 @@ describe("AccountCenter", () => {
     expect(callsOf("refresh_checkin_credits")).toBe(creditsBefore);
   });
 
+  it("产品切换后清空详情选择，即使两个产品 profile_id 相同", async () => {
+    mockRealMode([overviewEntry("shared-profile", "Work 同 ID 账号")]);
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "shared-profile",
+      display_name: "CN 同 ID 账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+
+    const adapter = createTraeCnAccountAdapter();
+    const { rerender } = render(<AccountCenter active={true} />);
+    fireEvent.click(await screen.findByTestId("account-card-shared-profile"));
+    expect(await screen.findByTestId("remote-devices-panel")).toBeInTheDocument();
+
+    rerender(<AccountCenter active={true} adapter={adapter} />);
+    expect(await screen.findByTestId("account-adapter-card-shared-profile")).toBeInTheDocument();
+    expect(screen.queryByTestId("remote-devices-panel")).not.toBeInTheDocument();
+  });
+
+  it("Work 跨产品返回时，较早的账号快照不能覆盖较新的读取", async () => {
+    const olderLoad = deferred<ManagedAccountsViewDto>();
+    const newerLoad = deferred<ManagedAccountsViewDto>();
+    const olderView = state({
+      saved_accounts: [{ ...currentProfile, profile_id: "old-work", display_name: "较早 Work 账号" }],
+    });
+    const newerView = state({
+      saved_accounts: [{ ...currentProfile, profile_id: "new-work", display_name: "较新 Work 账号" }],
+    });
+    let workReadCount = 0;
+    mockRoute("get_managed_account_state", () =>
+      ++workReadCount === 1 ? olderLoad.promise : newerLoad.promise,
+    );
+    mockRoute("get_checkin_capability", () => fixtureCapability);
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => [{
+      profile_id: "cn-during-read",
+      display_name: "CN 账号",
+      avatar_url: "",
+      last_verified_at: null,
+      status: "active",
+      is_current: true,
+    }]);
+
+    const { rerender } = render(<AccountCenter active={true} />);
+    await waitFor(() => expect(workReadCount).toBe(1));
+    rerender(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+    expect(await screen.findByTestId("account-adapter-card-cn-during-read")).toBeInTheDocument();
+    rerender(<AccountCenter active={true} />);
+    await waitFor(() => expect(workReadCount).toBe(2));
+
+    await act(async () => newerLoad.resolve(newerView));
+    expect(await screen.findByTestId("account-saved-card-new-work")).toHaveTextContent("较新 Work 账号");
+    await act(async () => olderLoad.resolve(olderView));
+
+    expect(screen.getByTestId("account-saved-card-new-work")).toHaveTextContent("较新 Work 账号");
+    expect(screen.queryByTestId("account-saved-card-old-work")).not.toBeInTheDocument();
+  });
+
   it("Work 详情页内嵌登录设备模块：默认折叠不触网，展开才按该账号拉取（P10-5）", async () => {
     mockRoute("get_managed_account_state", () => state());
     mockRoute("get_checkin_capability", () => realCapability);
     mockRoute("get_checkin_overview", () => [overviewEntry("profile-detail-1", "详情账号甲")]);
-    mockRoute("get_trae_instance_states", () => []);
+    mockRoute("get_trae_instance_states", () => [{
+      profile_id: "profile-detail-1",
+      login_state: "logged_in",
+      archive_available: true,
+    }]);
+    mockRoute("get_environment_state", () => ({
+      env_id: "master",
+      current_profile_id: "profile-detail-1",
+      current_account_name: "详情账号甲",
+      observed_profile_id: "profile-detail-1",
+      data_dir: "",
+      running: false,
+      login_state: "logged_in",
+      created_at_unix_seconds: 0,
+    }));
     mockRoute("list_remote_devices", () => ({
       profile_id: "profile-detail-1",
       account_label: "详情账号甲",
@@ -1678,9 +2262,24 @@ describe("AccountCenter", () => {
     // 进入详情：设备模块出现但默认折叠，未发任何设备命令（懒加载）。
     fireEvent.click(screen.getByTestId("account-card-profile-detail-1"));
     expect(await screen.findByTestId("remote-devices-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("account-detail-login-status")).toHaveTextContent("正常");
+    expect(screen.getByTestId("account-detail-current-account")).toHaveTextContent("使用中");
+    expect(screen.getByTestId("account-detail-verified")).toHaveTextContent("2026/08/22");
     expect(
       mockInvoke.mock.calls.filter(([name]) => name === "list_remote_devices"),
     ).toHaveLength(0);
+
+    const detailActions = screen.getByText("操作").closest("section");
+    const remoteDevices = screen.getByTestId("remote-devices-panel");
+    const dangerActions = screen.getByText("危险操作").closest("section");
+    const technicalDetails = screen.getByText("技术细节").closest("details");
+    const orderedSections = [detailActions, remoteDevices, dangerActions, technicalDetails];
+    expect(orderedSections.every((section) => section !== null)).toBe(true);
+    for (let index = 0; index < orderedSections.length - 1; index += 1) {
+      const current = orderedSections[index];
+      const next = orderedSections[index + 1];
+      expect(current!.compareDocumentPosition(next!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    }
 
     // 展开后按该账号的 profile_id 拉取列表：本机行无退出按钮，非本机行有。
     fireEvent.click(screen.getByTestId("remote-devices-toggle"));
@@ -1734,7 +2333,7 @@ describe("AccountCenter", () => {
 
     render(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
 
-    // 列表页无设备面板；卡片可点击（当前账号显示「使用中」标记）。
+    // 列表页无设备面板；卡片显示工具内选择状态。
     await screen.findByTestId("account-adapter-card-cn-a");
     expect(screen.queryByTestId("remote-devices-panel")).not.toBeInTheDocument();
 
@@ -1743,7 +2342,7 @@ describe("AccountCenter", () => {
     expect(await screen.findByTestId("adapter-account-detail")).toBeInTheDocument();
     expect(screen.getByTestId("adapter-account-detail-back")).toBeInTheDocument();
     expect(screen.getByTestId("adapter-account-detail-status")).toHaveTextContent("登录有效");
-    expect(screen.getByTestId("adapter-account-detail-current")).toHaveTextContent("使用中");
+    expect(screen.getByTestId("adapter-account-detail-current")).toHaveTextContent("工具内已选");
     expect(screen.getByTestId("remote-devices-panel")).toBeInTheDocument();
     expect(
       mockInvoke.mock.calls.filter(([name]) => name === "list_remote_devices"),
@@ -1761,5 +2360,47 @@ describe("AccountCenter", () => {
     // 其他设备分组默认折叠：先展开再断言非本机行退出按钮。
     fireEvent.click(screen.getByTestId("remote-devices-others-toggle"));
     expect(screen.getByTestId("remote-device-signout-dev-remote-1")).toBeInTheDocument();
+  });
+
+  it("Trae CN 选择账号只更新工具指针，成功回执说明官方客户端未切换", async () => {
+    let selectedProfileId = "cn-main";
+    const accounts = [
+      {
+        profile_id: "cn-main",
+        display_name: "CN 主账号",
+        avatar_url: "",
+        last_verified_at: null,
+        status: "active" as const,
+      },
+      {
+        profile_id: "cn-backup",
+        display_name: "CN 备用账号",
+        avatar_url: "",
+        last_verified_at: null,
+        status: "active" as const,
+      },
+    ];
+    mockRoute("get_product_identity_state", () => []);
+    mockRoute("list_trae_cn_accounts", () => accounts.map((account) => ({
+      ...account,
+      is_current: account.profile_id === selectedProfileId,
+    })));
+    mockRoute("switch_trae_cn_account", (args) => {
+      selectedProfileId = (args as { profileId: string }).profileId;
+    });
+
+    render(<AccountCenter active={true} adapter={createTraeCnAccountAdapter()} />);
+    await screen.findByTestId("account-adapter-card-cn-backup");
+    expect(screen.getByTestId("account-adapter-card-cn-backup")).toHaveTextContent("设为工具当前账号");
+
+    fireEvent.click(screen.getByTestId("account-adapter-tool-select"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("switch_trae_cn_account", { profileId: "cn-backup" });
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已在 Trae Sync 中将“CN 备用账号”设为工具当前账号；官方客户端登录账号没有改变。",
+      );
+    });
+    expect(screen.getByTestId("account-adapter-card-cn-backup")).toHaveTextContent("工具内已选");
   });
 });

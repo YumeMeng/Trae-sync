@@ -114,10 +114,12 @@ export const PRODUCT_DEFINITIONS: readonly ProductDefinition[] = [
   },
   {
     id: "trae_cn",
-    displayName: "Trae CN",
+    // 融合版 TRAE（Work CN 升级版）为唯一产品目标（ADR-0035）：trae_cn
+    // 产品 ID 保持稳定（后端/持久化引用不变），展示名用官方产品名。
+    displayName: "TRAE",
     capabilities: ["overview", "accounts", "checkin", "environment", "settings"],
-    credentialStatus: "need_authorization",
-    statusLabel: "需要授权",
+    credentialStatus: "verified",
+    statusLabel: "已支持",
   },
 ];
 

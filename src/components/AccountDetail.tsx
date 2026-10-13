@@ -16,9 +16,11 @@ import type {
   CredentialRefreshEntryDto,
   CheckinOverviewEntryDto,
   CreditsRefreshEntryDto,
+  TraeInstanceStateDto,
 } from "../types/account_switch";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
+import { LoginArchiveSlotBadge, deriveLoginSlotState } from "./StatusBadges";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -26,6 +28,10 @@ import { RemoteDevicesPanel } from "./RemoteDevicesPanel";
 
 interface AccountDetailProps {
   entry: CheckinOverviewEntryDto;
+  /** 凭据健康检测结果；未读取时用中性状态，不伪装为未登录。 */
+  loginState?: TraeInstanceStateDto;
+  /** 主库当前账号状态；未知值来自尚未确认的环境快照。 */
+  currentAccountStatus: "current" | "other" | "unknown";
   /** OAuth 重新登录（同一账号重复登录会覆盖更新档案与凭据）。 */
   onRelogin: () => Promise<void>;
   loginBusy: boolean;
@@ -51,7 +57,16 @@ type ConfirmableAction = "credentials" | "reset-device" | "remove";
  * 操作区包含：刷新登录凭据（同设备换发，不打开用户 OAuth）/ 刷新额度（只读查询）/
  * 立即签到（单账号批次）/ 重新登录（OAuth 覆盖更新）/ 删除账号（二次确认）。
  */
-export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSaveMobile, onBack }: AccountDetailProps) {
+export function AccountDetail({
+  entry,
+  loginState,
+  currentAccountStatus,
+  onRelogin,
+  loginBusy,
+  onDataChanged,
+  onSaveMobile,
+  onBack,
+}: AccountDetailProps) {
   const [busy, setBusy] = useState<DetailAction>(null);
   // 待确认操作：非空即弹出统一确认弹层（ConfirmDialog）。
   const [pendingAction, setPendingAction] = useState<ConfirmableAction | null>(null);
@@ -274,6 +289,43 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
             </dd>
           </div>
           <div className="account-detail__fact">
+            <dt>登录状态</dt>
+            <dd data-testid="account-detail-login-status">
+              {loginState ? (
+                <LoginArchiveSlotBadge
+                  state={deriveLoginSlotState({
+                    login_state: loginState.login_state,
+                    relogin_only: entry.credential_legacy,
+                  })}
+                  archiveAvailable={loginState.archive_available}
+                />
+              ) : (
+                <span className="slot-badge slot-badge--idle">状态待验证</span>
+              )}
+            </dd>
+          </div>
+          <div className="account-detail__fact">
+            <dt>当前账号</dt>
+            <dd data-testid="account-detail-current-account">
+              {currentAccountStatus === "current" ? (
+                <span
+                  className="account-item__current-chip"
+                  title="这是从 TRAE Work CN 登录材料中识别到的账号，不表示客户端进程此刻正在运行。"
+                >
+                  使用中
+                </span>
+              ) : currentAccountStatus === "other" ? (
+                "不是当前账号"
+              ) : (
+                "暂未确认"
+              )}
+            </dd>
+          </div>
+          <div className="account-detail__fact">
+            <dt>最近验证</dt>
+            <dd data-testid="account-detail-verified">{formatDateTime(entry.last_verified_at)}</dd>
+          </div>
+          <div className="account-detail__fact">
             <dt>手机号</dt>
             <dd data-testid="account-detail-mobile">
               {/* G11：行内补录完整手机号（与备注名同款交互）；未补录时占位
@@ -342,10 +394,6 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
           <div className="account-detail__fact">
             <dt>添加时间</dt>
             <dd>{formatDateTime(entry.created_at)}</dd>
-          </div>
-          <div className="account-detail__fact">
-            <dt>最近验证</dt>
-            <dd>{formatDateTime(entry.last_verified_at)}</dd>
           </div>
           <div className="account-detail__fact">
             <dt>签到设备</dt>
@@ -437,6 +485,17 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
         </div>
       </section>
 
+      {/* P10-5 登录设备模块：设备操作排在常规操作之后、危险操作之前。 */}
+      <RemoteDevicesPanel
+        productId="work_cn"
+        productName="TRAE Work CN"
+        profileId={entry.profile_id}
+        accountLabel={effectiveDisplayName(entry)}
+        onSignedOut={() => {
+          void onDataChanged();
+        }}
+      />
+
       {/* 危险区：破坏性操作独立分隔线下沉页底（U-2 分区决策）。 */}
       <section className="account-detail__section account-detail__section--danger" aria-labelledby="account-detail-danger">
         <h2 id="account-detail-danger">危险操作</h2>
@@ -449,19 +508,6 @@ export function AccountDetail({ entry, onRelogin, loginBusy, onDataChanged, onSa
           </button>
         </div>
       </section>
-
-      {/* P10-5 登录设备模块：内嵌本账号详情（设备管理绑定在账号上）。
-          默认折叠，展开才触网；退出成功后刷新总览数据，让列表侧
-          状态保持一致（健康检测由列表页自行发起，详情页不重复触发）。 */}
-      <RemoteDevicesPanel
-        productId="work_cn"
-        productName="TRAE Work CN"
-        profileId={entry.profile_id}
-        accountLabel={effectiveDisplayName(entry)}
-        onSignedOut={() => {
-          void onDataChanged();
-        }}
-      />
 
       {/* 技术细节：排障用标识，默认折叠 */}
       <details className="account-detail__tech">

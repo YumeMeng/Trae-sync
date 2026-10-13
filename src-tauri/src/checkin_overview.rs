@@ -7,16 +7,20 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use traesync_domain::{
     CheckinOutcome, CheckinResult, CheckinStatusSnapshot, EntitlementUsageSnapshot,
 };
 use traesync_infrastructure::account_registry::AccountRegistry;
 use traesync_infrastructure::checkin_credential::{CheckinCredentialStore, CheckinProfileBinding};
 use traesync_infrastructure::checkin_http::TRAE_SOLO_CLIENT_ID;
+use traesync_infrastructure::operation_lease::FileOperationLock;
 
 /// 积分缓存文件名（位于 `<storage_root>/checkin` 下）。
 const CREDITS_CACHE_FILE: &str = "credits-cache.json";
+static CREDITS_CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// 缓存文件体积上限：远超 1KB/账号即视为损坏，读取按空缓存处理。
 const MAX_CACHE_BYTES: u64 = 64 * 1024;
 
@@ -149,51 +153,40 @@ pub fn update_credits_cache(material_root: &Path, results: &[CheckinResult]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let mut cache = CreditsCacheFile {
-        entries: read_credits_cache(material_root),
-        ..CreditsCacheFile::default()
-    };
-    for result in results {
-        let Some(after) = &result.after else {
-            continue;
-        };
-        let previous = cache.entries.remove(&result.profile_id);
-        cache.entries.insert(
-            result.profile_id.clone(),
-            CreditsCacheEntry {
-                credits: after.credits,
-                checked_in: Some(after.checked_in),
-                cached_at_unix_seconds: now,
-                usage_remaining_credits: previous
-                    .as_ref()
-                    .and_then(|entry| entry.usage_remaining_credits),
-                usage_cached_at_unix_seconds: previous
-                    .as_ref()
-                    .and_then(|entry| entry.usage_cached_at_unix_seconds),
-                // 签到成功 = 凭据链路健康，清除历史失败标记。
-                refresh_error_code: None,
-                // 尝试证据由 update_last_attempt 随后写入；这里保留旧值防丢。
-                last_attempt_date: previous
-                    .as_ref()
-                    .and_then(|entry| entry.last_attempt_date.clone()),
-                last_attempt_outcome: previous
-                    .as_ref()
-                    .and_then(|entry| entry.last_attempt_outcome.clone()),
-            },
-        );
-    }
-    if std::fs::create_dir_all(material_root).is_err() {
-        return;
-    }
-    let Ok(payload) = serde_json::to_string_pretty(&cache) else {
-        return;
-    };
-    let destination = cache_path(material_root);
-    let temp = destination.with_extension("json.tmp");
-    // 写缓存失败不影响签到结果返回：这里只做展示增强。
-    if std::fs::write(&temp, payload).is_ok() {
-        let _ = std::fs::rename(&temp, &destination);
-    }
+    mutate_credits_cache(material_root, |entries| {
+        let mut changed = false;
+        for result in results {
+            let Some(after) = &result.after else {
+                continue;
+            };
+            changed = true;
+            let previous = entries.remove(&result.profile_id);
+            entries.insert(
+                result.profile_id.clone(),
+                CreditsCacheEntry {
+                    credits: after.credits,
+                    checked_in: Some(after.checked_in),
+                    cached_at_unix_seconds: now,
+                    usage_remaining_credits: previous
+                        .as_ref()
+                        .and_then(|entry| entry.usage_remaining_credits),
+                    usage_cached_at_unix_seconds: previous
+                        .as_ref()
+                        .and_then(|entry| entry.usage_cached_at_unix_seconds),
+                    // 签到成功 = 凭据链路健康，清除历史失败标记。
+                    refresh_error_code: None,
+                    // 尝试证据由 update_last_attempt 随后写入；这里保留旧值防丢。
+                    last_attempt_date: previous
+                        .as_ref()
+                        .and_then(|entry| entry.last_attempt_date.clone()),
+                    last_attempt_outcome: previous
+                        .as_ref()
+                        .and_then(|entry| entry.last_attempt_outcome.clone()),
+                },
+            );
+        }
+        changed
+    });
 }
 
 /// 用只读 status 快照更新积分缓存（refresh_checkin_credits 用）。
@@ -210,37 +203,35 @@ pub fn update_credits_from_snapshots(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let mut cache = CreditsCacheFile {
-        entries: read_credits_cache(material_root),
-        ..CreditsCacheFile::default()
-    };
-    for (profile_id, snapshot) in snapshots {
-        let previous = cache.entries.remove(profile_id);
-        cache.entries.insert(
-            profile_id.clone(),
-            CreditsCacheEntry {
-                credits: snapshot.credits,
-                checked_in: Some(snapshot.checked_in),
-                cached_at_unix_seconds: now,
-                usage_remaining_credits: previous
-                    .as_ref()
-                    .and_then(|entry| entry.usage_remaining_credits),
-                usage_cached_at_unix_seconds: previous
-                    .as_ref()
-                    .and_then(|entry| entry.usage_cached_at_unix_seconds),
-                // 刷新成功：清除失败标记（持久化标记只在持续失败期间展示）。
-                refresh_error_code: None,
-                // 铁律：只读查询不得清除尝试证据（last_attempt_* 只被新尝试覆盖）。
-                last_attempt_date: previous
-                    .as_ref()
-                    .and_then(|entry| entry.last_attempt_date.clone()),
-                last_attempt_outcome: previous
-                    .as_ref()
-                    .and_then(|entry| entry.last_attempt_outcome.clone()),
-            },
-        );
-    }
-    write_credits_cache(material_root, &cache);
+    mutate_credits_cache(material_root, |entries| {
+        for (profile_id, snapshot) in snapshots {
+            let previous = entries.remove(profile_id);
+            entries.insert(
+                profile_id.clone(),
+                CreditsCacheEntry {
+                    credits: snapshot.credits,
+                    checked_in: Some(snapshot.checked_in),
+                    cached_at_unix_seconds: now,
+                    usage_remaining_credits: previous
+                        .as_ref()
+                        .and_then(|entry| entry.usage_remaining_credits),
+                    usage_cached_at_unix_seconds: previous
+                        .as_ref()
+                        .and_then(|entry| entry.usage_cached_at_unix_seconds),
+                    // 刷新成功：清除失败标记（持久化标记只在持续失败期间展示）。
+                    refresh_error_code: None,
+                    // 铁律：只读查询不得清除尝试证据（last_attempt_* 只被新尝试覆盖）。
+                    last_attempt_date: previous
+                        .as_ref()
+                        .and_then(|entry| entry.last_attempt_date.clone()),
+                    last_attempt_outcome: previous
+                        .as_ref()
+                        .and_then(|entry| entry.last_attempt_outcome.clone()),
+                },
+            );
+        }
+        true
+    });
 }
 
 /// 记录额度刷新失败账号的原因码（refresh_checkin_credits 用）：
@@ -249,15 +240,9 @@ pub fn update_refresh_failures(material_root: &Path, failures: &[(String, String
     if failures.is_empty() {
         return;
     }
-    let mut cache = CreditsCacheFile {
-        entries: read_credits_cache(material_root),
-        ..CreditsCacheFile::default()
-    };
-    for (profile_id, error_code) in failures {
-        let previous = cache
-            .entries
-            .remove(profile_id)
-            .unwrap_or(CreditsCacheEntry {
+    mutate_credits_cache(material_root, |entries| {
+        for (profile_id, error_code) in failures {
+            let previous = entries.remove(profile_id).unwrap_or(CreditsCacheEntry {
                 credits: None,
                 checked_in: None,
                 cached_at_unix_seconds: 0,
@@ -267,15 +252,16 @@ pub fn update_refresh_failures(material_root: &Path, failures: &[(String, String
                 last_attempt_date: None,
                 last_attempt_outcome: None,
             });
-        cache.entries.insert(
-            profile_id.clone(),
-            CreditsCacheEntry {
-                refresh_error_code: Some(error_code.clone()),
-                ..previous
-            },
-        );
-    }
-    write_credits_cache(material_root, &cache);
+            entries.insert(
+                profile_id.clone(),
+                CreditsCacheEntry {
+                    refresh_error_code: Some(error_code.clone()),
+                    ..previous
+                },
+            );
+        }
+        true
+    });
 }
 
 /// 清除已成功完成凭据维护账号的展示失败标记；不触碰积分、额度和签到证据。
@@ -283,19 +269,15 @@ pub fn clear_refresh_failures(material_root: &Path, profile_ids: &[String]) {
     if profile_ids.is_empty() {
         return;
     }
-    let mut cache = CreditsCacheFile {
-        entries: read_credits_cache(material_root),
-        ..CreditsCacheFile::default()
-    };
-    let mut changed = false;
-    for profile_id in profile_ids {
-        if let Some(entry) = cache.entries.get_mut(profile_id) {
-            changed |= entry.refresh_error_code.take().is_some();
+    mutate_credits_cache(material_root, |entries| {
+        let mut changed = false;
+        for profile_id in profile_ids {
+            if let Some(entry) = entries.get_mut(profile_id) {
+                changed |= entry.refresh_error_code.take().is_some();
+            }
         }
-    }
-    if changed {
-        write_credits_cache(material_root, &cache);
-    }
+        changed
+    });
 }
 
 /// 用 `ide_user_ent_usage` 快照更新额度缓存（refresh_checkin_credits 用）。
@@ -308,16 +290,10 @@ pub fn update_usage_cache(material_root: &Path, usages: &[(String, EntitlementUs
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let mut cache = CreditsCacheFile {
-        entries: read_credits_cache(material_root),
-        ..CreditsCacheFile::default()
-    };
-    for (profile_id, usage) in usages {
-        // 条目可能尚不存在（从未签到）：用 Default 填充积分侧字段。
-        let previous = cache
-            .entries
-            .remove(profile_id)
-            .unwrap_or(CreditsCacheEntry {
+    mutate_credits_cache(material_root, |entries| {
+        for (profile_id, usage) in usages {
+            // 条目可能尚不存在（从未签到）：用 Default 填充积分侧字段。
+            let previous = entries.remove(profile_id).unwrap_or(CreditsCacheEntry {
                 credits: None,
                 checked_in: None,
                 cached_at_unix_seconds: 0,
@@ -327,28 +303,24 @@ pub fn update_usage_cache(material_root: &Path, usages: &[(String, EntitlementUs
                 last_attempt_date: None,
                 last_attempt_outcome: None,
             });
-        cache.entries.insert(
-            profile_id.clone(),
-            CreditsCacheEntry {
-                usage_remaining_credits: Some(usage.remaining_credits),
-                usage_cached_at_unix_seconds: Some(now),
-                ..previous
-            },
-        );
-    }
-    write_credits_cache(material_root, &cache);
+            entries.insert(
+                profile_id.clone(),
+                CreditsCacheEntry {
+                    usage_remaining_credits: Some(usage.remaining_credits),
+                    usage_cached_at_unix_seconds: Some(now),
+                    ..previous
+                },
+            );
+        }
+        true
+    });
 }
 
 /// 移除单账号积分缓存条目（账号删除流程）；文件整体重写，原子替换。
 pub fn remove_credits_cache_entry(material_root: &Path, profile_id: &str) {
-    let mut cache = CreditsCacheFile {
-        entries: read_credits_cache(material_root),
-        ..CreditsCacheFile::default()
-    };
-    if cache.entries.remove(profile_id).is_none() {
-        return;
-    }
-    write_credits_cache(material_root, &cache);
+    mutate_credits_cache(material_root, |entries| {
+        entries.remove(profile_id).is_some()
+    });
 }
 
 /// 签到结果 -> 今日尝试结果码（写入 last_attempt_outcome，G10 状态机数据地基）。
@@ -384,14 +356,8 @@ pub fn checkin_last_attempt_outcome(result: &CheckinResult) -> String {
 /// 无论成败都写：last_attempt_* 只被新的尝试覆盖，不被只读查询清除。
 /// 条目可能尚不存在（从未签到就失败的账号）：其余字段按空值创建。
 pub fn update_last_attempt(material_root: &Path, profile_id: &str, outcome: &str) {
-    let mut cache = CreditsCacheFile {
-        entries: read_credits_cache(material_root),
-        ..CreditsCacheFile::default()
-    };
-    let previous = cache
-        .entries
-        .remove(profile_id)
-        .unwrap_or(CreditsCacheEntry {
+    mutate_credits_cache(material_root, |entries| {
+        let previous = entries.remove(profile_id).unwrap_or(CreditsCacheEntry {
             credits: None,
             checked_in: None,
             cached_at_unix_seconds: 0,
@@ -401,29 +367,78 @@ pub fn update_last_attempt(material_root: &Path, profile_id: &str, outcome: &str
             last_attempt_date: None,
             last_attempt_outcome: None,
         });
-    cache.entries.insert(
-        profile_id.to_string(),
-        CreditsCacheEntry {
-            last_attempt_date: Some(local_today_string()),
-            last_attempt_outcome: Some(outcome.to_string()),
-            ..previous
-        },
-    );
-    write_credits_cache(material_root, &cache);
+        entries.insert(
+            profile_id.to_string(),
+            CreditsCacheEntry {
+                last_attempt_date: Some(local_today_string()),
+                last_attempt_outcome: Some(outcome.to_string()),
+                ..previous
+            },
+        );
+        true
+    });
 }
 
+/// 锁住积分缓存完整读改写；展示查询继续无锁读取。
+fn mutate_credits_cache(
+    material_root: &Path,
+    update: impl FnOnce(&mut BTreeMap<String, CreditsCacheEntry>) -> bool,
+) {
+    if std::fs::create_dir_all(material_root).is_err() {
+        return;
+    }
+    let destination = cache_path(material_root);
+    let Ok(_lock) = FileOperationLock::acquire_sibling_resource(&destination) else {
+        return;
+    };
+    let mut cache = CreditsCacheFile {
+        entries: read_credits_cache(material_root),
+        ..CreditsCacheFile::default()
+    };
+    if update(&mut cache.entries) {
+        write_credits_cache_locked(&destination, &cache);
+    }
+}
+
+#[cfg(test)]
 fn write_credits_cache(material_root: &Path, cache: &CreditsCacheFile) {
     if std::fs::create_dir_all(material_root).is_err() {
         return;
     }
+    let destination = cache_path(material_root);
+    let Ok(_lock) = FileOperationLock::acquire_sibling_resource(&destination) else {
+        return;
+    };
+    write_credits_cache_locked(&destination, cache);
+}
+
+fn write_credits_cache_locked(destination: &Path, cache: &CreditsCacheFile) {
     let Ok(payload) = serde_json::to_string_pretty(cache) else {
         return;
     };
-    let destination = cache_path(material_root);
-    let temp = destination.with_extension("json.tmp");
-    // 写缓存失败不影响调用方主流程：缓存只做展示增强。
-    if std::fs::write(&temp, payload).is_ok() {
-        let _ = std::fs::rename(&temp, &destination);
+    loop {
+        let sequence = CREDITS_CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = destination.with_file_name(format!(
+            "{CREDITS_CACHE_FILE}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return,
+        };
+        // PID 与序号避免固定临时名互撞；独占创建会跳过崩溃遗留的同名文件。
+        // 写缓存失败不影响调用方主流程：缓存只做展示增强。
+        if file.write_all(payload.as_bytes()).is_ok() {
+            drop(file);
+            let _ = std::fs::rename(&temp, destination);
+        }
+        return;
     }
 }
 
@@ -526,7 +541,10 @@ fn cached_on_local_today(cached_at_unix_seconds: u64) -> bool {
 /// 本地时区今日日期（YYYY-MM-DD）：与 checked_in 的自然日判定同一口径，
 /// 供 last_attempt_date 写入与日界过滤使用。
 fn local_today_string() -> String {
-    chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
+    chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 /// Unix 秒 -> RFC3339；超界时间（注册表防御性允许 0）映射为 None 展示“尚未验证”。
@@ -541,6 +559,7 @@ fn unix_seconds_to_rfc3339(seconds: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use traesync_domain::CheckinOutcome;
     use traesync_domain::CheckinStatusSnapshot;
     use traesync_domain::CheckinTaskState;
@@ -586,6 +605,57 @@ mod tests {
         assert_eq!(cache.get("p1").unwrap().credits, Some(120));
         assert_eq!(cache.get("p2").unwrap().credits, Some(30));
         assert_eq!(cache.get("p2").unwrap().checked_in, Some(false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_credits_cache_mutations_are_serialized() {
+        let root = temp_root("concurrent-writes");
+        const WRITERS: usize = 4;
+        let start = Arc::new(Barrier::new(WRITERS));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers = (0..WRITERS)
+            .map(|index| {
+                let root = root.clone();
+                let start = Arc::clone(&start);
+                let active = Arc::clone(&active);
+                let maximum_active = Arc::clone(&maximum_active);
+                std::thread::spawn(move || {
+                    start.wait();
+                    mutate_credits_cache(&root, |entries| {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum_active.fetch_max(current, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        entries.insert(
+                            format!("p{index}"),
+                            CreditsCacheEntry {
+                                credits: Some(index as i64),
+                                checked_in: Some(true),
+                                cached_at_unix_seconds: 1,
+                                usage_remaining_credits: None,
+                                usage_cached_at_unix_seconds: None,
+                                refresh_error_code: None,
+                                last_attempt_date: None,
+                                last_attempt_outcome: None,
+                            },
+                        );
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        true
+                    });
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+        let cache = read_credits_cache(&root);
+        assert_eq!(cache.len(), WRITERS);
+        for index in 0..WRITERS {
+            assert!(cache.contains_key(&format!("p{index}")));
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -809,10 +879,7 @@ mod tests {
         update_last_attempt(&root, "p1", "business:9074");
         let cache = read_credits_cache(&root);
         let entry = cache.get("p1").unwrap();
-        assert_eq!(
-            entry.last_attempt_outcome.as_deref(),
-            Some("business:9074")
-        );
+        assert_eq!(entry.last_attempt_outcome.as_deref(), Some("business:9074"));
         assert_eq!(
             entry.last_attempt_date.as_deref(),
             Some(local_today_string().as_str())
@@ -921,7 +988,10 @@ mod tests {
             Some("transport:network_error")
         );
         // date 与 outcome 成对输出：前端“今日尝试”判定依赖两者同现（G10a IPC 契约）。
-        assert_eq!(entry.last_attempt_date.as_deref(), Some(local_today_string().as_str()));
+        assert_eq!(
+            entry.last_attempt_date.as_deref(),
+            Some(local_today_string().as_str())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

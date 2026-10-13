@@ -213,20 +213,19 @@ test.describe("桌面尺寸与滚动验收", () => {
     await expect(productSwitcher).toHaveValue("work_cn");
     await productSwitcher.selectOption("trae_cn");
 
-    await expect(page.getByRole("region", { name: "Trae CN 账号" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "TRAE 账号" })).toBeVisible();
     await expect(page.getByTestId("product-credential-status")).toHaveText("需要授权");
     // P11-6（ADR-0032）：导航五页全产品开放；账号 region 不复用 Work CN 工作台。
     await expect(page.getByTestId("navigation-checkin")).toBeVisible();
     await expect(page.getByRole("region", { name: "账号", exact: true })).toHaveCount(0);
     // 产品凭据边界由共享账号工作台展示；不能把浏览器会话复用误报成凭据迁移。
-    await expect(page.getByText("尚未确认与 Work CN 的 TRAE 身份关系。")).toBeVisible();
+    await expect(page.getByText("目前无法确认 Trae CN 客户端身份与 Work CN 的关系。")).toBeVisible();
     await expect(page.getByRole("heading", { name: "我的账号", level: 3 })).toBeVisible();
 
-    // 签到页 P13-1 起为 ready（CN 签到实装）：本场景未配置 CN 账号 →
-    // 空状态引导，不出 pending 说明卡；总览页 pending 卡仍在（页面槽位常驻）。
+    // P15-7：签到页统一 SOLO 单通道（旧 CN 独立账号池签到区块已随产品
+    // 合并移除），任一产品下签到页渲染同一签到工作台，无 pending 说明卡。
     await page.getByTestId("navigation-checkin").click();
     const checkinRegion = page.getByRole("region", { name: "签到" });
-    await expect(checkinRegion.getByText(/还没有 Trae CN 账号/)).toBeVisible();
     await expect(checkinRegion.getByTestId("capability-pending")).toHaveCount(0);
 
     // 环境页为 absent 说明卡（环境体系是 Work CN 产品能力）。
@@ -239,28 +238,6 @@ test.describe("桌面尺寸与滚动验收", () => {
     await expect(page.getByTestId("navigation-checkin")).toBeVisible();
     await expect(page.getByTestId("current-account-context")).toBeVisible();
     await expect(page.getByTestId("capability-pending")).toHaveCount(0);
-  });
-
-  test("P13-1 Trae CN 签到：账号行状态 + 手动领取闭环（mock，不真触网）", async ({ page }) => {
-    await installMockBridge(page, { traeCnAccounts: true });
-    await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto("/");
-
-    await page.getByRole("combobox", { name: "当前产品" }).selectOption("trae_cn");
-    await page.getByTestId("navigation-checkin").click();
-
-    const checkinRegion = page.getByRole("region", { name: "签到" });
-    // CN 账号行就绪：未签徽章 + CN 特有额外积分展示 + 可点签到按钮。
-    await expect(checkinRegion.getByText("Trae CN 测试账号")).toBeVisible();
-    await expect(checkinRegion.getByText("未签")).toBeVisible();
-    await expect(checkinRegion.getByText(/额外积分 5/)).toBeVisible();
-    const claimButton = checkinRegion.getByTestId("checkin-cn-claim-trae-cn-profile");
-    await expect(claimButton).toBeEnabled();
-
-    // 手动领取：一次点击 = 一次授权；mock 翻转已签状态，行内徽章随之更新。
-    await claimButton.click();
-    await expect(checkinRegion.getByText("已签")).toBeVisible();
-    await expect(claimButton).toBeDisabled();
   });
 });
 

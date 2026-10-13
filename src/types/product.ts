@@ -1,5 +1,33 @@
 import type { ProductId } from "../platform/productRegistry";
-import type { CheckinOutcomeDto } from "./account_switch";
+
+export type OperationReadiness = "ready" | "pending" | "absent";
+
+export type ProductOperationId =
+  | "account.health_check"
+  | "account.tool_selection"
+  | "account.switch"
+  | "account.native_activation"
+  | "checkin.status"
+  | "checkin.claim"
+  | "checkin.schedule"
+  | "library.read"
+  | "library.archive"
+  | "library.delete"
+  | "library.work_project_merge"
+  | "library.trae_cn_project_merge";
+
+export interface ProductOperationStateDto {
+  readonly operation_id: ProductOperationId;
+  readonly state: OperationReadiness;
+  readonly reason: string;
+  readonly evidence_ref: string | null;
+}
+
+export interface ProductOperationSnapshotDto {
+  readonly product_id: ProductId;
+  readonly library_id: string | null;
+  readonly operations: readonly ProductOperationStateDto[];
+}
 
 /** 后端只读身份发现结果；不包含 userId、token 或 native storage。 */
 export interface ProductIdentityStateDto {
@@ -26,38 +54,6 @@ export interface TraeCnHealthEntryDto {
   readonly screen_name: string;
   readonly healthy: boolean;
   readonly error_code: string | null;
-}
-
-/** Trae CN 凭据续期逐账号回执；不包含新旧令牌。 */
-export interface TraeCnCredentialRefreshEntryDto {
-  readonly profile_id: string;
-  readonly screen_name: string;
-  readonly refreshed: boolean;
-  readonly error_code: string | null;
-}
-
-/**
- * Trae CN 签到状态（P13-1；探针实测字段全集）。
- * business_code 按红线透传不压平；did_checked_in/extra_credits 为 CN 特有
- * 字段（语义待 P13-4 真机验收），缺席为 null。
- */
-export interface TraeCnCheckinStatusDto {
-  readonly enable: boolean;
-  readonly checked_in: boolean;
-  readonly credits: number | null;
-  readonly did_checked_in: boolean | null;
-  readonly extra_credits: number | null;
-  readonly message: string;
-  readonly business_code: number;
-}
-
-/** Trae CN 手动签到回执；outcome 与 Work 结果行同口径（业务码在 detail_code 透传）。 */
-export interface TraeCnCheckinResultDto {
-  readonly profile_id: string;
-  readonly outcome: CheckinOutcomeDto;
-  readonly detail_code: string | null;
-  readonly credits: number | null;
-  readonly extra_credits: number | null;
 }
 
 /** 产品 OAuth 开始命令的最小返回值。 */

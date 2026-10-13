@@ -79,6 +79,7 @@ describe("应用工作区入口", () => {
       env_id: "master",
       current_profile_id: "profile-a",
       current_account_name: "主库账号",
+      observed_profile_id: "profile-a",
       data_dir: "C:\\TRAE\\master",
       running: false,
       login_state: "logged_in",
@@ -100,7 +101,7 @@ describe("应用工作区入口", () => {
       },
       {
         product_id: "trae_cn",
-        display_name: "Trae CN",
+        display_name: "TRAE",
         identity_status: "recognized",
         credential_status: "need_authorization",
         relation_to_work: "different_identity",
@@ -122,13 +123,17 @@ describe("应用工作区入口", () => {
     await waitFor(() => {
       expect(handlers.get("auto-checkin-finished")).toBeDefined();
     });
+    fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {
+      target: { value: "trae_cn" },
+    });
+    expect(screen.getByRole("combobox", { name: "当前产品" })).toHaveValue("trae_cn");
     handlers.get("auto-checkin-finished")?.({
       payload: { total: 4, completed: 2, failed: 1, skipped: 1 },
     });
 
     // 跨页摘要：失败/跳过计数收进标题，成功数经 notify.summary 的 okCount 承载。
     await waitFor(() => {
-      expect(notifyMock.summary).toHaveBeenCalledWith("今日自动签到完成（失败 1，跳过 1）", [], 2);
+      expect(notifyMock.summary).toHaveBeenCalledWith("TRAE Work CN：今日自动签到完成（失败 1，跳过 1）", [], 2);
     });
   });
 
@@ -177,6 +182,7 @@ describe("应用工作区入口", () => {
       env_id: "master",
       current_profile_id: null,
       current_account_name: null,
+      observed_profile_id: null,
       data_dir: "C:\\TRAE\\master",
       running: false,
       login_state: "logged_out",
@@ -332,6 +338,7 @@ describe("应用工作区入口", () => {
       env_id: "master",
       current_profile_id: "profile-a",
       current_account_name: "主库账号",
+      observed_profile_id: "profile-a",
       data_dir: "C:\\TRAE\\master",
       running: false,
       login_state: "logged_in",
@@ -353,7 +360,7 @@ describe("应用工作区入口", () => {
       },
       {
         product_id: "trae_cn",
-        display_name: "Trae CN",
+        display_name: "TRAE",
         identity_status: "recognized",
         credential_status: "need_authorization",
         relation_to_work: "different_identity",
@@ -424,10 +431,10 @@ describe("应用工作区入口", () => {
       expect(screen.getByTestId(`navigation-${page}`)).toBeInTheDocument();
     }
 
-    // accounts = ready：Trae CN 账号工作台，不复用 Work CN 账号页。
-    expect(await screen.findByRole("region", { name: "Trae CN 账号" })).toBeVisible();
+    // accounts = ready：TRAE 账号工作台，不复用 Work CN 账号页。
+    expect(await screen.findByRole("region", { name: "TRAE 账号" })).toBeVisible();
     expect(screen.getByTestId("product-credential-status")).toHaveTextContent("需要授权");
-    expect(screen.getByText("已发现账号材料")).toBeInTheDocument();
+    expect(screen.getByTestId("account-adapter-identity")).toHaveTextContent("官方客户端身份：已识别");
     expect(screen.queryByRole("region", { name: "账号" })).not.toBeInTheDocument();
 
     // overview = pending：问候语随产品变化，诚实说明卡 + 数据根浏览入口。
@@ -436,17 +443,16 @@ describe("应用工作区入口", () => {
     // 签到页也有 pending 卡（页面槽位常驻 DOM），在总览 region 内定位。
     expect(within(overviewRegion).getByTestId("capability-pending")).toBeVisible();
     expect(
-      within(overviewRegion).getByRole("heading", { level: 1, name: /Trae CN 工作台$/ }),
+      within(overviewRegion).getByRole("heading", { level: 1, name: /TRAE 工作台$/ }),
     ).toBeInTheDocument();
     // pending 形态同一槽位重渲染：Work CN 证据带与统计卡不再出现在总览内。
     expect(within(overviewRegion).queryByTestId("current-account-context")).not.toBeInTheDocument();
     expect(within(overviewRegion).queryByTestId("overview-stats-master")).not.toBeInTheDocument();
 
-    // checkin = ready（P13-1 CN 签到实装）：App 级 mock 未配置 CN 账号 →
-    // 空状态引导（操作界面按账号池存在性出现），不再渲染 pending 说明卡。
+    // P15-7：签到页统一 SOLO 单通道（旧 CN 独立账号池签到区块已随产品
+    // 合并移除），CN 产品下渲染同一签到工作台，无 pending 说明卡。
     fireEvent.click(screen.getByTestId("navigation-checkin"));
     const checkinRegion = await screen.findByRole("region", { name: "签到" });
-    expect(within(checkinRegion).getByText(/还没有 Trae CN 账号/)).toBeInTheDocument();
     expect(within(checkinRegion).queryByTestId("capability-pending")).not.toBeInTheDocument();
 
     // environment = absent：环境体系是 Work CN 产品能力，整页说明卡。
@@ -458,19 +464,19 @@ describe("应用工作区入口", () => {
     fireEvent.click(screen.getByTestId("navigation-settings"));
     expect(await screen.findByRole("region", { name: "设置" })).toBeVisible();
 
-    // master-library = ready：Trae CN 数据根详情（总览浏览入口进入）。
+    // master-library = ready：TRAE 数据根详情（总览浏览入口进入）。
     fireEvent.click(screen.getByTestId("navigation-overview"));
     fireEvent.click(await screen.findByTestId("overview-library-cta"));
-    const detailRegion = await screen.findByRole("region", { name: "Trae CN 数据根详情" });
+    const detailRegion = await screen.findByRole("region", { name: "TRAE 数据根详情" });
     expect(within(detailRegion).getByRole("heading", { level: 1 })).toHaveTextContent(
-      "Trae CN 数据根",
+      "TRAE 数据根",
     );
-    // P13-3 archive-only：选择入口与快捷归档按库能力开放（原 P11-6 断言反转），
-    // 历史列表正常挂载。
-    expect(screen.getByTestId("library-select-mode")).toBeInTheDocument();
+    // 真实验收前 CN 写入状态为 pending：写入口隐藏，历史列表仍可浏览。
+    expect(within(detailRegion).getByTestId("library-cn-write-pending")).toBeInTheDocument();
+    expect(within(detailRegion).queryByTestId("library-select-mode")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("library-project-p-t1"));
     expect(await screen.findByTestId("library-session-s-t1")).toBeVisible();
-    expect(screen.getByTestId("library-quick-archive-s-t1")).toBeInTheDocument();
+    expect(screen.queryByTestId("library-quick-archive-s-t1")).not.toBeInTheDocument();
 
     // 切回 Work CN：签到页恢复 ready 形态（pending 卡消失）。
     fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {

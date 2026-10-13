@@ -31,6 +31,16 @@ import { notify } from "../src/platform/notify";
 const mockInvoke = vi.mocked(invoke);
 const notifyMock = vi.mocked(notify);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("设置面板", () => {
   beforeEach(() => {
     // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
@@ -56,6 +66,429 @@ describe("设置面板", () => {
     expect(screen.queryByTestId("storage-root-state")).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "设置" })).toBeInTheDocument();
     expect(screen.queryByText("读取完成后重新打开 TRAE")).not.toBeInTheDocument();
+  });
+
+  it("CN 设置页不读取或显示 Work 专属设置", () => {
+    render(<SettingsPanel active={true} product="trae_cn" />);
+
+    expect(screen.getByTestId("product-settings-empty")).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it("切产品时丢弃未提交的 Work 备份位置草稿", async () => {
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: "D:\\bak", keep_policy: 5 }));
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), {
+      target: { value: "E:\\Unsubmitted" },
+    });
+    expect(screen.getByTestId("backup-location-input")).toHaveValue("E:\\Unsubmitted");
+
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    expect(screen.queryByTestId("backup-location-dialog")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("set_backup_dir", { backupDir: "E:\\Unsubmitted" });
+
+    rerender(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    expect(screen.getByTestId("backup-location-input")).toHaveValue("");
+    expect(mockInvoke).not.toHaveBeenCalledWith("migrate_master_backups", { targetDir: "E:\\Unsubmitted" });
+    expect(mockInvoke).not.toHaveBeenCalledWith("set_backup_dir", { backupDir: "E:\\Unsubmitted" });
+  });
+
+  it("备份位置迁移从 Work 切到 CN 后继续完成，但不回写设置页状态", async () => {
+    const migration = deferred<{ migrated_files: number; failures: [] }>();
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [],
+      backup_dir: "D:\\bak",
+      keep_policy: 5,
+    }));
+    mockRoute("migrate_master_backups", () => migration.promise);
+    mockRoute("set_backup_dir", () => undefined);
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), {
+      target: { value: "E:\\TraeBackups" },
+    });
+    fireEvent.click(screen.getByTestId("backup-location-dialog-confirm"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("migrate_master_backups", {
+      targetDir: "E:\\TraeBackups",
+    }));
+
+    const chainReadCount = mockInvoke.mock.calls.filter(([command]) => command === "get_master_backup_chain").length;
+    rerender(<SettingsPanel active={false} product="trae_cn" />);
+    migration.resolve({ migrated_files: 1, failures: [] });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_backup_dir", { backupDir: "E:\\TraeBackups" });
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "TRAE Work CN：备份位置已更新，1 个文件已复制到新位置（原位置备份保留，可自行清理）。",
+      );
+    });
+    expect(mockInvoke.mock.calls.filter(([command]) => command === "get_master_backup_chain")).toHaveLength(chainReadCount);
+
+    rerender(<SettingsPanel active={false} />);
+    expect(screen.queryByTestId("backup-location-dialog")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("master-backup-section")).not.toBeInTheDocument();
+  });
+
+  it("设置页失活后备份完成仍提示结果，但不刷新隐藏快照", async () => {
+    const backup = deferred<string>();
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: "D:\\bak", keep_policy: 5 }));
+    mockRoute("create_master_backup", () => backup.promise);
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("master-backup-create"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("create_master_backup", { includeCredentials: false }));
+
+    const chainReadCount = mockInvoke.mock.calls.filter(([command]) => command === "get_master_backup_chain").length;
+    rerender(<SettingsPanel active={false} />);
+    backup.resolve("D:\\bak\\.switch-bak-1");
+
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith(
+      "主库数据备份已创建，原数据未受影响。",
+    ));
+    expect(mockInvoke.mock.calls.filter(([command]) => command === "get_master_backup_chain")).toHaveLength(chainReadCount);
+  });
+
+  it("Work 切到 CN 再返回后，旧迁移结果不关闭新弹层或清除新操作忙状态", async () => {
+    const firstMigration = deferred<{ migrated_files: number; failures: [] }>();
+    const secondMigration = deferred<{ migrated_files: number; failures: [] }>();
+    let migrationCount = 0;
+    let backupDir = "D:\\bak";
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: backupDir, keep_policy: 5 }));
+    mockRoute("migrate_master_backups", () => {
+      migrationCount += 1;
+      return migrationCount === 1 ? firstMigration.promise : secondMigration.promise;
+    });
+    mockRoute("set_backup_dir", (args) => {
+      backupDir = (args as { backupDir: string }).backupDir;
+    });
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), {
+      target: { value: "E:\\Old" },
+    });
+    fireEvent.click(screen.getByTestId("backup-location-dialog-confirm"));
+    await waitFor(() => expect(migrationCount).toBe(1));
+
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    rerender(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), {
+      target: { value: "F:\\Current" },
+    });
+    fireEvent.click(screen.getByTestId("backup-location-dialog-confirm"));
+    await waitFor(() => expect(migrationCount).toBe(2));
+
+    firstMigration.resolve({ migrated_files: 1, failures: [] });
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_backup_dir", { backupDir: "E:\\Old" });
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "备份位置已更新，1 个文件已复制到新位置（原位置备份保留，可自行清理）。",
+      );
+    });
+    await waitFor(() => expect(screen.getByTestId("backup-location-current")).toHaveTextContent("E:\\Old"));
+    expect(screen.getByTestId("backup-location-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("backup-location-input")).toHaveValue("F:\\Current");
+    expect(screen.getByTestId("backup-location-dialog-confirm")).toBeDisabled();
+
+    secondMigration.resolve({ migrated_files: 2, failures: [] });
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_backup_dir", { backupDir: "F:\\Current" });
+      expect(screen.queryByTestId("backup-location-dialog")).not.toBeInTheDocument();
+    });
+  });
+
+  it("返回 Work 后旧自动签到写入重读当前代次，展示已提交的真实设置", async () => {
+    const returnRead = deferred<{
+      enabled: boolean;
+      daily_time_hhmm: string;
+      ledger: null;
+    }>();
+    const save = deferred<void>();
+    let status = { enabled: false, daily_time_hhmm: "08:30", ledger: null };
+    let readCount = 0;
+    mockRoute("get_auto_checkin_settings", () => {
+      readCount += 1;
+      return readCount === 2 ? returnRead.promise : { ...status };
+    });
+    mockRoute("set_auto_checkin_settings", (args) => {
+      const next = args as { enabled: boolean; dailyTimeHhmm: string };
+      return save.promise.then(() => {
+        status = { enabled: next.enabled, daily_time_hhmm: next.dailyTimeHhmm, ledger: null };
+      });
+    });
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("auto-checkin-settings");
+    fireEvent.click(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")!);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("set_auto_checkin_settings", {
+      enabled: true,
+      dailyTimeHhmm: "08:30",
+    }));
+
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    rerender(<SettingsPanel active={true} />);
+    await waitFor(() => expect(readCount).toBe(2));
+    returnRead.resolve({ enabled: false, daily_time_hhmm: "08:30", ledger: null });
+    await waitFor(() => expect(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")).not.toBeChecked());
+
+    save.resolve(undefined);
+    await waitFor(() => expect(readCount).toBe(3));
+    await waitFor(() => expect(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")).toBeChecked());
+    expect(screen.getByText("已开启")).toBeInTheDocument();
+  });
+
+  it("旧备份链初始读取晚于写后刷新返回时，不覆盖新快照", async () => {
+    const delayedInitial = deferred<{
+      backups: [];
+      backup_dir: string;
+      keep_policy: number;
+    }>();
+    const freshRefresh = deferred<{
+      backups: [];
+      backup_dir: string;
+      keep_policy: number;
+    }>();
+    const create = deferred<string>();
+    let readCount = 0;
+    mockRoute("get_master_backup_chain", () => {
+      readCount += 1;
+      if (readCount === 2) return delayedInitial.promise;
+      if (readCount === 3) return freshRefresh.promise;
+      return { backups: [], backup_dir: "D:\\Initial", keep_policy: 5 };
+    });
+    mockRoute("create_master_backup", () => create.promise);
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("master-backup-create"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("create_master_backup", { includeCredentials: false }));
+
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    rerender(<SettingsPanel active={true} />);
+    await waitFor(() => expect(readCount).toBe(2));
+    create.resolve("D:\\Initial\\.switch-bak-1");
+    await waitFor(() => expect(readCount).toBe(3));
+
+    freshRefresh.resolve({ backups: [], backup_dir: "E:\\Fresh", keep_policy: 5 });
+    await waitFor(() => expect(screen.getByTestId("backup-location-current")).toHaveTextContent("E:\\Fresh"));
+    delayedInitial.resolve({ backups: [], backup_dir: "C:\\Old", keep_policy: 5 });
+    await waitFor(() => expect(screen.getByTestId("backup-location-current")).toHaveTextContent("E:\\Fresh"));
+  });
+
+  it("旧保留策略初始读取晚于写后刷新返回时，不覆盖新快照", async () => {
+    const delayedInitial = deferred<{ enabled: boolean; keep: number }>();
+    const freshRefresh = deferred<{ enabled: boolean; keep: number }>();
+    const save = deferred<void>();
+    let readCount = 0;
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: "D:\\Initial", keep_policy: 5 }));
+    mockRoute("get_backup_retention", () => {
+      readCount += 1;
+      if (readCount === 2) return delayedInitial.promise;
+      if (readCount === 3) return freshRefresh.promise;
+      return { enabled: true, keep: 5 };
+    });
+    mockRoute("set_backup_retention", () => save.promise);
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("backup-retention-settings");
+    fireEvent.change(screen.getByTestId("backup-retention-enabled-select"), { target: { value: "off" } });
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("set_backup_retention", { enabled: false, keep: 5 }));
+
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    rerender(<SettingsPanel active={true} />);
+    await waitFor(() => expect(readCount).toBe(2));
+    save.resolve(undefined);
+    await waitFor(() => expect(readCount).toBe(3));
+
+    freshRefresh.resolve({ enabled: false, keep: 3 });
+    await waitFor(() => {
+      expect(screen.getByTestId("backup-retention-enabled-select")).toHaveValue("off");
+      expect(screen.getByTestId("backup-retention-keep-input")).toHaveValue(3);
+    });
+    delayedInitial.resolve({ enabled: true, keep: 9 });
+    await waitFor(() => {
+      expect(screen.getByTestId("backup-retention-enabled-select")).toHaveValue("off");
+      expect(screen.getByTestId("backup-retention-keep-input")).toHaveValue(3);
+    });
+  });
+
+  it("旧自动签到初始读取晚于写后刷新返回时，不覆盖新快照", async () => {
+    const delayedInitial = deferred<{
+      enabled: boolean;
+      daily_time_hhmm: string;
+      ledger: null;
+    }>();
+    const freshRefresh = deferred<{
+      enabled: boolean;
+      daily_time_hhmm: string;
+      ledger: null;
+    }>();
+    const save = deferred<void>();
+    let readCount = 0;
+    mockRoute("get_backup_retention", () => ({ enabled: true, keep: 5 }));
+    mockRoute("get_auto_checkin_settings", () => {
+      readCount += 1;
+      if (readCount === 2) return delayedInitial.promise;
+      if (readCount === 3) return freshRefresh.promise;
+      return { enabled: false, daily_time_hhmm: "08:30", ledger: null };
+    });
+    mockRoute("set_auto_checkin_settings", () => save.promise);
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("auto-checkin-settings");
+    fireEvent.click(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")!);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("set_auto_checkin_settings", {
+      enabled: true,
+      dailyTimeHhmm: "08:30",
+    }));
+
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    rerender(<SettingsPanel active={true} />);
+    await waitFor(() => expect(readCount).toBe(2));
+    save.resolve(undefined);
+    await waitFor(() => expect(readCount).toBe(3));
+
+    freshRefresh.resolve({ enabled: true, daily_time_hhmm: "09:45", ledger: null });
+    await waitFor(() => {
+      expect(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")).toBeChecked();
+      expect(screen.getByTestId("auto-checkin-time-input")).toHaveValue("09:45");
+    });
+    delayedInitial.resolve({ enabled: false, daily_time_hhmm: "08:30", ledger: null });
+    await waitFor(() => {
+      expect(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")).toBeChecked();
+      expect(screen.getByTestId("auto-checkin-time-input")).toHaveValue("09:45");
+    });
+  });
+
+  it("Work 备份操作跨到 CN 后成功与失败通知均标注来源", async () => {
+    const failedBackup = deferred<string>();
+    const createdBackup = deferred<string>();
+    let backupCount = 0;
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: "D:\\bak", keep_policy: 5 }));
+    mockRoute("create_master_backup", () => {
+      backupCount += 1;
+      return backupCount === 1 ? failedBackup.promise : createdBackup.promise;
+    });
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("master-backup-create"));
+    await waitFor(() => expect(backupCount).toBe(1));
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    failedBackup.reject(new Error("backup failed"));
+    await waitFor(() => expect(notifyMock.error).toHaveBeenCalledWith(expect.stringContaining("TRAE Work CN：")));
+
+    rerender(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("master-backup-create"));
+    await waitFor(() => expect(backupCount).toBe(2));
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    createdBackup.resolve("D:\\bak\\.switch-bak-1");
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith(
+      "TRAE Work CN：主库数据备份已创建，原数据未受影响。",
+    ));
+  });
+
+  it("Work 备份迁移跨到 CN 后部分结果通知标注来源", async () => {
+    const migration = deferred<{ migrated_files: number; failures: Array<{ file_name: string; reason: string }> }>();
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: "D:\\bak", keep_policy: 5 }));
+    mockRoute("migrate_master_backups", () => migration.promise);
+    mockRoute("set_backup_dir", () => undefined);
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+    fireEvent.click(screen.getByTestId("backup-location-change"));
+    fireEvent.change(screen.getByTestId("backup-location-input"), { target: { value: "E:\\TraeBackups" } });
+    fireEvent.click(screen.getByTestId("backup-location-dialog-confirm"));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("migrate_master_backups", {
+      targetDir: "E:\\TraeBackups",
+    }));
+
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    migration.resolve({
+      migrated_files: 1,
+      failures: [{ file_name: "old-backup", reason: "copy failed" }],
+    });
+    await waitFor(() => expect(notifyMock.summary).toHaveBeenCalledWith(
+      "TRAE Work CN：部分备份未能复制到新位置，备份位置未变更",
+      [expect.objectContaining({ displayName: "old-backup" })],
+      1,
+    ));
+    expect(mockInvoke).not.toHaveBeenCalledWith("set_backup_dir", { backupDir: "E:\\TraeBackups" });
+  });
+
+  it("Work 保留策略跨到 CN 后成功与失败通知均标注来源", async () => {
+    const saves = [deferred<void>(), deferred<void>()];
+    let retention = { enabled: true, keep: 5 };
+    let saveCount = 0;
+    mockRoute("get_master_backup_chain", () => ({ backups: [], backup_dir: "D:\\bak", keep_policy: 5 }));
+    mockRoute("get_backup_retention", () => ({ ...retention }));
+    mockRoute("set_backup_retention", (args) => {
+      const next = args as { enabled: boolean; keep: number };
+      const currentSave = saves[saveCount++];
+      return currentSave.promise.then(() => { retention = next; });
+    });
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("backup-retention-settings");
+    fireEvent.change(screen.getByTestId("backup-retention-enabled-select"), { target: { value: "off" } });
+    await waitFor(() => expect(saveCount).toBe(1));
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    saves[0].resolve(undefined);
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith(
+      "TRAE Work CN：备份自动清理已关闭，旧备份不会再被自动删除。",
+    ));
+
+    rerender(<SettingsPanel active={true} />);
+    await screen.findByTestId("backup-retention-settings");
+    fireEvent.change(screen.getByTestId("backup-retention-enabled-select"), { target: { value: "on" } });
+    await waitFor(() => expect(saveCount).toBe(2));
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    saves[1].reject(new Error("retention failed"));
+    await waitFor(() => expect(notifyMock.error).toHaveBeenCalledWith(expect.stringContaining("TRAE Work CN：")));
+  });
+
+  it("Work 自动签到跨到 CN 后成功与失败通知均标注来源", async () => {
+    const saves = [deferred<void>(), deferred<void>()];
+    let status = { enabled: true, daily_time_hhmm: "10:00", ledger: null };
+    let saveCount = 0;
+    mockRoute("get_auto_checkin_settings", () => ({ ...status }));
+    mockRoute("set_auto_checkin_settings", (args) => {
+      const next = args as { enabled: boolean; dailyTimeHhmm: string };
+      const currentSave = saves[saveCount++];
+      return currentSave.promise.then(() => {
+        status = { enabled: next.enabled, daily_time_hhmm: next.dailyTimeHhmm, ledger: null };
+      });
+    });
+
+    const { rerender } = render(<SettingsPanel active={true} />);
+    await screen.findByTestId("auto-checkin-settings");
+    fireEvent.click(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")!);
+    await waitFor(() => expect(saveCount).toBe(1));
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    saves[0].reject(new Error("checkin failed"));
+    await waitFor(() => expect(notifyMock.error).toHaveBeenCalledWith(expect.stringContaining("TRAE Work CN：")));
+
+    rerender(<SettingsPanel active={true} />);
+    await screen.findByTestId("auto-checkin-settings");
+    fireEvent.click(screen.getByTestId("auto-checkin-enabled-toggle").querySelector("input")!);
+    await waitFor(() => expect(saveCount).toBe(2));
+    rerender(<SettingsPanel active={true} product="trae_cn" />);
+    saves[1].resolve(undefined);
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith(
+      "TRAE Work CN：自动签到已关闭。",
+    ));
   });
 
   it("G3：备份路径收进 details，创建入口可见", async () => {

@@ -13,6 +13,14 @@
 // window.__TAURI_INTERNALS__.invoke(cmd, args, options)，因此 mock 该入口即可。
 
 import type { Page } from "@playwright/test";
+import type { ProductOperationSnapshotDto, OperationReadiness } from "../src/types/product";
+
+type MockProductOperationId =
+  | "checkin.claim"
+  | "library.archive"
+  | "library.delete"
+  | "library.work_project_merge"
+  | "library.trae_cn_project_merge";
 
 // P5-5 主库历史读取状态（get_master_history.status 同构）。
 export type MasterHistoryMode =
@@ -35,6 +43,8 @@ export interface MockScenario {
   traeCnAccounts?: boolean;
   // P13-2：Trae CN 归并入口 fixture（默认无其他账号项目；归并 e2e 开启）。
   traeCnMergeEntry?: boolean;
+  // 指定测试场景下模拟已验收的操作；未配置的 Trae CN 写操作保持 pending。
+  operationReadiness?: Partial<Record<MockProductOperationId, OperationReadiness>>;
 }
 
 /**
@@ -539,10 +549,6 @@ export async function installMockBridge(
       },
     ];
 
-    // P13-1：Trae CN 签到可变状态（必须在 mockInvoke 外声明）——
-    // run_trae_cn_checkin 成功后翻已签，供「领取后行内翻已签」断言。
-    let traeCnCheckedIn = false;
-
     // P13-2：Trae CN 归并可变状态（必须在 mockInvoke 外声明）——
     // 归并成功后入口行从清单移除，详情页刷新后「其他账号的项目」消失。
     let traeCnForeignProjects = initialScenario.traeCnMergeEntry
@@ -589,6 +595,49 @@ export async function installMockBridge(
           },
         ];
       }
+      if (cmd === "get_product_operation_states") {
+        const productId = args?.productId === "trae_cn" ? "trae_cn" : "work_cn";
+        const libraryId = typeof args?.libraryId === "string" ? args.libraryId : null;
+        const defaults: Partial<Record<MockProductOperationId, OperationReadiness>> =
+          productId === "trae_cn"
+            ? {
+                "checkin.claim": "pending",
+                "library.archive": "pending",
+                "library.delete": "absent",
+                "library.work_project_merge": "absent",
+                "library.trae_cn_project_merge": "pending",
+              }
+            : {
+                "library.archive": "ready",
+                "library.delete": "ready",
+                "library.work_project_merge": "ready",
+                "library.trae_cn_project_merge": "absent",
+              };
+        const operations = (
+          [
+            "checkin.claim",
+            "library.archive",
+            "library.delete",
+            "library.work_project_merge",
+            "library.trae_cn_project_merge",
+          ] as const
+        ).flatMap((operationId) => {
+          const state = scn.operationReadiness?.[operationId] ?? defaults[operationId];
+          return state
+            ? [{
+                operation_id: operationId,
+                state,
+                reason: state === "ready" ? "测试场景已配置此操作可用。" : "当前测试场景未验收此操作。",
+                evidence_ref: null,
+              }]
+            : [];
+        });
+        return {
+          product_id: productId,
+          library_id: libraryId,
+          operations,
+        } satisfies ProductOperationSnapshotDto;
+      }
       // P10-5：场景开启时返回一个与登录设备 fixture 同源的账号
       // （profile_id / 显示名对齐 list_remote_devices 的归属标注），
       // 让登录设备 e2e 能从账号列表进入 Trae CN 详情页。
@@ -604,9 +653,8 @@ export async function installMockBridge(
         }];
       }
       if (cmd === "check_trae_cn_account_health") return [];
-      if (cmd === "refresh_trae_cn_credentials") return [];
       if (cmd === "begin_trae_cn_login") {
-        return { login_url: "https://www.trae.cn/authorization?auth_from=trae" };
+        return { login_url: "https://www.trae.cn/authorization?auth_from=trae", attempt_id: 1 };
       }
       if (cmd === "complete_trae_cn_login") {
         return { profile_id: "trae-cn-profile", screen_name: "Trae CN 测试账号", avatar_url: "" };
@@ -683,6 +731,7 @@ export async function installMockBridge(
           env_id: "master",
           current_profile_id: envCurrentProfileId,
           current_account_name: current?.screen_name ?? null,
+          observed_profile_id: envCurrentProfileId,
           data_dir: "C:\\TraeSync\\data\\environments\\master",
           running: false,
           login_state: "logged_in",
@@ -859,28 +908,6 @@ export async function installMockBridge(
           restored_sessions: restored,
           relaunch_outcome: "launched",
         };
-      }
-      if (cmd === "archive_master_sessions") {
-        assertMasterLibrary();
-        const ids = new Set(Array.isArray(args?.sessionIds) ? args.sessionIds : []);
-        for (const session of MASTER_HISTORY_READY.sessions) {
-          if (ids.has(session.session_id) && !session.deleted) {
-            session.hidden_status = "voice_discussion";
-          }
-        }
-        return { affected: ids.size };
-      }
-      if (cmd === "restore_master_sessions") {
-        assertMasterLibrary();
-        const ids = new Set(Array.isArray(args?.sessionIds) ? args.sessionIds : []);
-        let affected = 0;
-        for (const session of MASTER_HISTORY_READY.sessions) {
-          if (ids.has(session.session_id) && session.hidden_status === "voice_discussion") {
-            session.hidden_status = null;
-            affected += 1;
-          }
-        }
-        return { affected };
       }
       if (cmd === "delete_master_sessions") {
         assertMasterLibrary();
@@ -1082,28 +1109,6 @@ export async function installMockBridge(
         };
       }
       if (cmd === "cancel_checkin") return true;
-      // ===== P13-1 Trae CN 签到：单账号手动 status/claim（不真触网） =====
-      if (cmd === "get_trae_cn_checkin_status") {
-        return {
-          enable: true,
-          checked_in: traeCnCheckedIn,
-          credits: 200,
-          did_checked_in: null,
-          extra_credits: 5,
-          message: "success",
-          business_code: 0,
-        };
-      }
-      if (cmd === "run_trae_cn_checkin") {
-        traeCnCheckedIn = true;
-        return {
-          profile_id: String(args?.profileId ?? ""),
-          outcome: "claimed",
-          detail_code: null,
-          credits: 205,
-          extra_credits: 5,
-        };
-      }
       // ===== P13-2 Trae CN 项目归并：入口清单/规模预览/归并（仅 trae_cn 库） =====
       // 后端守卫在 mock 侧同构：非 trae_cn libraryId 直接拒绝。
       const assertTraeCnLibrary = () => {

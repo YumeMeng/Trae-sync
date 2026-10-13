@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::operation_lease::FileOperationLock;
 
 const STORE_FILE: &str = "credential-maintenance.json";
 const FORMAT_VERSION: u32 = 1;
@@ -106,6 +107,7 @@ impl CredentialMaintenanceStateStore {
             return Err(CredentialMaintenanceStoreError::Invalid);
         }
 
+        let _lock = self.acquire_write_lock()?;
         let mut file = self.load()?;
         let entry = file.accounts.entry(profile_id.to_string()).or_default();
         let day = utc_day(now_unix_seconds);
@@ -133,6 +135,7 @@ impl CredentialMaintenanceStateStore {
         now_unix_seconds: u64,
     ) -> Result<(), CredentialMaintenanceStoreError> {
         validate_profile_id(profile_id)?;
+        let _lock = self.acquire_write_lock()?;
         let mut file = self.load()?;
         let entry = file.accounts.entry(profile_id.to_string()).or_default();
         entry.failure_streak = 0;
@@ -175,14 +178,20 @@ impl CredentialMaintenanceStateStore {
         Ok(file)
     }
 
+    /// 锁住账号退避状态文件，覆盖整表读改写过程。
+    fn acquire_write_lock(&self) -> Result<FileOperationLock, CredentialMaintenanceStoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| CredentialMaintenanceStoreError::Io)?;
+        }
+        FileOperationLock::acquire_sibling_resource(&self.path)
+            .map_err(|_| CredentialMaintenanceStoreError::Io)
+    }
+
     fn write(&self, file: &MaintenanceFile) -> Result<(), CredentialMaintenanceStoreError> {
         let content = serde_json::to_string_pretty(file)
             .map_err(|_| CredentialMaintenanceStoreError::Invalid)?;
         if content.len() as u64 > MAX_STORE_BYTES {
             return Err(CredentialMaintenanceStoreError::Invalid);
-        }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|_| CredentialMaintenanceStoreError::Io)?;
         }
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, content.as_bytes())
@@ -222,6 +231,45 @@ fn next_attempt_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_lease::FileOperationLock;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn record_failure_waits_for_shared_file_lock_and_preserves_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CredentialMaintenanceStateStore::new(root.path());
+        store
+            .record_failure("profile-a", 1_800_000_000, "network_error")
+            .unwrap();
+
+        let lock =
+            FileOperationLock::acquire_sibling_resource(&root.path().join(STORE_FILE)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(store.record_failure("profile-b", 1_800_000_001, "network_error"))
+                .unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(finished_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(lock);
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+
+        let store = CredentialMaintenanceStateStore::new(root.path());
+        assert!(store.read_entry("profile-a").unwrap().is_some());
+        assert!(store.read_entry("profile-b").unwrap().is_some());
+    }
 
     #[test]
     fn failure_backoff_survives_store_reload() {

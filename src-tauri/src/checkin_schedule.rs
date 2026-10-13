@@ -24,18 +24,14 @@ use traesync_application::{BatchCheckinRunner, CheckinService, CheckinTransport}
 use traesync_infrastructure::{
     AccountRecord, AccountRegistry, AutoCheckinBatchState, AutoCheckinLedger, AutoCheckinSettings,
     AutoCheckinStore, CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding,
-    CredentialMaintenanceStateStore, FixtureCheckinTransport, OAuthClient,
-    RealCheckinRenewalService, RealCheckinTransport, RealTraeCnCheckinClient, TraeCnCheckinClient,
-    TraeCnCheckinError,
+    CheckinProfileOperationLease, CredentialMaintenanceStateStore, FixtureCheckinTransport,
+    RealCheckinRenewalService, RealCheckinTransport,
 };
 
 use crate::{
-    checkin_overview, ensure_checkin_http_enabled,
-    error_mapping::{credential_maintenance_error_code, trae_cn_checkin_error_code},
-    run_blocking, AppState, RuntimeMode,
+    checkin_overview, error_mapping::credential_maintenance_error_code, run_blocking, AppState,
+    RuntimeMode,
 };
-// P13-1：CN 签到命令复用凭据域的 CN 产品根路径约定。
-use crate::credential_handover::trae_cn_material_root;
 // P12-R3：system_time_to_rfc3339 随凭据域迁 credential_handover。
 use crate::credential_handover::system_time_to_rfc3339;
 
@@ -232,7 +228,7 @@ pub(crate) async fn run_checkin(
                 let _guard = execution_lock_real
                     .try_lock()
                     .map_err(|_| "checkin_already_running".to_string())?;
-                run_real_checkin(material_root, ids, cancellation, Some(app_handle))
+                run_real_checkin(material_root, ids, cancellation, Some(app_handle), false)
             })
             .await?
         }
@@ -303,18 +299,25 @@ fn maintain_all_credentials(material_root: &Path, execution_lock: &Arc<Mutex<()>
         // 恰好重叠后整整延迟一个维护周期。
         return false;
     };
-    let records = AccountRegistry::new(material_root)
-        .load()
-        .unwrap_or_default();
+    let registry = AccountRegistry::new(material_root);
+    let records = registry.load().unwrap_or_default();
     let store = CheckinCredentialStore::new(material_root);
     let maintenance_state = CredentialMaintenanceStateStore::new(material_root);
     let renewal = RealCheckinRenewalService::new(&store);
     let now = Utc::now().timestamp().max(0) as u64;
-    let mut renewed = Vec::new();
-    let mut failures = Vec::new();
-
-    for record in records {
-        let profile_id = record.profile_id.clone();
+    for snapshot in records {
+        let profile_id = snapshot.profile_id;
+        // 账号级租约覆盖退避判定、续期与结果记录，避免多进程按旧状态重复触网。
+        let profile_lease = match store.lock_profile(&profile_id) {
+            Ok(lease) => lease,
+            Err(_) => continue,
+        };
+        // 排队等锁期间档案可能已删除、重登或修改设备，后续操作只使用锁内快照。
+        let record = match registry.find(&profile_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(_) => continue,
+        };
         let binding = CheckinProfileBinding::from(&record);
         // 退避状态落盘后，App 重启不会把失败账号重新当成可立即尝试，
         // 从而避免启动/定时器反复消耗服务端请求。
@@ -323,50 +326,61 @@ fn maintain_all_credentials(material_root: &Path, execution_lock: &Arc<Mutex<()>
             Err(_) => {
                 // 状态文件损坏或不可读时按 fail-closed 处理：不发网络请求，
                 // 同时留下可在账号列表中观察到的非敏感原因码。
-                failures.push((
-                    profile_id,
-                    "credential_maintenance_state_unavailable".to_string(),
-                ));
+                checkin_overview::update_refresh_failures(
+                    material_root,
+                    &[(
+                        profile_id,
+                        "credential_maintenance_state_unavailable".to_string(),
+                    )],
+                );
                 continue;
             }
         };
         if !allowed {
             continue;
         }
-        match renewal.renew_if_needed(&binding, now) {
+        match renewal.renew_if_needed_with_lease(&binding, now, &profile_lease) {
             Ok(Some(_)) => {
                 if maintenance_state
                     .record_success(&binding.profile_id, now)
                     .is_ok()
                 {
-                    renewed.push(profile_id);
+                    checkin_overview::clear_refresh_failures(
+                        material_root,
+                        std::slice::from_ref(&profile_id),
+                    );
                 } else {
-                    failures.push((
-                        profile_id,
-                        "credential_maintenance_state_unavailable".to_string(),
-                    ));
+                    checkin_overview::update_refresh_failures(
+                        material_root,
+                        &[(
+                            profile_id,
+                            "credential_maintenance_state_unavailable".to_string(),
+                        )],
+                    );
                 }
             }
             Ok(None) => {}
             Err(error) => {
                 let error_code = credential_maintenance_error_code(&error).to_string();
-                failures.push((profile_id.clone(), error_code.clone()));
+                checkin_overview::update_refresh_failures(
+                    material_root,
+                    &[(profile_id.clone(), error_code.clone())],
+                );
                 if maintenance_state
                     .record_failure(&profile_id, now, &error_code)
                     .is_err()
                 {
-                    failures.push((
-                        profile_id,
-                        "credential_maintenance_state_unavailable".to_string(),
-                    ));
+                    checkin_overview::update_refresh_failures(
+                        material_root,
+                        &[(
+                            profile_id,
+                            "credential_maintenance_state_unavailable".to_string(),
+                        )],
+                    );
                 }
             }
         }
     }
-    // 后台维护失败立即留下账号级展示标记；成功只清除维护失败标记，
-    // 不触碰积分、额度和签到尝试证据。
-    checkin_overview::update_refresh_failures(material_root, &failures);
-    checkin_overview::clear_refresh_failures(material_root, &renewed);
     true
 }
 
@@ -422,6 +436,10 @@ fn run_auto_checkin_tick(
     execution_lock: &Arc<Mutex<()>>,
 ) {
     let store = AutoCheckinStore::new(material_root);
+    // 一个共享产品根同一时间只允许一个进程推进批次台账；租约不锁设置文件。
+    let Ok(Some(_batch_lease)) = store.try_acquire_batch_execution_lease() else {
+        return;
+    };
     let Ok((settings, ledger)) = store.load() else {
         return;
     };
@@ -445,7 +463,14 @@ fn run_auto_checkin_tick(
         let _ = store.save_ledger(&ledger);
         match traesync_infrastructure::build_staggered_plan(eligible_ids) {
             Ok(plan) => {
-                run_auto_checkin_batch(app, material_root, execution_lock, &store, &mut ledger, plan);
+                run_auto_checkin_batch(
+                    app,
+                    material_root,
+                    execution_lock,
+                    &store,
+                    &mut ledger,
+                    plan,
+                );
             }
             // 随机源异常极罕见；台账已记 Running，下个 tick 走中断恢复补跑。
             Err(_) => return,
@@ -460,7 +485,14 @@ fn run_auto_checkin_tick(
         let _ = store.save_ledger(&ledger);
         // 补跑不错峰：顺序直跑；before 探测让已签账号直接 AlreadyCheckedIn。
         let plan = eligible_ids.into_iter().map(|id| (id, 0u64)).collect();
-        run_auto_checkin_batch(app, material_root, execution_lock, &store, &mut ledger, plan);
+        run_auto_checkin_batch(
+            app,
+            material_root,
+            execution_lock,
+            &store,
+            &mut ledger,
+            plan,
+        );
         return;
     }
 
@@ -473,8 +505,19 @@ fn run_auto_checkin_tick(
         let mut ledger = saved.clone();
         // 只重试撞锁跳过的账号（不错峰）；再撞锁则台账结束时刻随批次刷新，
         // 自然继续顺延到无 skipped 或当日结束。
-        let plan = ledger.skipped_ids.iter().map(|id| (id.clone(), 0u64)).collect();
-        run_auto_checkin_batch(app, material_root, execution_lock, &store, &mut ledger, plan);
+        let plan = ledger
+            .skipped_ids
+            .iter()
+            .map(|id| (id.clone(), 0u64))
+            .collect();
+        run_auto_checkin_batch(
+            app,
+            material_root,
+            execution_lock,
+            &store,
+            &mut ledger,
+            plan,
+        );
     }
 }
 
@@ -503,12 +546,52 @@ fn fresh_auto_checkin_ledger(today: String, total: usize) -> AutoCheckinLedger {
     }
 }
 
+/// 记录跳过总数，并只把仍需重试的撞锁账号留在 retry 集合。
+fn record_auto_checkin_skip(ledger: &mut AutoCheckinLedger, profile_id: &str, retryable: bool) {
+    let existing = ledger.skipped_ids.iter().position(|id| id == profile_id);
+    if retryable {
+        if existing.is_none() {
+            ledger.skipped += 1;
+            ledger.skipped_ids.push(profile_id.to_string());
+        }
+    } else if let Some(position) = existing {
+        ledger.skipped_ids.remove(position);
+    } else {
+        ledger.skipped += 1;
+    }
+}
+
+/// 手动批次占锁时复核账号开关，并在 profile lease 内更新可重试跳过状态。
+fn record_busy_auto_checkin_skip(
+    material_root: &Path,
+    store: &AutoCheckinStore,
+    ledger: &mut AutoCheckinLedger,
+    profile_id: &str,
+) {
+    let credential_store = CheckinCredentialStore::new(material_root);
+    let profile_lease = credential_store.lock_profile(profile_id).ok();
+    // 状态读取失败时保留顺延候选；实际签到仍会重新校验并失败关闭。
+    let retryable = profile_lease
+        .as_ref()
+        .map(|_| {
+            AccountRegistry::new(material_root)
+                .find(profile_id)
+                .ok()
+                .flatten()
+                .map(|record| record.auto_checkin_enabled)
+                .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    record_auto_checkin_skip(ledger, profile_id, retryable);
+    let _ = store.save_ledger(ledger);
+}
+
 /// 执行一个自动签到批次：逐账号短持锁 + 单账号签到路径，实时写台账并
 /// 推送进度；结束时置 Finished 并记录结束时刻（顺延重试的间隔基准）。
 /// plan 为 (profile_id, 相对延迟秒) 升序序列：首发批次错峰 0~15 分钟，
 /// 补跑/重试批次全部为 0（顺序直跑）。
-fn run_auto_checkin_batch(
-    app: &tauri::AppHandle,
+fn run_auto_checkin_batch<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     material_root: &Path,
     execution_lock: &Arc<Mutex<()>>,
     store: &AutoCheckinStore,
@@ -533,11 +616,8 @@ fn run_auto_checkin_batch(
         // 决策 5 互斥：手动批次执行中跳过该账号，记入当日顺延重试集合
         // （重试批次再撞锁则保持原状，等下个 30 分钟周期）。
         let Ok(_guard) = execution_lock.try_lock() else {
-            if !ledger.skipped_ids.contains(&profile_id) {
-                ledger.skipped += 1;
-                ledger.skipped_ids.push(profile_id.clone());
-                let _ = store.save_ledger(ledger);
-            }
+            // 不持 execution mutex；profile lease 与设置写入共用同一把账号锁。
+            record_busy_auto_checkin_skip(material_root, store, ledger, &profile_id);
             emit_auto_checkin_progress(
                 app,
                 &profile_id,
@@ -551,12 +631,23 @@ fn run_auto_checkin_batch(
         };
         // 自动批次使用独立取消标记：不受手动批次取消状态影响。
         let cancellation = Arc::new(AtomicBool::new(false));
-        let outcome = match run_real_checkin(
+        let checkin = run_real_checkin(
             material_root.to_path_buf(),
             vec![profile_id.clone()],
             cancellation,
             None,
-        ) {
+            true,
+        );
+        if checkin
+            .as_ref()
+            .is_ok_and(|summary| summary.cancelled == 1 && summary.results.is_empty())
+        {
+            // 用户在错峰等待期间关闭该账号时，记为本批跳过且不进入顺延重试。
+            record_auto_checkin_skip(ledger, &profile_id, false);
+            let _ = store.save_ledger(ledger);
+            continue;
+        }
+        let outcome = match checkin {
             Ok(summary) => summary
                 .results
                 .first()
@@ -610,8 +701,8 @@ fn run_auto_checkin_batch(
 
 /// 自动签到单账号进度事件（auto-checkin-progress）：与手动通道分离，
 /// completed/total 语义是"今日自动批次"而非单次调用。
-fn emit_auto_checkin_progress(
-    app: &tauri::AppHandle,
+fn emit_auto_checkin_progress<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     profile_id: &str,
     name_by_profile: &std::collections::BTreeMap<String, String>,
     outcome: &traesync_domain::CheckinOutcome,
@@ -630,6 +721,92 @@ fn emit_auto_checkin_progress(
             total,
         },
     );
+}
+
+#[cfg(test)]
+mod auto_checkin_schedule_tests {
+    use super::*;
+    use crate::test_support::registered_account;
+
+    #[test]
+    fn busy_manual_batch_skips_disabled_accounts_without_retrying() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::generate_context!())
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        registered_account(root.path(), "profile-a");
+        let material_root = root.path().join("checkin");
+        let registry = AccountRegistry::new(&material_root);
+        let execution_lock = Arc::new(Mutex::new(()));
+        let _manual_batch = execution_lock.lock().unwrap();
+        let store = AutoCheckinStore::new(&material_root);
+        let profile_id = "profile-a".to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        registry
+            .set_auto_checkin_enabled(&profile_id, false)
+            .unwrap();
+        let mut first_ledger = fresh_auto_checkin_ledger(today.clone(), 1);
+        assert!(execution_lock.try_lock().is_err());
+        run_auto_checkin_batch(
+            app.handle(),
+            &material_root,
+            &execution_lock,
+            &store,
+            &mut first_ledger,
+            vec![(profile_id.clone(), 0)],
+        );
+        assert_eq!(first_ledger.skipped, 1);
+        assert!(first_ledger.skipped_ids.is_empty());
+        first_ledger.state = AutoCheckinBatchState::Finished;
+        first_ledger.last_batch_finished_at = Some(0);
+        assert!(!traesync_infrastructure::should_retry_skipped_checkin(
+            Some(&first_ledger),
+            &today,
+            u64::MAX,
+        ));
+
+        registry
+            .set_auto_checkin_enabled(&profile_id, true)
+            .unwrap();
+        let mut retry_ledger = fresh_auto_checkin_ledger(today.clone(), 1);
+        run_auto_checkin_batch(
+            app.handle(),
+            &material_root,
+            &execution_lock,
+            &store,
+            &mut retry_ledger,
+            vec![(profile_id.clone(), 0)],
+        );
+        assert_eq!(retry_ledger.skipped, 1);
+        assert_eq!(retry_ledger.skipped_ids, [profile_id.clone()]);
+        retry_ledger.state = AutoCheckinBatchState::Finished;
+        retry_ledger.last_batch_finished_at = Some(0);
+        assert!(traesync_infrastructure::should_retry_skipped_checkin(
+            Some(&retry_ledger),
+            &today,
+            u64::MAX,
+        ));
+
+        registry
+            .set_auto_checkin_enabled(&profile_id, false)
+            .unwrap();
+        run_auto_checkin_batch(
+            app.handle(),
+            &material_root,
+            &execution_lock,
+            &store,
+            &mut retry_ledger,
+            vec![(profile_id, 0)],
+        );
+        assert_eq!(retry_ledger.skipped, 1);
+        assert!(retry_ledger.skipped_ids.is_empty());
+        assert!(!traesync_infrastructure::should_retry_skipped_checkin(
+            Some(&retry_ledger),
+            &today,
+            u64::MAX,
+        ));
+    }
 }
 
 /// 自动签到批次完成事件（auto-checkin-finished）：前端横幅汇总。
@@ -695,6 +872,10 @@ pub(crate) fn set_account_auto_checkin(
         return Err("checkin_profile_invalid".to_string());
     }
     let material_root = checkin_material_root(&state)?;
+    let store = CheckinCredentialStore::new(&material_root);
+    let _profile_lease = store
+        .lock_profile(&profile_id)
+        .map_err(|_| "checkin_storage_unavailable".to_string())?;
     let updated = AccountRegistry::new(&material_root)
         .set_auto_checkin_enabled(&profile_id, enabled)
         .map_err(|_| "checkin_registry_invalid".to_string())?;
@@ -735,6 +916,7 @@ fn run_real_checkin(
     selected: Vec<String>,
     cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     app: Option<tauri::AppHandle>,
+    automatic: bool,
 ) -> Result<traesync_domain::CheckinBatchSummary, String> {
     let registry = AccountRegistry::new(&material_root);
     let records = registry
@@ -757,33 +939,55 @@ fn run_real_checkin(
             )
         })
         .collect();
-    // 阶段事件（账号间等待）的材料：emit_progress 是 move 闭包（移走 app 与
-    // name_by_profile），供 emit_inter_wait 用的副本须在它之前克隆。
+    let expected_accounts: BTreeMap<String, String> = records
+        .iter()
+        .map(|record| (record.profile_id.clone(), record.account_id.clone()))
+        .collect();
+    let active_profile = std::cell::RefCell::new(None::<(String, String)>);
+    // 阶段事件需要独立持有名称与 AppHandle，避免和签到进度回调共享所有权。
     let phase_app = app.clone();
     let phase_names = name_by_profile.clone();
     // 串行循环内单线程调用：Cell 计数即可，无需原子类型。
     let progress_device_created = device_created_by_profile.clone();
-    let emit_progress = move |result: &traesync_domain::CheckinResult| {
-        let Some(app) = app.as_ref() else { return };
-        completed_seen.set(completed_seen.get() + 1);
+    let progress_names = &name_by_profile;
+    let progress_expected_accounts = &expected_accounts;
+    let progress_active_profile = &active_profile;
+    let emit_progress = |result: &traesync_domain::CheckinResult| {
         // 进度事件同样带 9074 上下文标注，与最终结果列表语义一致。
         let mut annotated = result.clone();
         annotate_device_too_new(
             &mut annotated,
             progress_device_created.get(&result.profile_id).copied(),
         );
-        emit_checkin_progress(
-            app,
-            &annotated,
-            &name_by_profile,
-            completed_seen.get(),
-            total,
-        );
+        // 回调在 transport 释放前执行，因此此账号租约仍保护结果与额度缓存写回。
+        if let Some((profile_id, account_id)) = progress_active_profile.borrow_mut().take() {
+            if profile_id == result.profile_id
+                && progress_expected_accounts.get(&profile_id) == Some(&account_id)
+                && AccountRegistry::new(&material_root)
+                    .find(&profile_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|current| current.account_id == account_id)
+            {
+                checkin_overview::update_credits_cache(
+                    &material_root,
+                    std::slice::from_ref(&annotated),
+                );
+                let outcome = checkin_overview::checkin_last_attempt_outcome(&annotated);
+                checkin_overview::update_last_attempt(&material_root, &profile_id, &outcome);
+            }
+        }
+        if let Some(app) = app.as_ref() {
+            completed_seen.set(completed_seen.get() + 1);
+            emit_checkin_progress(app, &annotated, progress_names, completed_seen.get(), total);
+        }
     };
 
     let mut bindings = BTreeMap::new();
     // None 表示注册表中无档案（未登录）；Some 为续期阶段的具体错误。
     let mut blocked: Vec<(String, Option<CheckinCredentialError>)> = Vec::new();
+    let mut auto_disabled = std::collections::BTreeSet::new();
+    let mut retained_leases = BTreeMap::<String, CheckinProfileOperationLease>::new();
     for profile_id in &selected {
         let Some(record) = records.iter().find(|r| &r.profile_id == profile_id) else {
             blocked.push((profile_id.clone(), None));
@@ -799,15 +1003,52 @@ fn run_real_checkin(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let mut renewal_blocked: Vec<String> = Vec::new();
-    for (profile_id, binding) in &bindings {
-        if let Err(error) = renewal.renew_if_needed(binding, now) {
-            blocked.push((profile_id.clone(), Some(error)));
-            renewal_blocked.push(profile_id.clone());
+    let profile_ids = bindings.keys().cloned().collect::<Vec<_>>();
+    for profile_id in profile_ids {
+        let lease = match store.lock_profile(&profile_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                blocked.push((profile_id.clone(), Some(error)));
+                bindings.remove(&profile_id);
+                continue;
+            }
+        };
+        let record = match registry.find(&profile_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                blocked.push((profile_id.clone(), Some(CheckinCredentialError::Missing)));
+                bindings.remove(&profile_id);
+                continue;
+            }
+            Err(_) => {
+                blocked.push((profile_id.clone(), Some(CheckinCredentialError::Invalid)));
+                bindings.remove(&profile_id);
+                continue;
+            }
+        };
+        if expected_accounts.get(&profile_id) != Some(&record.account_id) {
+            blocked.push((profile_id.clone(), Some(CheckinCredentialError::Invalid)));
+            bindings.remove(&profile_id);
+            continue;
         }
-    }
-    for profile_id in &renewal_blocked {
-        bindings.remove(profile_id);
+        if automatic && !record.auto_checkin_enabled {
+            auto_disabled.insert(profile_id.clone());
+            bindings.remove(&profile_id);
+            continue;
+        }
+        let binding = CheckinProfileBinding::from(&record);
+        if let Err(error) = renewal.renew_if_needed_with_lease(&binding, now, &lease) {
+            let synthetic = synthetic_real_checkin_failure(&profile_id, Some(&error));
+            let outcome = checkin_overview::checkin_last_attempt_outcome(&synthetic);
+            checkin_overview::update_last_attempt(&material_root, &profile_id, &outcome);
+            blocked.push((profile_id.clone(), Some(error)));
+            bindings.remove(&profile_id);
+        } else {
+            bindings.insert(profile_id.clone(), binding);
+            if automatic {
+                retained_leases.insert(profile_id, lease);
+            }
+        }
     }
 
     let batch_ids: Vec<String> = selected
@@ -816,11 +1057,49 @@ fn run_real_checkin(
         .cloned()
         .collect();
 
-    // v6（ADR-0019）：签到链路不再自动重铸设备——凭据在批次内不会变化，
-    // factory 直接复用续期后的绑定即可。
-    let factory_bindings = bindings.clone();
-    let factory = move || -> Box<dyn CheckinTransport> {
-        Box::new(RealCheckinTransport::new(&store, factory_bindings.clone()))
+    // 每个账号单独持有 profile 租约直到 status→claim→复核完成；工厂按
+    // profile_id 读取最新绑定，避免锁外快照被重登录/重铸覆盖。
+    let factory_root = material_root.clone();
+    let factory_store = store.clone();
+    let factory_active_profile = &active_profile;
+    let factory_expected_accounts = &expected_accounts;
+    let factory_retained_leases = std::cell::RefCell::new(retained_leases);
+    let factory = move |profile_id: &str| -> Box<dyn CheckinTransport> {
+        let fallback = || {
+            Box::new(RealCheckinTransport::new(&factory_store, BTreeMap::new()))
+                as Box<dyn CheckinTransport>
+        };
+        *factory_active_profile.borrow_mut() = None;
+        let lease = match factory_retained_leases
+            .borrow_mut()
+            .remove(profile_id)
+            .map(Ok)
+            .unwrap_or_else(|| factory_store.lock_profile(profile_id))
+        {
+            Ok(lease) => lease,
+            Err(_) => return fallback(),
+        };
+        let record = match AccountRegistry::new(&factory_root).find(profile_id) {
+            Ok(Some(record)) => record,
+            _ => return fallback(),
+        };
+        if factory_expected_accounts.get(profile_id) != Some(&record.account_id)
+            || (automatic && !record.auto_checkin_enabled)
+        {
+            return fallback();
+        }
+        match RealCheckinTransport::new_with_profile_lease(
+            &factory_store,
+            CheckinProfileBinding::from(&record),
+            lease,
+        ) {
+            Ok(transport) => {
+                *factory_active_profile.borrow_mut() =
+                    Some((profile_id.to_string(), record.account_id));
+                Box::new(transport)
+            }
+            Err(_) => fallback(),
+        }
     };
     // 账号间 3~8 秒随机间隔：模拟多真人错峰操作，降低批量连发风控特征。
     // 阶段事件（checkin-phase）：账号间等待开始时推送一次，前端本地倒计时。
@@ -868,6 +1147,8 @@ fn run_real_checkin(
         } else if batch_ids.contains(profile_id) {
             // run_batch 因取消跳过的条目：计入取消，不合成失败结果。
             cancelled += 1;
+        } else if auto_disabled.contains(profile_id) {
+            cancelled += 1;
         } else {
             let synthetic = synthetic_real_checkin_failure(
                 profile_id,
@@ -895,16 +1176,6 @@ fn run_real_checkin(
         cancelled,
         results,
     };
-    // 签到结束写回积分缓存（含合成失败结果里带 after 快照的条目），
-    // 供账号页/签到页离线展示最新积分与“今日已签”状态。
-    checkin_overview::update_credits_cache(&material_root, &summary.results);
-    // 每个账号尝试结束都写今日结果（无论成败）：失败证据不丢，
-    // 账号页才能区分“今日签到失败”与“从未尝试”（G10 状态机数据地基）。
-    // 取消跳过的账号不在 results 里，不写——它们今日确实从未尝试。
-    for result in &summary.results {
-        let outcome = checkin_overview::checkin_last_attempt_outcome(result);
-        checkin_overview::update_last_attempt(&material_root, &result.profile_id, &outcome);
-    }
     Ok(summary)
 }
 
@@ -1003,376 +1274,6 @@ pub(crate) fn get_checkin_overview(
     checkin_overview::build_overview(&material_root)
 }
 
-// ============================================================================
-// Trae CN 签到（P13-1）：单账号手动 status/claim，无批量无调度（CN 无自动签）
-// ============================================================================
-
-/// Trae CN 签到状态查询回执（checkin 域 wire 风格；业务码透传不压平）。
-/// pub(crate)：tauri 命令宏展开的包装函数签名需要暴露返回类型。
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct TraeCnCheckinStatusWireDto {
-    enable: bool,
-    checked_in: bool,
-    credits: Option<i64>,
-    /// CN 特有字段（探针报告顶层键；语义未验证，原样透传）。
-    did_checked_in: Option<bool>,
-    /// CN 特有字段：附加积分（未验证，原样透传）。
-    extra_credits: Option<i64>,
-    message: String,
-    business_code: i64,
-}
-
-/// Trae CN 手动签到（单账号 claim）回执；outcome/detail_code 与 Work 结果行
-/// 同口径，前端复用同一套人话映射与业务码透传规则。
-/// pub(crate)：tauri 命令宏展开的包装函数签名需要暴露返回类型。
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct TraeCnCheckinResultWireDto {
-    profile_id: String,
-    outcome: traesync_domain::CheckinOutcome,
-    detail_code: Option<String>,
-    credits: Option<i64>,
-    extra_credits: Option<i64>,
-}
-
-/// 单账号 profile_id 校验（CN 签到域；错误码与批量域一致）。
-fn validate_trae_cn_profile_id(profile_id: &str) -> Result<(), String> {
-    if profile_id.is_empty() || profile_id.len() > 256 {
-        return Err("checkin_profile_invalid".to_string());
-    }
-    Ok(())
-}
-
-/// CN 注册表档案 → 凭据绑定；注册表损坏/档案缺失分别收口（稳定错误码）。
-fn trae_cn_binding(
-    material_root: &Path,
-    profile_id: &str,
-) -> Result<CheckinProfileBinding, String> {
-    let record = AccountRegistry::new(material_root)
-        .find(profile_id)
-        .map_err(|_| "trae_cn_registry_invalid".to_string())?
-        .ok_or_else(|| "trae_cn_account_not_found".to_string())?;
-    Ok(CheckinProfileBinding::from(&record))
-}
-
-/// claim 错误 → (outcome, detail_code)：业务码 `business_{code}` 原样透传
-/// （红线：不压平）；401/403 与凭据类归授权不匹配，其余按传输/运行时收口。
-fn trae_cn_claim_outcome(
-    error: &TraeCnCheckinError,
-) -> (traesync_domain::CheckinOutcome, String) {
-    let detail_code = trae_cn_checkin_error_code(error);
-    let outcome = match error {
-        TraeCnCheckinError::Business(_) => traesync_domain::CheckinOutcome::NotEligible,
-        TraeCnCheckinError::Network => traesync_domain::CheckinOutcome::NetworkError,
-        TraeCnCheckinError::Http(401 | 403) | TraeCnCheckinError::Credential(_) => {
-            traesync_domain::CheckinOutcome::AuthMismatch
-        }
-        TraeCnCheckinError::Http(_) | TraeCnCheckinError::Protocol => {
-            traesync_domain::CheckinOutcome::RuntimeError
-        }
-    };
-    (outcome, detail_code)
-}
-
-/// 查询 CN 账号签到状态的内层编排（客户端可注入，供测试用 fake seam）。
-/// 不落任何缓存：手动查询直出，避免引入 credits-cache 失效复杂度（P13-1 决策）。
-fn get_trae_cn_checkin_status_inner(
-    material_root: &Path,
-    profile_id: &str,
-    build_client: impl Fn(PathBuf, CheckinProfileBinding) -> Box<dyn TraeCnCheckinClient>,
-) -> Result<TraeCnCheckinStatusWireDto, String> {
-    let binding = trae_cn_binding(material_root, profile_id)?;
-    let client = build_client(material_root.to_path_buf(), binding);
-    let status = client
-        .status(profile_id)
-        .map_err(|error| trae_cn_checkin_error_code(&error))?;
-    Ok(TraeCnCheckinStatusWireDto {
-        enable: status.enable,
-        checked_in: status.checked_in,
-        credits: status.credits,
-        did_checked_in: status.did_checked_in,
-        extra_credits: status.extra_credits,
-        message: status.message,
-        business_code: status.business_code,
-    })
-}
-
-/// CN 手动签到（claim）的内层编排（客户端可注入）。
-/// 互斥方案（P13-1）：claim 与 Work 签到/凭据维护共用同一把进程内
-/// `checkin_execution_lock`——claim 虽不写本地缓存，但会读取凭据包并与
-/// 凭据换发共享服务端交互面，共用锁以最小侵入保证同一账号操作不交错；
-/// 锁忙快速失败（checkin_already_running），与手动批量语义对等。
-fn run_trae_cn_checkin_inner(
-    material_root: &Path,
-    profile_id: &str,
-    execution_lock: &Arc<Mutex<()>>,
-    build_client: impl Fn(PathBuf, CheckinProfileBinding) -> Box<dyn TraeCnCheckinClient>,
-) -> Result<TraeCnCheckinResultWireDto, String> {
-    let binding = trae_cn_binding(material_root, profile_id)?;
-    let _guard = execution_lock
-        .try_lock()
-        .map_err(|_| "checkin_already_running".to_string())?;
-    let client = build_client(material_root.to_path_buf(), binding);
-    let claim_result = client.claim(profile_id);
-    let (outcome, detail_code) = match &claim_result {
-        Ok(_) => (traesync_domain::CheckinOutcome::Claimed, None),
-        Err(error) => {
-            let (outcome, code) = trae_cn_claim_outcome(error);
-            (outcome, Some(code))
-        }
-    };
-    let (credits, extra_credits) = claim_result
-        .map(|claim| (claim.credits, claim.extra_credits))
-        .unwrap_or((None, None));
-    Ok(TraeCnCheckinResultWireDto {
-        profile_id: profile_id.to_string(),
-        outcome,
-        detail_code,
-        credits,
-        extra_credits,
-    })
-}
-
-/// 查询 Trae CN 账号的签到状态（单账号只读直连；不落缓存，手动查询直出）。
-#[tauri::command]
-pub(crate) async fn get_trae_cn_checkin_status(
-    profile_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<TraeCnCheckinStatusWireDto, String> {
-    ensure_checkin_http_enabled(&state)?;
-    validate_trae_cn_profile_id(&profile_id)?;
-    let material_root = trae_cn_material_root(&state)?;
-    run_blocking("trae_cn_checkin_join_failed", move || {
-        get_trae_cn_checkin_status_inner(&material_root, &profile_id, |root, binding| {
-            Box::new(RealTraeCnCheckinClient::new(root, binding, OAuthClient::TraeCn))
-        })
-    })
-    .await
-}
-
-/// 对 Trae CN 账号发起一次手动签到（claim）：单账号、无批量、无调度；
-/// 一次调用 = 一次用户授权动作（前端按钮点击触发，claim 一次一授权）。
-#[tauri::command]
-pub(crate) async fn run_trae_cn_checkin(
-    profile_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<TraeCnCheckinResultWireDto, String> {
-    ensure_checkin_http_enabled(&state)?;
-    validate_trae_cn_profile_id(&profile_id)?;
-    let material_root = trae_cn_material_root(&state)?;
-    let execution_lock = Arc::clone(&state.checkin_execution_lock);
-    run_blocking("trae_cn_checkin_join_failed", move || {
-        run_trae_cn_checkin_inner(&material_root, &profile_id, &execution_lock, |root, binding| {
-            Box::new(RealTraeCnCheckinClient::new(root, binding, OAuthClient::TraeCn))
-        })
-    })
-    .await
-}
-
-/// CN 签到命令层测试：fake 客户端注入 + 注册表现场（Windows：DPAPI 凭据）。
-#[cfg(test)]
-mod trae_cn_checkin_tests {
-    use super::*;
-    use traesync_infrastructure::{generate_device_keypair, TraeCnCheckinClaim, TraeCnCheckinStatus};
-
-    /// fake CN 签到客户端：返回预置结果并记录 claim 调用（命令编排的 mock seam）。
-    struct FakeCnClient {
-        status_result: Result<TraeCnCheckinStatus, TraeCnCheckinError>,
-        claim_result: Result<TraeCnCheckinClaim, TraeCnCheckinError>,
-        claimed_profiles: std::sync::Arc<Mutex<Vec<String>>>,
-    }
-
-    impl TraeCnCheckinClient for FakeCnClient {
-        fn status(
-            &self,
-            _profile_id: &str,
-        ) -> Result<TraeCnCheckinStatus, TraeCnCheckinError> {
-            self.status_result.clone()
-        }
-
-        fn claim(&self, profile_id: &str) -> Result<TraeCnCheckinClaim, TraeCnCheckinError> {
-            self.claimed_profiles
-                .lock()
-                .unwrap()
-                .push(profile_id.to_string());
-            self.claim_result.clone()
-        }
-    }
-
-    /// CN 注册表档案夹具：直接写 CN material_root（无 checkin 子目录）。
-    fn registered_cn_account(root: &Path, profile_id: &str) {
-        let (_, public_pem) = generate_device_keypair().unwrap();
-        AccountRegistry::new(root)
-            .upsert(&AccountRecord {
-                profile_id: profile_id.to_string(),
-                account_id: format!("account-{profile_id}"),
-                screen_name: "CN 测试账号".to_string(),
-                avatar_url: String::new(),
-                device_id: "1234567890123456".to_string(),
-                device_public_key: public_pem,
-                display_name: None,
-                masked_mobile: String::new(),
-                created_at_unix_seconds: 0,
-                last_verified_at_unix_seconds: 0,
-                device_created_at_unix_seconds: 0,
-                auto_checkin_enabled: false,
-                archived: false,
-            })
-            .unwrap();
-    }
-
-    fn probe_status() -> TraeCnCheckinStatus {
-        TraeCnCheckinStatus {
-            enable: true,
-            checked_in: false,
-            credits: Some(200),
-            did_checked_in: Some(false),
-            extra_credits: Some(5),
-            message: "success".to_string(),
-            business_code: 0,
-        }
-    }
-
-    fn probe_claim() -> TraeCnCheckinClaim {
-        TraeCnCheckinClaim {
-            credits: Some(205),
-            extra_credits: Some(5),
-            checked_in: Some(true),
-            message: "success".to_string(),
-            business_code: 0,
-        }
-    }
-
-    /// claim 错误 → outcome/detail_code 映射：业务码透传（红线），其余按
-    /// 传输/凭据/运行时收口，与 Work 结果行口径同族。
-    #[test]
-    fn trae_cn_claim_outcome_maps_every_error_variant() {
-        let (outcome, detail) =
-            trae_cn_claim_outcome(&TraeCnCheckinError::Business(9095));
-        assert_eq!(outcome, traesync_domain::CheckinOutcome::NotEligible);
-        assert_eq!(detail, "business_9095");
-
-        let (outcome, detail) = trae_cn_claim_outcome(&TraeCnCheckinError::Network);
-        assert_eq!(outcome, traesync_domain::CheckinOutcome::NetworkError);
-        assert_eq!(detail, "network_error");
-
-        let (outcome, detail) = trae_cn_claim_outcome(&TraeCnCheckinError::Http(401));
-        assert_eq!(outcome, traesync_domain::CheckinOutcome::AuthMismatch);
-        assert_eq!(detail, "credential_invalid");
-
-        let (outcome, detail) =
-            trae_cn_claim_outcome(&TraeCnCheckinError::Credential("credential_missing"));
-        assert_eq!(outcome, traesync_domain::CheckinOutcome::AuthMismatch);
-        assert_eq!(detail, "credential_missing");
-
-        let (outcome, detail) = trae_cn_claim_outcome(&TraeCnCheckinError::Protocol);
-        assert_eq!(outcome, traesync_domain::CheckinOutcome::RuntimeError);
-        assert_eq!(detail, "trae_cn_checkin_protocol");
-    }
-
-    #[test]
-    fn trae_cn_status_inner_reports_missing_account_without_client() {
-        let root = tempfile::tempdir().unwrap();
-        let error = get_trae_cn_checkin_status_inner(root.path(), "profile-x", |_, _| {
-            panic!("档案缺失不应构造客户端")
-        })
-        .unwrap_err();
-        assert_eq!(error, "trae_cn_account_not_found");
-    }
-
-    #[test]
-    fn trae_cn_status_inner_roundtrips_probe_fields() {
-        let root = tempfile::tempdir().unwrap();
-        registered_cn_account(root.path(), "profile-cn");
-        let dto = get_trae_cn_checkin_status_inner(root.path(), "profile-cn", |_, _| {
-            Box::new(FakeCnClient {
-                status_result: Ok(probe_status()),
-                claim_result: Ok(probe_claim()),
-                claimed_profiles: Arc::new(Mutex::new(Vec::new())),
-            }) as Box<dyn TraeCnCheckinClient>
-        })
-        .unwrap();
-        assert!(dto.enable);
-        assert!(!dto.checked_in);
-        assert_eq!(dto.credits, Some(200));
-        assert_eq!(dto.did_checked_in, Some(false));
-        assert_eq!(dto.extra_credits, Some(5));
-        assert_eq!(dto.business_code, 0);
-    }
-
-    #[test]
-    fn trae_cn_claim_inner_reports_success_and_business_transparently() {
-        let root = tempfile::tempdir().unwrap();
-        registered_cn_account(root.path(), "profile-cn");
-        let execution_lock = Arc::new(Mutex::new(()));
-        let claimed = Arc::new(Mutex::new(Vec::new()));
-
-        // 成功路径：outcome=claimed + 积分字段透传。
-        let dto = run_trae_cn_checkin_inner(
-            root.path(),
-            "profile-cn",
-            &execution_lock,
-            |_, _| {
-                Box::new(FakeCnClient {
-                    status_result: Ok(probe_status()),
-                    claim_result: Ok(probe_claim()),
-                    claimed_profiles: Arc::clone(&claimed),
-                }) as Box<dyn TraeCnCheckinClient>
-            },
-        )
-        .unwrap();
-        assert_eq!(dto.outcome, traesync_domain::CheckinOutcome::Claimed);
-        assert_eq!(dto.detail_code, None);
-        assert_eq!(dto.credits, Some(205));
-        assert_eq!(dto.extra_credits, Some(5));
-        // 客户端收到的 profile_id 与命令入参一致。
-        assert_eq!(*claimed.lock().unwrap(), vec!["profile-cn".to_string()]);
-
-        // 业务拒绝路径：outcome=not_eligible + detail_code=business_{code}（不压平）。
-        let dto = run_trae_cn_checkin_inner(
-            root.path(),
-            "profile-cn",
-            &execution_lock,
-            |_, _| {
-                Box::new(FakeCnClient {
-                    status_result: Ok(probe_status()),
-                    claim_result: Err(TraeCnCheckinError::Business(9074)),
-                    claimed_profiles: Arc::new(Mutex::new(Vec::new())),
-                }) as Box<dyn TraeCnCheckinClient>
-            },
-        )
-        .unwrap();
-        assert_eq!(dto.outcome, traesync_domain::CheckinOutcome::NotEligible);
-        assert_eq!(dto.detail_code.as_deref(), Some("business_9074"));
-    }
-
-    #[test]
-    fn trae_cn_claim_inner_rejects_when_execution_lock_busy() {
-        let root = tempfile::tempdir().unwrap();
-        registered_cn_account(root.path(), "profile-cn");
-        let execution_lock = Arc::new(Mutex::new(()));
-        // 预占互斥（模拟 Work 批量签到/凭据维护执行中）：CN claim 快速失败。
-        let _guard = execution_lock.try_lock().unwrap();
-        let error = run_trae_cn_checkin_inner(root.path(), "profile-cn", &execution_lock, |_, _| {
-            panic!("锁忙不应构造客户端")
-        })
-        .unwrap_err();
-        assert_eq!(error, "checkin_already_running");
-    }
-
-    #[test]
-    fn trae_cn_profile_id_validation_rejects_empty_and_oversized() {
-        assert_eq!(
-            validate_trae_cn_profile_id("").unwrap_err(),
-            "checkin_profile_invalid"
-        );
-        assert_eq!(
-            validate_trae_cn_profile_id(&"x".repeat(257)).unwrap_err(),
-            "checkin_profile_invalid"
-        );
-        assert!(validate_trae_cn_profile_id("profile-cn").is_ok());
-    }
-}
-
 /// 批量操作逐账号进度事件统一契约（P12-R2b）：三条批量链（凭据刷新
 /// `credential-refresh-progress`、健康检测 `health-check-progress`、
 /// 积分/额度刷新 `credits-refresh-progress`）共用单一判别枚举，事件名保持
@@ -1429,6 +1330,20 @@ pub(crate) enum BatchProgressEvent {
         /// 失败原因码；成功为 None（序列化保留 null）。
         error_code: Option<String>,
     },
+}
+
+/// 在原进度载荷中加入产品来源；`flatten` 保持 `kind` 与进度字段处于同一层。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProductBatchProgressEvent<'a> {
+    product_id: &'a str,
+    #[serde(flatten)]
+    event: BatchProgressEvent,
+}
+
+impl<'a> ProductBatchProgressEvent<'a> {
+    pub(crate) fn new(product_id: &'a str, event: BatchProgressEvent) -> Self {
+        Self { product_id, event }
+    }
 }
 
 /// 泛型批量运行器（P12-R2b）：三条批量链共享的「串行循环 + 逐账号进度事件
@@ -1525,7 +1440,10 @@ mod batch_runner_tests {
             serde_json::to_value(&refresh).unwrap()["kind"],
             "credential_refresh"
         );
-        assert_eq!(serde_json::to_value(&health).unwrap()["kind"], "health_check");
+        assert_eq!(
+            serde_json::to_value(&health).unwrap()["kind"],
+            "health_check"
+        );
         assert_eq!(
             serde_json::to_value(&credits).unwrap()["kind"],
             "credits_refresh"
@@ -1589,9 +1507,7 @@ mod batch_runner_tests {
                     profile_id.to_string(),
                     BatchProgressEvent::HealthCheck {
                         profile_id: profile_id.to_string(),
-                        screen_name: record
-                            .map(|r| r.screen_name.clone())
-                            .unwrap_or_default(),
+                        screen_name: record.map(|r| r.screen_name.clone()).unwrap_or_default(),
                         completed,
                         total,
                         healthy,
@@ -1667,23 +1583,30 @@ mod progress_event_contract_tests {
 
     #[test]
     fn progress_events_serialize_non_sensitive_payload_shape() {
-        let refresh = BatchProgressEvent::CredentialRefresh {
-            profile_id: "profile-1".to_string(),
-            screen_name: "账号一".to_string(),
-            completed: 1,
-            total: 2,
-            refreshed: true,
-            error_code: None,
-        };
-        let health = BatchProgressEvent::HealthCheck {
-            profile_id: "profile-2".to_string(),
-            screen_name: "账号二".to_string(),
-            completed: 2,
-            total: 2,
-            healthy: false,
-            error_code: Some("credential_invalid".to_string()),
-        };
+        let refresh = ProductBatchProgressEvent::new(
+            "work_cn",
+            BatchProgressEvent::CredentialRefresh {
+                profile_id: "profile-1".to_string(),
+                screen_name: "账号一".to_string(),
+                completed: 1,
+                total: 2,
+                refreshed: true,
+                error_code: None,
+            },
+        );
+        let health = ProductBatchProgressEvent::new(
+            "trae_cn",
+            BatchProgressEvent::HealthCheck {
+                profile_id: "profile-2".to_string(),
+                screen_name: "账号二".to_string(),
+                completed: 2,
+                total: 2,
+                healthy: false,
+                error_code: Some("credential_invalid".to_string()),
+            },
+        );
         let refresh_json = serde_json::to_value(&refresh).unwrap();
+        assert_eq!(refresh_json["product_id"], "work_cn");
         assert_eq!(refresh_json["kind"], "credential_refresh");
         assert_eq!(refresh_json["profile_id"], "profile-1");
         assert_eq!(refresh_json["screen_name"], "账号一");
@@ -1692,6 +1615,7 @@ mod progress_event_contract_tests {
         assert_eq!(refresh_json["refreshed"], true);
         assert!(refresh_json["error_code"].is_null());
         let health_json = serde_json::to_value(&health).unwrap();
+        assert_eq!(health_json["product_id"], "trae_cn");
         assert_eq!(health_json["kind"], "health_check");
         assert_eq!(health_json["profile_id"], "profile-2");
         assert_eq!(health_json["completed"], 2);
@@ -1708,18 +1632,22 @@ mod progress_event_contract_tests {
 
     #[test]
     fn credits_refresh_progress_serializes_non_sensitive_payload_shape() {
-        let event = BatchProgressEvent::CreditsRefresh {
-            profile_id: "profile-1".to_string(),
-            screen_name: "账号一".to_string(),
-            completed: 1,
-            total: 2,
-            ok: true,
-            credits: Some(200),
-            checked_in: Some(false),
-            usage_remaining_credits: Some(80.5),
-            error_code: None,
-        };
+        let event = ProductBatchProgressEvent::new(
+            "work_cn",
+            BatchProgressEvent::CreditsRefresh {
+                profile_id: "profile-1".to_string(),
+                screen_name: "账号一".to_string(),
+                completed: 1,
+                total: 2,
+                ok: true,
+                credits: Some(200),
+                checked_in: Some(false),
+                usage_remaining_credits: Some(80.5),
+                error_code: None,
+            },
+        );
         let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["product_id"], "work_cn");
         assert_eq!(json["kind"], "credits_refresh");
         assert_eq!(json["profile_id"], "profile-1");
         assert_eq!(json["screen_name"], "账号一");
@@ -1798,12 +1726,21 @@ mod real_checkin_tests {
         state: &AppState,
         selected: &[String],
     ) -> Result<traesync_domain::CheckinBatchSummary, String> {
+        run_real_checkin_for_test_mode(state, selected, false)
+    }
+
+    fn run_real_checkin_for_test_mode(
+        state: &AppState,
+        selected: &[String],
+        automatic: bool,
+    ) -> Result<traesync_domain::CheckinBatchSummary, String> {
         let material_root = checkin_material_root(state)?;
         run_real_checkin(
             material_root,
             selected.to_vec(),
             Arc::new(AtomicBool::new(false)),
             None,
+            automatic,
         )
     }
 
@@ -1852,6 +1789,26 @@ mod real_checkin_tests {
             Some("credential_missing")
         );
         assert!(!summary.results[0].claim_attempted);
+    }
+
+    #[test]
+    fn automatic_checkin_skips_account_disabled_after_stagger_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        registered_account(root.path(), "profile-a");
+        let registry = AccountRegistry::new(root.path().join("checkin"));
+        assert!(registry
+            .set_auto_checkin_enabled("profile-a", false)
+            .unwrap());
+        let state = make_real_mode_state(root.path());
+
+        let summary =
+            run_real_checkin_for_test_mode(&state, &["profile-a".to_string()], true).unwrap();
+
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.completed, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.cancelled, 1);
+        assert!(summary.results.is_empty());
     }
 
     #[test]

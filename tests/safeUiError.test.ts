@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isReadAuthorizationInvalidationError,
+  masterArchiveCommitFailure,
   safeUiErrorMessage,
   safeUiRecommendedAction,
 } from "../src/utils/safeUiError";
@@ -76,6 +77,22 @@ describe("读取授权失效错误映射", () => {
     );
   });
 
+  it("写入租约冲突显示脱敏提示", () => {
+    // 后端附带的路径/锁细节不能泄露到错误提示。
+    const error = String.raw`operation_lease_unavailable:数据位置锁忙 D:\private\TRAE`;
+    expect(safeUiErrorMessage(error, "fallback")).toBe(
+      "同一数据目录的另一个写入操作正在进行，请稍后重试。",
+    );
+    expect(safeUiRecommendedAction(error, "fallback")).toBe("等待当前操作结束后再重试。");
+    expect(safeUiErrorMessage(error, "fallback")).not.toContain("private");
+  });
+
+  it("较新的账号选择意图覆盖切号时显示当前账号提示", () => {
+    expect(
+      safeUiErrorMessage("trae_cn_account_selection_superseded", "fallback"),
+    ).toBe("另一个较新的账号操作正在处理，本次切换没有生效；请刷新后查看当前账号。");
+  });
+
   // ===== P11-5 环境实例关闭 + 删除残留路径 + 归档草稿存储 =====
 
   it.each([
@@ -100,11 +117,31 @@ describe("读取授权失效错误映射", () => {
   });
 
   it.each([
+    [
+      "process_state_unknown",
+      "无法确认 TRAE 的运行状态，本次操作已停止以保护数据；请关闭相关客户端后重试。",
+    ],
     ["master_archive_busy", "主库正在生成回复，归档设置需等它完成；稍后重试即可。"],
     ["master_archive_close_failed", "主库实例未能关闭，归档设置尚未写入；请关闭 TRAE 后重试。"],
     ["master_archive_conflict", "同一会话同时出现在归档和恢复设置中，请调整后再应用。"],
     ["master_archive_join_failed", "归档设置提交未完成，草稿仍保留；请稍后重试。"],
   ])("归档批次错误 %s 使用稳定提示", (code, message) => {
+    expect(safeUiErrorMessage(code, "fallback")).toBe(message);
+  });
+
+  it.each([
+    [
+      "master_archive_commit_outcome_unknown",
+      "unknown",
+      "会话操作的提交结果无法确认。请保留当前草稿和数据备份，检查数据库状态后再决定下一步，不要直接重试。",
+    ],
+    [
+      "master_archive_committed_needs_attention",
+      "committed",
+      "会话操作已提交，但写后校验未通过。请保留数据备份，不要重复应用；检查数据库状态后再继续。",
+    ],
+  ] as const)("归档提交状态 %s 有明确文案并要求先核对", (code, state, message) => {
+    expect(masterArchiveCommitFailure({ code, message: "database detail" })).toBe(state);
     expect(safeUiErrorMessage(code, "fallback")).toBe(message);
   });
 

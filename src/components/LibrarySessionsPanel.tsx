@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -35,7 +35,8 @@ import type {
   TraeCnMergeResultDto,
 } from "../types/history";
 import type { SessionMessageDto } from "../types/account_switch";
-import { safeUiErrorMessage } from "../utils/safeUiError";
+import type { ProductOperationSnapshotDto } from "../types/product";
+import { masterArchiveCommitFailure, safeUiErrorMessage } from "../utils/safeUiError";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
 // 归档草稿状态机（P12-R2c 自本组件收敛为 hook；迁移语义见 hook 注释）。
@@ -67,8 +68,8 @@ export interface LibraryRef {
 
 /**
  * 库写能力（P13-3，ADR-0033 选择性写）：取代旧布尔 readOnly 的内部判定。
- * full = 归档/恢复/删除/合并全开放（主库、副环境）；archive-only = 仅会话
- * 归档/恢复开放（Trae CN）；none = 纯只读（其余未知库，fail-closed）。
+ * full/archive-only 说明产品支持范围；每项实际写操作还须通过 P14 ready 门禁。
+ * none = 纯只读（其余未知库，fail-closed）。
  */
 export type LibraryWriteCapability = "full" | "archive-only" | "none";
 
@@ -137,7 +138,7 @@ const CHAT_WINDOW_LIMIT = 2000;
 
 /** 需要就地恢复的异常收尾（P11-1 切片②）：带一句原因与重试动作。 */
 interface ArchiveRecovery {
-  readonly kind: "relaunch" | "refresh";
+  readonly kind: "relaunch" | "refresh" | "commit-unknown" | "committed-attention";
   readonly message: string;
 }
 
@@ -157,8 +158,56 @@ export function LibrarySessionsPanel({
   // 只降级不升级：全能力库被标记只读时维持 none（P11-6 旧形态兼容）；
   // trae_cn 虽传 readOnly，仍按能力开放归档/恢复。
   const derivedCapability = deriveWriteCapability(library.id);
-  const writeCapability: LibraryWriteCapability =
-    readOnly && derivedCapability === "full" ? "none" : derivedCapability;
+  const [operationSnapshot, setOperationSnapshot] = useState<ProductOperationSnapshotDto | null>(null);
+  const snapshotMatchesLibrary = operationSnapshot?.product_id === (library.id === "trae_cn" ? "trae_cn" : "work_cn")
+    && operationSnapshot.library_id === library.id;
+  const currentOperations = snapshotMatchesLibrary ? operationSnapshot?.operations ?? [] : [];
+  const archiveOperation = currentOperations.find((operation) => operation.operation_id === "library.archive");
+  const workMergeOperation = currentOperations.find(
+    (operation) => operation.operation_id === "library.work_project_merge",
+  );
+  const deleteOperation = currentOperations.find((operation) => operation.operation_id === "library.delete");
+  const cnMergeOperation = currentOperations.find(
+    (operation) => operation.operation_id === "library.trae_cn_project_merge",
+  );
+  const baseWriteCapability: LibraryWriteCapability = readOnly && derivedCapability === "full"
+    ? "none"
+    : derivedCapability;
+  const canArchive = baseWriteCapability !== "none" && archiveOperation?.state === "ready";
+  const canWorkMerge = baseWriteCapability === "full" && workMergeOperation?.state === "ready";
+  const canDelete = baseWriteCapability === "full" && deleteOperation?.state === "ready";
+  const mergeOperationReady = cnMergeOperation?.state === "ready";
+  const workArchiveNotice = library.id !== "trae_cn" && archiveOperation?.state === "ready"
+    ? archiveOperation.reason
+    : null;
+  const writeCapability: LibraryWriteCapability = baseWriteCapability === "archive-only" && !canArchive
+    ? "none"
+    : baseWriteCapability;
+  const pendingWorkOperations = [
+    ["归档与恢复", archiveOperation],
+    ["项目归并", workMergeOperation],
+    ["删除", deleteOperation],
+  ] as const;
+  const pendingWorkNotice = !snapshotMatchesLibrary
+    ? "暂时无法确认当前库的操作状态，写操作暂不可用。"
+    : (() => {
+        const pending = pendingWorkOperations.filter(([, operation]) => operation?.state === "pending");
+        return pending.length > 0
+          ? `${pending.map(([label]) => label).join("、")}暂不可用。${pending[0][1]?.reason ?? ""}`
+          : null;
+      })();
+  const pendingCnNotice = !snapshotMatchesLibrary
+    ? "暂时无法确认 Trae CN 的操作状态，写操作暂不可用。"
+    : (() => {
+        const pending = [
+          ["归档与恢复", archiveOperation],
+          ["项目归并", cnMergeOperation],
+        ] as const;
+        const blocked = pending.filter(([, operation]) => operation?.state === "pending");
+        return blocked.length > 0
+          ? `${blocked.map(([label]) => label).join("、")}暂不可用。${blocked[0][1]?.reason ?? ""}`
+          : null;
+      })();
 
   const [history, setHistory] = useState<MasterHistoryDto | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -169,6 +218,9 @@ export function LibrarySessionsPanel({
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(new Set());
   // 归档视图（同一棵树灰显，层级 模式 → 项目 → 会话）。
   const [archiveView, setArchiveView] = useState(false);
+  const availableSelectionActions = archiveView
+    ? canArchive || canDelete
+    : canArchive || canWorkMerge || canDelete;
   // 归档页项目文件夹默认展开；用户可单独折叠每个模式下的项目。
   const [archiveCollapsedProjectKeys, setArchiveCollapsedProjectKeys] = useState<ReadonlySet<string>>(
     new Set(),
@@ -190,10 +242,11 @@ export function LibrarySessionsPanel({
     hasChanges: archiveDraftHasChanges,
     storageError: archiveDraftStorageError,
     reset: resetArchiveDraft,
-  } = useArchiveDraft(library.id, { active, readOnly: writeCapability === "none" });
+  } = useArchiveDraft(library.id, { active, readOnly: !canArchive });
   // 数据库已更新但实例启动或列表刷新失败时，保留带重试按钮的就地恢复入口
   // （正常完成的回执走全局通知，不再保留页内横幅）。
   const [archiveRecovery, setArchiveRecovery] = useState<ArchiveRecovery | null>(null);
+  const [workArchiveConfirmOpen, setWorkArchiveConfirmOpen] = useState(false);
   // 删除二次确认（ADR-0018：列明规模，单次确认）。
   const [deleteConfirm, setDeleteConfirm] = useState<readonly MasterSessionEntryDto[] | null>(null);
   // 合并确认弹层（两步：选保留目标 → 确认页）。
@@ -210,14 +263,56 @@ export function LibrarySessionsPanel({
   // 指纹相同但主库切号时文件可能未变，身份也必须参与 unchanged 判定。
   const currentUserIdRef = useRef<string | null>(null);
   const pollCancelled = useRef(false);
+  // 库变化只使旧请求结果失效，不取消已经发出的 IPC。
+  const libraryRequestRef = useRef({ libraryId: library.id, generation: 0 });
+  const viewerRequestIdRef = useRef(0);
+
+  useLayoutEffect(() => {
+    if (libraryRequestRef.current.libraryId === library.id) return;
+    libraryRequestRef.current = {
+      libraryId: library.id,
+      generation: libraryRequestRef.current.generation + 1,
+    };
+    viewerRequestIdRef.current += 1;
+    fingerprintRef.current = null;
+    currentUserIdRef.current = null;
+    setWorkArchiveConfirmOpen(false);
+    setHistory(null);
+    setLoadError(null);
+    setLedger([]);
+    setViewer(null);
+  }, [library.id]);
+
+  useEffect(() => {
+    if (!active) {
+      setOperationSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    setOperationSnapshot(null);
+    const productId = library.id === "trae_cn" ? "trae_cn" : "work_cn";
+    void invoke<ProductOperationSnapshotDto>("get_product_operation_states", {
+      productId,
+      libraryId: library.id,
+    })
+      .then((snapshot) => { if (!cancelled) setOperationSnapshot(snapshot); })
+      .catch(() => { if (!cancelled) setOperationSnapshot(null); });
+    return () => { cancelled = true; };
+  }, [active, library.id]);
 
   const load = useCallback(
     async (force: boolean) => {
+      const requestLibraryId = library.id;
+      const requestGeneration = libraryRequestRef.current.generation;
       const next = await invoke<MasterHistoryDto>("get_master_history", {
         previous: force ? null : fingerprintRef.current,
         previousCurrentUserId: force ? null : currentUserIdRef.current,
-        libraryId: library.id,
+        libraryId: requestLibraryId,
       });
+      if (
+        libraryRequestRef.current.libraryId !== requestLibraryId ||
+        libraryRequestRef.current.generation !== requestGeneration
+      ) return;
       if (next.status === "unchanged") return;
       setHistory(next);
       setLoadError(null);
@@ -226,9 +321,12 @@ export function LibrarySessionsPanel({
       if (next.status === "ready") {
         // 台账只在库记录实际变化时随行刷新（切号后轨迹立即更新）。
         const entries = await invoke<RelayLedgerEntryDto[]>("get_relay_ledger", {
-          libraryId: library.id,
+          libraryId: requestLibraryId,
         });
-        setLedger(entries);
+        if (
+          libraryRequestRef.current.libraryId === requestLibraryId &&
+          libraryRequestRef.current.generation === requestGeneration
+        ) setLedger(entries);
       } else {
         setLedger([]);
       }
@@ -236,20 +334,17 @@ export function LibrarySessionsPanel({
     [library.id],
   );
 
-  // 切换库实例时不能复用上一库的指纹或账号身份。
-  useEffect(() => {
-    fingerprintRef.current = null;
-    currentUserIdRef.current = null;
-    setHistory(null);
-    setLedger([]);
-    setViewer(null);
-  }, [library.id]);
-
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
+    const requestLibraryId = library.id;
+    const requestGeneration = libraryRequestRef.current.generation;
     void load(false).catch((reason: unknown) => {
-      if (!cancelled) setLoadError(safeUiErrorMessage(reason, "库记录暂时不可读取，请稍后重试。"));
+      if (
+        !cancelled &&
+        libraryRequestRef.current.libraryId === requestLibraryId &&
+        libraryRequestRef.current.generation === requestGeneration
+      ) setLoadError(safeUiErrorMessage(reason, "库记录暂时不可读取，请稍后重试。"));
     });
     return () => {
       cancelled = true;
@@ -279,6 +374,14 @@ export function LibrarySessionsPanel({
 
   const openSession = useCallback(
     async (session: MasterSessionEntryDto) => {
+      const requestLibraryId = library.id;
+      const requestGeneration = libraryRequestRef.current.generation;
+      if (libraryRequestRef.current.libraryId !== requestLibraryId) return;
+      const viewerRequestId = ++viewerRequestIdRef.current;
+      const isCurrentRequest = () =>
+        viewerRequestIdRef.current === viewerRequestId &&
+        libraryRequestRef.current.libraryId === requestLibraryId &&
+        libraryRequestRef.current.generation === requestGeneration;
       setViewerTab("messages");
       setViewer({
         session,
@@ -294,10 +397,11 @@ export function LibrarySessionsPanel({
           status: "ready" | "no_master_data" | "read_failed";
           messages: SessionMessageDto[];
           has_more?: boolean;
-        }>("get_master_session_messages", { sessionId: session.session_id, libraryId: library.id });
+        }>("get_master_session_messages", { sessionId: session.session_id, libraryId: requestLibraryId });
+        if (!isCurrentRequest()) return;
         const messages = result.status === "ready" ? result.messages : [];
         setViewer((current) =>
-          current?.session.session_id === session.session_id
+          isCurrentRequest() && current?.session.session_id === session.session_id
             ? {
                 session,
                 status: result.status === "ready" ? "ready" : "error",
@@ -312,7 +416,7 @@ export function LibrarySessionsPanel({
         );
       } catch {
         setViewer((current) =>
-          current?.session.session_id === session.session_id
+          isCurrentRequest() && current?.session.session_id === session.session_id
             ? {
                 session,
                 status: "error",
@@ -328,7 +432,10 @@ export function LibrarySessionsPanel({
     [library.id],
   );
 
-  const closeViewer = useCallback(() => setViewer(null), []);
+  const closeViewer = useCallback(() => {
+    viewerRequestIdRef.current += 1;
+    setViewer(null);
+  }, []);
 
   /** 查看器滚到顶部时继续取更早的一页，并把新消息拼到当前窗口前面。 */
   const loadOlderMessages = useCallback(async () => {
@@ -341,8 +448,16 @@ export function LibrarySessionsPanel({
     ) {
       return;
     }
+    const requestLibraryId = library.id;
+    const requestGeneration = libraryRequestRef.current.generation;
+    const viewerRequestId = viewerRequestIdRef.current;
+    const isCurrentRequest = () =>
+      viewerRequestIdRef.current === viewerRequestId &&
+      libraryRequestRef.current.libraryId === requestLibraryId &&
+      libraryRequestRef.current.generation === requestGeneration;
+    if (!isCurrentRequest()) return;
     setViewer((previous) =>
-      previous?.session.session_id === current.session.session_id
+      isCurrentRequest() && previous?.session.session_id === current.session.session_id
         ? { ...previous, loadingOlder: true }
         : previous,
     );
@@ -353,11 +468,11 @@ export function LibrarySessionsPanel({
         has_more?: boolean;
       }>("get_master_session_messages", {
         sessionId: current.session.session_id,
-        libraryId: library.id,
+        libraryId: requestLibraryId,
         offset: current.messageOffset,
       });
       setViewer((previous) => {
-        if (!previous || previous.session.session_id !== current.session.session_id) return previous;
+        if (!isCurrentRequest() || !previous || previous.session.session_id !== current.session.session_id) return previous;
         const older = result.status === "ready" ? result.messages : [];
         return {
           ...previous,
@@ -371,7 +486,7 @@ export function LibrarySessionsPanel({
       });
     } catch {
       setViewer((previous) =>
-        previous?.session.session_id === current.session.session_id
+        isCurrentRequest() && previous?.session.session_id === current.session.session_id
           ? { ...previous, loadingOlder: false }
           : previous,
       );
@@ -596,14 +711,21 @@ export function LibrarySessionsPanel({
       setBatchBusy(true);
       setArchiveRecovery(null);
       try {
-        await action();
+        try {
+          await action();
+        } catch (reason: unknown) {
+          notify.error(safeUiErrorMessage(reason, "操作未完成，请稍后重试。"));
+          return;
+        }
         onDone();
         // 成功回执为空时由 action 内按后端结果发布通知（合并流）。
         if (successMessage) notify.success(successMessage);
         // 归档/恢复/删除/合并都直接改库文件，强制重读让两栏立即反映新状态。
-        await load(true);
-      } catch (reason: unknown) {
-        notify.error(safeUiErrorMessage(reason, "操作未完成，请稍后重试。"));
+        try {
+          await load(true);
+        } catch {
+          notify.warning("操作已完成，但列表刷新失败，请手动刷新。");
+        }
       } finally {
         setBatchBusy(false);
       }
@@ -622,6 +744,13 @@ export function LibrarySessionsPanel({
     setSelectedSessionIds(new Set());
     setSelectedProjectIds(new Set());
   }, []);
+
+  useEffect(() => {
+    if (!canDelete) setDeleteConfirm(null);
+    if (!canWorkMerge) setMergeConfirm(null);
+    if (!active || !canArchive || library.id === "trae_cn") setWorkArchiveConfirmOpen(false);
+    if (selectMode && !availableSelectionActions) exitSelectMode();
+  }, [active, availableSelectionActions, canArchive, canDelete, canWorkMerge, exitSelectMode, library.id, selectMode]);
 
   /** 项目行统一切换选择；项目选择同时覆盖当前视图中的全部子会话。 */
   const toggleProjectSelection = useCallback(
@@ -736,7 +865,7 @@ export function LibrarySessionsPanel({
   /** 把会话加入待归档集合；再次反向操作可撤销同一条草稿变更。 */
   const stageArchiveChange = useCallback(
     (mode: "archive" | "restore", sessionIds: readonly string[]) => {
-      if (sessionIds.length === 0) return;
+      if (!canArchive || sessionIds.length === 0) return;
       setArchiveDraft((current) => {
         const archiveIds = new Set(current.archiveSessionIds);
         const restoreIds = new Set(current.restoreSessionIds);
@@ -759,7 +888,7 @@ export function LibrarySessionsPanel({
           : `已加入待恢复设置，共 ${sessionIds.length} 个会话。完成选择后点击“应用归档设置”。`,
       );
     },
-    [],
+    [canArchive],
   );
 
   /** 归档只改草稿，不立即写数据库或重启 TRAE。 */
@@ -776,15 +905,21 @@ export function LibrarySessionsPanel({
 
   /** 归档视图：恢复所选只进入草稿，待用户统一应用。 */
   const restoreSelected = useCallback(() => {
+    if (!canArchive) return;
     const ids = [...selectedVisibleSessionIds];
     if (ids.length === 0) return;
     stageArchiveChange("restore", ids);
     exitSelectMode();
-  }, [selectedVisibleSessionIds, stageArchiveChange, exitSelectMode]);
+  }, [canArchive, selectedVisibleSessionIds, stageArchiveChange, exitSelectMode]);
 
   /** 应用整批归档设置：关闭实例、单事务写入、重启并校验启动结果。 */
-  const applyArchiveDraft = useCallback(async () => {
-    if (!archiveDraftHasChanges || batchBusy) return;
+  const applyArchiveDraft = useCallback(async (confirmedWorkClose = false) => {
+    if (!canArchive || !archiveDraftHasChanges || batchBusy || archiveRecovery?.kind === "commit-unknown" || archiveRecovery?.kind === "committed-attention") return;
+    if (library.id !== "trae_cn" && archiveOperation?.state === "ready" && !confirmedWorkClose) {
+      setWorkArchiveConfirmOpen(true);
+      return;
+    }
+    setWorkArchiveConfirmOpen(false);
     setBatchBusy(true);
     setArchiveRecovery(null);
     try {
@@ -806,6 +941,8 @@ export function LibrarySessionsPanel({
       }
       const resultNotice = result.relaunch_outcome === "failed"
         ? `主库已更新（归档 ${archivedCount} 个、恢复 ${restoredCount} 个），实例尚未启动，请重试启动。`
+        : result.relaunch_outcome === "not_requested"
+          ? `已应用归档设置：归档 ${archivedCount} 个、恢复 ${restoredCount} 个会话。TRAE CN 客户端未由此操作启动，需要查看时请手动启动。`
         : `已应用归档设置：归档 ${archivedCount} 个、恢复 ${restoredCount} 个会话。`;
       if (result.relaunch_outcome === "failed") {
         // 实例未启动需要就地重试：保留带按钮的页内提示条。
@@ -821,11 +958,23 @@ export function LibrarySessionsPanel({
         notify.success(resultNotice);
       }
     } catch (reason: unknown) {
+      const commitFailure = masterArchiveCommitFailure(reason);
+      if (commitFailure === "unknown") {
+        setArchiveRecovery({
+          kind: "commit-unknown",
+          message: "提交结果无法确认。先刷新历史列表并核对状态，再决定是否重新应用；本批次不会自动重试。",
+        });
+      } else if (commitFailure === "committed") {
+        setArchiveRecovery({
+          kind: "committed-attention",
+          message: "归档操作已提交，但写后校验未通过。先刷新历史列表检查结果，不要重新应用本批次。",
+        });
+      }
       notify.error(safeUiErrorMessage(reason, "归档设置未提交，草稿仍保留。"));
     } finally {
       setBatchBusy(false);
     }
-  }, [archiveDraft, archiveDraftHasChanges, batchBusy, exitSelectMode, library.id, load]);
+  }, [archiveDraft, archiveDraftHasChanges, archiveOperation?.state, archiveRecovery?.kind, batchBusy, canArchive, exitSelectMode, library.id, load]);
 
   /** 数据库已提交后重试启动或刷新，避免用户只能离开页面自行猜测下一步。 */
   const retryArchiveRecovery = useCallback(async () => {
@@ -839,11 +988,24 @@ export function LibrarySessionsPanel({
         await load(true);
       } catch (reason: unknown) {
         failureStage = "refresh";
-        setArchiveRecovery({ kind: "refresh", message: "历史列表刷新失败，请手动刷新。" });
+        setArchiveRecovery({
+          kind: recovery.kind === "commit-unknown" || recovery.kind === "committed-attention"
+            ? recovery.kind
+            : "refresh",
+          message: "历史列表刷新失败，请先刷新并核对归档状态。",
+        });
         throw reason;
       }
       setArchiveRecovery(null);
-      notify.success(recovery.kind === "relaunch" ? "主库实例已重新启动，历史列表已刷新。" : "历史列表已刷新。");
+      if (recovery.kind === "committed-attention") {
+        resetArchiveDraft();
+        exitSelectMode();
+        notify.info("历史列表已刷新；归档操作已经提交，请核对当前状态后再继续。");
+      } else if (recovery.kind === "commit-unknown") {
+        notify.info("历史列表已刷新；请核对当前状态后再决定是否重新应用保留的草稿。");
+      } else {
+        notify.success(recovery.kind === "relaunch" ? "主库实例已重新启动，历史列表已刷新。" : "历史列表已刷新。");
+      }
     } catch (reason: unknown) {
       notify.error(
         safeUiErrorMessage(
@@ -854,25 +1016,35 @@ export function LibrarySessionsPanel({
     } finally {
       setBatchBusy(false);
     }
-  }, [archiveRecovery, batchBusy, load]);
+  }, [archiveRecovery, batchBusy, exitSelectMode, load, resetArchiveDraft]);
 
   /** 放弃未提交的归档设置，不触碰主库。 */
   const discardArchiveDraft = useCallback(() => {
     if (batchBusy) return;
     resetArchiveDraft();
-    notify.info("已放弃未提交的归档设置，主库没有变化。");
-  }, [batchBusy]);
+    const outcomeUnknown = archiveRecovery?.kind === "commit-unknown";
+    const alreadyCommitted = archiveRecovery?.kind === "committed-attention";
+    setArchiveRecovery(null);
+    notify.info(
+      alreadyCommitted
+        ? "已清除本地归档草稿；归档操作已经提交，请以历史列表当前状态为准。"
+        : outcomeUnknown
+          ? "已清除本地归档草稿；请以刷新后的历史列表确认数据库状态。"
+          : "已放弃未提交的归档设置，主库没有变化。",
+    );
+  }, [archiveRecovery?.kind, batchBusy, resetArchiveDraft]);
 
   /** 删除所选（先弹确认，确认后走后端先备份再删除）。 */
   const openDeleteConfirm = useCallback(() => {
+    if (!canDelete) return;
     const targets = selectedDeleteSessions;
     if (targets.length === 0) return;
     setDeleteConfirm(targets);
-  }, [selectedDeleteSessions]);
+  }, [canDelete, selectedDeleteSessions]);
 
   /** 确认删除：真实删除（后端自动创建备份；失败不动原数据）。 */
   const confirmDelete = useCallback(() => {
-    if (!deleteConfirm) return;
+    if (!canDelete || !deleteConfirm) return;
     const ids = deleteConfirm.map((session) => session.session_id);
     setDeleteConfirm(null);
     void runBatch(
@@ -883,20 +1055,20 @@ export function LibrarySessionsPanel({
       },
       `已删除 ${ids.length} 个会话。`,
     );
-  }, [deleteConfirm, runBatch, viewer, library.id, exitSelectMode]);
+  }, [canDelete, deleteConfirm, runBatch, viewer, library.id, exitSelectMode]);
 
   /** 打开合并确认弹层（至少选 2 个项目才有合并意义）。 */
   const openMergeConfirm = useCallback(() => {
-    if (selectedMergeProjects.length < 2) return;
+    if (!canWorkMerge || selectedMergeProjects.length < 2) return;
     const targets = selectedMergeProjects;
     if (targets.length < 2) return;
     setMergeConfirm(targets);
-  }, [selectedMergeProjects]);
+  }, [canWorkMerge, selectedMergeProjects]);
 
   /** 确认合并：其余项目的全部会话并入保留项目（后端先备份再事务改挂）。 */
   const confirmMerge = useCallback(
     (target: MasterProjectEntryDto) => {
-      if (!mergeConfirm) return;
+      if (!canWorkMerge || !mergeConfirm) return;
       const sourceIds = mergeConfirm
         .filter((project) => project.project_id !== target.project_id)
         .map((project) => project.project_id);
@@ -918,7 +1090,7 @@ export function LibrarySessionsPanel({
         null, // 回执在 action 内按后端结果发布，此处不重复。
       );
     },
-    [mergeConfirm, runBatch, library.id, exitSelectMode],
+    [canWorkMerge, mergeConfirm, runBatch, library.id, exitSelectMode],
   );
 
   // ===== 视图切换（正常 ↔ 归档）：切换时清空选择，避免跨视图残留勾选。 =====
@@ -979,10 +1151,19 @@ export function LibrarySessionsPanel({
             ? `，并清理 ${receipt.removed_mirror_rows} 个空项目。`
             : "。"),
       );
-      // 归并直接改库文件：强制重读让两栏立即反映新状态（失败静默，
-      // 指纹轮询会自然追上）。宿主侧其他账号项目清单同步重取（入口随归并消失）。
-      await load(true).catch(() => undefined);
-      onTraeCnMerged?.();
+      // 归并回执已确认提交；主视图和外部账号项目清单分别尝试刷新。
+      let refreshFailed = false;
+      try {
+        await load(true);
+      } catch {
+        refreshFailed = true;
+      }
+      try {
+        onTraeCnMerged?.();
+      } catch {
+        refreshFailed = true;
+      }
+      if (refreshFailed) notify.warning("归并已完成，但项目列表刷新失败，请手动刷新。");
     } catch (reason: unknown) {
       setTraeCnMerge(null);
       notify.error(safeUiErrorMessage(reason, "归并未完成，数据保持操作前状态；请稍后重试。"));
@@ -1085,7 +1266,7 @@ export function LibrarySessionsPanel({
                 session={session}
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
-                showQuickArchive={!selectMode && writeCapability !== "none"}
+                showQuickArchive={!selectMode && canArchive}
                 onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
@@ -1155,7 +1336,7 @@ export function LibrarySessionsPanel({
                 session={session}
                 selectMode={selectMode}
                 checked={selectedSessionIds.has(session.session_id)}
-                showQuickArchive={!selectMode && writeCapability !== "none"}
+                showQuickArchive={!selectMode && canArchive}
                 onToggle={toggleSessionSelection}
                 onOpen={(target) => void openSession(target)}
                 onQuickArchive={(target) => archiveSessions([target.session_id])}
@@ -1186,15 +1367,17 @@ export function LibrarySessionsPanel({
             {project.name?.trim() || "未关联文件夹"}
           </span>
           <span className="lib-project__count">{project.session_count}</span>
-          <button
-            className="lib-project__merge"
-            type="button"
-            onClick={() => void openTraeCnMergePreview(project)}
-            title={`把这些会话归并到当前账号（共 ${project.message_count} 条消息）`}
-            data-testid={`library-merge-entry-${project.project_id}`}
-          >
-            归并到当前账号
-          </button>
+            {mergeOperationReady && (
+              <button
+                className="lib-project__merge"
+                type="button"
+                onClick={() => void openTraeCnMergePreview(project)}
+                title={`把这些会话归并到当前账号（共 ${project.message_count} 条消息）`}
+                data-testid={`library-merge-entry-${project.project_id}`}
+              >
+                归并到当前账号
+              </button>
+            )}
         </div>
       ))}
     </div>
@@ -1489,7 +1672,7 @@ export function LibrarySessionsPanel({
                 <span className="lib-archive-entry__count">{archivedSessions.length}</span>
               </button>
             )}
-            {writeCapability !== "none" && (
+            {availableSelectionActions && (
               <button
                 className="btn btn--quiet lib-select-btn"
                 type="button"
@@ -1555,6 +1738,22 @@ export function LibrarySessionsPanel({
         </header>
       )}
 
+      {active && library.id === "trae_cn" && pendingCnNotice && (
+        <p className="checkin-page__meta" role="status" data-testid="library-cn-write-pending">
+          {pendingCnNotice} 当前仍可浏览对话。
+        </p>
+      )}
+      {active && workArchiveNotice && (
+        <p className="checkin-page__meta" role="status" data-testid="library-work-archive-notice">
+          {workArchiveNotice}
+        </p>
+      )}
+      {active && library.id !== "trae_cn" && baseWriteCapability === "full" && pendingWorkNotice && (
+        <p className="checkin-page__meta" role="status" data-testid="library-work-write-pending">
+          {pendingWorkNotice}
+        </p>
+      )}
+
       {body()}
 
       {/* G22 Gmail 式浮动操作栏：选择模式浮出（fixed），按钮随视图切换 */}
@@ -1571,17 +1770,19 @@ export function LibrarySessionsPanel({
           <div className="lib-actionbar__actions">
             {archiveView ? (
               <>
-                <button
-                  className="btn btn--primary"
-                  type="button"
-                  onClick={restoreSelected}
-                  disabled={batchBusy || selectedVisibleSessionIds.size === 0}
-                  data-testid="batch-restore"
-                >
-                  <Undo2 size={15} aria-hidden="true" />恢复
-                </button>
+                {canArchive && (
+                  <button
+                    className="btn btn--primary"
+                    type="button"
+                    onClick={restoreSelected}
+                    disabled={batchBusy || selectedVisibleSessionIds.size === 0}
+                    data-testid="batch-restore"
+                  >
+                    <Undo2 size={15} aria-hidden="true" />恢复
+                  </button>
+                )}
                 {/* 删除属全能力库写（P13-3）：CN 库 archive-only 不渲染。 */}
-                {writeCapability === "full" && (
+                {canDelete && (
                   <button
                     className="btn btn--danger"
                     type="button"
@@ -1595,40 +1796,42 @@ export function LibrarySessionsPanel({
               </>
             ) : (
               <>
-                <button
-                  className="btn btn--primary"
-                  type="button"
-                  onClick={() => archiveSessions([...selectedVisibleSessionIds])}
-                  disabled={batchBusy || selectedVisibleSessionIds.size === 0}
-                  data-testid="batch-archive"
-                >
-                  <Archive size={15} aria-hidden="true" />归档
-                </button>
+                {canArchive && (
+                  <button
+                    className="btn btn--primary"
+                    type="button"
+                    onClick={() => archiveSessions([...selectedVisibleSessionIds])}
+                    disabled={batchBusy || selectedVisibleSessionIds.size === 0}
+                    data-testid="batch-archive"
+                  >
+                    <Archive size={15} aria-hidden="true" />归档
+                  </button>
+                )}
                 {/* 合并项目与删除属全能力库写（P13-3）：CN 库不渲染。 */}
-                {writeCapability === "full" && (
-                  <>
-                    <button
-                      className="btn"
-                      type="button"
-                      onClick={openMergeConfirm}
-                      disabled={batchBusy || selectedMergeProjects.length < 2}
-                      title={
-                        selectedMergeProjects.length < 2 ? "至少选择 2 个有名称的项目才能合并" : undefined
-                      }
-                      data-testid="batch-merge"
-                    >
-                      <Merge size={15} aria-hidden="true" />合并到…
-                    </button>
-                    <button
-                      className="btn btn--danger"
-                      type="button"
-                      onClick={openDeleteConfirm}
-                      disabled={batchBusy || selectedDeleteSessions.length === 0}
-                      data-testid="batch-delete"
-                    >
-                      <Trash2 size={15} aria-hidden="true" />删除
-                    </button>
-                  </>
+                {canWorkMerge && (
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={openMergeConfirm}
+                    disabled={batchBusy || selectedMergeProjects.length < 2}
+                    title={
+                      selectedMergeProjects.length < 2 ? "至少选择 2 个有名称的项目才能合并" : undefined
+                    }
+                    data-testid="batch-merge"
+                  >
+                    <Merge size={15} aria-hidden="true" />合并到…
+                  </button>
+                )}
+                {canDelete && (
+                  <button
+                    className="btn btn--danger"
+                    type="button"
+                    onClick={openDeleteConfirm}
+                    disabled={batchBusy || selectedDeleteSessions.length === 0}
+                    data-testid="batch-delete"
+                  >
+                    <Trash2 size={15} aria-hidden="true" />删除
+                  </button>
                 )}
               </>
             )}
@@ -1660,13 +1863,32 @@ export function LibrarySessionsPanel({
               className="btn btn--primary"
               type="button"
               onClick={() => void applyArchiveDraft()}
-              disabled={batchBusy}
+              disabled={!canArchive || batchBusy || archiveRecovery?.kind === "commit-unknown" || archiveRecovery?.kind === "committed-attention"}
               data-testid="archive-draft-apply"
             >
               {batchBusy ? "正在应用…" : "应用归档设置"}
             </button>
           </div>
         </div>
+      )}
+
+      {workArchiveConfirmOpen && (
+        <ConfirmDialog
+          title="应用 Work 归档设置"
+          lines={[
+            "操作会尝试关闭 Work 客户端，应用完成后再尝试重新启动。",
+            "请先保存 Work 客户端中尚未提交的内容。",
+            "如果启动失败，可以在当前页面重试。",
+          ]}
+          confirmLabel="关闭并应用"
+          confirmIcon={<Archive size={15} aria-hidden="true" />}
+          onCancel={() => setWorkArchiveConfirmOpen(false)}
+          onConfirm={() => {
+            setWorkArchiveConfirmOpen(false);
+            void applyArchiveDraft(true);
+          }}
+          testId="work-archive-confirm"
+        />
       )}
 
       {/* 删除二次确认：列明会话数与消息量（ADR-0018 单次确认） */}

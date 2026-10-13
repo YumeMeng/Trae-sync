@@ -14,8 +14,8 @@
 //!   保留旧身份作为证据，永不改写、永不删除。
 //!
 //! 本模块只做第 4 步「交接」；关实例/备份/blob 互换/重启由调用方
-//! （lib.rs 五步编排）负责。交接全程单事务：任一步失败整体回滚，
-//! 环境不会停留在半切换状态。
+//! （lib.rs 五步编排）负责。提交前失败由单事务整体回滚；提交结果无法确认
+//! 或提交后完整性校验失败时，调用方必须保留阶段错误并检查主库。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,8 +52,10 @@ pub enum MasterHandoverError {
     DbOpenFailed,
     /// UNIQUE(biz_project_id, user_id) 非空冲突，需人工决策（附 biz 短指纹）。
     TargetConflict(String),
-    /// 换腿后正文完整性校验失败（事务已回滚，库保持交接前状态）。
-    IntegrityFailed,
+    /// 事务已提交，但提交后完整性校验未通过或读回失败。
+    CommittedNeedsAttention,
+    /// SQLite 返回提交错误，无法证明事务最终持久状态。
+    CommitOutcomeUnknown,
     /// 文件读写失败。
     Io,
     /// P13-2：定位的项目行不存在（已被清理或 id 失效）。
@@ -71,7 +73,8 @@ impl std::fmt::Display for MasterHandoverError {
             Self::DbUnavailable => "主库对话库不存在",
             Self::DbOpenFailed => "主库对话库打开或解密失败",
             Self::TargetConflict(_) => "目标账号名下存在同名项目的非空记录，需人工决策",
-            Self::IntegrityFailed => "换腿后正文完整性校验失败（已回滚）",
+            Self::CommittedNeedsAttention => "记录交接已提交，但写后完整性校验未通过，需检查主库",
+            Self::CommitOutcomeUnknown => "记录交接提交结果无法确认，需检查主库",
             Self::Io => "交接文件读写失败",
             Self::ProjectNotFound => "项目记录不存在或已被清理",
             Self::ProjectNotMergeable => "该项目没有关联文件夹路径，不能参与归并",
@@ -82,6 +85,19 @@ impl std::fmt::Display for MasterHandoverError {
 }
 
 impl std::error::Error for MasterHandoverError {}
+
+/// 统一标记提交错误，避免调用路径把未知持久状态误报为可回滚失败。
+fn commit_handover_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), MasterHandoverError> {
+    tx.commit()
+        .map_err(|_| MasterHandoverError::CommitOutcomeUnknown)
+}
+
+/// 事务提交后的查询失败只能表示“已提交但无法验证”，不能降级为普通数据库错误。
+fn post_commit_verification<T>(
+    result: Result<T, MasterHandoverError>,
+) -> Result<T, MasterHandoverError> {
+    result.map_err(|_| MasterHandoverError::CommittedNeedsAttention)
+}
 
 /// 一个被换腿的会话（接力台账数据源）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +116,7 @@ pub struct HandoverSession {
     pub message_count: i64,
 }
 
-/// 交接结果（交接事务提交成功后返回）。
+/// 交接结果（事务提交且提交后完整性校验通过才返回）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterHandover {
     /// 交接前记录的实际归属账号（非目标 user_id 中项目数最多者；
@@ -206,7 +222,10 @@ pub fn backup_master_trio_stamped(
     for suffix in ["-wal", "-shm"] {
         let source = db_path.with_file_name(format!("{db_name}{suffix}"));
         if source.is_file() {
-            copy_file_create_new(&source, &dir.join(format!("{db_name}.switch-bak-{stamp}{suffix}")))?;
+            copy_file_create_new(
+                &source,
+                &dir.join(format!("{db_name}.switch-bak-{stamp}{suffix}")),
+            )?;
         }
     }
     Ok(backup)
@@ -279,13 +298,17 @@ pub fn list_master_backups_in(dir: &Path, db_name: &str) -> Vec<MasterBackupEntr
     }
     let mut result: Vec<MasterBackupEntry> = chain
         .into_iter()
-        .map(|(stamp_unix_seconds, (total_bytes, has_wal))| MasterBackupEntry {
-            stamp_unix_seconds,
-            total_bytes,
-            has_wal,
-            // P11-4②：凭据子目录存在性（与三件套同戳命名）。
-            has_credentials: dir.join(format!("credentials-{stamp_unix_seconds}")).is_dir(),
-        })
+        .map(
+            |(stamp_unix_seconds, (total_bytes, has_wal))| MasterBackupEntry {
+                stamp_unix_seconds,
+                total_bytes,
+                has_wal,
+                // P11-4②：凭据子目录存在性（与三件套同戳命名）。
+                has_credentials: dir
+                    .join(format!("credentials-{stamp_unix_seconds}"))
+                    .is_dir(),
+            },
+        )
         .collect();
     result.sort_by(|a, b| b.stamp_unix_seconds.cmp(&a.stamp_unix_seconds));
     result
@@ -438,14 +461,7 @@ pub fn handover_master_records_with_progress(
     target_user_id: &str,
     on_progress: &dyn Fn(HandoverProgress),
 ) -> Result<MasterHandover, MasterHandoverError> {
-    handover_master_records_core(
-        db_path,
-        raw_key,
-        target_user_id,
-        None,
-        false,
-        on_progress,
-    )
+    handover_master_records_core(db_path, raw_key, target_user_id, None, false, on_progress)
 }
 
 /// 指定来源账号的选择性交接（手动转移场景）：只把 source 名下带正常会话的
@@ -700,7 +716,12 @@ pub fn merge_trae_cn_project_records_with_progress(
     // ===== 事务外定位与规模预检（任一拒绝路径库零改动）=====
     let (biz, target_row, source_rows) =
         trae_cn_merge_scope(&conn, target_user_id, source_project_id)?;
-    if source_rows.iter().map(|row| row.normal_sessions).sum::<i64>() == 0 {
+    if source_rows
+        .iter()
+        .map(|row| row.normal_sessions)
+        .sum::<i64>()
+        == 0
+    {
         return Err(MasterHandoverError::NothingToMerge);
     }
 
@@ -745,7 +766,11 @@ pub fn merge_trae_cn_project_records_with_progress(
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         let rows = statement
             .query_map(rusqlite::params![biz, target_user_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|_| MasterHandoverError::DbOpenFailed)?
             .collect::<Result<Vec<_>, _>>()
@@ -802,8 +827,11 @@ pub fn merge_trae_cn_project_records_with_progress(
         .unchecked_transaction()
         .map_err(|_| MasterHandoverError::DbOpenFailed)?;
     for mirror in &mirrors_to_delete {
-        tx.execute("DELETE FROM session_project WHERE project_id = ?1", [mirror])
-            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+        tx.execute(
+            "DELETE FROM session_project WHERE project_id = ?1",
+            [mirror],
+        )
+        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         tx.execute("DELETE FROM project WHERE project_id = ?1", [mirror])
             .map_err(|_| MasterHandoverError::DbOpenFailed)?;
     }
@@ -922,16 +950,17 @@ pub fn merge_trae_cn_project_records_with_progress(
         [],
     )
     .map_err(|_| MasterHandoverError::DbOpenFailed)?;
-    tx.commit().map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    commit_handover_transaction(tx)?;
 
     // ===== 写后完整性校验（正文指纹 + 行数守恒 + 新腿无旧镜像）=====
     let new_session_ids: Vec<String> = leg_maps
         .iter()
         .map(|(_, new_session)| new_session.clone())
         .collect();
-    let after_digests = text_digests(&conn, &new_session_ids)?;
-    let after_counts = session_counts(&conn, &new_session_ids)?;
-    let after_server_counts = session_server_counts(&conn, &new_session_ids)?;
+    let after_digests = post_commit_verification(text_digests(&conn, &new_session_ids))?;
+    let after_counts = post_commit_verification(session_counts(&conn, &new_session_ids))?;
+    let after_server_counts =
+        post_commit_verification(session_server_counts(&conn, &new_session_ids))?;
     for (index, (old_session, _, _)) in sessions_to_switch.iter().enumerate() {
         let new_session = &leg_maps[index].1;
         on_progress(HandoverProgress {
@@ -941,13 +970,13 @@ pub fn merge_trae_cn_project_records_with_progress(
             label: session_labels[index].clone(),
         });
         if after_digests.get(new_session) != before_digests.get(old_session) {
-            return Err(MasterHandoverError::IntegrityFailed);
+            return Err(MasterHandoverError::CommittedNeedsAttention);
         }
         if after_counts.get(new_session) != before_counts.get(old_session) {
-            return Err(MasterHandoverError::IntegrityFailed);
+            return Err(MasterHandoverError::CommittedNeedsAttention);
         }
         if after_server_counts.get(new_session).copied().unwrap_or(0) != 0 {
-            return Err(MasterHandoverError::IntegrityFailed);
+            return Err(MasterHandoverError::CommittedNeedsAttention);
         }
     }
 
@@ -968,17 +997,19 @@ pub fn merge_trae_cn_project_records_with_progress(
         switched_sessions: sessions_to_switch
             .iter()
             .enumerate()
-            .map(|(index, (source_session, _, previous_user_id))| HandoverSession {
-                session_id: leg_maps[index].1.clone(),
-                previous_session_id: source_session.clone(),
-                // 全部换腿会话的落点都是承接行（并入或原地）。
-                project_id: survivor_id.clone(),
-                previous_user_id: previous_user_id.clone(),
-                message_count: before_counts
-                    .get(source_session)
-                    .map(|(count, _)| *count)
-                    .unwrap_or(0),
-            })
+            .map(
+                |(index, (source_session, _, previous_user_id))| HandoverSession {
+                    session_id: leg_maps[index].1.clone(),
+                    previous_session_id: source_session.clone(),
+                    // 全部换腿会话的落点都是承接行（并入或原地）。
+                    project_id: survivor_id.clone(),
+                    previous_user_id: previous_user_id.clone(),
+                    message_count: before_counts
+                        .get(source_session)
+                        .map(|(count, _)| *count)
+                        .unwrap_or(0),
+                },
+            )
             .collect(),
     })
 }
@@ -1291,7 +1322,7 @@ fn handover_master_records_core(
         )
         .map_err(|_| MasterHandoverError::DbOpenFailed)?;
         tx.execute("DELETE FROM project WHERE project_id = ?1", [project])
-        .map_err(|_| MasterHandoverError::DbOpenFailed)?;
+            .map_err(|_| MasterHandoverError::DbOpenFailed)?;
     }
     let mut merged_projects = 0;
     for (source_project, target_project) in &merge_pairs {
@@ -1429,16 +1460,17 @@ fn handover_master_records_core(
             },
         )
         .collect();
-    tx.commit().map_err(|_| MasterHandoverError::DbOpenFailed)?;
+    commit_handover_transaction(tx)?;
 
     // ===== 写后完整性校验（集合读取：正文指纹 + 行数守恒）=====
     let new_session_ids: Vec<String> = leg_maps
         .iter()
         .map(|(_, new_session)| new_session.clone())
         .collect();
-    let after_digests = text_digests(&conn, &new_session_ids)?;
-    let after_counts = session_counts(&conn, &new_session_ids)?;
-    let after_server_counts = session_server_counts(&conn, &new_session_ids)?;
+    let after_digests = post_commit_verification(text_digests(&conn, &new_session_ids))?;
+    let after_counts = post_commit_verification(session_counts(&conn, &new_session_ids))?;
+    let after_server_counts =
+        post_commit_verification(session_server_counts(&conn, &new_session_ids))?;
     for (index, (old_session, _, _)) in sessions_to_switch.iter().enumerate() {
         let new_session = &leg_maps[index].1;
         on_progress(HandoverProgress {
@@ -1448,14 +1480,14 @@ fn handover_master_records_core(
             label: session_labels[index].clone(),
         });
         if after_digests.get(new_session) != before_digests.get(old_session) {
-            return Err(MasterHandoverError::IntegrityFailed);
+            return Err(MasterHandoverError::CommittedNeedsAttention);
         }
         if after_counts.get(new_session) != before_counts.get(old_session) {
-            return Err(MasterHandoverError::IntegrityFailed);
+            return Err(MasterHandoverError::CommittedNeedsAttention);
         }
         // 新腿不得携带旧云端镜像（e5-r2 验收标准 2）。
         if after_server_counts.get(new_session).copied().unwrap_or(0) != 0 {
-            return Err(MasterHandoverError::IntegrityFailed);
+            return Err(MasterHandoverError::CommittedNeedsAttention);
         }
         let _ = old_session;
     }
@@ -1794,6 +1826,99 @@ mod tests {
         conn.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn post_commit_readback_error_is_not_reported_as_precommit_failure() {
+        let result: Result<(), MasterHandoverError> = Err(MasterHandoverError::DbOpenFailed);
+        assert_eq!(
+            post_commit_verification(result),
+            Err(MasterHandoverError::CommittedNeedsAttention)
+        );
+    }
+
+    /// 用延迟外键制造真实 COMMIT 错误，并确认事务释放后写入没有残留。
+    #[test]
+    fn failed_handover_commit_is_unknown_and_rolls_back_fixture_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        let raw_key = "aa".repeat(32);
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{raw_key}'\";
+             PRAGMA foreign_keys = ON;
+             CREATE TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE child (
+                parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+             );",
+        ))
+        .unwrap();
+        let foreign_keys_enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys_enabled, 1);
+
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("INSERT INTO child VALUES (1)", []).unwrap();
+        assert_eq!(
+            commit_handover_transaction(tx),
+            Err(MasterHandoverError::CommitOutcomeUnknown)
+        );
+        let child_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM child", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(child_count, 0);
+    }
+
+    #[test]
+    fn committed_handover_integrity_mismatch_keeps_committed_database_state() {
+        let db_path = temp_db_path("handover-post-commit-mismatch");
+        let raw_key = "ae".repeat(32);
+        create_fixture_db(&db_path, &raw_key);
+        {
+            let conn = open_fixture(&db_path, &raw_key);
+            // 合成提交后不一致：随账号改归属时篡改正文，事务仍会整体提交。
+            conn.execute_batch(
+                "CREATE TRIGGER mutate_transferred_message
+                 AFTER UPDATE OF user_id ON project
+                 WHEN NEW.user_id = '222'
+                 BEGIN
+                   UPDATE chat_message_general SET content = '合成篡改正文'
+                   WHERE message_id = 'm1';
+                 END;",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            handover_master_records(&db_path, &raw_key, "222"),
+            Err(MasterHandoverError::CommittedNeedsAttention)
+        );
+
+        let conn = open_fixture(&db_path, &raw_key);
+        let owner: String = conn
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "222", "数据库已提交，不得描述为已回滚");
+        let old_session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_session_count, 0, "换腿事务本身仍已提交");
+        let message_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_message_general WHERE content = '合成篡改正文'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 1, "合成数据异常随事务提交并被读回发现");
+        let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
     }
 
     #[test]
@@ -2434,7 +2559,7 @@ mod tests {
 
         let outcome = handover_master_records(&db_path, &raw_key, "222").unwrap();
         assert_eq!(outcome.switched_sessions.len(), 2);
-        // 完整性校验已内含（正文指纹 + 行数守恒），未报 IntegrityFailed。
+        // 完整性校验已内含（正文指纹 + 行数守恒），返回结果代表写后验证通过。
 
         let conn = open_fixture(&db_path, &raw_key);
         // 旧会话 → 新会话映射（sessions_to_switch 无 ORDER BY，按 previous 定位）。
@@ -2685,11 +2810,7 @@ mod tests {
         let db_path = root.join("data").join("database.db");
         std::fs::create_dir_all(&db_path.parent().unwrap()).unwrap();
         std::fs::write(&db_path, [1u8; 100]).unwrap();
-        std::fs::write(
-            db_path.parent().unwrap().join("database.db-wal"),
-            [2u8; 20],
-        )
-        .unwrap();
+        std::fs::write(db_path.parent().unwrap().join("database.db-wal"), [2u8; 20]).unwrap();
         let target = root.join("backups");
         let backup = backup_master_trio_to(&db_path, Some(&target)).unwrap();
         assert_eq!(backup.parent().unwrap(), target);
@@ -2706,10 +2827,8 @@ mod tests {
             [1u8; 100]
         );
         assert_eq!(
-            std::fs::read(
-                target.join("database.db.switch-bak-".to_string() + &stamp + "-wal")
-            )
-            .unwrap(),
+            std::fs::read(target.join("database.db.switch-bak-".to_string() + &stamp + "-wal"))
+                .unwrap(),
             [2u8; 20]
         );
         // db 原目录无新备份文件。
@@ -2892,7 +3011,14 @@ mod tests {
 
     /// 标准场景：账号 111 的 p1（biz-a / D:\work\demo）挂两个正常会话。
     fn seed_standard_source(conn: &Connection) {
-        seed_cn_project(conn, "p1", "111", Some("biz-a"), "演示项目", Some("D:\\work\\demo"));
+        seed_cn_project(
+            conn,
+            "p1",
+            "111",
+            Some("biz-a"),
+            "演示项目",
+            Some("D:\\work\\demo"),
+        );
         seed_cn_session(conn, "s1", "p1", "会话一", None, false);
         seed_cn_session(conn, "s2", "p1", "会话二", None, false);
         // 云端镜像证据（E5/e5-r2：永不改写、新腿不携带）。
@@ -2926,9 +3052,11 @@ mod tests {
 
         let conn = open_fixture(&db_path, &raw_key);
         let owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(owner, "222", "来源行归属改写为当前指针账号");
         // 会话全部换腿：旧 ID 消失，身份表跟随新腿。
@@ -2955,9 +3083,11 @@ mod tests {
             let _ = column;
         }
         let old_sessions: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_session WHERE session_id IN ('s1','s2')", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id IN ('s1','s2')",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(old_sessions, 0);
         // 会话仍挂在 p1 上（项目身份保留，只换归属与腿）。
@@ -2990,7 +3120,9 @@ mod tests {
         assert_eq!(mirror, "conv-old");
         // 正文内容原样保留。
         let content_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_message_general", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM chat_message_general", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(content_count, 4);
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
@@ -3006,7 +3138,14 @@ mod tests {
         {
             let conn = open_fixture(&db_path, &raw_key);
             seed_standard_source(&conn);
-            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的演示项目", Some("D:\\work\\demo"));
+            seed_cn_project(
+                &conn,
+                "p-t",
+                "222",
+                Some("biz-a"),
+                "我的演示项目",
+                Some("D:\\work\\demo"),
+            );
             seed_cn_session(&conn, "s-t", "p-t", "目标既有会话", None, false);
         }
 
@@ -3018,18 +3157,28 @@ mod tests {
         let conn = open_fixture(&db_path, &raw_key);
         // 来源行移空清理；目标行身份保留。
         let source_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(source_rows, 0, "并入后的空来源行应被清理");
         let target_owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p-t'", [], |row| row.get(0))
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p-t'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(target_owner, "222");
         // 目标既有会话身份不改写。
         let target_session: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chat_session WHERE session_id = 's-t'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM chat_session WHERE session_id = 's-t'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(target_session, 1, "目标既有会话不换腿");
         // 来源会话全部改挂目标行且换腿。
@@ -3066,21 +3215,43 @@ mod tests {
             seed_cn_project(&conn, "p-nopath", "333", Some("biz-x"), "无路径项目", None);
             seed_cn_session(&conn, "s-np", "p-nopath", "无路径会话", None, false);
             // biz 为 NULL 的项目：没有目录身份，同样不可归并。
-            seed_cn_project(&conn, "p-nobiz", "333", None, "无 biz 项目", Some("D:\\work\\x"));
+            seed_cn_project(
+                &conn,
+                "p-nobiz",
+                "333",
+                None,
+                "无 biz 项目",
+                Some("D:\\work\\x"),
+            );
             seed_cn_session(&conn, "s-nb", "p-nobiz", "无 biz 会话", None, false);
         }
 
-        let error =
-            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-nopath", &|_| {})
-                .unwrap_err();
+        let error = merge_trae_cn_project_records_with_progress(
+            &db_path,
+            &raw_key,
+            "222",
+            "p-nopath",
+            &|_| {},
+        )
+        .unwrap_err();
         assert!(matches!(error, MasterHandoverError::ProjectNotMergeable));
-        let error =
-            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-nobiz", &|_| {})
-                .unwrap_err();
+        let error = merge_trae_cn_project_records_with_progress(
+            &db_path,
+            &raw_key,
+            "222",
+            "p-nobiz",
+            &|_| {},
+        )
+        .unwrap_err();
         assert!(matches!(error, MasterHandoverError::ProjectNotMergeable));
-        let error =
-            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-gone", &|_| {})
-                .unwrap_err();
+        let error = merge_trae_cn_project_records_with_progress(
+            &db_path,
+            &raw_key,
+            "222",
+            "p-gone",
+            &|_| {},
+        )
+        .unwrap_err();
         assert!(matches!(error, MasterHandoverError::ProjectNotFound));
 
         // 归属目标账号自己的行：不满足「归属非当前账号」门槛。
@@ -3092,23 +3263,33 @@ mod tests {
             "自己的项目",
             Some("D:\\work\\own"),
         );
-        let error =
-            merge_trae_cn_project_records_with_progress(&db_path, &raw_key, "222", "p-own", &|_| {})
-                .unwrap_err();
+        let error = merge_trae_cn_project_records_with_progress(
+            &db_path,
+            &raw_key,
+            "222",
+            "p-own",
+            &|_| {},
+        )
+        .unwrap_err();
         assert!(matches!(error, MasterHandoverError::ProjectNotMergeable));
 
         // 全部拒绝路径库零改动：无路径项目归属不变、会话原样。
         let conn = open_fixture(&db_path, &raw_key);
         let owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p-nopath'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p-nopath'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(owner, "333");
         let sessions: i64 = conn
             .query_row("SELECT COUNT(*) FROM chat_session", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(sessions, 4, "拒绝路径不产生任何写（p1 两会话 + 无路径/无 biz 各一）");
+        assert_eq!(
+            sessions, 4,
+            "拒绝路径不产生任何写（p1 两会话 + 无路径/无 biz 各一）"
+        );
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
     }
 
@@ -3122,9 +3303,23 @@ mod tests {
         {
             let conn = open_fixture(&db_path, &raw_key);
             seed_standard_source(&conn);
-            seed_cn_session(&conn, "s-arch", "p1", "归档会话", Some("voice_discussion"), false);
+            seed_cn_session(
+                &conn,
+                "s-arch",
+                "p1",
+                "归档会话",
+                Some("voice_discussion"),
+                false,
+            );
             seed_cn_session(&conn, "s-del", "p1", "软删会话", None, true);
-            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的演示项目", Some("D:\\work\\demo"));
+            seed_cn_project(
+                &conn,
+                "p-t",
+                "222",
+                Some("biz-a"),
+                "我的演示项目",
+                Some("D:\\work\\demo"),
+            );
             seed_cn_session(&conn, "s-t", "p-t", "目标既有会话", None, false);
         }
 
@@ -3146,7 +3341,11 @@ mod tests {
         let conn = open_fixture(&db_path, &raw_key);
         // 来源行保留（残留冻结会话），归属不变。
         let source_owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(source_owner, "111", "带冻结内容的来源行不得改归属");
         // 归档会话原身份、原挂接、原状态。
@@ -3200,9 +3399,23 @@ mod tests {
             let conn = open_fixture(&db_path, &raw_key);
             seed_standard_source(&conn);
             // 第三账号的同目录空镜像行。
-            seed_cn_project(&conn, "p-m", "333", Some("biz-a"), "空镜像", Some("D:\\work\\demo"));
+            seed_cn_project(
+                &conn,
+                "p-m",
+                "333",
+                Some("biz-a"),
+                "空镜像",
+                Some("D:\\work\\demo"),
+            );
             // 目标账号名下的同目录空镜像行（目标无真实行）。
-            seed_cn_project(&conn, "p-t2", "222", Some("biz-a"), "目标镜像", Some("D:\\work\\demo"));
+            seed_cn_project(
+                &conn,
+                "p-t2",
+                "222",
+                Some("biz-a"),
+                "目标镜像",
+                Some("D:\\work\\demo"),
+            );
         }
 
         let outcome =
@@ -3223,7 +3436,11 @@ mod tests {
             assert_eq!(rows, 0, "{mirror} 空镜像应被清理");
         }
         let owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(owner, "222");
         // 目标镜像行删除后 (biz-a, 222) 唯一键由转入的 p1 承接。
@@ -3249,10 +3466,24 @@ mod tests {
             let conn = open_fixture(&db_path, &raw_key);
             seed_standard_source(&conn);
             // 第二来源账号（同目录、有会话）。
-            seed_cn_project(&conn, "p3", "333", Some("biz-a"), "第三账号项目", Some("D:\\work\\demo"));
+            seed_cn_project(
+                &conn,
+                "p3",
+                "333",
+                Some("biz-a"),
+                "第三账号项目",
+                Some("D:\\work\\demo"),
+            );
             seed_cn_session(&conn, "s3", "p3", "第三账号会话", None, false);
             // 目标账号的空镜像行。
-            seed_cn_project(&conn, "p-t2", "222", Some("biz-a"), "目标镜像", Some("D:\\work\\demo"));
+            seed_cn_project(
+                &conn,
+                "p-t2",
+                "222",
+                Some("biz-a"),
+                "目标镜像",
+                Some("D:\\work\\demo"),
+            );
         }
 
         let outcome =
@@ -3262,21 +3493,35 @@ mod tests {
         assert_eq!(outcome.switched_sessions.len(), 3, "三个来源会话全部换腿");
         assert_eq!(outcome.removed_mirror_rows, 1, "目标空镜像清理");
         assert_eq!(outcome.transferred_projects, 2, "p3 并走 + p1 转入");
-        assert_eq!(outcome.previous_owner_user_id.as_deref(), Some("111"), "会话最多者为前归属");
+        assert_eq!(
+            outcome.previous_owner_user_id.as_deref(),
+            Some("111"),
+            "会话最多者为前归属"
+        );
         let conn = open_fixture(&db_path, &raw_key);
         // 承接行 = 点击的 p1，归属 222，三会话都在。
         let owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(owner, "222");
         let path: String = conn
-            .query_row("SELECT absolute_path FROM project WHERE project_id = 'p1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT absolute_path FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(path, "D:\\work\\demo", "承接行身份与路径保留");
         let p3_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM project WHERE project_id = 'p3'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM project WHERE project_id = 'p3'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(p3_rows, 0, "移空的第三账号行清理");
         let total: i64 = conn
@@ -3299,10 +3544,31 @@ mod tests {
         create_trae_cn_fixture_db(&db_path, &raw_key);
         {
             let conn = open_fixture(&db_path, &raw_key);
-            seed_cn_project(&conn, "p1", "111", Some("biz-a"), "冻结项目", Some("D:\\work\\demo"));
-            seed_cn_session(&conn, "s-arch", "p1", "归档会话", Some("voice_discussion"), false);
+            seed_cn_project(
+                &conn,
+                "p1",
+                "111",
+                Some("biz-a"),
+                "冻结项目",
+                Some("D:\\work\\demo"),
+            );
+            seed_cn_session(
+                &conn,
+                "s-arch",
+                "p1",
+                "归档会话",
+                Some("voice_discussion"),
+                false,
+            );
             seed_cn_session(&conn, "s-del", "p1", "软删会话", None, true);
-            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的项目", Some("D:\\work\\demo"));
+            seed_cn_project(
+                &conn,
+                "p-t",
+                "222",
+                Some("biz-a"),
+                "我的项目",
+                Some("D:\\work\\demo"),
+            );
             seed_cn_session(&conn, "s-t", "p-t", "目标会话", None, false);
         }
 
@@ -3313,7 +3579,11 @@ mod tests {
 
         let conn = open_fixture(&db_path, &raw_key);
         let source_owner: String = conn
-            .query_row("SELECT user_id FROM project WHERE project_id = 'p1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT user_id FROM project WHERE project_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(source_owner, "111", "无可并内容时库零改动");
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
@@ -3329,11 +3599,32 @@ mod tests {
         {
             let conn = open_fixture(&db_path, &raw_key);
             seed_standard_source(&conn);
-            seed_cn_session(&conn, "s-arch", "p1", "归档会话", Some("voice_discussion"), false);
-            seed_cn_project(&conn, "p-t", "222", Some("biz-a"), "我的项目", Some("D:\\work\\demo"));
+            seed_cn_session(
+                &conn,
+                "s-arch",
+                "p1",
+                "归档会话",
+                Some("voice_discussion"),
+                false,
+            );
+            seed_cn_project(
+                &conn,
+                "p-t",
+                "222",
+                Some("biz-a"),
+                "我的项目",
+                Some("D:\\work\\demo"),
+            );
             seed_cn_session(&conn, "s-t", "p-t", "目标会话", None, false);
             // 无关目录，不应出现在预览里。
-            seed_cn_project(&conn, "p-other", "333", Some("biz-z"), "别的目录", Some("D:\\elsewhere"));
+            seed_cn_project(
+                &conn,
+                "p-other",
+                "333",
+                Some("biz-z"),
+                "别的目录",
+                Some("D:\\elsewhere"),
+            );
             seed_cn_session(&conn, "s-o", "p-other", "别的会话", None, false);
         }
 
@@ -3390,16 +3681,22 @@ mod tests {
         assert_eq!(outcome.switched_sessions.len(), 2);
 
         let events = events.into_inner().unwrap();
-        let mapping: Vec<&HandoverProgress> =
-            events.iter().filter(|event| event.phase == "mapping").collect();
+        let mapping: Vec<&HandoverProgress> = events
+            .iter()
+            .filter(|event| event.phase == "mapping")
+            .collect();
         assert_eq!(mapping.len(), 2, "mapping 逐会话上报");
         assert_eq!(mapping[0].total, 2);
         assert_eq!(mapping[0].label, "演示项目", "label 用项目名");
-        let executing: Vec<&HandoverProgress> =
-            events.iter().filter(|event| event.phase == "executing").collect();
+        let executing: Vec<&HandoverProgress> = events
+            .iter()
+            .filter(|event| event.phase == "executing")
+            .collect();
         assert!(!executing.is_empty(), "executing 按身份组上报");
-        let verifying: Vec<&HandoverProgress> =
-            events.iter().filter(|event| event.phase == "verifying").collect();
+        let verifying: Vec<&HandoverProgress> = events
+            .iter()
+            .filter(|event| event.phase == "verifying")
+            .collect();
         assert_eq!(verifying.len(), 2, "verifying 逐会话上报");
         let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
     }

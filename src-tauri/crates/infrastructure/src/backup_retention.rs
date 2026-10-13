@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
 use crate::master_handover::list_master_backups_in;
+use crate::operation_lease::FileOperationLock;
 
 const STORE_FILE: &str = "backup-retention.json";
 const MAX_STORE_BYTES: u64 = 64 * 1024;
@@ -70,9 +71,7 @@ pub fn is_valid_backup_dir(backup_dir: Option<&str>) -> bool {
     match backup_dir {
         None => true,
         Some(dir) => {
-            !dir.is_empty()
-                && dir.len() <= MAX_BACKUP_DIR_BYTES
-                && Path::new(dir).is_absolute()
+            !dir.is_empty() && dir.len() <= MAX_BACKUP_DIR_BYTES && Path::new(dir).is_absolute()
         }
     }
 }
@@ -126,10 +125,34 @@ impl BackupRetentionStore {
     /// 现有文件损坏时拒绝保存——不覆盖重建以保留用户决策证据
     /// （与台账/档案同纪律）；文件不存在视为首次使用，正常写入。
     pub fn save(&self, settings: &BackupRetentionSettings) -> Result<(), BackupRetentionError> {
+        let _lock = self.acquire_write_lock()?;
+        self.load().map_err(|_| BackupRetentionError::Invalid)?;
+        self.write(settings)
+    }
+
+    /// 在同一文件锁内读取最新设置、修改指定字段并原子发布。
+    pub fn update(
+        &self,
+        update: impl FnOnce(&mut BackupRetentionSettings),
+    ) -> Result<(), BackupRetentionError> {
+        let _lock = self.acquire_write_lock()?;
+        let mut settings = self.load()?;
+        update(&mut settings);
+        self.write(&settings)
+    }
+
+    fn acquire_write_lock(&self) -> Result<FileOperationLock, BackupRetentionError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| BackupRetentionError::Io)?;
+        }
+        FileOperationLock::acquire_sibling_resource(&self.path)
+            .map_err(|_| BackupRetentionError::Io)
+    }
+
+    fn write(&self, settings: &BackupRetentionSettings) -> Result<(), BackupRetentionError> {
         if !is_valid_keep(settings.keep) || !is_valid_backup_dir(settings.backup_dir.as_deref()) {
             return Err(BackupRetentionError::Invalid);
         }
-        self.load().map_err(|_| BackupRetentionError::Invalid)?;
         let store = StoreFile {
             format_version: 1,
             settings: settings.clone(),
@@ -382,6 +405,50 @@ mod tests {
     }
 
     #[test]
+    fn update_serializes_read_modify_write_and_preserves_unmodified_fields() {
+        let root = tempdir().unwrap();
+        let store = BackupRetentionStore::new(root.path());
+        let custom_backup_dir = root.path().join("custom-backups");
+        store
+            .save(&BackupRetentionSettings {
+                enabled: false,
+                keep: 5,
+                backup_dir: Some(custom_backup_dir.display().to_string()),
+            })
+            .unwrap();
+        let path = root.path().join(STORE_FILE);
+        let held_lock = FileOperationLock::acquire_sibling_resource(&path).unwrap();
+        let writer_store = BackupRetentionStore::new(root.path());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = writer_store.update(|settings| {
+                settings.enabled = true;
+                settings.keep = 3;
+            });
+            done_tx.send(result).unwrap();
+        });
+
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(held_lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(
+            store.load().unwrap(),
+            BackupRetentionSettings {
+                enabled: true,
+                keep: 3,
+                backup_dir: Some(custom_backup_dir.display().to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn invalid_keep_rejected() {
         let root = tempdir().unwrap();
         let store = BackupRetentionStore::new(root.path());
@@ -400,10 +467,7 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        assert_eq!(
-            store.load().unwrap_err(),
-            BackupRetentionError::Invalid
-        );
+        assert_eq!(store.load().unwrap_err(), BackupRetentionError::Invalid);
     }
 
     #[test]
@@ -433,23 +497,11 @@ mod tests {
         let removed = prune_master_backups(dir.path(), "database.db", 2);
         assert_eq!(removed, 1);
         // 最新两份在位（1000 含附属件），最旧的 800 连主文件一起删除。
-        assert!(dir
-            .path()
-            .join("database.db.switch-bak-1000")
-            .is_file());
-        assert!(dir
-            .path()
-            .join("database.db.switch-bak-1000-wal")
-            .is_file());
-        assert!(dir
-            .path()
-            .join("database.db.switch-bak-1000-shm")
-            .is_file());
+        assert!(dir.path().join("database.db.switch-bak-1000").is_file());
+        assert!(dir.path().join("database.db.switch-bak-1000-wal").is_file());
+        assert!(dir.path().join("database.db.switch-bak-1000-shm").is_file());
         assert!(dir.path().join("database.db.switch-bak-900").is_file());
-        assert!(!dir
-            .path()
-            .join("database.db.switch-bak-800")
-            .is_file());
+        assert!(!dir.path().join("database.db.switch-bak-800").is_file());
     }
 
     #[test]
@@ -480,10 +532,7 @@ mod tests {
         std::fs::write(dir.path().join("database.db.switch-bak-abc"), [1u8; 7]).unwrap();
         std::fs::write(dir.path().join("unrelated.txt"), [1u8; 3]).unwrap();
         assert_eq!(prune_master_backups(dir.path(), "database.db", 1), 0);
-        assert!(dir
-            .path()
-            .join("database.db.switch-bak-abc")
-            .is_file());
+        assert!(dir.path().join("database.db.switch-bak-abc").is_file());
         assert!(dir.path().join("unrelated.txt").is_file());
     }
 
@@ -708,8 +757,13 @@ mod tests {
             [1u8; 100]
         );
         assert_eq!(
-            std::fs::read(target.join("credentials-1000").join("profiles").join("a.checkin"))
-                .unwrap(),
+            std::fs::read(
+                target
+                    .join("credentials-1000")
+                    .join("profiles")
+                    .join("a.checkin")
+            )
+            .unwrap(),
             b"TRVCKN01-cipher"
         );
         // 散件与无关文件不迁移。
@@ -736,10 +790,7 @@ mod tests {
         let outcome = migrate_master_backups(&source, &target, "database.db").unwrap();
         assert_eq!(outcome.migrated_files, 0);
         assert_eq!(outcome.failures.len(), 1);
-        assert_eq!(
-            outcome.failures[0].file_name,
-            "database.db.switch-bak-1000"
-        );
+        assert_eq!(outcome.failures[0].file_name, "database.db.switch-bak-1000");
         assert!(!outcome.failures[0].reason.is_empty());
         // 目标未被覆盖、源原位保留。
         assert_eq!(

@@ -25,10 +25,12 @@ impl TraeProduct {
     }
 
     /// 面向用户的产品名称；不把安装包内部 packageType 直接暴露到 UI。
+    /// 融合版 TRAE（Work CN 升级版）作为唯一产品目标后，TraeCn 变体即
+    /// 融合版（ADR-0035），展示名用官方产品名。
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::WorkCn => "TRAE Work CN",
-            Self::TraeCn => "Trae CN",
+            Self::TraeCn => "TRAE",
         }
     }
 
@@ -144,6 +146,7 @@ mod tests {
         assert_eq!(TraeProduct::WorkCn.product_id(), "work_cn");
         assert_eq!(TraeProduct::WorkCn.display_name(), "TRAE Work CN");
         assert_eq!(TraeProduct::TraeCn.product_id(), "trae_cn");
-        assert_eq!(TraeProduct::TraeCn.display_name(), "Trae CN");
+        // 融合版后 TraeCn 变体即官方产品"TRAE"（ADR-0035）。
+        assert_eq!(TraeProduct::TraeCn.display_name(), "TRAE");
     }
 }

@@ -148,8 +148,7 @@ fn query_session_summaries(
     // 增量过滤子句：boundary 为本函数内部计算的 i64 字面量，无注入面。
     let where_clause = match (delta_boundary_raw, has_updated_at) {
         (Some(boundary), true) => {
-            let mut clause =
-                format!(" WHERE (s.updated_at >= {boundary} OR s.updated_at IS NULL");
+            let mut clause = format!(" WHERE (s.updated_at >= {boundary} OR s.updated_at IS NULL");
             if has_session_deleted {
                 clause.push_str(" OR COALESCE(s.deleted_at, 0) != 0");
             }
@@ -191,10 +190,7 @@ fn query_session_summaries(
 /// 只读打开隔离副本；任何失败（文件无法复制、key 不匹配、表缺失）统一映射为
 /// `Err(())`，由调用方聚合为 `ReadFailed`——错误细节不透传，保持索引读取的
 /// 批量语义（单账号失败不影响整体）。
-fn read_instance_sessions(
-    db_path: &Path,
-    raw_key: &str,
-) -> Result<Vec<SessionSummaryEntry>, ()> {
+fn read_instance_sessions(db_path: &Path, raw_key: &str) -> Result<Vec<SessionSummaryEntry>, ()> {
     let conn = open_with_key_readonly(db_path, raw_key).map_err(|_| ())?;
     query_session_summaries(&conn, None)
 }
@@ -628,10 +624,7 @@ mod tests {
                 assert_eq!(sessions[0].session_id, "s1");
                 assert_eq!(sessions[0].title, "加密库会话");
                 assert_eq!(sessions[0].message_count, 2);
-                assert_eq!(
-                    sessions[0].updated_at_unix_seconds,
-                    Some(1770000000)
-                );
+                assert_eq!(sessions[0].updated_at_unix_seconds, Some(1770000000));
             }
             other => panic!("期望 Ready，实际 {:?}", other),
         }
@@ -763,10 +756,7 @@ mod tests {
             &[("../escape".to_string(), "非法账号".to_string())],
             &"ff".repeat(32),
         );
-        assert_eq!(
-            entries[0].status,
-            AccountSessionIndexStatus::NoInstanceData
-        );
+        assert_eq!(entries[0].status, AccountSessionIndexStatus::NoInstanceData);
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -1015,10 +1005,7 @@ mod tests {
             .iter()
             .map(|entry| (entry.session_id.as_str(), entry.deleted))
             .collect();
-        assert_eq!(
-            ids,
-            vec![("s3", false), ("s1", false), ("s2", true)]
-        );
+        assert_eq!(ids, vec![("s3", false), ("s1", false), ("s2", true)]);
         let s1 = merged.iter().find(|e| e.session_id == "s1").unwrap();
         assert_eq!((s1.title.as_str(), s1.message_count), ("新标题一", 5));
     }
@@ -1117,7 +1104,10 @@ mod tests {
         // 首次增量读取（无缓存）：退化为全量，写缓存 + 高水位。
         let first = read_account_session_index_incremental(&temp, "checkin-a", "账号甲", &key);
         assert_eq!(ready_sessions(&first).len(), 2);
-        assert_eq!(next_high_water_mark(ready_sessions(&first)), Some(1770000000));
+        assert_eq!(
+            next_high_water_mark(ready_sessions(&first)),
+            Some(1770000000)
+        );
 
         // 源库变化：新增 s3 + 软删 s2（毫秒库，与实测 TRAE 库单位一致）。
         mutate_encrypted_db(
@@ -1135,10 +1125,7 @@ mod tests {
             .iter()
             .map(|entry| (entry.session_id.as_str(), entry.deleted))
             .collect();
-        assert_eq!(
-            ids,
-            vec![("s3", false), ("s2", true), ("s1", false)]
-        );
+        assert_eq!(ids, vec![("s3", false), ("s2", true), ("s1", false)]);
         assert_eq!(next_high_water_mark(sessions), Some(1771000000));
 
         // 第三次读取（无新变化）：幂等——高水位以上只剩 s3 行，upsert 后列表不变。
@@ -1153,11 +1140,7 @@ mod tests {
         let temp = w3_temp_dir("seconds");
         let key = "bb".repeat(32);
         let db_path = instance_db_path(&temp, "checkin-a");
-        create_encrypted_db_with_sessions(
-            &db_path,
-            &key,
-            &[("s1", "会话一", 1770000000, 0)],
-        );
+        create_encrypted_db_with_sessions(&db_path, &key, &[("s1", "会话一", 1770000000, 0)]);
         let first = read_account_session_index_incremental(&temp, "checkin-a", "账号甲", &key);
         assert_eq!(ready_sessions(&first).len(), 1);
 
@@ -1178,11 +1161,7 @@ mod tests {
         let temp = w3_temp_dir("transient");
         let key = "cc".repeat(32);
         let db_path = instance_db_path(&temp, "checkin-a");
-        create_encrypted_db_with_sessions(
-            &db_path,
-            &key,
-            &[("s1", "会话一", 1770000000000, 0)],
-        );
+        create_encrypted_db_with_sessions(&db_path, &key, &[("s1", "会话一", 1770000000000, 0)]);
 
         // 成功读取 → 缓存落盘。
         let ok = read_account_session_index_incremental(&temp, "checkin-a", "账号甲", &key);
@@ -1201,11 +1180,7 @@ mod tests {
 
         // 恢复后重试成功：从缓存续增量（无新变化 → 幂等同列表）。
         std::fs::remove_file(&db_path).unwrap();
-        create_encrypted_db_with_sessions(
-            &db_path,
-            &key,
-            &[("s1", "会话一", 1770000000000, 0)],
-        );
+        create_encrypted_db_with_sessions(&db_path, &key, &[("s1", "会话一", 1770000000000, 0)]);
         let retried = read_account_session_index_incremental(&temp, "checkin-a", "账号甲", &key);
         assert_eq!(ready_sessions(&retried).len(), 1);
         let _ = std::fs::remove_dir_all(&temp);
@@ -1214,12 +1189,8 @@ mod tests {
     #[test]
     fn incremental_read_reports_no_instance_data_without_db() {
         let temp = w3_temp_dir("no-instance");
-        let entry = read_account_session_index_incremental(
-            &temp,
-            "checkin-b",
-            "账号乙",
-            &"dd".repeat(32),
-        );
+        let entry =
+            read_account_session_index_incremental(&temp, "checkin-b", "账号乙", &"dd".repeat(32));
         assert_eq!(entry.status, AccountSessionIndexStatus::NoInstanceData);
         // 无实例数据也有指纹（全 None）——db 出现后轮询可检测。
         assert_eq!(entry.fingerprint.db, None);

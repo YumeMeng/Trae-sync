@@ -136,8 +136,10 @@ fn validate_protected_material(material: &ProtectedCatalogKey) -> Result<(), Key
     )
 }
 
+/// DPAPI 加密原语（CryptProtectData，CurrentUser 作用域）。
+/// crate 内共享：key_wrapper 与 fused_login_credential（ADR-0035）复用同一实现。
 #[cfg(windows)]
-fn protect(plaintext: &[u8]) -> Result<Vec<u8>, KeyWrapperError> {
+pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, KeyWrapperError> {
     use std::ptr::null;
     use std::slice;
 
@@ -164,8 +166,9 @@ fn protect(plaintext: &[u8]) -> Result<Vec<u8>, KeyWrapperError> {
     Ok(result)
 }
 
+/// DPAPI 解密原语（CryptUnprotectData；与 `protect` 成对）。
 #[cfg(windows)]
-fn unprotect(encrypted: &[u8]) -> Result<Vec<u8>, KeyWrapperError> {
+pub(crate) fn unprotect(encrypted: &[u8]) -> Result<Vec<u8>, KeyWrapperError> {
     use std::ptr::null_mut;
     use std::slice;
 

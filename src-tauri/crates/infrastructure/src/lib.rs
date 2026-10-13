@@ -29,6 +29,7 @@ pub mod catalog;
 pub mod catalog_path;
 pub mod checkin;
 pub mod checkin_credential;
+pub mod fused_login_credential;
 pub mod checkin_http;
 pub mod checkin_login;
 // P13-1：Trae CN 签到协议实装（status/claim，探针形状为唯一权威来源）。
@@ -64,8 +65,8 @@ pub mod operation_manifest;
 pub mod plugin_cloud_sync;
 pub mod plugin_manifest;
 pub mod process_observation;
-pub mod product_adapter;
 pub mod product_account_state;
+pub mod product_adapter;
 #[cfg(feature = "sqlcipher")]
 pub mod production_catalog;
 pub mod progress;
@@ -106,8 +107,9 @@ pub use auto_checkin_store::{
 };
 pub use blob_keepalive::{
     archive_login_user_id, construct_auth_identity, decrypt_auth_blob, decrypt_named_blob,
-    switch_auth_identity, writeback_auth_blob, AuthIdentitySwitch, AuthSwitchError,
-    ConstructAuthInput, KeepaliveError, KeepaliveOutcome,
+    master_login_material, switch_auth_identity, switch_auth_identity_for_account,
+    writeback_auth_blob, AuthIdentitySwitch, AuthSwitchError, ConstructAuthInput, KeepaliveError,
+    KeepaliveOutcome, MasterLoginMaterial,
 };
 #[cfg(feature = "sqlcipher")]
 pub use catalog::{
@@ -118,11 +120,15 @@ pub use catalog_path::{
     resolve_current_catalog_generation_id, resolve_current_catalog_path, CatalogPathError,
 };
 pub use checkin::FixtureCheckinTransport;
+pub use fused_login_credential::{
+    FusedLoginRecord, FusedLoginStore, FusedLoginStoreError, FusedLoginSummary,
+};
 pub use checkin_credential::{
     device_proof_signing_input, generate_device_keypair, needs_refresh, sign_device_proof,
     verify_device_proof, CheckinCredentialBundle, CheckinCredentialError, CheckinCredentialStore,
-    CheckinProfileBinding, FixtureExchangeRequest, FixtureRenewalService, FixtureTokenEndpoint,
-    FixtureUserInfoEndpoint, PendingRenewalRecord, RenewalReceipt,
+    CheckinProfileBinding, CheckinProfileOperationLease, FixtureExchangeRequest,
+    FixtureRenewalService, FixtureTokenEndpoint, FixtureUserInfoEndpoint, PendingRenewalRecord,
+    RenewalReceipt,
 };
 pub use checkin_http::{
     checkin_claim_request, checkin_status_request, exchange_token_by_auth_code,
@@ -134,19 +140,21 @@ pub use checkin_http::{
 };
 pub use checkin_login::{
     begin_login, begin_login_for, build_login_url_for, complete_login, LoginAcceptance,
-    LoginCallbackServer, LoginError, LoginHandoff, LoginProduct, LoginReceipt, LoginSession,
-    CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
+    LoginAttemptCancelled, LoginAttemptControl, LoginAttemptPhase, LoginAttemptResult,
+    LoginCallbackServer, LoginCancelResult, LoginError, LoginHandoff, LoginProduct, LoginReceipt,
+    LoginSession, CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
 };
 // P13-1：Trae CN 签到协议端口与 Real 实现（命令层经此引用）。
 pub use trae_cn_checkin::{
-    parse_claim_envelope, parse_status_envelope, status_request, claim_request,
+    claim_request, parse_claim_envelope, parse_status_envelope, status_request,
     RealTraeCnCheckinClient, ReqwestTraeCnCheckinHttp, TraeCnCheckinClaim, TraeCnCheckinClient,
     TraeCnCheckinError, TraeCnCheckinHttp, TraeCnCheckinRequest, TraeCnCheckinStatus,
 };
 // P11-6：只读探针公开 API（真实探测由 #[ignore] 集成测试显式授权运行）。
 pub use checkin_probe::{
     build_probe_report, candidate_endpoints, derive_probe_conclusion, probe_get_user_info_shape,
-    probe_trae_cn_status_endpoints, write_probe_report, TraeCnCheckinProbeReport, TraeCnProbeFinding,
+    probe_trae_cn_status_endpoints, write_probe_report, TraeCnCheckinProbeReport,
+    TraeCnProbeFinding,
 };
 pub use content_graph::DeterministicContentGraphHasher;
 pub use credential_maintenance::{
@@ -172,9 +180,9 @@ pub use logging::{
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_archive::{
-    apply_master_archive_changes, archive_master_sessions, delete_master_sessions,
-    merge_master_projects, restore_master_sessions, MasterArchiveApplyOutcome, MasterArchiveError,
-    MasterDeleteOutcome, MasterMergeOutcome, ARCHIVE_HIDDEN_STATUS,
+    apply_master_archive_changes, delete_master_sessions, merge_master_projects,
+    MasterArchiveApplyOutcome, MasterArchiveError, MasterDeleteOutcome, MasterMergeOutcome,
+    ARCHIVE_HIDDEN_STATUS,
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_checkup::{
@@ -182,13 +190,13 @@ pub use master_checkup::{
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_handover::{
-    backup_master_trio, backup_master_trio_stamped, backup_master_trio_to,
-    handover_master_records, handover_master_records_from_merge_with_progress,
-    handover_master_records_from_with_progress, handover_master_records_with_progress,
-    list_master_backups, list_master_backups_in, master_backup_db_name, master_database_path,
-    master_db_activity_detected, merge_trae_cn_project_records_with_progress,
-    preview_trae_cn_project_merge, HandoverProgress, HandoverSession, MasterBackupEntry,
-    MasterHandover, MasterHandoverError, TraeCnMergeRow, TraeCnProjectMergePreview,
+    backup_master_trio, backup_master_trio_stamped, backup_master_trio_to, handover_master_records,
+    handover_master_records_from_merge_with_progress, handover_master_records_from_with_progress,
+    handover_master_records_with_progress, list_master_backups, list_master_backups_in,
+    master_backup_db_name, master_database_path, master_db_activity_detected,
+    merge_trae_cn_project_records_with_progress, preview_trae_cn_project_merge, HandoverProgress,
+    HandoverSession, MasterBackupEntry, MasterHandover, MasterHandoverError, TraeCnMergeRow,
+    TraeCnProjectMergePreview,
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_history::{
@@ -199,7 +207,6 @@ pub use operation_lease::{
     inspect_lock_status, OperationLease, OperationLeaseError, OperationLockStatus,
 };
 pub use operation_manifest::{list_operation_summaries, OperationManifestError, OperationSummary};
-pub use product_account_state::{ProductAccountStateError, ProductAccountStateStore};
 pub use plugin_cloud_sync::{
     fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, install_market_plugin,
     reconcile_plan, sync_account_cloud_plugins, uninstall_cloud_plugin, CloudPluginItem,
@@ -207,6 +214,9 @@ pub use plugin_cloud_sync::{
 };
 pub use plugin_manifest::{PluginManifest, PluginManifestEntry, PluginManifestError};
 pub use process_observation::{FixedProcessController, WorkCnProcessController};
+pub use product_account_state::{
+    product_state_root_from, ProductAccountStateError, ProductAccountStateStore,
+};
 pub use product_adapter::TraeProduct;
 #[cfg(feature = "sqlcipher")]
 pub use production_catalog::{

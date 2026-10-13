@@ -50,7 +50,10 @@ mod tests {
         let json = serde_json::to_value(error).unwrap();
         assert_eq!(json["code"], "gate_not_qualified");
         assert_eq!(json["message"], "测试门禁未通过。");
-        assert_eq!(json["recommended_action"], "当前保持只读；待对应 Gate 通过后再使用。");
+        assert_eq!(
+            json["recommended_action"],
+            "当前保持只读；待对应 Gate 通过后再使用。"
+        );
         assert_eq!(json["retryable"], false);
         assert!(json.get("raw_key").is_none());
     }

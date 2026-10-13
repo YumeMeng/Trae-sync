@@ -512,7 +512,9 @@ export interface MasterAccountSwitchDto {
   readonly relay_ledger_written: boolean;
   /** 云端插件预同步回执。 */
   readonly plugin_sync: PluginCloudSyncDto;
-  /** 主库重启结果：launched=已重启。 */
+  /** 环境档案是否已记住本次切换的账号。 */
+  readonly current_profile_saved: boolean;
+  /** 主库重启结果；failed 表示账号与记录已切换，但 TRAE 未自动启动。 */
   readonly relaunch_outcome: string;
 }
 
@@ -527,7 +529,8 @@ export type MasterSwitchErrorCode =
   | "master_switch_close_failed"
   | "master_switch_backup_failed"
   | "switch_verify_failed"
-  | "master_switch_integrity_failed"
+  | "master_switch_committed_needs_attention"
+  | "master_switch_commit_outcome_unknown"
   | "master_switch_db_open_failed"
   | "master_switch_rollback_failed" // 切换失败且自动还原未完成（指向备份链）
   | "switch_auth_failed"

@@ -8,7 +8,7 @@
 # 任何反向依赖会被 cargo 直接拒绝编译，构成 AC2 的自动检查。
 [package]
 name = "trae-sync"
-version = "0.2.2"
+version = "0.2.5"
 description = "TRAE Work CN 本地历史浏览与安全同步预览桌面工具"
 edition = "2021"
 rust-version = "1.77"
@@ -37,11 +37,19 @@ traesync-infrastructure = { path = "crates/infrastructure" }
 traesync-commands = { path = "crates/commands" }
 
 [dev-dependencies]
+# Tauri command 测试用官方 mock builder 验证命令级门禁。
+tauri = { version = "2", features = ["test"] }
 tempfile = "3"
 trybuild = "1"
 # P13-2 命令层测试需要构造真实 SQLCipher fixture 库（归并编排回执/预检）；
 # 版本与 feature 与 infrastructure 一致，cargo 合并后共享同一份编译产物。
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[features]
+# 真机切号探针（P15-5/P15-8 验收驱动）：为正式依赖启用 tauri/test，
+# 探针以 mock AppHandle 驱动生产切号编排（仅事件发射走 mock，业务编排、
+# 进程开关、数据库交接、网络复核全部真实）。生产构建不含此 feature。
+probe = ["tauri/test"]
 
 [workspace]
 members = ["crates/*"]

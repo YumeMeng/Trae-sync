@@ -1,7 +1,7 @@
 {
   "name": "trae-sync",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.5",
   "type": "module",
   "description": "TRAE Work CN 本地历史浏览与安全同步预览桌面工具",
   "scripts": {

@@ -7,6 +7,7 @@ import type {
   RelayLedgerEntryDto,
   TraeCnForeignProjectDto,
 } from "../src/types/history";
+import type { ProductOperationSnapshotDto } from "../src/types/product";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
@@ -234,7 +235,48 @@ function sessionMessages(sessionId: string, offset = 0) {
   };
 }
 
+function historyForLibrary(name: string): MasterHistoryDto {
+  const history = historyDto();
+  return {
+    ...history,
+    projects: history.projects.map((project) =>
+      project.project_id === "p1" ? { ...project, name } : project,
+    ),
+    sessions: history.sessions.map((session) =>
+      session.session_id === "s1" ? { ...session, title: `${name} 会话` } : session,
+    ),
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function viewerMessages(text: string, hasMore = false) {
+  return {
+    session_id: "s1",
+    status: "ready" as const,
+    has_more: hasMore,
+    messages: [
+      {
+        message_id: text,
+        role: "user",
+        message_type: "general",
+        created_at_unix_seconds: Math.floor(NOW),
+        content: { kind: "text" as const, text, step_count: 0, thoughts: [] },
+      },
+    ],
+  };
+}
+
 function setupHistory(history: MasterHistoryDto) {
+  mockReadyProductOperations();
   mockRoute("get_master_history", () => history);
   mockRoute("get_relay_ledger", () => ledgerEntries());
   mockRoute("get_master_session_messages", (args) => {
@@ -249,6 +291,37 @@ function setupHistory(history: MasterHistoryDto) {
   mockRoute("set_archive_draft", () => true);
 }
 
+function mockReadyProductOperations() {
+  mockRoute("get_product_operation_states", (args) => {
+    const request = args as { productId: "work_cn" | "trae_cn"; libraryId: string };
+    return {
+      product_id: request.productId,
+      library_id: request.libraryId,
+      operations: [
+        { operation_id: "library.archive", state: "ready", reason: "已验收。", evidence_ref: null },
+        {
+          operation_id: "library.delete",
+          state: request.productId === "trae_cn" ? "absent" : "ready",
+          reason: "已验收。",
+          evidence_ref: null,
+        },
+        {
+          operation_id: request.productId === "trae_cn" ? "library.trae_cn_project_merge" : "library.work_project_merge",
+          state: "ready",
+          reason: "已验收。",
+          evidence_ref: null,
+        },
+      ],
+    } satisfies ProductOperationSnapshotDto;
+  });
+}
+
+function clickArchiveDraftApply() {
+  fireEvent.click(screen.getByTestId("archive-draft-apply"));
+  const workConfirm = screen.queryByTestId("work-archive-confirm-confirm");
+  if (workConfirm) fireEvent.click(workConfirm);
+}
+
 /** 展开项目树分支（会话子级按需渲染）。 */
 async function expandProject(projectId: string) {
   fireEvent.click(await screen.findByTestId(`library-project-${projectId}`));
@@ -261,6 +334,7 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
     // 等价于原 mockImplementation 每用例重设：清调用历史 + 重装路由分发。
     resetRoutes();
     installFakeInvoke();
+    mockReadyProductOperations();
   });
 
   it("树结构：项目行 + 会话子级按需展开 + 未关联文件夹末位 + 库注入参数", async () => {
@@ -487,6 +561,214 @@ describe("LibrarySessionsPanel（G21 项目树与对话查看器）", () => {
   });
 });
 
+describe("LibrarySessionsPanel P14-1d（库读取代次隔离）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    resetRoutes();
+    installFakeInvoke();
+    mockReadyProductOperations();
+  });
+
+  it("切库后新库读取未返回时，旧列表与查看器立即清空", async () => {
+    const masterHistory = historyForLibrary("Work 主库");
+    const pendingCnHistory = deferred<MasterHistoryDto>();
+    setupHistory(masterHistory);
+    mockRoute("get_master_history", (args) =>
+      (args as { libraryId: string }).libraryId === "master" ? masterHistory : pendingCnHistory.promise,
+    );
+    mockRoute("get_relay_ledger", () => []);
+    mockRoute("get_master_session_messages", () => viewerMessages("Work 详情内容"));
+
+    const { rerender } = render(<LibrarySessionsPanel active library={{ id: "master" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Work 主库"));
+    await expandProject("p1");
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    expect(await screen.findByText("Work 详情内容")).toBeInTheDocument();
+
+    rerender(<LibrarySessionsPanel active library={{ id: "trae_cn" }} />);
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_history", expect.objectContaining({ libraryId: "trae_cn" }));
+    });
+
+    expect(screen.queryByTestId("library-project-p1")).not.toBeInTheDocument();
+    expect(screen.queryByText("Work 主库 会话")).not.toBeInTheDocument();
+    expect(screen.queryByText("Work 详情内容")).not.toBeInTheDocument();
+    expect(screen.getByTestId("history-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("library-viewer")).not.toBeInTheDocument();
+  });
+
+  it("切库后忽略迟到的历史响应，不覆盖当前库树与台账来源", async () => {
+    const masterHistory = deferred<MasterHistoryDto>();
+    const cnHistory = historyForLibrary("Trae CN");
+    setupHistory(cnHistory);
+    mockRoute("get_master_history", (args) =>
+      (args as { libraryId: string }).libraryId === "master" ? masterHistory.promise : cnHistory,
+    );
+
+    const { rerender } = render(<LibrarySessionsPanel active library={{ id: "master" }} />);
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_history", expect.objectContaining({ libraryId: "master" }));
+    });
+
+    rerender(<LibrarySessionsPanel active library={{ id: "trae_cn" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Trae CN"));
+
+    await act(async () => {
+      masterHistory.resolve(historyForLibrary("旧主库"));
+      await masterHistory.promise;
+    });
+
+    expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Trae CN");
+    expect(screen.queryByText("旧主库 会话")).not.toBeInTheDocument();
+    expect(mockInvoke.mock.calls.filter(([command, args]) =>
+      command === "get_relay_ledger" && (args as { libraryId: string }).libraryId === "master",
+    )).toHaveLength(0);
+  });
+
+  it("切库后旧库迟到的读取失败不写入当前错误态", async () => {
+    const masterHistory = deferred<MasterHistoryDto>();
+    const cnHistory = historyForLibrary("Trae CN");
+    setupHistory(cnHistory);
+    mockRoute("get_master_history", (args) =>
+      (args as { libraryId: string }).libraryId === "master" ? masterHistory.promise : cnHistory,
+    );
+
+    const { rerender } = render(<LibrarySessionsPanel active library={{ id: "master" }} />);
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_history", expect.objectContaining({ libraryId: "master" }));
+    });
+    rerender(<LibrarySessionsPanel active library={{ id: "trae_cn" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Trae CN"));
+
+    await act(async () => {
+      masterHistory.reject(new Error("old_master_read_failed"));
+      await masterHistory.promise.catch(() => undefined);
+    });
+
+    expect(screen.queryByTestId("history-error")).not.toBeInTheDocument();
+    expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Trae CN");
+  });
+
+  it("切库后旧库迟到的台账不污染相同 session_id 的当前查看器", async () => {
+    const masterHistory = historyForLibrary("Work 主库");
+    const cnHistory = historyForLibrary("Trae CN");
+    const masterLedger = deferred<RelayLedgerEntryDto[]>();
+    setupHistory(masterHistory);
+    mockRoute("get_master_history", (args) =>
+      (args as { libraryId: string }).libraryId === "master" ? masterHistory : cnHistory,
+    );
+    mockRoute("get_relay_ledger", (args) =>
+      (args as { libraryId: string }).libraryId === "master" ? masterLedger.promise : [],
+    );
+    mockRoute("get_master_session_messages", () => viewerMessages("当前库消息"));
+
+    const { rerender } = render(<LibrarySessionsPanel active library={{ id: "master" }} />);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("get_relay_ledger", { libraryId: "master" }));
+    rerender(<LibrarySessionsPanel active library={{ id: "trae_cn" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Trae CN"));
+    await expandProject("p1");
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    expect(await screen.findByText("当前库消息")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("library-tab-relay"));
+    const relay = await screen.findByTestId("library-relay-tab");
+    expect(relay.querySelectorAll(".leg-step")).toHaveLength(1);
+
+    await act(async () => {
+      masterLedger.resolve(ledgerEntries());
+      await masterLedger.promise;
+    });
+
+    expect(relay.querySelectorAll(".leg-step")).toHaveLength(1);
+    expect(relay).not.toHaveTextContent("小谢");
+  });
+
+  it("相同 session_id 下，迟到的旧库 open 与 load-older 结果都不覆盖当前消息", async () => {
+    const masterHistory = historyForLibrary("Work 主库");
+    const cnHistory = historyForLibrary("Trae CN");
+    const oldOpen = deferred<ReturnType<typeof viewerMessages>>();
+    setupHistory(masterHistory);
+    mockRoute("get_master_history", (args) =>
+      (args as { libraryId: string }).libraryId === "master" ? masterHistory : cnHistory,
+    );
+    mockRoute("get_relay_ledger", () => []);
+    mockRoute("get_master_session_messages", (args) =>
+      (args as { libraryId: string }).libraryId === "master"
+        ? oldOpen.promise
+        : viewerMessages("CN 库消息"),
+    );
+
+    const { rerender } = render(<LibrarySessionsPanel active library={{ id: "master" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Work 主库"));
+    await expandProject("p1");
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_session_messages", {
+        sessionId: "s1",
+        libraryId: "master",
+      });
+    });
+
+    rerender(<LibrarySessionsPanel active library={{ id: "trae_cn" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Trae CN"));
+    fireEvent.click(await screen.findByTestId("library-session-s1"));
+    expect(await screen.findByText("CN 库消息")).toBeInTheDocument();
+
+    await act(async () => {
+      oldOpen.resolve(viewerMessages("旧主库消息"));
+      await oldOpen.promise;
+    });
+
+    expect(screen.getByTestId("library-viewer-messages")).toHaveTextContent("CN 库消息");
+    expect(screen.queryByText("旧主库消息")).not.toBeInTheDocument();
+  });
+
+  it("相同 session_id 下，旧库迟到的 load-older 不拼入新库消息", async () => {
+    const masterHistory = historyForLibrary("Work 主库");
+    const cnHistory = historyForLibrary("Trae CN");
+    const oldOlder = deferred<ReturnType<typeof viewerMessages>>();
+    setupHistory(masterHistory);
+    mockRoute("get_master_history", (args) =>
+      (args as { libraryId: string }).libraryId === "master" ? masterHistory : cnHistory,
+    );
+    mockRoute("get_relay_ledger", () => []);
+    mockRoute("get_master_session_messages", (args) => {
+      const request = args as { libraryId: string; offset?: number };
+      if (request.libraryId === "master" && request.offset !== undefined) return oldOlder.promise;
+      return request.libraryId === "master"
+        ? viewerMessages("主库当前消息", true)
+        : viewerMessages("CN 库当前消息");
+    });
+
+    const { rerender } = render(<LibrarySessionsPanel active library={{ id: "master" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Work 主库"));
+    await expandProject("p1");
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    expect(await screen.findByText("主库当前消息")).toBeInTheDocument();
+    fireEvent.scroll(screen.getByTestId("library-viewer-messages"), { target: { scrollTop: 0 } });
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_session_messages", {
+        sessionId: "s1",
+        libraryId: "master",
+        offset: 1,
+      });
+    });
+
+    rerender(<LibrarySessionsPanel active library={{ id: "trae_cn" }} />);
+    await waitFor(() => expect(screen.getByTestId("library-project-p1")).toHaveTextContent("Trae CN"));
+    fireEvent.click(await screen.findByTestId("library-session-s1"));
+    expect(await screen.findByText("CN 库当前消息")).toBeInTheDocument();
+
+    await act(async () => {
+      oldOlder.resolve(viewerMessages("旧主库更早消息"));
+      await oldOlder.promise;
+    });
+
+    expect(screen.getByTestId("library-viewer-messages")).toHaveTextContent("CN 库当前消息");
+    expect(screen.queryByText("旧主库更早消息")).not.toBeInTheDocument();
+  });
+});
+
 // ============================================================================
 // G22 统一选择模式：左栏底部进入，浮出 Gmail 式操作栏
 // ============================================================================
@@ -505,8 +787,9 @@ type MutableSession = {
 
 /** 可变历史 mock：归档草稿只在 apply 命令时一次性改写状态。 */
 function setupMutableHistory(options: {
-  relaunchOutcomes?: readonly ("launched" | "failed")[];
+  relaunchOutcomes?: readonly ("launched" | "failed" | "not_requested")[];
   refreshFailures?: number;
+  applyFailure?: string;
   /** P11-5：提供时模拟工具管理数据中的草稿持久化（libraryId → 草稿）。 */
   drafts?: Map<string, { archive_session_ids: string[]; restore_session_ids: string[] }>;
 } = {}) {
@@ -557,6 +840,15 @@ function setupMutableHistory(options: {
       archiveSessionIds: string[];
       restoreSessionIds: string[];
     };
+    if (options.applyFailure) {
+      if (options.applyFailure === "master_archive_committed_needs_attention") {
+        const archiveIds = new Set(archiveSessionIds);
+        for (const session of sessions) {
+          if (archiveIds.has(session.session_id)) session.hidden_status = "voice_discussion";
+        }
+      }
+      throw options.applyFailure;
+    }
     const archiveIds = new Set(archiveSessionIds);
     const restoreIds = new Set(restoreSessionIds);
     let archived = 0;
@@ -622,6 +914,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     window.localStorage.clear();
     resetRoutes();
     installFakeInvoke();
+    mockReadyProductOperations();
   });
 
   it("批量归档：勾选会话只生成草稿，点击应用后一次性提交", async () => {
@@ -646,7 +939,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 2 个");
 
     // 应用时才一次性调用关闭实例/事务/重启链路。
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
         archiveSessionIds: ["s1", "s2"],
@@ -674,7 +967,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     await expandProject("p1");
 
     fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
 
     await waitFor(() => {
       expect(screen.getByTestId("action-notice")).toHaveTextContent("实例尚未启动");
@@ -693,13 +986,29 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.queryByTestId("archive-recovery-retry")).not.toBeInTheDocument();
   });
 
+  it("未要求客户端启动的回执不误报为已启动", async () => {
+    setupMutableHistory({ relaunchOutcomes: ["not_requested"] });
+    render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    clickArchiveDraftApply();
+
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已应用归档设置：归档 1 个、恢复 0 个会话。TRAE CN 客户端未由此操作启动，需要查看时请手动启动。",
+      );
+    });
+    expect(screen.queryByTestId("action-notice")).not.toBeInTheDocument();
+  });
+
   it("应用后历史列表刷新失败显示刷新入口，并可重试", async () => {
     setupMutableHistory({ refreshFailures: 1 });
     render(<LibrarySessionsPanel active />);
     await expandProject("p1");
 
     fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
 
     await waitFor(() => {
       expect(screen.getByTestId("action-notice")).toHaveTextContent("历史列表刷新失败");
@@ -721,6 +1030,40 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.queryByTestId("archive-recovery-retry")).not.toBeInTheDocument();
   });
 
+  it.each([
+    ["master_archive_commit_outcome_unknown", "commit-unknown"],
+    ["master_archive_committed_needs_attention", "committed-attention"],
+  ] as const)("归档提交状态 %s 先阻止重试并要求刷新核对", async (code, state) => {
+    setupMutableHistory({ applyFailure: code });
+    render(<LibrarySessionsPanel active />);
+    await expandProject("p1");
+
+    fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    clickArchiveDraftApply();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("action-notice")).toBeInTheDocument();
+      expect(screen.getByTestId("archive-draft-apply")).toBeDisabled();
+    });
+    expect(notifyMock.error).toHaveBeenCalled();
+
+    mockInvoke.mockClear();
+    fireEvent.click(screen.getByTestId("archive-recovery-retry"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("get_master_history", {
+        previous: null,
+        previousCurrentUserId: null,
+        libraryId: "master",
+      });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+    if (state === "committed-attention") {
+      expect(screen.queryByTestId("archive-draft-bar")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("archive-draft-apply")).toBeEnabled();
+    }
+  });
+
   it("勾选项目后可归档项目下的全部会话", async () => {
     setupMutableHistory();
     render(<LibrarySessionsPanel active />);
@@ -736,7 +1079,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     expect(screen.getByTestId("batch-archive")).not.toBeDisabled();
 
     fireEvent.click(screen.getByTestId("batch-archive"));
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
         archiveSessionIds: ["s1", "s2"],
@@ -821,7 +1164,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
     expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
     expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
         archiveSessionIds: ["s2"],
@@ -1007,7 +1350,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-session-s3"));
     fireEvent.click(screen.getByTestId("batch-restore"));
     expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("恢复 1 个");
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
         archiveSessionIds: [],
@@ -1102,7 +1445,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
 
     expect(screen.getByTestId("batch-restore")).not.toBeDisabled();
     fireEvent.click(screen.getByTestId("batch-restore"));
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
         archiveSessionIds: [],
@@ -1136,7 +1479,7 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     fireEvent.click(screen.getByTestId("library-select-mode"));
     fireEvent.click(screen.getByTestId("library-project-__unlinked__"));
     fireEvent.click(screen.getByTestId("batch-archive"));
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
@@ -1190,6 +1533,25 @@ describe("LibrarySessionsPanel（G22 统一选择模式与批量操作）", () =
     });
     expect(screen.queryByTestId("library-project-p1")).not.toBeInTheDocument();
     expect(screen.getByTestId("library-project-p2")).toHaveTextContent("4");
+  });
+
+  it("Work 项目合并后刷新失败仍保留成功回执", async () => {
+    setupMutableHistory({ refreshFailures: 1 });
+    render(<LibrarySessionsPanel active />);
+    await screen.findByTestId("library-project-p1");
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    fireEvent.click(screen.getByTestId("library-project-p1"));
+    fireEvent.click(screen.getByTestId("library-project-p2"));
+    fireEvent.click(screen.getByTestId("batch-merge"));
+    fireEvent.click(await screen.findByTestId("merge-confirm-confirm"));
+
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已把 3 个会话并入「项目一」，清理 1 个空分组。",
+      );
+      expect(notifyMock.warning).toHaveBeenCalledWith("操作已完成，但列表刷新失败，请手动刷新。");
+    });
+    expect(notifyMock.error).not.toHaveBeenCalled();
   });
 
   it("合并错误走安全文案：不吞失败、树维持", async () => {
@@ -1258,6 +1620,109 @@ describe("LibrarySessionsPanel readOnly（全能力库降级为纯只读）", ()
   });
 });
 
+describe("LibrarySessionsPanel P14-1a（按 Work 操作状态门控写入口）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    resetRoutes();
+    installFakeInvoke();
+    mockReadyProductOperations();
+  });
+
+  it("运行态 Work 归档显示关停提示，并在提交前要求确认", async () => {
+    setupMutableHistory();
+    mockRoute("get_product_operation_states", () => ({
+      product_id: "work_cn",
+      library_id: "master",
+      operations: [
+        { operation_id: "library.archive", state: "ready", reason: "归档前会先关闭 Work 客户端。", evidence_ref: null },
+        { operation_id: "library.delete", state: "pending", reason: "请先关闭 Work 客户端。", evidence_ref: null },
+        { operation_id: "library.work_project_merge", state: "pending", reason: "请先关闭 Work 客户端。", evidence_ref: null },
+      ],
+    } satisfies ProductOperationSnapshotDto));
+    render(<LibrarySessionsPanel active />);
+
+    expect(await screen.findByTestId("library-work-archive-notice")).toHaveTextContent(
+      "归档前会先关闭 Work 客户端。",
+    );
+    expect(await screen.findByTestId("library-work-write-pending")).toHaveTextContent("项目归并、删除暂不可用");
+    await expandProject("p1");
+    expect(screen.getByTestId("library-quick-archive-s1")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    expect(screen.getByTestId("batch-archive")).toBeInTheDocument();
+    expect(screen.queryByTestId("batch-merge")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("batch-delete")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    fireEvent.click(screen.getByTestId("batch-archive"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+
+    expect(screen.getByTestId("work-archive-confirm")).toHaveTextContent("关闭 Work 客户端");
+    expect(screen.getByTestId("work-archive-confirm")).toHaveTextContent("重新启动");
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+    fireEvent.click(screen.getByTestId("work-archive-confirm-cancel"));
+    expect(screen.getByTestId("archive-draft-bar")).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    fireEvent.click(screen.getByTestId("work-archive-confirm-confirm"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
+        archiveSessionIds: ["s1"],
+        restoreSessionIds: [],
+        libraryId: "master",
+      });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("merge_master_projects", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("delete_master_sessions", expect.anything());
+  });
+
+  it("Work 库写入尚待操作验收时关闭全部归档、删除和归并入口", async () => {
+    setupMutableHistory();
+    mockRoute("get_product_operation_states", () => ({
+      product_id: "work_cn",
+      library_id: "master",
+      operations: [
+        { operation_id: "library.archive", state: "pending", reason: "归档与恢复的客户端结果仍需验收。", evidence_ref: null },
+        { operation_id: "library.delete", state: "pending", reason: "删除结果仍需验收。", evidence_ref: null },
+        { operation_id: "library.work_project_merge", state: "pending", reason: "归并结果仍需验收。", evidence_ref: null },
+      ],
+    } satisfies ProductOperationSnapshotDto));
+    render(<LibrarySessionsPanel active />);
+
+    expect(await screen.findByTestId("library-work-write-pending")).toHaveTextContent(
+      "归档与恢复、项目归并、删除暂不可用",
+    );
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    await expandProject("p1");
+    expect(screen.queryByTestId("library-quick-archive-s1")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("apply_master_archive_changes", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("delete_master_sessions", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("merge_master_projects", expect.anything());
+  });
+
+  it("错库操作快照 fail-closed，不读取或修改归档草稿", async () => {
+    setupHistory(historyDto());
+    mockRoute("get_product_operation_states", () => ({
+      product_id: "work_cn",
+      library_id: "env-other",
+      operations: [
+        { operation_id: "library.archive", state: "ready", reason: "测试错误库。", evidence_ref: null },
+        { operation_id: "library.delete", state: "ready", reason: "测试错误库。", evidence_ref: null },
+        { operation_id: "library.work_project_merge", state: "ready", reason: "测试错误库。", evidence_ref: null },
+      ],
+    } satisfies ProductOperationSnapshotDto));
+    render(<LibrarySessionsPanel active />);
+
+    expect(await screen.findByTestId("library-work-write-pending")).toHaveTextContent("暂时无法确认当前库的操作状态");
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    await expandProject("p1");
+    expect(screen.queryByTestId("library-quick-archive-s1")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("get_archive_draft", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("set_archive_draft", expect.anything());
+  });
+});
+
 // ============================================================================
 // P13-3（ADR-0033 决策 1）：CN 库 archive-only 形态——trae_cn 库按写能力
 // 开放归档/恢复（选择入口、快捷归档、草稿机制、批量归档、归档视图恢复），
@@ -1270,6 +1735,29 @@ describe("LibrarySessionsPanel P13-3（CN 库归档开放）", () => {
     window.localStorage.clear();
     resetRoutes();
     installFakeInvoke();
+    mockReadyProductOperations();
+  });
+
+  it("CN 归档与归并待验收时仍可浏览，但隐藏所有写入口", async () => {
+    setupHistory(historyDto());
+    mockRoute("get_product_operation_states", () => ({
+      product_id: "trae_cn",
+      library_id: "trae_cn",
+      operations: [
+        { operation_id: "library.archive", state: "pending", reason: "尚待验收。", evidence_ref: null },
+        { operation_id: "library.trae_cn_project_merge", state: "pending", reason: "尚待验收。", evidence_ref: null },
+      ],
+    } satisfies ProductOperationSnapshotDto));
+    render(
+      <LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={foreignProjects()} />,
+    );
+
+    await screen.findByTestId("library-project-p1");
+    expect(await screen.findByTestId("library-cn-write-pending")).toHaveTextContent("尚待验收");
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    await expandProject("p1");
+    expect(screen.queryByTestId("library-quick-archive-s1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("library-merge-entry-p-f1")).not.toBeInTheDocument();
   });
 
   it("归档控件放行：选择入口与快捷归档可见，草稿机制按 CN 库键参与", async () => {
@@ -1299,7 +1787,7 @@ describe("LibrarySessionsPanel P13-3（CN 库归档开放）", () => {
 
     fireEvent.click(screen.getByTestId("library-session-s1"));
     fireEvent.click(screen.getByTestId("batch-archive"));
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
         archiveSessionIds: ["s1"],
@@ -1319,7 +1807,7 @@ describe("LibrarySessionsPanel P13-3（CN 库归档开放）", () => {
     fireEvent.click(screen.getByTestId("library-session-s3"));
     fireEvent.click(screen.getByTestId("batch-restore"));
     expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("恢复 1 个");
-    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    clickArchiveDraftApply();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("apply_master_archive_changes", {
         archiveSessionIds: [],
@@ -1350,6 +1838,7 @@ function foreignProjects(): TraeCnForeignProjectDto[] {
 
 /** CN 归并流 mock：预览/归并命令 + 可选错误注入（含基础读路径分支）。 */
 function setupTraeCnMerge(overrides: { previewError?: string; mergeError?: string } = {}) {
+  mockReadyProductOperations();
   mockRoute("get_master_history", () => historyDto());
   mockRoute("get_relay_ledger", () => ledgerEntries());
   mockRoute("get_master_session_messages", (args) => {
@@ -1402,7 +1891,7 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
   it("入口条件：foreignProjects 注入时树末位渲染「其他账号的项目」组；未注入不渲染", async () => {
     setupTraeCnMerge();
     const { rerender } = render(
-      <LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />,
+      <LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={foreignProjects()} />,
     );
     const group = await screen.findByTestId("library-foreign-group");
     expect(group).toHaveTextContent("其他账号的项目");
@@ -1411,24 +1900,24 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
     expect(screen.getByTestId("library-merge-entry-p-f1")).toHaveTextContent("归并到当前账号");
 
     // 未注入（非 CN 库详情页）：分组与入口不存在。
-    rerender(<LibrarySessionsPanel active readOnly />);
+    rerender(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} />);
     await screen.findByTestId("library-project-p1");
     expect(screen.queryByTestId("library-foreign-group")).not.toBeInTheDocument();
     // 空清单同样不渲染分组。
-    rerender(<LibrarySessionsPanel active readOnly foreignProjects={[]} />);
+    rerender(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={[]} />);
     expect(screen.queryByTestId("library-foreign-group")).not.toBeInTheDocument();
   });
 
   it("确认流：点击入口拉取规模预览 → 单次确认 → 归并命令 → 成功回执 + 强制刷新", async () => {
     setupTraeCnMerge();
-    render(<LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />);
+    render(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={foreignProjects()} />);
     fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
 
     // 预览命令带 projectId + libraryId；弹层列明逐账号规模（主信息 = 账号名）。
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("preview_trae_cn_project_merge", {
         projectId: "p-f1",
-        libraryId: "master",
+        libraryId: "trae_cn",
       });
     });
     const dialog = await screen.findByTestId("trae-cn-merge-confirm");
@@ -1441,7 +1930,7 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("merge_trae_cn_project", {
         projectId: "p-f1",
-        libraryId: "master",
+        libraryId: "trae_cn",
       });
     });
     // 回执走全局通知（会话数 + 消息数；无空项目清理时不拼清理句）。
@@ -1457,8 +1946,39 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
     expect(mockInvoke).toHaveBeenCalledWith("get_master_history", {
       previous: null,
       previousCurrentUserId: null,
-      libraryId: "master",
+      libraryId: "trae_cn",
     });
+  });
+
+  it("Trae CN 归并后刷新失败仍保留成功回执", async () => {
+    let failRefresh = false;
+    setupTraeCnMerge();
+    mockRoute("get_master_history", () => {
+      if (failRefresh) throw new Error("history_refresh_failed");
+      return historyDto();
+    });
+    mockRoute("merge_trae_cn_project", () => {
+      failRefresh = true;
+      return {
+        transferred_projects: 1,
+        removed_mirror_rows: 0,
+        switched_sessions: 2,
+        moved_messages: 9,
+        backup_path: "C:\\bak",
+        relay_ledger_written: true,
+      };
+    });
+    render(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={foreignProjects()} />);
+    fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
+    fireEvent.click(await screen.findByTestId("trae-cn-merge-confirm-confirm"));
+
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已把 2 个会话归并到当前账号（共 9 条消息）。",
+      );
+      expect(notifyMock.warning).toHaveBeenCalledWith("归并已完成，但项目列表刷新失败，请手动刷新。");
+    });
+    expect(notifyMock.error).not.toHaveBeenCalled();
   });
 
   it("进度事件：确认后按钮文案随 trae-cn-merge-progress 阶段推进，完成后复原", async () => {
@@ -1478,7 +1998,7 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
       new Promise((resolve) => {
         resolveMerge = resolve;
       }));
-    render(<LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />);
+    render(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={foreignProjects()} />);
     fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
     fireEvent.click(await screen.findByTestId("trae-cn-merge-confirm-confirm"));
 
@@ -1522,7 +2042,7 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
   it("失败路径：预览失败/归并失败都走全局通知，弹层关闭且数据保持操作前状态", async () => {
     setupTraeCnMerge({ previewError: "trae_cn_merge_client_running" });
     const { rerender } = render(
-      <LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />,
+      <LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={foreignProjects()} />,
     );
     fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
     await waitFor(() => {
@@ -1533,13 +2053,13 @@ describe("LibrarySessionsPanel P13-2（Trae CN 归并入口）", () => {
     expect(screen.queryByTestId("trae-cn-merge-confirm")).not.toBeInTheDocument();
 
     // 归并失败：弹层关闭 + 稳定错误码映射的通知。
-    setupTraeCnMerge({ mergeError: "trae_cn_merge_integrity_failed" });
-    rerender(<LibrarySessionsPanel active readOnly foreignProjects={foreignProjects()} />);
+    setupTraeCnMerge({ mergeError: "trae_cn_merge_committed_needs_attention" });
+    rerender(<LibrarySessionsPanel active readOnly library={{ id: "trae_cn" }} foreignProjects={foreignProjects()} />);
     fireEvent.click(await screen.findByTestId("library-merge-entry-p-f1"));
     fireEvent.click(await screen.findByTestId("trae-cn-merge-confirm-confirm"));
     await waitFor(() => {
       expect(notifyMock.error).toHaveBeenCalledWith(
-        "归并后数据校验未通过，已保留操作前备份；请用备份恢复并反馈。",
+        "项目归并已提交，但写后校验未通过。请保留操作前备份，不要重复归并；检查数据后再继续。",
       );
     });
     expect(screen.queryByTestId("trae-cn-merge-confirm")).not.toBeInTheDocument();

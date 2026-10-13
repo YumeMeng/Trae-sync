@@ -25,14 +25,14 @@ use sha2::{Digest, Sha256};
 use base64::Engine;
 use serde::Deserialize;
 use traesync_domain::{
-    CheckinClaimSnapshot, CheckinStatusSnapshot, EntitlementPackSnapshot,
-    EntitlementUsageSnapshot,
+    CheckinClaimSnapshot, CheckinStatusSnapshot, EntitlementPackSnapshot, EntitlementUsageSnapshot,
 };
 use traesync_ports::{CheckinTransport, CheckinTransportError};
 
 use crate::checkin_credential::{
     device_proof_signing_input, needs_refresh, sign_device_proof, CheckinCredentialBundle,
-    CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding, RenewalReceipt,
+    CheckinCredentialError, CheckinCredentialStore, CheckinProfileBinding,
+    CheckinProfileOperationLease, RenewalReceipt,
 };
 use crate::checkin_login::{decode_account_from_jwt, generate_pkce_pair};
 
@@ -50,7 +50,8 @@ const GET_PC_AUTH_CODE_PATH: &str = "/cloudide/api/v3/trae/oauth/GetPCAuthCode";
 const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:18963/authorize";
 /// 授权页来源头（与真实客户端一致；2026-09-02 实测网关存在动态 IP 风控，
 /// 请求过密时不带这三头会被 403 拦截，带上可通过）。
-const OAUTH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36";
+const OAUTH_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36";
 /// 与真实客户端一致的 IDE 版本号（product.json `appVersion`；
 /// `version`/`vscodeVersion` 1.107.x 是 VS Code 基座版本，不用于协议字段）。
 /// GetUserInfo 等只读资料查询沿用该值（生产实测可行，ADR-0019 v6）。
@@ -101,6 +102,7 @@ impl CheckinHttpError {
 pub struct RealCheckinTransport {
     store: CheckinCredentialStore,
     bindings: BTreeMap<String, CheckinProfileBinding>,
+    _profile_lease: Option<CheckinProfileOperationLease>,
     client: reqwest::blocking::Client,
 }
 
@@ -113,8 +115,26 @@ impl RealCheckinTransport {
         Self {
             store: store.clone(),
             bindings,
+            _profile_lease: None,
             client: http_client(),
         }
+    }
+
+    /// 创建持有单账号租约的 transport，覆盖该账号的完整签到流程。
+    pub fn new_with_profile_lease(
+        store: &CheckinCredentialStore,
+        binding: CheckinProfileBinding,
+        lease: CheckinProfileOperationLease,
+    ) -> Result<Self, CheckinCredentialError> {
+        store.validate_profile_lease(&lease, &binding.profile_id)?;
+        let mut bindings = BTreeMap::new();
+        bindings.insert(binding.profile_id.clone(), binding);
+        Ok(Self {
+            store: store.clone(),
+            bindings,
+            _profile_lease: Some(lease),
+            client: http_client(),
+        })
     }
 
     fn credential_context(
@@ -218,9 +238,7 @@ fn derived_market_user_id(device_id: &str) -> String {
 
 /// `vscode-sessionid`：设备 ID 确定性派生的 64 位 hex。
 fn derived_session_id(device_id: &str) -> String {
-    hex::encode(Sha256::digest(
-        format!("session:{device_id}").as_bytes(),
-    ))
+    hex::encode(Sha256::digest(format!("session:{device_id}").as_bytes()))
 }
 
 /// 每请求刷新的 `x-request-id`（UUID v4 形状）。
@@ -431,8 +449,7 @@ pub fn entitlement_usage_request(
         let Some(base) = &pack.entitlement_base_info else {
             continue;
         };
-        let Some(credits_limit) = base.quota.as_ref().and_then(|quota| quota.credits_limit)
-        else {
+        let Some(credits_limit) = base.quota.as_ref().and_then(|quota| quota.credits_limit) else {
             continue;
         };
         // 过期包不计入当前可用额度（expire_time=0 视为长期有效）。
@@ -541,7 +558,12 @@ impl OAuthClient {
 
     /// 构造设备信息块；硬件字段与真实客户端一致（SOLO 形态
     /// 带完整本机硬件描述——r34 探针实测值，新设备首签依赖这些字段）。
-    pub fn device_info(&self, device_id: &str, machine_id: &str, device_public_key: &str) -> DeviceInfoBlock {
+    pub fn device_info(
+        &self,
+        device_id: &str,
+        machine_id: &str,
+        device_public_key: &str,
+    ) -> DeviceInfoBlock {
         match self {
             Self::Solo => DeviceInfoBlock {
                 device_id: device_id.to_string(),
@@ -1144,6 +1166,19 @@ impl<'a> RealCheckinRenewalService<'a> {
         binding: &CheckinProfileBinding,
         now_unix_seconds: u64,
     ) -> Result<Option<RenewalReceipt>, CheckinCredentialError> {
+        let lease = self.store.lock_profile(&binding.profile_id)?;
+        self.renew_if_needed_with_lease(binding, now_unix_seconds, &lease)
+    }
+
+    /// 在调用者持有账号租约时检查维护策略并续期。
+    pub fn renew_if_needed_with_lease(
+        &self,
+        binding: &CheckinProfileBinding,
+        now_unix_seconds: u64,
+        lease: &CheckinProfileOperationLease,
+    ) -> Result<Option<RenewalReceipt>, CheckinCredentialError> {
+        self.store
+            .validate_profile_lease(lease, &binding.profile_id)?;
         // 中断现场未收口前禁止新的写回。
         if self.store.has_pending_renewal()? {
             return Err(CheckinCredentialError::RecoveryRequired);
@@ -1152,7 +1187,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         if !needs_refresh(&bundle, now_unix_seconds) {
             return Ok(None);
         }
-        self.renew_loaded(binding, bundle, now_unix_seconds)
+        self.renew_loaded(binding, bundle, now_unix_seconds, lease)
             .map(Some)
     }
 
@@ -1166,11 +1201,24 @@ impl<'a> RealCheckinRenewalService<'a> {
         binding: &CheckinProfileBinding,
         now_unix_seconds: u64,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
+        let lease = self.store.lock_profile(&binding.profile_id)?;
+        self.renew_now_with_lease(binding, now_unix_seconds, &lease)
+    }
+
+    /// 在调用者持有同一凭据存储租约时立即续期，不重复加锁。
+    pub fn renew_now_with_lease(
+        &self,
+        binding: &CheckinProfileBinding,
+        now_unix_seconds: u64,
+        lease: &CheckinProfileOperationLease,
+    ) -> Result<RenewalReceipt, CheckinCredentialError> {
+        self.store
+            .validate_profile_lease(lease, &binding.profile_id)?;
         if self.store.has_pending_renewal()? {
             return Err(CheckinCredentialError::RecoveryRequired);
         }
         let bundle = self.store.load(binding)?;
-        self.renew_loaded(binding, bundle, now_unix_seconds)
+        self.renew_loaded(binding, bundle, now_unix_seconds, lease)
     }
 
     /// 按当前凭据代次选择不创建新设备的换发路径。
@@ -1179,6 +1227,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         binding: &CheckinProfileBinding,
         bundle: CheckinCredentialBundle,
         now_unix_seconds: u64,
+        lease: &CheckinProfileOperationLease,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
         // 凭据包必须使用与当前产品一致的 client；跨产品材料不能进入续期。
         if bundle.client_id != self.oauth_client.client_id() {
@@ -1188,20 +1237,18 @@ impl<'a> RealCheckinRenewalService<'a> {
         // token 可连续滚动；refresh 模式在当前账号代次上稳定返回 20403。
         // 只有 access 已经过期、无法再申请 AuthCode 时才保留一次旧 refresh 兜底。
         if bundle.access_token_expires_at_unix_seconds > now_unix_seconds {
-            return self.renew_via_same_device_auth_code(binding, bundle);
+            return self.renew_via_same_device_auth_code(binding, bundle, lease);
         }
 
         // access 已过期时沿用一次性代次闸门，避免手动点击或多实例并发
         // 反复重放已被服务端拒绝的旧 refresh token。
-        let claimed = self.store.claim_refresh_rescue_attempt(
-            binding,
-            &bundle,
-            now_unix_seconds,
-        )?;
+        let claimed =
+            self.store
+                .claim_refresh_rescue_attempt(binding, &bundle, now_unix_seconds)?;
         if !claimed {
             return Err(CheckinCredentialError::CredentialRefreshFailed);
         }
-        self.renew(binding, bundle, now_unix_seconds)
+        self.renew(binding, bundle, now_unix_seconds, lease)
     }
 
     /// 用当前设备和仍有效的 access token 滚动换发凭据。
@@ -1213,29 +1260,34 @@ impl<'a> RealCheckinRenewalService<'a> {
         &self,
         binding: &CheckinProfileBinding,
         bundle: CheckinCredentialBundle,
+        lease: &CheckinProfileOperationLease,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
         let oauth_client = self.oauth_client;
-        let pkce = generate_pkce_pair()
+        let pkce =
+            generate_pkce_pair().map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
+        let auth_code = self
+            .http
+            .get_pc_auth_code(
+                &bundle.access_token,
+                &pkce.code_challenge,
+                &bundle.device_id,
+                oauth_client,
+            )
             .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
-        let auth_code = self.http.get_pc_auth_code(
-            &bundle.access_token,
-            &pkce.code_challenge,
-            &bundle.device_id,
-            oauth_client,
-        )
-        .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
         let device_info = oauth_client.device_info(
             &bundle.device_id,
             &bundle.machine_id,
             &bundle.device_public_key,
         );
-        let grant = self.http.exchange_token_by_auth_code(
-            &auth_code,
-            &pkce.code_verifier,
-            &device_info,
-            oauth_client,
-        )
-        .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
+        let grant = self
+            .http
+            .exchange_token_by_auth_code(
+                &auth_code,
+                &pkce.code_verifier,
+                &device_info,
+                oauth_client,
+            )
+            .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
         let (account_id, _) = decode_account_from_jwt(&grant.access_token)
             .map_err(|_| CheckinCredentialError::AuthMismatch)?;
         if account_id != binding.account_id {
@@ -1246,9 +1298,8 @@ impl<'a> RealCheckinRenewalService<'a> {
         updated.refresh_token = grant.refresh_token;
         updated.client_id = oauth_client.client_id().to_string();
         updated.access_token_expires_at_unix_seconds = grant.access_token_expires_at_unix_seconds;
-        updated.refresh_token_expires_at_unix_seconds =
-            grant.refresh_token_expires_at_unix_seconds;
-        let operation_id = self.store.write_back(binding, &updated)?;
+        updated.refresh_token_expires_at_unix_seconds = grant.refresh_token_expires_at_unix_seconds;
+        let operation_id = self.store.write_back_with_lease(lease, binding, &updated)?;
         // Work 的实例 blob 保活属于 Work 专属能力；Trae CN 只更新自己的凭据仓库。
         if matches!(oauth_client, OAuthClient::Solo) {
             crate::blob_keepalive::keepalive_after_renewal(
@@ -1272,6 +1323,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         binding: &CheckinProfileBinding,
         bundle: CheckinCredentialBundle,
         timestamp_unix_seconds: u64,
+        lease: &CheckinProfileOperationLease,
     ) -> Result<RenewalReceipt, CheckinCredentialError> {
         let oauth_client = self.oauth_client;
         // DeviceInfo 必须与登录/铸造时一致（设备绑定校验依据）。
@@ -1281,16 +1333,18 @@ impl<'a> RealCheckinRenewalService<'a> {
             &bundle.device_public_key,
         );
         let nonce = random_nonce()?;
-        let grant = self.http.exchange_token_by_refresh(
-            &bundle.access_token,
-            &bundle.refresh_token,
-            &bundle.device_private_key,
-            &device_info,
-            oauth_client,
-            timestamp_unix_seconds,
-            &nonce,
-        )
-        .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
+        let grant = self
+            .http
+            .exchange_token_by_refresh(
+                &bundle.access_token,
+                &bundle.refresh_token,
+                &bundle.device_private_key,
+                &device_info,
+                oauth_client,
+                timestamp_unix_seconds,
+                &nonce,
+            )
+            .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
         // 身份校验：新访问令牌签发的账号 ID 必须与绑定一致，否则禁止回写。
         let (account_id, _) = decode_account_from_jwt(&grant.access_token)
             .map_err(|_| CheckinCredentialError::AuthMismatch)?;
@@ -1303,7 +1357,7 @@ impl<'a> RealCheckinRenewalService<'a> {
         updated.client_id = oauth_client.client_id().to_string();
         updated.access_token_expires_at_unix_seconds = grant.access_token_expires_at_unix_seconds;
         updated.refresh_token_expires_at_unix_seconds = grant.refresh_token_expires_at_unix_seconds;
-        let operation_id = self.store.write_back(binding, &updated)?;
+        let operation_id = self.store.write_back_with_lease(lease, binding, &updated)?;
         // Work 的实例 blob 保活属于 Work 专属能力；Trae CN 只更新自己的凭据仓库。
         if matches!(oauth_client, OAuthClient::Solo) {
             crate::blob_keepalive::keepalive_after_renewal(
@@ -1335,6 +1389,41 @@ fn random_nonce() -> Result<String, CheckinCredentialError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_lease_transport_requires_matching_store_and_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path().join("work"));
+        let other_store = CheckinCredentialStore::new(root.path().join("cn"));
+        let binding = CheckinProfileBinding::new(
+            "profile-test",
+            "account-test",
+            "1234567890123456",
+            "public-key",
+        );
+        let lease = store.lock_profile(&binding.profile_id).unwrap();
+        assert!(
+            RealCheckinTransport::new_with_profile_lease(&store, binding.clone(), lease,).is_ok()
+        );
+
+        let other_store_lease = other_store.lock_profile(&binding.profile_id).unwrap();
+        assert_eq!(
+            RealCheckinTransport::new_with_profile_lease(
+                &store,
+                binding.clone(),
+                other_store_lease,
+            )
+            .err(),
+            Some(CheckinCredentialError::BindingMismatch)
+        );
+
+        let other_profile_lease = store.lock_profile("other-profile").unwrap();
+        assert_eq!(
+            RealCheckinTransport::new_with_profile_lease(&store, binding, other_profile_lease,)
+                .err(),
+            Some(CheckinCredentialError::BindingMismatch)
+        );
+    }
 
     #[test]
     fn telemetry_derived_market_user_id_shape_and_stability() {
@@ -1440,8 +1529,12 @@ mod tests {
     fn exchange_http_error_prefers_body_business_code() {
         // 2026-09-02 实测：设备上限 20401 以 HTTP 403 + 响应体业务码返回；
         // 只报 Http(403) 会把真实原因（设备配额）吞成笼统的网络错误。
-        let body = r#"{"ResponseMetadata":{"Error":{"Code":20401,"Message":"Device limit reached."}}}"#;
-        assert_eq!(exchange_http_error(403, body), CheckinHttpError::Business(20401));
+        let body =
+            r#"{"ResponseMetadata":{"Error":{"Code":20401,"Message":"Device limit reached."}}}"#;
+        assert_eq!(
+            exchange_http_error(403, body),
+            CheckinHttpError::Business(20401)
+        );
         // 同日实测：服务端实际返回的 Code 是 JSON 字符串形态——
         // 只解析数字会吞掉 20401（登录诊断日志 Http(403) 误报根因）。
         let string_code_body = r#"{"ResponseMetadata":{"Error":{"Code":"20401","Message":"Device limit reached.","StandardCode":"040034"}}}"#;
@@ -1470,7 +1563,10 @@ mod tests {
         }"#;
         let envelope: AuthCodeEnvelope = serde_json::from_str(body).unwrap();
         assert_eq!(
-            envelope.Result.and_then(|result| result.AuthCode).as_deref(),
+            envelope
+                .Result
+                .and_then(|result| result.AuthCode)
+                .as_deref(),
             Some("auth-code-1")
         );
         // 无 Error 字段（成功路径）。
@@ -1710,6 +1806,51 @@ mod tests {
     }
 
     #[cfg(windows)]
+    struct BlockingCredentialRenewalHttpAdapter {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        grant: TokenGrant,
+    }
+
+    #[cfg(windows)]
+    impl CredentialRenewalHttpAdapter for BlockingCredentialRenewalHttpAdapter {
+        fn get_pc_auth_code(
+            &self,
+            _access_token: &str,
+            _code_challenge: &str,
+            _device_id: &str,
+            _oauth_client: OAuthClient,
+        ) -> Result<String, CheckinHttpError> {
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok("auth-code-test".to_string())
+        }
+
+        fn exchange_token_by_auth_code(
+            &self,
+            _auth_code: &str,
+            _code_verifier: &str,
+            _device_info: &DeviceInfoBlock,
+            _oauth_client: OAuthClient,
+        ) -> Result<TokenGrant, CheckinHttpError> {
+            Ok(self.grant.clone())
+        }
+
+        fn exchange_token_by_refresh(
+            &self,
+            _current_token: &str,
+            _refresh_token: &str,
+            _device_private_key_pem: &str,
+            _device_info: &DeviceInfoBlock,
+            _oauth_client: OAuthClient,
+            _timestamp_unix_seconds: u64,
+            _nonce: &str,
+        ) -> Result<TokenGrant, CheckinHttpError> {
+            Err(CheckinHttpError::Protocol)
+        }
+    }
+
+    #[cfg(windows)]
     fn test_jwt(account_id: &str, expires_at: u64) -> String {
         let payload = serde_json::json!({
             "data": {"id": account_id},
@@ -1726,7 +1867,8 @@ mod tests {
         now: u64,
         access_expires_at: u64,
     ) -> CheckinProfileBinding {
-        let (private_key, public_key) = crate::checkin_credential::generate_device_keypair().unwrap();
+        let (private_key, public_key) =
+            crate::checkin_credential::generate_device_keypair().unwrap();
         let bundle = CheckinCredentialBundle {
             profile_id: "profile-test".to_string(),
             account_id: "account-test".to_string(),
@@ -1774,7 +1916,8 @@ mod tests {
         };
         let service = RealCheckinRenewalService::with_http_adapter(&store, Box::new(adapter));
 
-        let receipt = service.renew_now(&binding, now).unwrap();
+        let lease = store.lock_profile(&binding.profile_id).unwrap();
+        let receipt = service.renew_now_with_lease(&binding, now, &lease).unwrap();
         assert_eq!(receipt.profile_id, "profile-test");
         assert_eq!(*calls.lock().unwrap(), vec!["auth_code", "auth_exchange"]);
 
@@ -1785,6 +1928,100 @@ mod tests {
         assert_eq!(updated.device_id, binding.device_id);
         assert_eq!(updated.device_public_key, binding.device_public_key);
         assert_eq!(updated.client_id, TRAE_SOLO_CLIENT_ID);
+    }
+
+    #[test]
+    fn renewal_lease_rejects_same_profile_from_another_product_root() {
+        let root = tempfile::tempdir().unwrap();
+        let work_store = CheckinCredentialStore::new(root.path().join("work"));
+        let cn_store = CheckinCredentialStore::new(root.path().join("cn"));
+        let work_lease = work_store.lock_profile("profile-test").unwrap();
+        let cn_lease = cn_store.lock_profile("profile-test").unwrap();
+        let binding = CheckinProfileBinding::new(
+            "profile-test",
+            "account-test",
+            "1234567890123456",
+            "public-key",
+        );
+        let now = 1_800_000_000;
+
+        let work_service = RealCheckinRenewalService::new(&work_store);
+        assert_eq!(
+            work_service.renew_now_with_lease(&binding, now, &cn_lease),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+        let cn_service = RealCheckinRenewalService::new(&cn_store);
+        assert_eq!(
+            cn_service.renew_if_needed_with_lease(&binding, now, &work_lease),
+            Err(CheckinCredentialError::BindingMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn renewal_holds_profile_lock_through_exchange_and_writeback() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let now = 1_800_000_000u64;
+        let binding = test_bundle(&store, now, now + 10 * 24 * 60 * 60);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let adapter = BlockingCredentialRenewalHttpAdapter {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+            grant: TokenGrant {
+                access_token: test_jwt("account-test", now + 14 * 24 * 60 * 60),
+                refresh_token: "refresh-new".to_string(),
+                access_token_expires_at_unix_seconds: now + 14 * 24 * 60 * 60,
+                refresh_token_expires_at_unix_seconds: now + 180 * 24 * 60 * 60,
+            },
+        };
+        let renewal_store = store.clone();
+        let renewal_binding = binding.clone();
+        let (renewal_tx, renewal_rx) = std::sync::mpsc::channel();
+        let renewal = std::thread::spawn(move || {
+            let service =
+                RealCheckinRenewalService::with_http_adapter(&renewal_store, Box::new(adapter));
+            renewal_tx
+                .send(service.renew_now(&renewal_binding, now))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let mobile_store = store.clone();
+        let mobile_binding = binding.clone();
+        let (mobile_started_tx, mobile_started_rx) = std::sync::mpsc::channel();
+        let (mobile_tx, mobile_rx) = std::sync::mpsc::channel();
+        let mobile_update = std::thread::spawn(move || {
+            mobile_started_tx.send(()).unwrap();
+            mobile_tx
+                .send(mobile_store.set_mobile_full(&mobile_binding, Some("13812345678")))
+                .unwrap();
+        });
+        mobile_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(mobile_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+
+        release_tx.send(()).unwrap();
+        renewal_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        mobile_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        renewal.join().unwrap();
+        mobile_update.join().unwrap();
+
+        let updated = store.load(&binding).unwrap();
+        assert_eq!(updated.refresh_token, "refresh-new");
+        assert_eq!(updated.mobile_full.as_deref(), Some("13812345678"));
     }
 
     #[cfg(windows)]

@@ -90,7 +90,8 @@ const ERROR_COPY: Record<MasterSwitchErrorCode, string> = {
   master_switch_close_failed: "关闭主库实例失败，请稍后重试。",
   master_switch_backup_failed: "主库数据备份失败，切换已中止（主库数据未受影响）。",
   switch_verify_failed: "登录信息写入后校验失败，切换已中止；主库数据备份已保留。",
-  master_switch_integrity_failed: "对话记录转移后的完整性校验未通过，切换已中止；可用切换前的备份恢复。",
+  master_switch_committed_needs_attention: "账号与对话记录已切换，但写后校验未通过，主库尚未自动启动。请保留切换前备份，不要重复切换；检查数据后再启动主库。",
+  master_switch_commit_outcome_unknown: "账号登录信息已切换，但对话记录提交结果无法确认，主库尚未自动启动。请保留备份并检查主库状态，不要重复切换。",
   master_switch_db_open_failed: "主库数据库暂时无法打开（可能仍在写入），请稍后重试。",
   master_switch_rollback_failed: "切换失败，且自动还原未完成：请使用切换前的备份恢复主库数据。",
   switch_auth_failed: "账号登录状态切换失败，已中止。",
@@ -107,7 +108,7 @@ type DialogPhase =
   | { kind: "confirm"; preview: MasterSwitchPluginPreviewDto }
   | { kind: "running"; stage: MasterSwitchStage }
   | { kind: "busy" }
-  | { kind: "done"; receipt: MasterAccountSwitchDto }
+  | { kind: "done"; receipt: MasterAccountSwitchDto; refreshFailed: boolean }
   | { kind: "failed"; message: string; code?: string };
 
 /**
@@ -143,8 +144,12 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
         profileId: next.profile_id,
         force,
       });
-      setPhase({ kind: "done", receipt });
-      await onFinished();
+      setPhase({ kind: "done", receipt, refreshFailed: false });
+      try {
+        await onFinished();
+      } catch {
+        setPhase((current) => current.kind === "done" ? { ...current, refreshFailed: true } : current);
+      }
     } catch (reason: unknown) {
       const code = rawErrorCode(reason);
       if (code === "master_switch_busy") {
@@ -238,6 +243,13 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
       : 0;
   const progressPercent = allDone ? 100 : Math.round((stageIndex + 1) / STAGES.length * 100);
   const displayName = (phase.kind === "busy" ? busyTargetRef.current?.display_name : null) ?? target.display_name;
+  const doneWarnings = phase.kind === "done"
+    ? [
+        phase.receipt.current_profile_saved ? null : "应用未能记住当前账号；请刷新账号页，问题持续时重启应用。",
+        phase.receipt.relaunch_outcome === "failed" ? "账号已切换，但 TRAE 未能自动启动，请手动启动 TRAE。" : null,
+        phase.refreshFailed ? "账号页刷新失败，请稍后手动刷新。" : null,
+      ].filter((warning): warning is string => warning !== null)
+    : [];
   const forceResetAvailable = phase.kind === "failed"
     && ["master_login_missing", "switch_auth_failed", "switch_verify_failed"].includes(phase.code ?? "");
 
@@ -392,17 +404,29 @@ export function MasterSwitchDialog({ target, onFinished, onClose }: MasterSwitch
                 </span>
               </div>
             )}
+            {doneWarnings.length > 0 && (
+              <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+                <TriangleAlert size={18} aria-hidden="true" />
+                <p>{doneWarnings.join(" ")}</p>
+              </div>
+            )}
             <div className="switch-dialog__bar" aria-hidden="true">
               <div className="switch-dialog__bar-fill" style={{ width: `${progressPercent}%` }} />
             </div>
             <ol className="switch-dialog__steps">
               {STAGES.map((item, index) => {
-                const state = phase.kind === "done" || index < stageIndex ? "done"
+                const restartFailed = phase.kind === "done"
+                  && item.stage === "restarting"
+                  && phase.receipt.relaunch_outcome === "failed";
+                const state = restartFailed ? "failed"
+                  : phase.kind === "done" || index < stageIndex ? "done"
                   : phase.kind === "running" && index === stageIndex ? "run" : "idle";
                 return (
                   <li key={item.stage} className={`switch-step switch-step--${state}`} data-stage={item.stage}>
                     <span className="switch-step__icon" aria-hidden="true">
-                      {state === "done" ? <CheckCircle2 size={16} /> : <span className="switch-step__ring" />}
+                      {state === "done" ? <CheckCircle2 size={16} />
+                        : state === "failed" ? <TriangleAlert size={16} />
+                          : <span className="switch-step__ring" />}
                     </span>
                     <span className="switch-step__label">{item.label}</span>
                   </li>

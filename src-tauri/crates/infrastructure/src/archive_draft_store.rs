@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::operation_lease::FileOperationLock;
 
 const STORE_FILE: &str = "archive-drafts.json";
 /// 存储上限：与环境注册表同口径（256 KB）。
@@ -134,6 +135,12 @@ impl ArchiveDraftStore {
             return Err(ArchiveDraftStoreError::Invalid);
         }
         draft.validate()?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| ArchiveDraftStoreError::Io)?;
+        }
+        // 多库草稿共用一份 JSON；锁需覆盖整表读取、修改和发布。
+        let _lock = FileOperationLock::acquire_sibling_resource(&self.path)
+            .map_err(|_| ArchiveDraftStoreError::Io)?;
         let mut drafts = self.load()?;
         if draft.is_empty() {
             // 空草稿即清除该库键（应用归档后草稿清空的路径）。
@@ -147,9 +154,6 @@ impl ArchiveDraftStore {
         };
         let content =
             serde_json::to_string_pretty(&file).map_err(|_| ArchiveDraftStoreError::Invalid)?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|_| ArchiveDraftStoreError::Io)?;
-        }
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, content.as_bytes()).map_err(|_| ArchiveDraftStoreError::Io)?;
         publish_replacing(&temporary, &self.path).map_err(|_| ArchiveDraftStoreError::Io)
@@ -190,6 +194,37 @@ mod tests {
     }
 
     #[test]
+    fn set_waits_for_the_shared_file_lock_and_preserves_other_library_drafts() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        store
+            .set("master", &draft(&["master-session"], &[]))
+            .unwrap();
+        let path = root.path().join(STORE_FILE);
+        let held_lock = FileOperationLock::acquire_sibling_resource(&path).unwrap();
+        let writer_store = ArchiveDraftStore::new(root.path());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = writer_store.set("env-1", &draft(&["env-session"], &[]));
+            done_tx.send(result).unwrap();
+        });
+
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(held_lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.get("master"), Some(&draft(&["master-session"], &[])));
+        assert_eq!(loaded.get("env-1"), Some(&draft(&["env-session"], &[])));
+    }
+
+    #[test]
     fn libraries_are_isolated_and_empty_draft_removes_key() {
         let root = tempfile::tempdir().unwrap();
         let s = store(root.path());
@@ -218,11 +253,16 @@ mod tests {
         let path = root.path().join(STORE_FILE);
         std::fs::write(&path, "{ not json").unwrap();
         // 损坏 fail-closed：读取报错（命令层降级为空草稿），文件保留（铁律）。
-        assert_eq!(store(root.path()).load().unwrap_err(), ArchiveDraftStoreError::Invalid);
+        assert_eq!(
+            store(root.path()).load().unwrap_err(),
+            ArchiveDraftStoreError::Invalid
+        );
         assert!(path.exists());
         // 写入同样拒绝：不覆盖损坏文件，避免吞掉其他库的草稿证据。
         assert_eq!(
-            store(root.path()).set("master", &draft(&["s1"], &[])).unwrap_err(),
+            store(root.path())
+                .set("master", &draft(&["s1"], &[]))
+                .unwrap_err(),
             ArchiveDraftStoreError::Invalid
         );
         assert!(path.exists());
@@ -234,7 +274,10 @@ mod tests {
         let path = root.path().join(STORE_FILE);
         // 超过 256 KB 视为异常文件（防垃圾膨胀），fail-closed。
         std::fs::write(&path, "x".repeat((MAX_STORE_BYTES + 1) as usize)).unwrap();
-        assert_eq!(store(root.path()).load().unwrap_err(), ArchiveDraftStoreError::Invalid);
+        assert_eq!(
+            store(root.path()).load().unwrap_err(),
+            ArchiveDraftStoreError::Invalid
+        );
     }
 
     #[test]
@@ -247,7 +290,8 @@ mod tests {
             ArchiveDraftStoreError::Invalid
         );
         assert_eq!(
-            s.set(&"l".repeat(MAX_LIBRARY_ID_BYTES + 1), &draft(&["s1"], &[])).unwrap_err(),
+            s.set(&"l".repeat(MAX_LIBRARY_ID_BYTES + 1), &draft(&["s1"], &[]))
+                .unwrap_err(),
             ArchiveDraftStoreError::Invalid
         );
         // 草稿非法：空 id / 超长 id / restore 与 archive 重叠。
@@ -256,7 +300,11 @@ mod tests {
             ArchiveDraftStoreError::Invalid
         );
         assert_eq!(
-            s.set("master", &draft(&[&"s".repeat(MAX_SESSION_ID_BYTES + 1)], &[])).unwrap_err(),
+            s.set(
+                "master",
+                &draft(&[&"s".repeat(MAX_SESSION_ID_BYTES + 1)], &[])
+            )
+            .unwrap_err(),
             ArchiveDraftStoreError::Invalid
         );
         assert_eq!(

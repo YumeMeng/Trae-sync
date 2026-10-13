@@ -166,6 +166,10 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "TRAE 正在运行，请关闭后重试。",
   ],
   [
+    /process_state_unknown|process_target_ambiguous|wrong_target_process/i,
+    "无法确认 TRAE 的运行状态，本次操作已停止以保护数据；请关闭相关客户端后重试。",
+  ],
+  [
     /storage_root_unavailable|存储根.*不可用|恢复区.*不可用/i,
     "本地存储暂不可用，请检查磁盘后重试。",
   ],
@@ -182,8 +186,8 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "当前能力仍保持只读，相关操作暂不可用。",
   ],
   [
-    /another_operation_running|operation_lease_busy|操作正在进行/i,
-    "已有操作正在进行，请稍后重试。",
+    /another_operation_running|operation_lease_busy|operation_lease_unavailable|操作正在进行/i,
+    "同一数据目录的另一个写入操作正在进行，请稍后重试。",
   ],
   [
     /manual_recovery_required/i,
@@ -272,7 +276,15 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
   ],
   [
     /master_archive_write_failed/i,
-    "会话操作未完成，数据保持操作前状态；请稍后重试。",
+    "会话操作在提交前失败，数据库未提交修改；请稍后重试。",
+  ],
+  [
+    /master_archive_commit_outcome_unknown/i,
+    "会话操作的提交结果无法确认。请保留当前草稿和数据备份，检查数据库状态后再决定下一步，不要直接重试。",
+  ],
+  [
+    /master_archive_committed_needs_attention/i,
+    "会话操作已提交，但写后校验未通过。请保留数据备份，不要重复应用；检查数据库状态后再继续。",
   ],
   [
     /master_archive_backup_failed/i,
@@ -331,8 +343,12 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "存在同名项目的记录冲突，已停止归入以保护数据；请先在主库详情的对话列表中合并同名分组后再试。",
   ],
   [
-    /master_incorporate_integrity_failed/i,
-    "归入后数据校验未通过，已保留操作前备份；请重启工具后用备份恢复并反馈。",
+    /master_incorporate_committed_needs_attention/i,
+    "记录已归入主库，但写后校验未通过。请保留操作前备份，不要重复归入；检查主库后再继续。",
+  ],
+  [
+    /master_incorporate_commit_outcome_unknown/i,
+    "记录归入主库的提交结果无法确认。请保留操作前备份并检查主库状态，不要重复归入。",
   ],
   [
     /master_incorporate_join_failed/i,
@@ -510,8 +526,12 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "该环境的对话库暂时无法打开，请稍后重试。",
   ],
   [
-    /environment_login_integrity_failed/i,
-    "切换后数据校验未通过，已自动还原到切换前状态；请稍后重试。",
+    /environment_login_committed_needs_attention/i,
+    "环境登录信息和对话记录已切换，但写后校验未通过；当前账号档案可能尚未更新。请保留备份，不要重复登录切换，检查数据后再继续。",
+  ],
+  [
+    /environment_login_commit_outcome_unknown/i,
+    "环境登录信息已切换，但对话记录提交结果无法确认；当前账号档案可能尚未更新。请保留备份并检查环境状态，不要重复登录切换。",
   ],
   [
     /environment_login_rollback_failed/i,
@@ -554,23 +574,10 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /remote_device_protocol/i,
     "服务端返回了无法识别的设备信息，请稍后重试或使用官方管理页。",
   ],
-  // ===== P13-1 Trae CN 签到：稳定原因码映射（业务码不在此压平——
-  // 签到区块先按 trae_cn_checkin_business_{code} 提取数值展示，再落到词表） =====
+  // ===== P15-7：旧 CN 签到命令族已随产品合并移除，trae_cn_checkin_* 词表同步清退 =====
   [
-    /trae_cn_checkin_network|trae_cn_checkin_http_/i,
-    "网络或服务暂时不可用，请稍后重试。",
-  ],
-  [
-    /trae_cn_checkin_credential_/i,
-    "登录凭据不可用，请先完成登录或刷新登录凭据。",
-  ],
-  [
-    /trae_cn_checkin_protocol/i,
-    "服务端返回了无法识别的签到信息，请稍后重试。",
-  ],
-  [
-    /trae_cn_checkin_join_failed/i,
-    "签到操作未能完成，请稍后重试。",
+    /trae_cn_account_selection_superseded/i,
+    "另一个较新的账号操作正在处理，本次切换没有生效；请刷新后查看当前账号。",
   ],
   [
     /trae_cn_account_not_found|trae_cn_registry_invalid/i,
@@ -602,8 +609,12 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "当前账号信息不可用，请先在「账号」页登录 Trae CN 后重试。",
   ],
   [
-    /trae_cn_merge_integrity_failed/i,
-    "归并后数据校验未通过，已保留操作前备份；请用备份恢复并反馈。",
+    /trae_cn_merge_committed_needs_attention/i,
+    "项目归并已提交，但写后校验未通过。请保留操作前备份，不要重复归并；检查数据后再继续。",
+  ],
+  [
+    /trae_cn_merge_commit_outcome_unknown/i,
+    "项目归并的提交结果无法确认。请保留操作前备份并检查数据库状态，不要重复归并。",
   ],
   [
     /trae_cn_merge_backup_failed|trae_cn_merge_db_missing|trae_cn_merge_db_open_failed|trae_cn_merge_join_failed/i,
@@ -633,6 +644,14 @@ function errorText(error: unknown): string {
     if (parts.length > 0) return parts.join("\n");
   }
   return "";
+}
+
+/** 归档提交异常要先刷新列表核对，不能直接再次应用同一草稿。 */
+export function masterArchiveCommitFailure(error: unknown): "unknown" | "committed" | null {
+  const text = errorText(error);
+  if (/master_archive_commit_outcome_unknown/i.test(text)) return "unknown";
+  if (/master_archive_committed_needs_attention/i.test(text)) return "committed";
+  return null;
 }
 
 /**
@@ -679,7 +698,7 @@ export function safeUiRecommendedAction(error: unknown, fallback: string): strin
   if (/operation_state_unavailable/i.test(text)) {
     return "保留现有证据，稍后重新打开操作页重试。";
   }
-  if (/another_operation_running|operation_lease_busy/i.test(text)) {
+  if (/another_operation_running|operation_lease_busy|operation_lease_unavailable/i.test(text)) {
     return "等待当前操作结束后再重试。";
   }
   if (/plan_unavailable|没有可执行的同步计划/i.test(text)) {

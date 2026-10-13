@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::operation_lease::FileOperationLock;
 
 const MANIFEST_FILE: &str = "plugin-manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
@@ -118,22 +119,67 @@ impl PluginManifest {
         Ok(Some(manifest.plugins))
     }
 
+    /// 首次导入只在清单仍缺失时发布，避免与同时完成的插件写入互相覆盖。
+    pub fn initialize(
+        &self,
+        entries: &[PluginManifestEntry],
+    ) -> Result<Vec<PluginManifestEntry>, PluginManifestError> {
+        let _lock = self.acquire_write_lock()?;
+        if let Some(existing) = self.load()? {
+            return Ok(existing);
+        }
+        self.write(entries)?;
+        Ok(entries.to_vec())
+    }
+
+    /// 在文件锁内重新读取并更新一个市场插件，保留其它条目。
+    pub fn upsert(&self, entry: &PluginManifestEntry) -> Result<(), PluginManifestError> {
+        entry.validate()?;
+        let _lock = self.acquire_write_lock()?;
+        let mut entries = self.load()?.unwrap_or_default();
+        entries.retain(|existing| existing.marketplace_plugin_id != entry.marketplace_plugin_id);
+        entries.push(entry.clone());
+        self.write(&entries)
+    }
+
+    /// 在文件锁内重新读取并移除一个市场插件，保留其它条目。
+    pub fn remove(&self, marketplace_plugin_id: &str) -> Result<(), PluginManifestError> {
+        let _lock = self.acquire_write_lock()?;
+        let Some(mut entries) = self.load()? else {
+            return Ok(());
+        };
+        entries.retain(|entry| entry.marketplace_plugin_id != marketplace_plugin_id);
+        self.write(&entries)
+    }
+
     /// 原子写入：失败时保留原文件。
     /// 文件已存在但损坏时拒绝写入（报错而非静默重建——档案纪律）。
     pub fn save(&self, entries: &[PluginManifestEntry]) -> Result<(), PluginManifestError> {
+        let _lock = self.acquire_write_lock()?;
         if self.path.exists() {
             // load 返回 Ok(None) 不可能（文件已存在）；Err = 损坏，拒绝覆盖。
             if self.load()?.is_none() {
                 return Err(PluginManifestError::Invalid);
             }
         }
+        self.write(entries)
+    }
+
+    fn acquire_write_lock(&self) -> Result<FileOperationLock, PluginManifestError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| PluginManifestError::Io)?;
+        }
+        FileOperationLock::acquire_sibling_resource(&self.path).map_err(|_| PluginManifestError::Io)
+    }
+
+    fn write(&self, entries: &[PluginManifestEntry]) -> Result<(), PluginManifestError> {
         validate_entries(entries)?;
         let manifest = ManifestFile {
             format_version: 1,
             plugins: entries.to_vec(),
         };
-        let content = serde_json::to_string_pretty(&manifest)
-            .map_err(|_| PluginManifestError::Invalid)?;
+        let content =
+            serde_json::to_string_pretty(&manifest).map_err(|_| PluginManifestError::Invalid)?;
         let bytes = content.as_bytes();
         if bytes.len() as u64 > MAX_MANIFEST_BYTES {
             return Err(PluginManifestError::Invalid);
@@ -181,6 +227,54 @@ mod tests {
     }
 
     #[test]
+    fn upsert_waits_for_the_manifest_lock_and_preserves_unrelated_entries() {
+        let root = tempdir().unwrap();
+        let manifest = PluginManifest::new(root.path());
+        manifest.save(&[entry("uuid-a", 100)]).unwrap();
+        let path = root.path().join(MANIFEST_FILE);
+        let held_lock = FileOperationLock::acquire_sibling_resource(&path).unwrap();
+        let writer_manifest = PluginManifest::new(root.path());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = writer_manifest.upsert(&entry("uuid-b", 200));
+            done_tx.send(result).unwrap();
+        });
+
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(held_lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(
+            manifest.load().unwrap(),
+            Some(vec![entry("uuid-a", 100), entry("uuid-b", 200)])
+        );
+        manifest.remove("uuid-b").unwrap();
+        assert_eq!(manifest.load().unwrap(), Some(vec![entry("uuid-a", 100)]));
+    }
+
+    #[test]
+    fn initialize_does_not_replace_a_manifest_created_by_another_writer() {
+        let root = tempdir().unwrap();
+        let manifest = PluginManifest::new(root.path());
+        manifest.save(&[entry("installed", 100)]).unwrap();
+
+        assert_eq!(
+            manifest.initialize(&[entry("stale-cloud-snapshot", 200)]),
+            Ok(vec![entry("installed", 100)])
+        );
+        assert_eq!(
+            manifest.load().unwrap(),
+            Some(vec![entry("installed", 100)])
+        );
+    }
+
+    #[test]
     fn empty_manifest_persists_and_distinct_from_missing() {
         let root = tempdir().unwrap();
         let manifest = PluginManifest::new(root.path());
@@ -194,7 +288,10 @@ mod tests {
         let root = tempdir().unwrap();
         let manifest = PluginManifest::new(root.path());
         let entries = vec![entry("uuid-a", 100), entry("uuid-a", 200)];
-        assert_eq!(manifest.save(&entries), Err(PluginManifestError::InvalidEntry));
+        assert_eq!(
+            manifest.save(&entries),
+            Err(PluginManifestError::InvalidEntry)
+        );
     }
 
     #[test]
@@ -211,17 +308,19 @@ mod tests {
             Err(PluginManifestError::Invalid)
         );
         // 版本不符（V2 格式倒灌防护）。
-        std::fs::write(
-            &path,
-            r#"{"format_version":2,"plugins":[]}"#,
-        )
-        .unwrap();
+        std::fs::write(&path, r#"{"format_version":2,"plugins":[]}"#).unwrap();
         assert_eq!(manifest.load().unwrap_err(), PluginManifestError::Invalid);
     }
 
     #[test]
     fn blank_fields_rejected() {
-        assert_eq!(entry("", 100).validate(), Err(PluginManifestError::InvalidEntry));
-        assert_eq!(entry("uuid", 0).validate(), Err(PluginManifestError::InvalidEntry));
+        assert_eq!(
+            entry("", 100).validate(),
+            Err(PluginManifestError::InvalidEntry)
+        );
+        assert_eq!(
+            entry("uuid", 0).validate(),
+            Err(PluginManifestError::InvalidEntry)
+        );
     }
 }

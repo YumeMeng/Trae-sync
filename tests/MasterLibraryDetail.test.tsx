@@ -40,6 +40,7 @@ function envState(overrides: Partial<EnvironmentStateDto> = {}): EnvironmentStat
     env_id: "master",
     current_profile_id: "profile-a",
     current_account_name: "账号甲",
+    observed_profile_id: "profile-a",
     data_dir: "C:\\TraeSync\\data\\environments\\master",
     running: true,
     login_state: "logged_in",
@@ -386,7 +387,7 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
   });
 
   // ==========================================================================
-  // P11-6（ADR-0032 决策 5）+ P13-3（ADR-0033）：Trae CN 数据根详情。
+  // P11-6（ADR-0032 决策 5）+ P13-3（ADR-0033）：TRAE 数据根详情。
   // 后端契约：trae_cn 库读放行（历史/消息/统计），选择性写开放（归档/恢复
   // 经 ensure_archive_writable；删除/合并项目仍 library_read_only），体检
   // not_applicable——前端按 archive-only 能力呈现：归档控件开放，删除/合并
@@ -460,17 +461,18 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     });
   }
 
-  it("P11-6→P13-3：trae_cn 详情——标题取注册表口径，归档控件按能力开放，历史列表挂载", async () => {
+  it("P14-1a：trae_cn 详情——未验收写入口隐藏，历史列表仍可浏览", async () => {
     setupTraeCnDetail();
     render(<MasterLibraryDetail active onNavigate={() => undefined} library={{ id: "trae_cn" }} />);
 
-    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Trae CN 数据根");
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("TRAE 数据根");
     // 历史列表正常挂载（读路径放行）。
     fireEvent.click(await screen.findByTestId("library-project-p-t1"));
     await screen.findByTestId("library-session-s-t1");
-    // P13-3：CN 库 archive-only——批量选择入口与悬浮快捷归档按能力开放。
-    expect(screen.getByTestId("library-select-mode")).toBeInTheDocument();
-    expect(screen.getByTestId("library-quick-archive-s-t1")).toBeInTheDocument();
+    // 能力快照读取失败时不开放归档入口，已验证的历史浏览仍可用。
+    expect(screen.getByTestId("library-cn-write-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("library-quick-archive-s-t1")).not.toBeInTheDocument();
     // 只读库不做环境档案查询（工具不管理 Trae CN 登录态）。
     expect(mockInvoke).not.toHaveBeenCalledWith("get_environment_state", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith("list_environments", expect.anything());
@@ -501,7 +503,7 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     expect(screen.queryByTestId("plugin-workbench")).not.toBeInTheDocument();
   });
 
-  it("P13-2：trae_cn 归并入口——其他账号项目组随读路径下发，主库不发归并清单读取", async () => {
+  it("P14-1a：trae_cn 归并待验收时保留只读项目资料，不显示归并动作", async () => {
     setupTraeCnDetail();
     render(<MasterLibraryDetail active onNavigate={() => undefined} library={{ id: "trae_cn" }} />);
 
@@ -509,7 +511,7 @@ describe("MasterLibraryDetail（P5-8a-2 主库详情页 shell）", () => {
     const group = await screen.findByTestId("library-foreign-group");
     expect(group).toHaveTextContent("其他账号的项目");
     expect(screen.getByTestId("library-foreign-project-p-f1")).toHaveTextContent("其他账号目录");
-    expect(screen.getByTestId("library-merge-entry-p-f1")).toHaveTextContent("归并到当前账号");
+    expect(screen.queryByTestId("library-merge-entry-p-f1")).not.toBeInTheDocument();
     expect(mockInvoke).toHaveBeenCalledWith("list_trae_cn_foreign_projects", {
       libraryId: "trae_cn",
     });

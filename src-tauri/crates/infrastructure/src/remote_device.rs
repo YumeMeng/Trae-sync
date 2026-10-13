@@ -235,11 +235,9 @@ fn credential_load_error(error: CheckinCredentialError) -> RemoteDeviceError {
 impl RemoteDeviceManager for RealRemoteDeviceManager {
     fn list_devices(&self, profile_id: &str) -> Result<RemoteDeviceSnapshot, RemoteDeviceError> {
         let bundle = self.credential_bundle(profile_id)?;
-        let envelope = self.http.list_devices(
-            &bundle.access_token,
-            &bundle.client_id,
-            &bundle.device_id,
-        )?;
+        let envelope =
+            self.http
+                .list_devices(&bundle.access_token, &bundle.client_id, &bundle.device_id)?;
         parse_device_snapshot(&envelope, &bundle.device_id)
     }
 
@@ -258,11 +256,9 @@ impl RemoteDeviceManager for RealRemoteDeviceManager {
         // device_id 是两套标识体系，仅靠本地比对防不住真实本机行。退出前
         // 先拉一次只读列表，目标行带 CurrentDevice 标记即拒绝且不发起
         // 退出请求；目标不在列表中时交由服务端裁决。
-        let envelope = self.http.list_devices(
-            &bundle.access_token,
-            &bundle.client_id,
-            &bundle.device_id,
-        )?;
+        let envelope =
+            self.http
+                .list_devices(&bundle.access_token, &bundle.client_id, &bundle.device_id)?;
         let snapshot = parse_device_snapshot(&envelope, &bundle.device_id)?;
         if let Some(row) = snapshot
             .devices
@@ -273,9 +269,11 @@ impl RemoteDeviceManager for RealRemoteDeviceManager {
                 return Err(RemoteDeviceError::LocalDeviceTargeted);
             }
         }
-        let envelope =
-            self.http
-                .clear_refresh_token(&bundle.access_token, &bundle.client_id, target_device_id)?;
+        let envelope = self.http.clear_refresh_token(
+            &bundle.access_token,
+            &bundle.client_id,
+            target_device_id,
+        )?;
         // 退出响应：有 Error.Code 且非 0 → 业务失败；否则视为成功
         // （官方页退出后随即重拉设备列表，本模块不代拉）。
         if let Some(code) = envelope_error_code(&envelope) {
@@ -474,7 +472,8 @@ mod tests {
     ) -> Fixture {
         let root = tempfile::tempdir().unwrap();
         let store = CheckinCredentialStore::new(root.path());
-        let (private_key, public_key) = crate::checkin_credential::generate_device_keypair().unwrap();
+        let (private_key, public_key) =
+            crate::checkin_credential::generate_device_keypair().unwrap();
         let now = 1_800_000_000u64;
         let client_id = client_id_override
             .map(str::to_string)
@@ -494,12 +493,8 @@ mod tests {
             mobile_full: None,
         };
         store.save(&bundle).unwrap();
-        let binding = CheckinProfileBinding::new(
-            PROFILE_ID,
-            "account-device",
-            LOCAL_DEVICE_ID,
-            public_key,
-        );
+        let binding =
+            CheckinProfileBinding::new(PROFILE_ID, "account-device", LOCAL_DEVICE_ID, public_key);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let list_requests = Arc::new(Mutex::new(Vec::new()));
         let clear_requests = Arc::new(Mutex::new(Vec::new()));
@@ -662,7 +657,10 @@ mod tests {
         );
         let fixture = fixture_manager(Ok(envelope), Ok(json!({})), None, OAuthClient::Solo);
         let snapshot = fixture.manager.list_devices(PROFILE_ID).unwrap();
-        assert!(snapshot.devices[0].is_local, "本机凭据 device_id 命中的行标记为本机（兜底路径）");
+        assert!(
+            snapshot.devices[0].is_local,
+            "本机凭据 device_id 命中的行标记为本机（兜底路径）"
+        );
         assert!(!snapshot.devices[1].is_local);
     }
 
@@ -685,7 +683,10 @@ mod tests {
         let snapshot = fixture.manager.list_devices(PROFILE_ID).unwrap();
         assert!(snapshot.devices[0].is_local, "CurrentDevice=true 命中本机");
         assert!(!snapshot.devices[1].is_local);
-        assert!(!snapshot.devices[2].is_local, "无标记且 device_id 不等 → 非本机");
+        assert!(
+            !snapshot.devices[2].is_local,
+            "无标记且 device_id 不等 → 非本机"
+        );
     }
 
     #[test]

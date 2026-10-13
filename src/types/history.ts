@@ -85,8 +85,8 @@ export interface MasterMergeResultDto {
 export interface MasterArchiveApplyResultDto {
   readonly archived_sessions: number;
   readonly restored_sessions: number;
-  /** launched/focused/failed；failed 表示数据库已提交但实例待恢复。 */
-  readonly relaunch_outcome: string;
+  /** failed 表示库已提交但实例待启动；not_requested 表示产品自行管理客户端生命周期。 */
+  readonly relaunch_outcome: "launched" | "focused" | "failed" | "not_requested";
 }
 
 /**

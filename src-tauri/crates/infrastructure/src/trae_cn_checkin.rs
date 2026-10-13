@@ -73,7 +73,11 @@ pub fn claim_request(access_token: &str, device_id: &str) -> TraeCnCheckinReques
 
 /// status/claim 共同请求形状：与探针 `probe_one` 通过形态逐项同源
 /// （认证头 + 设备头 + 最小标准头 + `{}` 体），不假借 Work SOLO 遥测值。
-fn checkin_request(path: &'static str, access_token: &str, device_id: &str) -> TraeCnCheckinRequest {
+fn checkin_request(
+    path: &'static str,
+    access_token: &str,
+    device_id: &str,
+) -> TraeCnCheckinRequest {
     TraeCnCheckinRequest {
         method: "POST",
         path,
@@ -182,7 +186,10 @@ pub fn parse_status_envelope(envelope: &Value) -> Result<TraeCnCheckinStatus, Tr
         return Err(TraeCnCheckinError::Business(code));
     }
     Ok(TraeCnCheckinStatus {
-        enable: envelope.get("enable").and_then(Value::as_bool).unwrap_or(false),
+        enable: envelope
+            .get("enable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         checked_in: envelope
             .get("checked_in")
             .and_then(Value::as_bool)
@@ -412,10 +419,13 @@ mod tests {
             request
                 .headers
                 .iter()
-                .find(|(key, _)| *key ==name)
+                .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.clone())
         };
-        assert_eq!(header("Authorization").as_deref(), Some("Cloud-IDE-JWT token-1"));
+        assert_eq!(
+            header("Authorization").as_deref(),
+            Some("Cloud-IDE-JWT token-1")
+        );
         assert_eq!(header("x-device-id").as_deref(), Some("device-1"));
         assert_eq!(header("Content-Type").as_deref(), Some("application/json"));
         assert_eq!(header("x-user-region").as_deref(), Some("CN"));
@@ -437,10 +447,13 @@ mod tests {
             request
                 .headers
                 .iter()
-                .find(|(key, _)| *key ==name)
+                .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.clone())
         };
-        assert_eq!(header("Authorization").as_deref(), Some("Cloud-IDE-JWT token-1"));
+        assert_eq!(
+            header("Authorization").as_deref(),
+            Some("Cloud-IDE-JWT token-1")
+        );
         assert_eq!(header("x-device-id").as_deref(), Some("device-1"));
     }
 
@@ -548,13 +561,22 @@ mod tests {
     /// 不携带 Token 或响应正文。
     #[test]
     fn error_display_uses_stable_snake_case_codes() {
-        assert_eq!(TraeCnCheckinError::Network.to_string(), "trae_cn_checkin_network");
-        assert_eq!(TraeCnCheckinError::Http(502).to_string(), "trae_cn_checkin_http_502");
+        assert_eq!(
+            TraeCnCheckinError::Network.to_string(),
+            "trae_cn_checkin_network"
+        );
+        assert_eq!(
+            TraeCnCheckinError::Http(502).to_string(),
+            "trae_cn_checkin_http_502"
+        );
         assert_eq!(
             TraeCnCheckinError::Business(9095).to_string(),
             "trae_cn_checkin_business_9095"
         );
-        assert_eq!(TraeCnCheckinError::Protocol.to_string(), "trae_cn_checkin_protocol");
+        assert_eq!(
+            TraeCnCheckinError::Protocol.to_string(),
+            "trae_cn_checkin_protocol"
+        );
         assert_eq!(
             TraeCnCheckinError::Credential("client_mismatch").to_string(),
             "trae_cn_checkin_credential_client_mismatch"
@@ -580,7 +602,10 @@ mod tests {
         }
 
         impl TraeCnCheckinHttp for FakeCheckinHttp {
-            fn send(&self, request: TraeCnCheckinRequest) -> Result<serde_json::Value, TraeCnCheckinError> {
+            fn send(
+                &self,
+                request: TraeCnCheckinRequest,
+            ) -> Result<serde_json::Value, TraeCnCheckinError> {
                 self.requests.lock().unwrap().push(request);
                 self.result.clone()
             }
@@ -674,7 +699,7 @@ mod tests {
                 requests[0]
                     .headers
                     .iter()
-                    .find(|(key, _)| *key =="Authorization")
+                    .find(|(key, _)| *key == "Authorization")
                     .map(|(_, value)| value.clone()),
                 Some(format!("Cloud-IDE-JWT {}", fixture.access_token))
             );
@@ -682,7 +707,7 @@ mod tests {
                 requests[0]
                     .headers
                     .iter()
-                    .find(|(key, _)| *key =="x-device-id")
+                    .find(|(key, _)| *key == "x-device-id")
                     .map(|(_, value)| value.clone()),
                 Some(DEVICE_ID.to_string())
             );
@@ -697,12 +722,12 @@ mod tests {
             );
             let claim = ok.client.claim(PROFILE_ID).unwrap();
             assert_eq!(claim.credits, Some(205));
-            assert_eq!(ok.requests.lock().unwrap()[0].path, "/trae/api/v2/ug/checkin_credits/claim");
-
-            let rejected = fixture_client(
-                Ok(json!({"code": 9074, "message": "device"})),
-                None,
+            assert_eq!(
+                ok.requests.lock().unwrap()[0].path,
+                "/trae/api/v2/ug/checkin_credits/claim"
             );
+
+            let rejected = fixture_client(Ok(json!({"code": 9074, "message": "device"})), None);
             assert_eq!(
                 rejected.client.claim(PROFILE_ID).unwrap_err(),
                 TraeCnCheckinError::Business(9074)

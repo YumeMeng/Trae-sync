@@ -7,9 +7,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
+use fs2::{lock_contended_error, FileExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use traesync_ports::FileIdentityProvider;
+
+use crate::file_identity::PlatformFileIdentityProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationLeaseError {
@@ -17,6 +20,7 @@ pub enum OperationLeaseError {
     DataLocationBusy,
     LockDirectoryUnavailable,
     InvalidLocationId,
+    InvalidResourcePath,
     InvalidStorageRoot,
     LeaseContextUnbound,
     StorageRootMismatch,
@@ -29,6 +33,7 @@ impl std::fmt::Display for OperationLeaseError {
             Self::DataLocationBusy => "数据位置已有其他写操作",
             Self::LockDirectoryUnavailable => "锁目录不可用",
             Self::InvalidLocationId => "数据位置标识无效",
+            Self::InvalidResourcePath => "数据资源路径无效",
             Self::InvalidStorageRoot => "存储根无效",
             Self::LeaseContextUnbound => "租约未绑定存储根",
             Self::StorageRootMismatch => "租约与存储根不匹配",
@@ -52,7 +57,7 @@ pub struct OperationLease {
     data_location_id: String,
     catalog_path: PathBuf,
     data_path: PathBuf,
-    catalog_file: File,
+    catalog_file: Option<File>,
     data_file: File,
     /// 目录库入口必须绑定到取得租约时验证过的存储根；普通数据位置租约可为空。
     bound_storage_root: Option<PathBuf>,
@@ -70,15 +75,25 @@ impl std::fmt::Debug for OperationLease {
 }
 
 impl OperationLease {
-    /// 供非 fixture 的本机受控写入口复用固定恢复区与数据位置租约。
+    /// 供非 fixture 的本机受控写入口复用按数据位置划分的租约。
     ///
-    /// 调用方必须先完成数据位置授权与路径见证；该方法只负责取得共享锁，
-    /// 不替代上层的 Gate、进程观测或写前复核。
+    /// 此租约不拿目录库全局锁，避免独立 TRAE 数据目录互相阻塞。
+    /// 调用方仍须完成数据位置授权、进程观测与写前复核。
     pub fn acquire_shared(
         recovery_root: &Path,
         data_location_id: &str,
     ) -> Result<Self, OperationLeaseError> {
-        Self::acquire(recovery_root, data_location_id)
+        Self::acquire_data_only(recovery_root, data_location_id)
+    }
+
+    /// 按实际数据目录身份取得租约；同一物理父目录下同名资源共用锁，
+    /// 即使调用方通过不同路径别名进入也不会分出两把锁。
+    pub fn acquire_shared_for_path(
+        recovery_root: &Path,
+        resource_path: &Path,
+    ) -> Result<Self, OperationLeaseError> {
+        let resource_id = resource_location_id(resource_path)?;
+        Self::acquire_data_only(recovery_root, &resource_id)
     }
 
     pub(crate) fn acquire(
@@ -97,31 +112,65 @@ impl OperationLease {
         let lock_dir = ensure_lock_directory(&canonical_recovery_root)?;
         let catalog_path = lock_dir.join("catalog-write.lock");
         let data_path = lock_dir.join(format!("data-{}.lock", hash_id(data_location_id)));
-        let catalog_file =
-            open_lock_file(&catalog_path).map_err(|_| OperationLeaseError::CatalogBusy)?;
-        if catalog_file.try_lock_exclusive().is_err() {
-            return Err(OperationLeaseError::CatalogBusy);
+        let catalog_file = open_lock_file(&catalog_path)
+            .map_err(|_| OperationLeaseError::LockDirectoryUnavailable)?;
+        if let Err(error) = catalog_file.try_lock_exclusive() {
+            return Err(map_lock_attempt_error(
+                error,
+                OperationLeaseError::CatalogBusy,
+            ));
         }
         let data_file = match open_lock_file(&data_path) {
             Ok(file) => file,
             Err(_) => {
                 let _ = catalog_file.unlock();
                 drop(catalog_file);
-                return Err(OperationLeaseError::DataLocationBusy);
+                return Err(OperationLeaseError::LockDirectoryUnavailable);
             }
         };
-        if data_file.try_lock_exclusive().is_err() {
+        if let Err(error) = data_file.try_lock_exclusive() {
             let _ = catalog_file.unlock();
             drop(data_file);
             drop(catalog_file);
-            return Err(OperationLeaseError::DataLocationBusy);
+            return Err(map_lock_attempt_error(
+                error,
+                OperationLeaseError::DataLocationBusy,
+            ));
         }
         Ok(Self {
             recovery_root: canonical_recovery_root,
             data_location_id: data_location_id.to_string(),
             catalog_path,
             data_path,
-            catalog_file,
+            catalog_file: Some(catalog_file),
+            data_file,
+            bound_storage_root: None,
+        })
+    }
+
+    fn acquire_data_only(
+        recovery_root: &Path,
+        data_location_id: &str,
+    ) -> Result<Self, OperationLeaseError> {
+        validate_location_id(data_location_id)?;
+        let canonical_recovery_root = canonical_storage_root(recovery_root)?;
+        let lock_dir = ensure_lock_directory(&canonical_recovery_root)?;
+        let catalog_path = lock_dir.join("catalog-write.lock");
+        let data_path = lock_dir.join(format!("data-{}.lock", hash_id(data_location_id)));
+        let data_file = open_lock_file(&data_path)
+            .map_err(|_| OperationLeaseError::LockDirectoryUnavailable)?;
+        if let Err(error) = data_file.try_lock_exclusive() {
+            return Err(map_lock_attempt_error(
+                error,
+                OperationLeaseError::DataLocationBusy,
+            ));
+        }
+        Ok(Self {
+            recovery_root: canonical_recovery_root,
+            data_location_id: data_location_id.to_string(),
+            catalog_path,
+            data_path,
+            catalog_file: None,
             data_file,
             bound_storage_root: None,
         })
@@ -246,10 +295,12 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 impl Drop for OperationLease {
     fn drop(&mut self) {
-        let _ = self.catalog_file.sync_all();
         let _ = self.data_file.sync_all();
         let _ = self.data_file.unlock();
-        let _ = self.catalog_file.unlock();
+        if let Some(catalog_file) = &self.catalog_file {
+            let _ = catalog_file.sync_all();
+            let _ = catalog_file.unlock();
+        }
         // 锁文件本身是稳定的命名锚点。释放时只解除 OS 锁，不删除路径，
         // 避免解锁与下一个进程重新加锁之间发生删除竞态。
     }
@@ -257,7 +308,7 @@ impl Drop for OperationLease {
 
 fn open_lock_file(path: &Path) -> io::Result<File> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
+        Ok(metadata) if is_reparse_point(&metadata) => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "锁标记不能是符号链接",
@@ -273,6 +324,123 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
+}
+
+/// 针对单个共享文件的短锁。锁文件与目标文件分开，目标可安全原子替换。
+pub struct FileOperationLock {
+    file: File,
+}
+
+impl FileOperationLock {
+    /// 锁定目标旁的稳定 sidecar，覆盖调用方的完整读改写过程。
+    pub fn acquire_sibling_resource(resource_path: &Path) -> Result<Self, OperationLeaseError> {
+        Self::acquire(&sibling_resource_lock_path(resource_path)?)
+    }
+
+    /// 非阻塞获取目标旁的稳定 sidecar；仅锁竞争返回 `Ok(None)`。
+    pub fn try_acquire_sibling_resource(
+        resource_path: &Path,
+    ) -> Result<Option<Self>, OperationLeaseError> {
+        Self::try_acquire(&sibling_resource_lock_path(resource_path)?)
+    }
+
+    fn acquire(lock_path: &Path) -> Result<Self, OperationLeaseError> {
+        let file =
+            open_lock_file(lock_path).map_err(|_| OperationLeaseError::LockDirectoryUnavailable)?;
+        file.lock_exclusive()
+            .map_err(|_| OperationLeaseError::LockDirectoryUnavailable)?;
+        Ok(Self { file })
+    }
+
+    fn try_acquire(lock_path: &Path) -> Result<Option<Self>, OperationLeaseError> {
+        let file =
+            open_lock_file(lock_path).map_err(|_| OperationLeaseError::LockDirectoryUnavailable)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if is_lock_contended_error(&error) => Ok(None),
+            Err(_) => Err(OperationLeaseError::LockDirectoryUnavailable),
+        }
+    }
+}
+
+impl Drop for FileOperationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn sibling_resource_lock_path(resource_path: &Path) -> Result<PathBuf, OperationLeaseError> {
+    let parent = resource_path
+        .parent()
+        .ok_or(OperationLeaseError::InvalidResourcePath)?
+        .canonicalize()
+        .map_err(|_| OperationLeaseError::InvalidResourcePath)?;
+    let name = resource_path
+        .file_name()
+        .ok_or(OperationLeaseError::InvalidResourcePath)?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".lock");
+    Ok(parent.join(lock_name))
+}
+
+fn resource_location_id(resource_path: &Path) -> Result<String, OperationLeaseError> {
+    let parent = resource_path
+        .parent()
+        .ok_or(OperationLeaseError::InvalidResourcePath)?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|_| OperationLeaseError::InvalidResourcePath)?;
+    let name = resource_path
+        .file_name()
+        .ok_or(OperationLeaseError::InvalidResourcePath)?
+        .to_string_lossy();
+    match fs::symlink_metadata(resource_path) {
+        Ok(metadata) if is_reparse_point(&metadata) => {
+            return Err(OperationLeaseError::InvalidResourcePath);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(OperationLeaseError::InvalidResourcePath),
+    }
+    let identity = PlatformFileIdentityProvider::new()
+        .read_file_identity(&canonical_parent)
+        .ok_or(OperationLeaseError::InvalidResourcePath)?;
+    let normalized_name = if cfg!(windows) {
+        name.to_lowercase()
+    } else {
+        name.into_owned()
+    };
+    let mut digest = Sha256::new();
+    digest.update(identity.volume_serial.to_le_bytes());
+    digest.update(identity.file_index_high.to_le_bytes());
+    digest.update(identity.file_index_low.to_le_bytes());
+    digest.update([0]);
+    digest.update(normalized_name.as_bytes());
+    Ok(format!("path-{}", hex::encode(digest.finalize())))
+}
+
+/// 只把 fs2 明确标记为锁竞争的错误报为占用，其余都归为锁设施不可用。
+fn map_lock_attempt_error(error: io::Error, busy: OperationLeaseError) -> OperationLeaseError {
+    if is_lock_contended_error(&error) {
+        busy
+    } else {
+        OperationLeaseError::LockDirectoryUnavailable
+    }
+}
+
+fn is_lock_contended_error(error: &io::Error) -> bool {
+    error.raw_os_error().is_some() && error.raw_os_error() == lock_contended_error().raw_os_error()
+}
+
+fn validate_location_id(data_location_id: &str) -> Result<(), OperationLeaseError> {
+    if data_location_id.is_empty()
+        || !data_location_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err(OperationLeaseError::InvalidLocationId);
+    }
+    Ok(())
 }
 
 fn is_lock_held(path: &Path) -> bool {
@@ -302,18 +470,12 @@ fn hash_id(data_location_id: &str) -> String {
     hex::encode(digest.finalize())
 }
 
-/// 查询目录库锁和数据位置锁，目录库锁永远先于数据位置锁参与判断。
+/// 查询目录库元数据锁与数据位置锁；`write_allowed` 只表示该数据位置可写。
 pub fn inspect_lock_status(
     recovery_root: &Path,
     data_location_id: &str,
 ) -> Result<OperationLockStatus, OperationLeaseError> {
-    if data_location_id.is_empty()
-        || !data_location_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
-    {
-        return Err(OperationLeaseError::InvalidLocationId);
-    }
+    validate_location_id(data_location_id)?;
     let lock_dir = recovery_root.join("locks");
     match fs::symlink_metadata(&lock_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -338,14 +500,16 @@ pub fn inspect_lock_status(
     Ok(OperationLockStatus {
         catalog_lock_held,
         data_location_lock_held,
-        write_allowed: !catalog_lock_held && !data_location_lock_held,
+        // catalog 锁保护共享目录库元数据，不代表本数据位置不可写。
+        write_allowed: !data_location_lock_held,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
 
     #[test]
     fn child_process_cannot_acquire_existing_lease() {
@@ -357,6 +521,62 @@ mod tests {
             OperationLease::acquire(Path::new(&root), "loc-one"),
             Err(OperationLeaseError::CatalogBusy)
         ));
+    }
+
+    #[test]
+    fn try_sibling_resource_lock_returns_none_only_for_contention() {
+        let parent = tempfile::tempdir().unwrap();
+        let resource_path = parent.path().join("shared.json");
+        let lock = FileOperationLock::acquire_sibling_resource(&resource_path).unwrap();
+
+        assert!(
+            FileOperationLock::try_acquire_sibling_resource(&resource_path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            FileOperationLock::try_acquire_sibling_resource(Path::new("invalid")),
+            Err(OperationLeaseError::InvalidResourcePath)
+        ));
+        drop(lock);
+        assert!(
+            FileOperationLock::try_acquire_sibling_resource(&resource_path)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn child_process_cannot_acquire_existing_path_lease() {
+        let (Ok(root), Ok(resource_path)) = (
+            std::env::var("TRAE_SYNC_PATH_LOCK_CHILD_ROOT"),
+            std::env::var("TRAE_SYNC_PATH_LOCK_CHILD_RESOURCE"),
+        ) else {
+            return;
+        };
+        assert!(matches!(
+            OperationLease::acquire_shared_for_path(Path::new(&root), Path::new(&resource_path)),
+            Err(OperationLeaseError::DataLocationBusy)
+        ));
+    }
+
+    /// 子进程持有租约并报告就绪，供父进程验证进程退出会释放系统锁。
+    #[test]
+    fn child_process_holds_path_lease_until_terminated() {
+        let (Ok(root), Ok(resource_path)) = (
+            std::env::var("TRAE_SYNC_PATH_LOCK_HOLD_ROOT"),
+            std::env::var("TRAE_SYNC_PATH_LOCK_HOLD_RESOURCE"),
+        ) else {
+            return;
+        };
+        let _lease =
+            OperationLease::acquire_shared_for_path(Path::new(&root), Path::new(&resource_path))
+                .unwrap();
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "PATH_LOCK_READY").unwrap();
+        stdout.flush().unwrap();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
     }
 
     #[test]
@@ -374,6 +594,43 @@ mod tests {
     }
 
     #[test]
+    fn shared_lease_keeps_catalog_lock_independent_from_other_locations() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog_lease = OperationLease::acquire(root.path(), "loc-one").unwrap();
+        let independent_lease = OperationLease::acquire_shared(root.path(), "loc-two").unwrap();
+        drop(independent_lease);
+        let status = inspect_lock_status(root.path(), "loc-three").unwrap();
+        assert!(status.catalog_lock_held);
+        assert!(!status.data_location_lock_held);
+        assert!(status.write_allowed);
+        drop(catalog_lease);
+    }
+
+    #[test]
+    fn path_lease_uses_parent_identity_and_allows_independent_directories() {
+        let recovery_root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("data");
+        fs::create_dir_all(&parent).unwrap();
+        let work_path = parent.join("work");
+        let cn_path = parent.join("cn");
+        fs::create_dir_all(&work_path).unwrap();
+        fs::create_dir_all(&cn_path).unwrap();
+        let alias = parent.join(".").join("work");
+
+        let work_lease =
+            OperationLease::acquire_shared_for_path(recovery_root.path(), &work_path).unwrap();
+        assert!(matches!(
+            OperationLease::acquire_shared_for_path(recovery_root.path(), &alias),
+            Err(OperationLeaseError::DataLocationBusy)
+        ));
+        let cn_lease =
+            OperationLease::acquire_shared_for_path(recovery_root.path(), &cn_path).unwrap();
+        drop(cn_lease);
+        drop(work_lease);
+    }
+
+    #[test]
     fn invalid_location_id_fails_before_creating_locks() {
         let root = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -381,6 +638,53 @@ mod tests {
             Err(OperationLeaseError::InvalidLocationId)
         ));
         assert!(!root.path().join("locks").exists());
+    }
+
+    /// 锁标记无法打开时应报告锁目录不可用，不能伪报成并发占用。
+    #[test]
+    fn resource_lock_file_open_failure_is_not_reported_as_busy() {
+        let recovery_root = tempfile::tempdir().unwrap();
+        let resource_parent = tempfile::tempdir().unwrap();
+        let resource_path = resource_parent.path().join("work-data");
+        fs::create_dir(&resource_path).unwrap();
+        let lock_dir = recovery_root.path().join("locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let resource_id = resource_location_id(&resource_path).unwrap();
+        fs::create_dir(lock_dir.join(format!("data-{}.lock", hash_id(&resource_id)))).unwrap();
+
+        assert_eq!(
+            OperationLease::acquire_shared_for_path(recovery_root.path(), &resource_path)
+                .unwrap_err(),
+            OperationLeaseError::LockDirectoryUnavailable
+        );
+    }
+
+    /// 目录库锁标记损坏也应报告锁目录不可用。
+    #[test]
+    fn catalog_lock_file_open_failure_is_not_reported_as_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let lock_dir = root.path().join("locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        fs::create_dir(lock_dir.join("catalog-write.lock")).unwrap();
+
+        assert_eq!(
+            OperationLease::acquire(root.path(), "loc-one").unwrap_err(),
+            OperationLeaseError::LockDirectoryUnavailable
+        );
+    }
+
+    /// 目录库数据锁标记损坏同样应报告锁目录不可用。
+    #[test]
+    fn legacy_data_lock_file_open_failure_is_not_reported_as_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let lock_dir = root.path().join("locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        fs::create_dir(lock_dir.join(format!("data-{}.lock", hash_id("loc-one")))).unwrap();
+
+        assert_eq!(
+            OperationLease::acquire(root.path(), "loc-one").unwrap_err(),
+            OperationLeaseError::LockDirectoryUnavailable
+        );
     }
 
     #[test]
@@ -488,5 +792,65 @@ mod tests {
             .unwrap();
 
         assert!(status.success());
+    }
+
+    #[test]
+    fn second_process_is_blocked_by_path_resource_lock() {
+        let recovery_root = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let resource_path = parent.path().join("work-data");
+        fs::create_dir(&resource_path).unwrap();
+        let resource_alias = parent.path().join(".").join("work-data");
+        let _lease =
+            OperationLease::acquire_shared_for_path(recovery_root.path(), &resource_path).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .env("TRAE_SYNC_PATH_LOCK_CHILD_ROOT", recovery_root.path())
+            .env("TRAE_SYNC_PATH_LOCK_CHILD_RESOURCE", &resource_alias)
+            .args([
+                "--exact",
+                "operation_lease::tests::child_process_cannot_acquire_existing_path_lease",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    /// 父进程强制结束持锁子进程后，应能重新取得同一资源租约。
+    #[test]
+    fn terminated_process_releases_path_resource_lock() {
+        let recovery_root = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let resource_path = parent.path().join("work-data");
+        fs::create_dir(&resource_path).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .env("TRAE_SYNC_PATH_LOCK_HOLD_ROOT", recovery_root.path())
+            .env("TRAE_SYNC_PATH_LOCK_HOLD_RESOURCE", &resource_path)
+            .args([
+                "--exact",
+                "operation_lease::tests::child_process_holds_path_lease_until_terminated",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line.trim() == "PATH_LOCK_READY" {
+                break;
+            }
+        }
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            OperationLease::acquire_shared_for_path(recovery_root.path(), &resource_path).is_ok()
+        );
     }
 }

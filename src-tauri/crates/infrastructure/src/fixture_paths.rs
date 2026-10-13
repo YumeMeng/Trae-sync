@@ -467,6 +467,33 @@ impl FixturePathGuard {
                     OperationLeaseError::DataLocationBusy => "数据位置锁忙".to_string(),
                     OperationLeaseError::LockDirectoryUnavailable => "锁目录不可用".to_string(),
                     OperationLeaseError::InvalidLocationId => "数据位置标识无效".to_string(),
+                    OperationLeaseError::InvalidResourcePath => "数据资源路径无效".to_string(),
+                    OperationLeaseError::InvalidStorageRoot => "存储根无效".to_string(),
+                    OperationLeaseError::LeaseContextUnbound => "租约未绑定存储根".to_string(),
+                    OperationLeaseError::StorageRootMismatch => "租约与存储根不匹配".to_string(),
+                },
+            }
+        })
+    }
+
+    /// 先把资源路径约束在 fixture 根内，再按真实目录身份取得并发租约。
+    pub fn acquire_shared_path_lease(
+        &self,
+        recovery_root: &Path,
+        resource_path: &Path,
+    ) -> Result<OperationLease, FixturePathError> {
+        let recovery_root = self.policy.validate_shared_recovery_root(recovery_root)?;
+        let resource_path = self
+            .policy
+            .validate_write_target(&self.canonical_fixture_root, resource_path)?;
+        OperationLease::acquire_shared_for_path(&recovery_root, &resource_path).map_err(|error| {
+            FixturePathError::OperationLeaseUnavailable {
+                source: match error {
+                    OperationLeaseError::CatalogBusy => "目录库锁忙".to_string(),
+                    OperationLeaseError::DataLocationBusy => "数据位置锁忙".to_string(),
+                    OperationLeaseError::LockDirectoryUnavailable => "锁目录不可用".to_string(),
+                    OperationLeaseError::InvalidLocationId => "数据位置标识无效".to_string(),
+                    OperationLeaseError::InvalidResourcePath => "数据资源路径无效".to_string(),
                     OperationLeaseError::InvalidStorageRoot => "存储根无效".to_string(),
                     OperationLeaseError::LeaseContextUnbound => "租约未绑定存储根".to_string(),
                     OperationLeaseError::StorageRootMismatch => "租约与存储根不匹配".to_string(),
@@ -491,6 +518,7 @@ impl FixturePathGuard {
                     OperationLeaseError::DataLocationBusy => "数据位置锁忙".to_string(),
                     OperationLeaseError::LockDirectoryUnavailable => "锁目录不可用".to_string(),
                     OperationLeaseError::InvalidLocationId => "数据位置标识无效".to_string(),
+                    OperationLeaseError::InvalidResourcePath => "数据资源路径无效".to_string(),
                     OperationLeaseError::InvalidStorageRoot => "存储根无效".to_string(),
                     OperationLeaseError::LeaseContextUnbound => "租约未绑定存储根".to_string(),
                     OperationLeaseError::StorageRootMismatch => "租约与存储根不匹配".to_string(),

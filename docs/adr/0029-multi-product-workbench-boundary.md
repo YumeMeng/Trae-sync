@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted，2026-09-22。基于 `.scratch/research-multi-product-adaptation-20260922.md` 的本地只读探测、官方产品资料和网页 Agent 复核结果建立。本 ADR 不承诺跨产品凭据自动迁移；任何未来改变该边界的决定必须另开 ADR。
+Accepted，2026-09-22。基于 `.scratch/research-multi-product-adaptation-20260922.md` 的本地只读探测、官方产品资料和网页 Agent 复核结果建立。本 ADR 不承诺跨产品凭据自动迁移。决策 4/9 的页面可见策略已被 ADR-0032 局部取代；决策 7/8 的本产品原生激活限制与 `verified` 门槛由 [ADR-0034](0034-product-operation-boundaries-and-native-switch.md) 局部修订（2026-09-30），跨产品复制禁令继续有效。
 
 > **⚠️ 局部取代标注（2026-09-28）**：决策 4（未适配能力不进主导航）与决策 9（Trae CN 不显示签到入口）已被 **ADR-0032** 的「导航五页全产品开放 + 区块能力三态（ready/pending/absent）+ Trae CN 签到探针门禁」取代。其余决策（产品上下文隔离、凭据/数据库隔离、验收状态流、禁止跨产品迁移）继续有效。
 

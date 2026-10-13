@@ -12,6 +12,7 @@
  * 徽章组件只接收枚举态负责「词 × 色」，两页（账号页/签到页）共用同一判定。
  */
 import type { TraeInstanceLoginState } from "../types/account_switch";
+import type { EnvironmentProcessState } from "../types/environment";
 
 // ===== G10 签到槽状态机（六态） =====
 
@@ -258,12 +259,25 @@ export function LoginArchiveSlotBadge({
  */
 export function InstanceSlotBadge({
   running,
+  processState,
   loginState,
 }: {
   running: boolean;
+  processState?: EnvironmentProcessState;
   loginState?: TraeInstanceLoginState;
 }) {
-  if (!running) {
+  const isRunning = processState ? processState === "running" : running;
+  if (processState === "unknown") {
+    return (
+      <span
+        className="slot-badge slot-badge--warn"
+        title="无法确认 TRAE 是否正在运行；为保护数据，实例操作暂不可用。"
+      >
+        <i className="slot-badge__dot slot-badge__dot--warn" aria-hidden="true" />状态未知
+      </span>
+    );
+  }
+  if (!isRunning) {
     if (loginState === "stale") {
       // 停止 + 登录失效：持续性异常，琥珀加强（U-7 保活后无需手动重登，等待自动恢复）。
       return (

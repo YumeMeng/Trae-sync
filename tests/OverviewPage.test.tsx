@@ -61,6 +61,7 @@ function setupReadyMocks() {
     env_id: "master",
     current_profile_id: "profile-a",
     current_account_name: "主库账号",
+    observed_profile_id: "profile-a",
     data_dir: "C:\\TRAE\\master",
     running: false,
     login_state: "logged_in",
@@ -94,10 +95,10 @@ describe("OverviewPage 问候语动态化（任务 1）", () => {
     expect(heading).toHaveTextContent(/，这里是你的 TRAE Work CN 工作台$/);
   });
 
-  it("Trae CN：问候语随产品切换变为「Trae CN 工作台」", () => {
+  it("TRAE：问候语随产品切换变为「TRAE 工作台」", () => {
     render(<OverviewPage state={workspaceState()} active product="trae_cn" onNavigate={() => undefined} />);
     const heading = screen.getByRole("heading", { level: 1 });
-    expect(heading).toHaveTextContent(/，这里是你的 Trae CN 工作台$/);
+    expect(heading).toHaveTextContent(/，这里是你的 TRAE 工作台$/);
     expect(heading).not.toHaveTextContent("TRAE Work CN");
   });
 });

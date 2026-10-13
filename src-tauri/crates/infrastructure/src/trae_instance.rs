@@ -127,6 +127,26 @@ pub struct TraeProcessInfo {
     pub command_line: Option<String>,
 }
 
+/// 进程与目标产品目录的归属判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessMatch {
+    /// 产品和目录都能确认匹配。
+    Match,
+    /// 进程可确认属于别的产品或目录。
+    NoMatch,
+    /// 缺少身份材料，不能证明进程与目标无关。
+    Unknown,
+}
+
+/// 多进程快照相对某个产品目录的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductProcessState {
+    Running,
+    NotRunning,
+    Unknown,
+}
+
 /// PowerShell 查询脚本：列出 TRAE IDE 进程（排除本应用 trae-sync 与
 /// 参考项目 manager），UTF-8 输出 JSON 数组。
 /// 注意：WQL 不支持 `NOT LIKE`，必须用 `NOT (Name LIKE '...')` 形式
@@ -148,7 +168,12 @@ pub fn list_trae_processes() -> Result<Vec<TraeProcessInfo>, TraeInstanceError> 
     // CREATE_NO_WINDOW：避免每次查询闪出 PowerShell 控制台窗口。
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", PROCESS_QUERY_SCRIPT])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            PROCESS_QUERY_SCRIPT,
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|_| TraeInstanceError::ProcessQueryFailed)?;
@@ -156,27 +181,31 @@ pub fn list_trae_processes() -> Result<Vec<TraeProcessInfo>, TraeInstanceError> 
         return Err(TraeInstanceError::ProcessQueryFailed);
     }
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    Ok(parse_process_json(&stdout))
+    parse_process_json(&stdout)
 }
 
 /// 解析 `ConvertTo-Json` 输出的进程数组（纯函数，可单测）。
-/// 容忍单对象（非数组）、空输出与字段缺失，尽量多恢复条目。
-pub fn parse_process_json(raw: &str) -> Vec<TraeProcessInfo> {
+/// 容忍单对象退化形态；坏快照或缺 PID 整体失败，身份字段缺失则保留为未知。
+pub fn parse_process_json(raw: &str) -> Result<Vec<TraeProcessInfo>, TraeInstanceError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Vec::new();
+        return Err(TraeInstanceError::ProcessQueryFailed);
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return Vec::new();
-    };
+    let value = serde_json::from_str::<serde_json::Value>(trimmed)
+        .map_err(|_| TraeInstanceError::ProcessQueryFailed)?;
     let rows: Vec<&serde_json::Value> = match &value {
         serde_json::Value::Array(items) => items.iter().collect(),
         object @ serde_json::Value::Object(_) => vec![object],
-        _ => return Vec::new(),
+        _ => return Err(TraeInstanceError::ProcessQueryFailed),
     };
     rows.iter()
-        .filter_map(|row| {
-            let pid = row.get("ProcessId")?.as_u64()? as u32;
+        .map(|row| {
+            let pid = row
+                .get("ProcessId")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid != 0)
+                .ok_or(TraeInstanceError::ProcessQueryFailed)?;
             let exe_path = row
                 .get("ExecutablePath")
                 .and_then(|v| v.as_str())
@@ -187,10 +216,7 @@ pub fn parse_process_json(raw: &str) -> Vec<TraeProcessInfo> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            if pid == 0 && exe_path.is_none() && command_line.is_none() {
-                return None;
-            }
-            Some(TraeProcessInfo {
+            Ok(TraeProcessInfo {
                 pid,
                 exe_path,
                 command_line,
@@ -199,43 +225,284 @@ pub fn parse_process_json(raw: &str) -> Vec<TraeProcessInfo> {
         .collect()
 }
 
-/// 判断进程命令行是否以 `--user-data-dir=<data_dir>` 运行。
-/// 比较前去除全部引号并统一小写：Windows 路径大小写不敏感，
-/// 且 PowerShell 展示命令行时引号形态不稳定（`--user-data-dir="path"` 与
-/// `--user-data-dir=path` 均为合法 Chromium 参数形态）。
-pub fn command_line_uses_data_dir(command_line: &str, data_dir: &Path) -> bool {
-    let normalized: String = command_line
-        .chars()
-        .filter(|c| *c != '"')
-        .flat_map(|c| c.to_lowercase())
-        .collect();
-    let dir = data_dir.to_string_lossy().replace('"', "").to_lowercase();
-    // 需匹配到完整目录边界：data_dir 是另一目录的前缀时不误判
-    //（如 ...\profile-a 与 ...\profile-ab）。
-    let Some(position) = normalized.find(&dir) else {
-        return false;
-    };
-    let prefix_end = position + dir.len();
-    let boundary_ok = normalized.len() == prefix_end
-        || !normalized.as_bytes()[prefix_end].is_ascii_alphanumeric();
-    boundary_ok && normalized.contains("--user-data-dir=")
+/// 当前产品默认数据根；APPDATA 缺失或不是绝对路径时返回 None，由调用者按未知处理。
+pub fn default_product_data_dir(product: TraeProduct) -> Option<PathBuf> {
+    default_product_data_dir_from_appdata(product, std::env::var_os("APPDATA").map(PathBuf::from))
 }
 
-/// 主库实例匹配（2026-08-31 架构修订：主库 = 官方目录）。
+fn default_product_data_dir_from_appdata(
+    product: TraeProduct,
+    appdata: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let appdata = appdata.filter(|path| path.is_absolute())?;
+    Some(appdata.join(product.data_root_name()))
+}
+
+/// 判断单个 TRAE 进程是否属于指定产品和数据目录。
 ///
-/// 官方目录实例有两种运行形态：
-/// 1. 带参形态：`--user-data-dir=<官方目录>`（App 启动的主进程与全部
-///    Chromium 子进程，官方启动形态的子进程同样带参）；
-/// 2. 无参形态：用户从官方快捷方式启动的主进程，命令行不带
-///    `--user-data-dir`（Chromium 默认 data_dir 即官方目录）。
-/// 两种形态都必须识别，否则聚焦/关闭/切号都管不到用户日常手开的实例。
-pub fn command_line_matches_master(command_line: &str, data_dir: &Path) -> bool {
-    if command_line_uses_data_dir(command_line, data_dir) {
-        return true;
+/// 官方默认目录的无参主进程只在 exe 产品匹配且目录确为该产品默认根时成立；
+/// 无参数子进程、缺失身份或产品/目录矛盾均返回 Unknown，不能授权危险写入。
+pub fn match_product_process(
+    process: &TraeProcessInfo,
+    product: TraeProduct,
+    data_dir: &Path,
+    default_data_dir: Option<&Path>,
+) -> ProcessMatch {
+    let Some(exe_path) = process.exe_path.as_deref() else {
+        return ProcessMatch::Unknown;
+    };
+    let Some(command_line) = process.command_line.as_deref() else {
+        return ProcessMatch::Unknown;
+    };
+    if command_line.trim().is_empty() {
+        return ProcessMatch::Unknown;
     }
-    // 无参主进程：非子进程（无 --type=）且未指定其他 data_dir。
-    let lowered = command_line.to_lowercase();
-    !lowered.contains("--user-data-dir") && !lowered.contains("--type=")
+    let Some(exe_product) = known_executable_product(Path::new(exe_path)) else {
+        return ProcessMatch::Unknown;
+    };
+
+    match command_line_data_dir_arg(command_line) {
+        UserDataDirArg::Value(value) => {
+            if windows_path_eq(Path::new(&value), data_dir) {
+                return if exe_product == product {
+                    ProcessMatch::Match
+                } else {
+                    ProcessMatch::Unknown
+                };
+            }
+            return ProcessMatch::NoMatch;
+        }
+        UserDataDirArg::Invalid => return ProcessMatch::Unknown,
+        UserDataDirArg::Absent => {}
+    }
+
+    if exe_product != product {
+        return ProcessMatch::NoMatch;
+    }
+
+    let is_default_target =
+        default_data_dir.is_some_and(|default_dir| windows_path_eq(default_dir, data_dir));
+    if command_line.to_ascii_lowercase().contains("--type=") {
+        // 子进程通常继承主进程的数据目录，但部分启动形态不会在自身命令行重复参数。
+        // 因而不能仅凭“不是默认目录”证明它与目标实例无关。
+        return ProcessMatch::Unknown;
+    }
+    if is_default_target {
+        ProcessMatch::Match
+    } else if default_data_dir.is_none() {
+        ProcessMatch::Unknown
+    } else {
+        ProcessMatch::NoMatch
+    }
+}
+
+/// 汇总进程快照；明确运行优先，其次未知，只有全量可归属才报告未运行。
+pub fn product_process_state(
+    processes: &[TraeProcessInfo],
+    product: TraeProduct,
+    data_dir: &Path,
+    default_data_dir: Option<&Path>,
+) -> ProductProcessState {
+    let mut unknown = false;
+    for process in processes {
+        match match_product_process(process, product, data_dir, default_data_dir) {
+            ProcessMatch::Match => return ProductProcessState::Running,
+            ProcessMatch::NoMatch => {}
+            ProcessMatch::Unknown => unknown = true,
+        }
+    }
+    if unknown {
+        ProductProcessState::Unknown
+    } else {
+        ProductProcessState::NotRunning
+    }
+}
+
+/// 将进程查询结果转换为状态；枚举失败时保持 Unknown。
+fn product_process_state_from_query(
+    processes: Result<Vec<TraeProcessInfo>, TraeInstanceError>,
+    product: TraeProduct,
+    data_dir: &Path,
+    default_data_dir: Option<&Path>,
+) -> ProductProcessState {
+    match processes {
+        Ok(processes) => product_process_state(&processes, product, data_dir, default_data_dir),
+        Err(_) => ProductProcessState::Unknown,
+    }
+}
+
+/// 取得可安全聚焦或关闭的目标进程；任何无法归属的 TRAE 候选都会拒绝操作。
+pub fn matched_product_process_ids(
+    processes: &[TraeProcessInfo],
+    product: TraeProduct,
+    data_dir: &Path,
+    default_data_dir: Option<&Path>,
+) -> Result<Vec<u32>, ProductProcessState> {
+    let mut matching_pids = Vec::new();
+    let mut unknown = false;
+    for process in processes {
+        match match_product_process(process, product, data_dir, default_data_dir) {
+            ProcessMatch::Match => matching_pids.push(process.pid),
+            ProcessMatch::NoMatch => {}
+            ProcessMatch::Unknown => unknown = true,
+        }
+    }
+    if unknown {
+        Err(ProductProcessState::Unknown)
+    } else {
+        Ok(matching_pids)
+    }
+}
+
+/// 查询当前产品与数据目录的进程状态；枚举失败或平台不支持时保留未知。
+#[cfg(windows)]
+pub fn current_product_process_state(product: TraeProduct, data_dir: &Path) -> ProductProcessState {
+    let default_data_dir = default_product_data_dir(product);
+    product_process_state_from_query(
+        list_trae_processes(),
+        product,
+        data_dir,
+        default_data_dir.as_deref(),
+    )
+}
+
+/// 非 Windows 环境不能确认 TRAE 桌面进程状态，危险写入必须停止。
+#[cfg(not(windows))]
+pub fn current_product_process_state(
+    _product: TraeProduct,
+    _data_dir: &Path,
+) -> ProductProcessState {
+    ProductProcessState::Unknown
+}
+
+fn known_executable_product(path: &Path) -> Option<TraeProduct> {
+    [TraeProduct::WorkCn, TraeProduct::TraeCn]
+        .into_iter()
+        .find(|product| product.matches_executable(path))
+}
+
+/// `--user-data-dir` 的解析结果。
+///
+/// 只把真正的命令行参数当作目录参数；目录字符串出现在其他参数中不算。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UserDataDirArg {
+    Absent,
+    Value(String),
+    Invalid,
+}
+
+/// 按 Windows 命令行规则拆分参数。
+///
+/// 这里只处理进程查询需要的引号、空白和反斜杠转义，不依赖 Windows API，
+/// 使纯函数边界可以在同一模块中直接测试。
+fn split_windows_command_line(command_line: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = command_line.chars().collect();
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut token_started = false;
+    let mut index = 0;
+
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => {
+                let start = index;
+                while index < chars.len() && chars[index] == '\\' {
+                    index += 1;
+                }
+                let slash_count = index - start;
+                if index < chars.len() && chars[index] == '"' {
+                    current.extend(std::iter::repeat_n('\\', slash_count / 2));
+                    if slash_count % 2 == 1 {
+                        current.push('"');
+                        token_started = true;
+                        index += 1;
+                    } else {
+                        in_quotes = !in_quotes;
+                        token_started = true;
+                        index += 1;
+                    }
+                } else {
+                    current.extend(std::iter::repeat_n('\\', slash_count));
+                    token_started = true;
+                }
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                token_started = true;
+                index += 1;
+            }
+            character if character.is_ascii_whitespace() && !in_quotes => {
+                if token_started {
+                    args.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+                index += 1;
+            }
+            character => {
+                current.push(character);
+                token_started = true;
+                index += 1;
+            }
+        }
+    }
+
+    if in_quotes {
+        return None;
+    }
+    if token_started {
+        args.push(current);
+    }
+    Some(args)
+}
+
+/// 解析唯一的 `--user-data-dir` 实际值。
+///
+/// 参数缺值、空值、重复出现或引号未闭合都返回 `Invalid`，调用方必须按
+/// `Unknown` 处理，不能退化成默认目录匹配。
+fn command_line_data_dir_arg(command_line: &str) -> UserDataDirArg {
+    let Some(args) = split_windows_command_line(command_line) else {
+        return UserDataDirArg::Invalid;
+    };
+    let mut value = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let lowered = argument.to_ascii_lowercase();
+        let inline = lowered.strip_prefix("--user-data-dir=");
+        if lowered == "--user-data-dir" {
+            if value.is_some() {
+                return UserDataDirArg::Invalid;
+            }
+            let Some(next) = args.get(index + 1) else {
+                return UserDataDirArg::Invalid;
+            };
+            if next.is_empty() || next.starts_with('-') {
+                return UserDataDirArg::Invalid;
+            }
+            value = Some(next.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(inline) = inline {
+            if value.is_some() || inline.is_empty() {
+                return UserDataDirArg::Invalid;
+            }
+            value = Some(argument["--user-data-dir=".len()..].to_string());
+        }
+        index += 1;
+    }
+    value.map_or(UserDataDirArg::Absent, UserDataDirArg::Value)
+}
+
+fn windows_path_eq(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(right)
 }
 
 /// TRAE 安装信息（注册表 Uninstall 查询结果）。
@@ -307,10 +574,7 @@ fn parse_registry_json(raw: &str) -> Vec<TraeInstallRecord> {
 
 /// 注册表记录中提取目标产品 exe 路径；DisplayIcon 优先，InstallLocation 下
 /// 扫描目标产品主程序文件名兜底。
-fn exe_from_install_record(
-    product: TraeProduct,
-    record: &TraeInstallRecord,
-) -> Option<PathBuf> {
+fn exe_from_install_record(product: TraeProduct, record: &TraeInstallRecord) -> Option<PathBuf> {
     if let Some(icon) = &record.exe_path {
         let path = PathBuf::from(icon);
         if path.is_file() && product.matches_executable(&path) {
@@ -386,9 +650,7 @@ pub fn discover_trae_executable_for(
                 let records = parse_registry_json(&stdout);
                 // 目标产品优先，其余记录保持稳定顺序，避免跨产品误选。
                 let mut ordered: Vec<&TraeInstallRecord> = records.iter().collect();
-                ordered.sort_by_key(|record| {
-                    !product.matches_install_name(&record.display_name)
-                });
+                ordered.sort_by_key(|record| !product.matches_install_name(&record.display_name));
                 for record in ordered {
                     if let Some(exe) = exe_from_install_record(product, record) {
                         return Ok(exe);
@@ -475,8 +737,7 @@ pub fn focus_instance_windows(pids: &[u32]) -> bool {
     unsafe {
         EnumWindows(
             Some(enum_callback),
-            &mut context as *mut FocusContext
-                as windows_sys::Win32::Foundation::LPARAM,
+            &mut context as *mut FocusContext as windows_sys::Win32::Foundation::LPARAM,
         );
     }
     context.focused
@@ -529,10 +790,7 @@ fn latest_session_login_evidence(instance_dir: &Path) -> LoginEvidence {
     let Some(latest) = latest else {
         return LoginEvidence::default();
     };
-    let renderer_log = logs_dir
-        .join(latest)
-        .join("window1")
-        .join("renderer.log");
+    let renderer_log = logs_dir.join(latest).join("window1").join("renderer.log");
     let Ok(log) = std::fs::read_to_string(&renderer_log) else {
         return LoginEvidence::default();
     };
@@ -732,10 +990,7 @@ pub fn write_window_title(instance_dir: &Path, title: &str) -> std::io::Result<(
 
 /// 递归复制目录；单个文件失败（如被运行中的原生实例锁定）时跳过继续，
 /// 整个目录创建失败才返回错误。
-fn copy_dir_best_effort(
-    source: &Path,
-    destination: &Path,
-) -> Result<(), TraeInstanceError> {
+fn copy_dir_best_effort(source: &Path, destination: &Path) -> Result<(), TraeInstanceError> {
     std::fs::create_dir_all(destination).map_err(|_| TraeInstanceError::SeedCopyFailed)?;
     let entries = std::fs::read_dir(source).map_err(|_| TraeInstanceError::SeedCopyFailed)?;
     for entry in entries.flatten() {
@@ -764,9 +1019,14 @@ pub enum CloseOutcome {
     NotRunning,
 }
 
-/// 实例关闭失败（强制结束后进程仍存在，如权限不足）。
+/// 实例关闭错误；身份无法确认与确认关闭失败需要区别处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TraeInstanceCloseError;
+pub enum TraeInstanceCloseError {
+    /// 进程枚举失败或候选进程身份不完整，不能证明目标实例已安全关闭。
+    ProcessStateUnknown,
+    /// 目标进程身份明确，但关闭后仍无法确认其退出。
+    CloseFailed,
+}
 
 /// 优雅关闭等待窗口：给 TRAE 处理 WM_CLOSE 的时间。
 /// 实测 Electron 收到 WM_CLOSE 常驻留托盘不退出，短窗口即可进入强制兜底。
@@ -798,7 +1058,7 @@ fn run_taskkill(pid: u32, force: bool) -> bool {
         .unwrap_or(false)
 }
 
-/// 关闭运行于指定 data_dir 的 TRAE 实例（账号实例口径：带参匹配）。
+/// 关闭运行于指定产品与 data_dir 的 TRAE 实例。
 ///
 /// 策略（2026-08-23 E2E 实测：WM_CLOSE 12 秒不退出，TRAE 疑似驻留托盘）：
 /// 1. 对主进程 taskkill /T（WM_CLOSE 优雅关闭）；
@@ -806,37 +1066,51 @@ fn run_taskkill(pid: u32, force: bool) -> bool {
 /// 3. 强制后再复查，仍存在视为失败。
 /// 只影响该 data_dir 的进程树，其他实例与用户手动打开的 TRAE 不受波及。
 #[cfg(windows)]
-pub fn close_instance(instance_dir: &Path) -> Result<CloseOutcome, TraeInstanceCloseError> {
-    close_instance_impl(instance_dir, command_line_uses_data_dir)
+pub fn close_instance(
+    product: TraeProduct,
+    instance_dir: &Path,
+) -> Result<CloseOutcome, TraeInstanceCloseError> {
+    close_instance_impl(product, instance_dir)
 }
 
-/// 关闭主库（官方目录）实例：额外覆盖官方无参启动的主进程形态
-/// （用户从官方快捷方式手开的实例，切号第 1 步必须能关掉它）。
-#[cfg(windows)]
-pub fn close_master_instance(instance_dir: &Path) -> Result<CloseOutcome, TraeInstanceCloseError> {
-    close_instance_impl(instance_dir, command_line_matches_master)
-}
-
-/// 关闭实现：matcher 决定「哪些进程属于该实例」（账号 vs 主库口径）。
+/// 关闭实现：产品与目录 matcher 决定哪些进程属于该实例。
 #[cfg(windows)]
 fn close_instance_impl(
+    product: TraeProduct,
     instance_dir: &Path,
-    matcher: fn(&str, &Path) -> bool,
 ) -> Result<CloseOutcome, TraeInstanceCloseError> {
-    let running_pids = |processes: &[TraeProcessInfo]| -> Vec<u32> {
-        processes
-            .iter()
-            .filter(|process| {
-                process
-                    .command_line
-                    .as_deref()
-                    .is_some_and(|line| matcher(line, instance_dir))
-            })
-            .map(|process| process.pid)
-            .collect()
+    let default_data_dir = default_product_data_dir(product);
+    close_instance_with(
+        product,
+        instance_dir,
+        default_data_dir.as_deref(),
+        || list_trae_processes().map_err(|_| TraeInstanceCloseError::ProcessStateUnknown),
+        run_taskkill,
+        std::thread::sleep,
+    )
+}
+
+/// 注入进程观察、结束动作和等待；离线测试可验证目标进程集合而不触碰真实 TRAE。
+#[cfg(windows)]
+fn close_instance_with(
+    product: TraeProduct,
+    instance_dir: &Path,
+    default_data_dir: Option<&Path>,
+    mut query_processes: impl FnMut() -> Result<Vec<TraeProcessInfo>, TraeInstanceCloseError>,
+    mut taskkill: impl FnMut(u32, bool) -> bool,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<CloseOutcome, TraeInstanceCloseError> {
+    let running_pids = |processes: &[TraeProcessInfo]| {
+        matched_product_process_ids(
+            processes,
+            product,
+            instance_dir,
+            default_data_dir.as_deref(),
+        )
+        .map_err(|_| TraeInstanceCloseError::ProcessStateUnknown)
     };
-    let processes = list_trae_processes().map_err(|_| TraeInstanceCloseError)?;
-    let pids = running_pids(&processes);
+    let processes = query_processes()?;
+    let pids = running_pids(&processes)?;
     if pids.is_empty() {
         return Ok(CloseOutcome::NotRunning);
     }
@@ -853,52 +1127,50 @@ fn close_instance_impl(
         .map(|process| process.pid)
         .collect();
     for pid in &main_pids {
-        run_taskkill(*pid, false);
+        taskkill(*pid, false);
     }
-    std::thread::sleep(std::time::Duration::from_secs(
-        GRACEFUL_CLOSE_WAIT_SECONDS,
-    ));
-    let processes = list_trae_processes().map_err(|_| TraeInstanceCloseError)?;
-    let remaining = running_pids(&processes);
+    wait(std::time::Duration::from_secs(GRACEFUL_CLOSE_WAIT_SECONDS));
+    let processes = query_processes()?;
+    let remaining = running_pids(&processes)?;
     if remaining.is_empty() {
         return Ok(CloseOutcome::Closed);
     }
     for pid in &remaining {
-        run_taskkill(*pid, true);
+        taskkill(*pid, true);
     }
-    std::thread::sleep(std::time::Duration::from_secs(FORCE_CLOSE_WAIT_SECONDS));
+    wait(std::time::Duration::from_secs(FORCE_CLOSE_WAIT_SECONDS));
     // 强制结束后的退出确认：终止落地存在滞后，逐次复查而非单次判定，
     // 避免把已成功的关闭误报为失败（详见 CLOSE_VERIFY_ATTEMPTS 注释）。
     for attempt in 0..CLOSE_VERIFY_ATTEMPTS {
-        let processes = list_trae_processes().map_err(|_| TraeInstanceCloseError)?;
-        if running_pids(&processes).is_empty() {
+        let processes = query_processes()?;
+        if running_pids(&processes)?.is_empty() {
             return Ok(CloseOutcome::ForceClosed);
         }
         if attempt + 1 < CLOSE_VERIFY_ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_secs(
+            wait(std::time::Duration::from_secs(
                 CLOSE_VERIFY_RETRY_DELAY_SECONDS,
             ));
         }
     }
-    Err(TraeInstanceCloseError)
+    Err(TraeInstanceCloseError::CloseFailed)
 }
 
 #[cfg(all(test, windows))]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
 
     use crate::product_adapter::TraeProduct;
 
     use super::{
-        command_line_matches_master, command_line_uses_data_dir, dir_size_recursive,
-        discover_trae_executable_for, instance_data_dir, instance_login_state,
-        is_session_dir_name, native_account_dir, native_account_dir_for,
-        parse_process_json, seed_login_state_from_donor, seed_login_state_with_appdata,
-        write_window_title, InstanceLoginState, SeedOutcome, TraeInstanceError,
-        TraeProcessInfo,
+        close_instance_with, dir_size_recursive, discover_trae_executable_for, instance_data_dir,
+        instance_login_state, is_session_dir_name, match_product_process, native_account_dir,
+        native_account_dir_for, parse_process_json, product_process_state,
+        seed_login_state_from_donor, seed_login_state_with_appdata, write_window_title,
+        CloseOutcome, InstanceLoginState, ProcessMatch, ProductProcessState, SeedOutcome,
+        TraeInstanceCloseError, TraeInstanceError, TraeProcessInfo,
     };
 
     #[test]
@@ -961,7 +1233,10 @@ mod tests {
         let env = root.path().join("environments").join("env-1-a");
         fs::create_dir_all(donor.join("User").join("globalStorage")).unwrap();
         fs::write(
-            donor.join("User").join("globalStorage").join("storage.json"),
+            donor
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
             r#"{"iCubeAuthInfo://usertag":"blob"}"#,
         )
         .unwrap();
@@ -977,8 +1252,16 @@ mod tests {
             seed_login_state_from_donor(&env, &donor).unwrap(),
             SeedOutcome::Seeded
         );
-        assert!(env.join("User").join("globalStorage").join("storage.json").is_file());
-        assert!(env.join("User").join("globalStorage").join("state.vscdb").is_file());
+        assert!(env
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json")
+            .is_file());
+        assert!(env
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb")
+            .is_file());
         assert_eq!(
             fs::read_to_string(env.join("machineid")).unwrap(),
             "machine-123"
@@ -995,7 +1278,8 @@ mod tests {
             SeedOutcome::NotNeeded
         );
         assert_eq!(
-            fs::read_to_string(env.join("User").join("globalStorage").join("storage.json")).unwrap(),
+            fs::read_to_string(env.join("User").join("globalStorage").join("storage.json"))
+                .unwrap(),
             r#"{"iCubeAuthInfo://usertag":"changed"}"#
         );
     }
@@ -1009,7 +1293,10 @@ mod tests {
         let env = root.path().join("environments").join("env-2-a");
         fs::create_dir_all(donor.join("User").join("globalStorage")).unwrap();
         fs::write(
-            donor.join("User").join("globalStorage").join("storage.json"),
+            donor
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
             r#"{"iCubeAuthInfo://usertag":"blob"}"#,
         )
         .unwrap();
@@ -1041,7 +1328,11 @@ mod tests {
             TraeInstanceError::SeedCopyFailed
         );
         // 目录未创建（失败不留半成品痕迹）。
-        assert!(!env.join("User").join("globalStorage").join("storage.json").exists());
+        assert!(!env
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json")
+            .exists());
     }
 
     #[test]
@@ -1097,9 +1388,7 @@ mod tests {
         fs::create_dir_all(dir.join("User").join("globalStorage")).unwrap();
         fs::write(dir.join("machineid"), vec![0u8; 10]).unwrap();
         fs::write(
-            dir.join("User")
-                .join("globalStorage")
-                .join("storage.json"),
+            dir.join("User").join("globalStorage").join("storage.json"),
             vec![0u8; 26],
         )
         .unwrap();
@@ -1111,53 +1400,631 @@ mod tests {
     #[test]
     fn process_json_parses_array_single_and_empty() {
         let array = r#"[{"ProcessId":123,"ExecutablePath":"E:\\TRAE.exe","CommandLine":"\"E:\\TRAE.exe\" --user-data-dir=D:\\a"}]"#;
-        let parsed = parse_process_json(array);
+        let parsed = parse_process_json(array).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].pid, 123);
         assert_eq!(parsed[0].exe_path.as_deref(), Some("E:\\TRAE.exe"));
 
         // 单对象（ConvertTo-Json 对单元素数组的退化形态）也要兼容。
         let single = r#"{"ProcessId":7,"ExecutablePath":null,"CommandLine":null}"#;
-        let parsed = parse_process_json(single);
+        let parsed = parse_process_json(single).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].pid, 7);
         assert_eq!(parsed[0].exe_path, None);
+        assert_eq!(parsed[0].command_line, None);
 
-        assert!(parse_process_json("").is_empty());
-        assert!(parse_process_json("not json").is_empty());
+        assert!(parse_process_json("[]").unwrap().is_empty());
+        assert!(parse_process_json("").is_err());
+        assert!(parse_process_json("not json").is_err());
+        assert!(parse_process_json(r#"[{"ExecutablePath":"E:\\TRAE.exe"}]"#).is_err());
+    }
+
+    #[test]
+    fn product_process_match_requires_executable_and_data_directory() {
+        let appdata = std::path::Path::new(r"C:\Users\u\AppData\Roaming");
+        let work_root = appdata.join(TraeProduct::WorkCn.data_root_name());
+        let cn_root = appdata.join(TraeProduct::TraeCn.data_root_name());
+        let secondary = std::path::Path::new(r"D:\Trae Sync\environments\env-a");
+        let process = |pid, exe: &str, command_line: &str| TraeProcessInfo {
+            pid,
+            exe_path: Some(exe.to_string()),
+            command_line: Some(command_line.to_string()),
+        };
+
+        let work_bare = process(1, r"E:\TRAE SOLO CN.exe", r#""E:\TRAE SOLO CN.exe""#);
+        let work_old_bare = process(2, r"E:\trae.exe", r#""E:\trae.exe""#);
+        let cn_bare = process(3, r"E:\Trae CN.exe", r#""E:\Trae CN.exe""#);
+        let work_child = process(
+            4,
+            r"E:\TRAE SOLO CN.exe",
+            r#""E:\TRAE SOLO CN.exe" --type=renderer"#,
+        );
+        let work_secondary = process(
+            5,
+            r"E:\TRAE SOLO CN.exe",
+            r#""E:\TRAE SOLO CN.exe" --user-data-dir="D:\Trae Sync\environments\env-a" --type=renderer"#,
+        );
+
+        assert_eq!(
+            match_product_process(
+                &work_bare,
+                TraeProduct::WorkCn,
+                &work_root,
+                Some(&work_root)
+            ),
+            ProcessMatch::Match
+        );
+        assert_eq!(
+            match_product_process(
+                &work_old_bare,
+                TraeProduct::WorkCn,
+                &work_root,
+                Some(&work_root)
+            ),
+            ProcessMatch::Match
+        );
+        assert_eq!(
+            match_product_process(&cn_bare, TraeProduct::WorkCn, &work_root, Some(&work_root)),
+            ProcessMatch::NoMatch
+        );
+        assert_eq!(
+            match_product_process(&cn_bare, TraeProduct::TraeCn, &cn_root, Some(&cn_root)),
+            ProcessMatch::Match
+        );
+        assert_eq!(
+            match_product_process(
+                &work_child,
+                TraeProduct::WorkCn,
+                &work_root,
+                Some(&work_root)
+            ),
+            ProcessMatch::Unknown
+        );
+        assert_eq!(
+            match_product_process(
+                &work_secondary,
+                TraeProduct::WorkCn,
+                secondary,
+                Some(&work_root)
+            ),
+            ProcessMatch::Match
+        );
+        assert_eq!(
+            product_process_state(
+                &[work_bare.clone(), cn_bare.clone()],
+                TraeProduct::WorkCn,
+                &work_root,
+                Some(&work_root)
+            ),
+            ProductProcessState::Running
+        );
+        assert_eq!(
+            product_process_state(
+                &[work_bare.clone(), cn_bare.clone()],
+                TraeProduct::TraeCn,
+                &cn_root,
+                Some(&cn_root)
+            ),
+            ProductProcessState::Running
+        );
+        let missing_executable = TraeProcessInfo {
+            pid: 6,
+            exe_path: None,
+            command_line: Some(r#""E:\TRAE SOLO CN.exe" --user-data-dir="D:\other""#.to_string()),
+        };
+        let missing_command_line = TraeProcessInfo {
+            pid: 7,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: None,
+        };
+        for process in [missing_executable, missing_command_line] {
+            assert_eq!(
+                match_product_process(&process, TraeProduct::WorkCn, &work_root, Some(&work_root)),
+                ProcessMatch::Unknown
+            );
+            assert_eq!(
+                product_process_state(
+                    std::slice::from_ref(&process),
+                    TraeProduct::WorkCn,
+                    &work_root,
+                    Some(&work_root)
+                ),
+                ProductProcessState::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn process_query_failure_preserves_unknown_state() {
+        let target = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        assert_eq!(
+            super::product_process_state_from_query(
+                Err(TraeInstanceError::ProcessQueryFailed),
+                TraeProduct::WorkCn,
+                target,
+                Some(target),
+            ),
+            ProductProcessState::Unknown
+        );
+    }
+
+    #[test]
+    fn invalid_appdata_keeps_bare_official_process_state_unknown() {
+        let target = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let process = TraeProcessInfo {
+            pid: 11,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(r#""E:\TRAE SOLO CN.exe""#.to_string()),
+        };
+
+        // APPDATA 为空或相对时，裸启动进程无法归属到默认目录，必须保留未知。
+        for appdata in [
+            None,
+            Some(PathBuf::new()),
+            Some(PathBuf::from(r"relative\appdata")),
+        ] {
+            let default_data_dir =
+                super::default_product_data_dir_from_appdata(TraeProduct::WorkCn, appdata);
+            assert!(default_data_dir.is_none());
+            assert_eq!(
+                super::product_process_state(
+                    std::slice::from_ref(&process),
+                    TraeProduct::WorkCn,
+                    target,
+                    default_data_dir.as_deref(),
+                ),
+                ProductProcessState::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn matched_process_ids_refuse_unknown_identity_even_with_a_match() {
+        let appdata = std::path::Path::new(r"C:\Users\u\AppData\Roaming");
+        let work_root = appdata.join(TraeProduct::WorkCn.data_root_name());
+        let secondary = std::path::Path::new(r"D:\Trae Sync\environments\env-a");
+        let work_main = TraeProcessInfo {
+            pid: 1,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(r#""E:\TRAE SOLO CN.exe""#.to_string()),
+        };
+        let work_child_without_directory = TraeProcessInfo {
+            pid: 2,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(r#""E:\TRAE SOLO CN.exe" --type=renderer"#.to_string()),
+        };
+        let other_product = TraeProcessInfo {
+            pid: 3,
+            exe_path: Some(r"E:\Trae CN.exe".to_string()),
+            command_line: Some(r#""E:\Trae CN.exe""#.to_string()),
+        };
+
+        assert_eq!(
+            super::matched_product_process_ids(
+                &[work_main.clone(), other_product],
+                TraeProduct::WorkCn,
+                &work_root,
+                Some(&work_root),
+            ),
+            Ok(vec![1])
+        );
+        assert_eq!(
+            super::matched_product_process_ids(
+                &[work_main, work_child_without_directory],
+                TraeProduct::WorkCn,
+                secondary,
+                Some(&work_root),
+            ),
+            Err(ProductProcessState::Unknown)
+        );
+    }
+
+    #[test]
+    fn close_instance_only_targets_work_processes() {
+        let work_dir = std::path::Path::new(r"D:\Trae Sync\master");
+        let default_work_dir = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let work = TraeProcessInfo {
+            pid: 21,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(
+                r#""E:\TRAE SOLO CN.exe" --user-data-dir="D:\Trae Sync\master""#.to_string(),
+            ),
+        };
+        let cn = TraeProcessInfo {
+            pid: 31,
+            exe_path: Some(r"E:\Trae CN\Trae CN.exe".to_string()),
+            command_line: Some(
+                r#""E:\Trae CN\Trae CN.exe" --user-data-dir="D:\Trae CN\data""#.to_string(),
+            ),
+        };
+        let mut snapshots =
+            std::collections::VecDeque::from([Ok(vec![work, cn.clone()]), Ok(vec![cn])]);
+        let mut taskkill_calls = Vec::new();
+        let mut waits = Vec::new();
+
+        let outcome = close_instance_with(
+            TraeProduct::WorkCn,
+            work_dir,
+            Some(default_work_dir),
+            || snapshots.pop_front().expect("测试快照应足够"),
+            |pid, force| {
+                taskkill_calls.push((pid, force));
+                true
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CloseOutcome::Closed);
+        assert_eq!(taskkill_calls, vec![(21, false)]);
+        assert_eq!(waits, vec![std::time::Duration::from_secs(3)]);
+    }
+
+    #[test]
+    fn close_instance_only_targets_trae_cn_processes() {
+        let cn_dir = std::path::Path::new(r"D:\Trae CN\data");
+        let work = TraeProcessInfo {
+            pid: 21,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(
+                r#""E:\TRAE SOLO CN.exe" --user-data-dir="D:\Trae Sync\master""#.to_string(),
+            ),
+        };
+        let cn = TraeProcessInfo {
+            pid: 31,
+            exe_path: Some(r"E:\Trae CN\Trae CN.exe".to_string()),
+            command_line: Some(
+                r#""E:\Trae CN\Trae CN.exe" --user-data-dir="D:\Trae CN\data""#.to_string(),
+            ),
+        };
+        let mut snapshots =
+            std::collections::VecDeque::from([Ok(vec![work.clone(), cn]), Ok(vec![work])]);
+        let mut taskkill_calls = Vec::new();
+        let mut waits = Vec::new();
+
+        // CN 为目标时只结束 CN 进程，Work 实例必须保留。
+        let outcome = close_instance_with(
+            TraeProduct::TraeCn,
+            cn_dir,
+            None,
+            || snapshots.pop_front().expect("测试快照应足够"),
+            |pid, force| {
+                taskkill_calls.push((pid, force));
+                true
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CloseOutcome::Closed);
+        assert_eq!(taskkill_calls, vec![(31, false)]);
+        assert_eq!(waits, vec![std::time::Duration::from_secs(3)]);
+    }
+
+    #[test]
+    fn close_instance_unknown_identity_has_no_side_effects() {
+        let work_dir = std::path::Path::new(r"D:\Trae Sync\master");
+        let default_work_dir = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let unknown = TraeProcessInfo {
+            pid: 42,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: None,
+        };
+        let mut taskkill_calls = Vec::new();
+        let mut waits = Vec::new();
+
+        let error = close_instance_with(
+            TraeProduct::WorkCn,
+            work_dir,
+            Some(default_work_dir),
+            || Ok(vec![unknown.clone()]),
+            |pid, force| {
+                taskkill_calls.push((pid, force));
+                true
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TraeInstanceCloseError::ProcessStateUnknown);
+        assert!(taskkill_calls.is_empty());
+        assert!(waits.is_empty());
+    }
+
+    #[test]
+    fn close_instance_query_failure_has_no_side_effects() {
+        let work_dir = std::path::Path::new(r"D:\Trae Sync\master");
+        let default_work_dir = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let mut taskkill_calls = Vec::new();
+        let mut waits = Vec::new();
+
+        let error = close_instance_with(
+            TraeProduct::WorkCn,
+            work_dir,
+            Some(default_work_dir),
+            || Err(TraeInstanceCloseError::ProcessStateUnknown),
+            |pid, force| {
+                taskkill_calls.push((pid, force));
+                true
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TraeInstanceCloseError::ProcessStateUnknown);
+        assert!(taskkill_calls.is_empty());
+        assert!(waits.is_empty());
+    }
+
+    #[test]
+    fn close_instance_recheck_failure_does_not_force_kill() {
+        let work_dir = std::path::Path::new(r"D:\Trae Sync\master");
+        let default_work_dir = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let work = TraeProcessInfo {
+            pid: 21,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(
+                r#""E:\TRAE SOLO CN.exe" --user-data-dir="D:\Trae Sync\master""#.to_string(),
+            ),
+        };
+        let mut snapshots = std::collections::VecDeque::from([
+            Ok(vec![work]),
+            Err(TraeInstanceCloseError::ProcessStateUnknown),
+        ]);
+        let mut taskkill_calls = Vec::new();
+        let mut waits = Vec::new();
+
+        let error = close_instance_with(
+            TraeProduct::WorkCn,
+            work_dir,
+            Some(default_work_dir),
+            || snapshots.pop_front().expect("测试快照应足够"),
+            |pid, force| {
+                taskkill_calls.push((pid, force));
+                true
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TraeInstanceCloseError::ProcessStateUnknown);
+        assert_eq!(taskkill_calls, vec![(21, false)]);
+        assert_eq!(waits, vec![std::time::Duration::from_secs(3)]);
+    }
+
+    #[test]
+    fn close_instance_force_closes_only_remaining_target_process() {
+        let work_dir = std::path::Path::new(r"D:\Trae Sync\master");
+        let default_work_dir = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let work = TraeProcessInfo {
+            pid: 21,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(
+                r#""E:\TRAE SOLO CN.exe" --user-data-dir="D:\Trae Sync\master""#.to_string(),
+            ),
+        };
+        let mut snapshots = std::collections::VecDeque::from([
+            Ok(vec![work.clone()]),
+            Ok(vec![work]),
+            Ok(Vec::new()),
+        ]);
+        let mut taskkill_calls = Vec::new();
+        let mut waits = Vec::new();
+
+        let outcome = close_instance_with(
+            TraeProduct::WorkCn,
+            work_dir,
+            Some(default_work_dir),
+            || snapshots.pop_front().expect("测试快照应足够"),
+            |pid, force| {
+                taskkill_calls.push((pid, force));
+                true
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CloseOutcome::ForceClosed);
+        assert_eq!(taskkill_calls, vec![(21, false), (21, true)]);
+        assert_eq!(
+            waits,
+            vec![
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(2)
+            ]
+        );
     }
 
     #[test]
     fn command_line_matching_ignores_quotes_and_case() {
         let dir = std::path::Path::new(r"D:\Work\Trae Sync\data\trae-instances\checkin-a");
+        let default_dir = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let process = |command_line: &str| TraeProcessInfo {
+            pid: 8,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(command_line.to_string()),
+        };
         let quoted = r#""E:\x\TRAE.exe" --user-data-dir="D:\Work\Trae Sync\data\trae-instances\checkin-a" --type=gpu"#;
-        let plain = "--user-data-dir=d:\\work\\trae sync\\data\\trae-instances\\CHECKIN-A";
-        assert!(command_line_uses_data_dir(quoted, dir));
-        assert!(command_line_uses_data_dir(plain, dir));
+        let differently_cased =
+            r#""E:\x\TRAE.exe" --user-data-dir="d:\work\trae sync\data\trae-instances\CHECKIN-A""#;
+        assert_eq!(
+            match_product_process(
+                &process(quoted),
+                TraeProduct::WorkCn,
+                dir,
+                Some(default_dir)
+            ),
+            ProcessMatch::Match
+        );
+        assert_eq!(
+            match_product_process(
+                &process(differently_cased),
+                TraeProduct::WorkCn,
+                dir,
+                Some(default_dir)
+            ),
+            ProcessMatch::Match
+        );
 
         // 前缀目录不误判：checkin-ab 不是 checkin-a 的运行实例。
-        let other = r#""E:\x\TRAE.exe" --user-data-dir=D:\Work\Trae Sync\data\trae-instances\checkin-ab"#;
-        assert!(!command_line_uses_data_dir(other, dir));
+        let other =
+            r#""E:\x\TRAE.exe" --user-data-dir=D:\Work\Trae Sync\data\trae-instances\checkin-ab"#;
+        assert_eq!(
+            match_product_process(&process(other), TraeProduct::WorkCn, dir, Some(default_dir)),
+            ProcessMatch::NoMatch
+        );
         // 无关命令行。
-        assert!(!command_line_uses_data_dir(r#""E:\x\TRAE.exe""#, dir));
+        assert_eq!(
+            match_product_process(
+                &process(r#""E:\x\TRAE.exe""#),
+                TraeProduct::WorkCn,
+                dir,
+                Some(default_dir)
+            ),
+            ProcessMatch::NoMatch
+        );
     }
 
     #[test]
-    fn master_matching_covers_official_bare_launch() {
+    fn command_line_matching_requires_one_complete_actual_argument() {
+        let dir = std::path::Path::new(r"D:\Work\Trae Sync\data\trae-instances\checkin-a");
+        let default_dir = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let match_line = |command_line: &str| {
+            let process = TraeProcessInfo {
+                pid: 9,
+                exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+                command_line: Some(command_line.to_string()),
+            };
+            match_product_process(&process, TraeProduct::WorkCn, dir, Some(default_dir))
+        };
+        assert_eq!(
+            match_line(
+                r#""E:\x\TRAE.exe" --user-data-dir "D:\Work\Trae Sync\data\trae-instances\checkin-a""#
+            ),
+            ProcessMatch::Match
+        );
+        assert_eq!(
+            match_line(r#""E:\x\TRAE.exe" --user-data-dir="""#),
+            ProcessMatch::Unknown
+        );
+        assert_eq!(
+            match_line(r#""E:\x\TRAE.exe" --user-data-dir"#),
+            ProcessMatch::Unknown
+        );
+        assert_eq!(
+            match_line(
+                r#""E:\x\TRAE.exe" --user-data-dir=D:\Work\Trae Sync\data\trae-instances\checkin-a --user-data-dir=D:\other"#
+            ),
+            ProcessMatch::Unknown
+        );
+        // 目录字符串仅出现在其他参数时，不得当成 user-data-dir。
+        assert_eq!(
+            match_line(
+                r#""E:\x\TRAE.exe" --other=D:\Work\Trae Sync\data\trae-instances\checkin-a"#
+            ),
+            ProcessMatch::NoMatch
+        );
+        assert_eq!(
+            match_line(
+                r#""E:\x\TRAE.exe" --user-data-dir=D:\Work\Trae Sync\data\trae-instances\checkin-a\child"#
+            ),
+            ProcessMatch::NoMatch
+        );
+    }
+
+    #[test]
+    fn malformed_data_dir_does_not_fall_back_to_default_match() {
+        let root = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let malformed = |command_line: &str| TraeProcessInfo {
+            pid: 9,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(command_line.to_string()),
+        };
+        for process in [
+            malformed(r#""E:\TRAE SOLO CN.exe" --user-data-dir="#),
+            malformed(r#""E:\TRAE SOLO CN.exe" --user-data-dir=""#),
+            malformed(r#""E:\TRAE SOLO CN.exe" --user-data-dir=C:\one --user-data-dir=C:\two"#),
+            // 未闭合引号表示目录参数解析不完整，不能退回默认目录匹配。
+            malformed(
+                r#""E:\TRAE SOLO CN.exe" --user-data-dir="C:\Users\u\AppData\Roaming\TRAE SOLO CN"#,
+            ),
+            TraeProcessInfo {
+                pid: 10,
+                exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+                command_line: Some("   ".to_string()),
+            },
+        ] {
+            assert_eq!(
+                match_product_process(&process, TraeProduct::WorkCn, root, Some(root)),
+                ProcessMatch::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn product_matching_covers_official_bare_launch() {
         let official = std::path::Path::new(r"C:\Users\u\AppData\Roaming\TRAE SOLO CN");
+        let process = |command_line: &str| TraeProcessInfo {
+            pid: 10,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: Some(command_line.to_string()),
+        };
         // 官方快捷方式无参启动的主进程：默认 data_dir 即官方目录。
         let bare = r#""E:\软件\TRAE\TRAE SOLO CN\TRAE SOLO CN.exe""#;
-        assert!(command_line_matches_master(bare, official));
+        assert_eq!(
+            match_product_process(
+                &process(bare),
+                TraeProduct::WorkCn,
+                official,
+                Some(official)
+            ),
+            ProcessMatch::Match
+        );
         // 带参形态（App 启动或官方实例子进程）。
         let quoted = r#""E:\x\TRAE.exe" --type=gpu-process --user-data-dir="C:\Users\u\AppData\Roaming\TRAE SOLO CN""#;
-        assert!(command_line_matches_master(quoted, official));
+        assert_eq!(
+            match_product_process(
+                &process(quoted),
+                TraeProduct::WorkCn,
+                official,
+                Some(official)
+            ),
+            ProcessMatch::Match
+        );
 
         // 账号实例（显式指向别的目录）不误判为主库。
-        let account = r#""E:\x\TRAE.exe" --user-data-dir=D:\Work\Trae Sync\data\trae-instances\checkin-a"#;
-        assert!(!command_line_matches_master(account, official));
-        // 子进程形态（--type=）不带主库目录也不算（无参主进程仅限主进程）。
+        let account =
+            r#""E:\x\TRAE.exe" --user-data-dir=D:\Work\Trae Sync\data\trae-instances\checkin-a"#;
+        assert_eq!(
+            match_product_process(
+                &process(account),
+                TraeProduct::WorkCn,
+                official,
+                Some(official)
+            ),
+            ProcessMatch::NoMatch
+        );
+        let incomplete = r#""E:\x\TRAE.exe" --user-data-dir="#;
+        assert_eq!(
+            match_product_process(
+                &process(incomplete),
+                TraeProduct::WorkCn,
+                official,
+                Some(official)
+            ),
+            ProcessMatch::Unknown
+        );
+        // 无目录参数的子进程无法证明属于其他实例，保留未知。
         let child = r#""E:\x\TRAE.exe" --type=utility --utility-sub-type=monitor"#;
-        assert!(!command_line_matches_master(child, official));
+        assert_eq!(
+            match_product_process(
+                &process(child),
+                TraeProduct::WorkCn,
+                official,
+                Some(official)
+            ),
+            ProcessMatch::Unknown
+        );
     }
 
     #[test]
@@ -1321,8 +2188,16 @@ mod tests {
         let outcome =
             seed_login_state_with_appdata(&instance_dir, "1234567890", appdata.path()).unwrap();
         assert_eq!(outcome, SeedOutcome::Seeded);
-        assert!(instance_dir.join("User").join("globalStorage").join("storage.json").is_file());
-        assert!(instance_dir.join("User").join("globalStorage").join("state.vscdb").is_file());
+        assert!(instance_dir
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json")
+            .is_file());
+        assert!(instance_dir
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb")
+            .is_file());
         assert!(instance_dir.join("machineid").is_file());
 
         // 再次：幂等跳过。

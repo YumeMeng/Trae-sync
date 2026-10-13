@@ -7,8 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use traesync_domain::{
-    CheckinClaimSnapshot, CheckinStatusSnapshot, EntitlementPackSnapshot,
-    EntitlementUsageSnapshot,
+    CheckinClaimSnapshot, CheckinStatusSnapshot, EntitlementPackSnapshot, EntitlementUsageSnapshot,
 };
 use traesync_ports::{CheckinTransport, CheckinTransportError};
 

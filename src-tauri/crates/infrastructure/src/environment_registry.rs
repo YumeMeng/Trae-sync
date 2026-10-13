@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::operation_lease::FileOperationLock;
 use crate::product_adapter::TraeProduct;
 
 const REGISTRY_FILE: &str = "environments.json";
@@ -145,11 +146,13 @@ pub struct EnvironmentRegistry {
     path: PathBuf,
 }
 
-/// 主库 data_dir：官方 TRAE Work CN 默认数据目录。
+/// 主库 data_dir：官方融合版 TRAE 默认数据目录（`%APPDATA%\Trae CN`）。
 ///
-/// 2026-08-31 架构修订：主库 = 官方启动的环境（`%APPDATA%\TRAE SOLO CN`，
-/// 与 `work_cn_location` 固定发现路径同源）。日常从官方快捷方式启动即使用
-/// 主库，App 负责切号（关实例 → 备份 → 凭据互换 → 记录交接 → 重启）。
+/// 2026-10-13 主库目标切换（ADR-0035）：融合版 TRAE 取代 Work CN 成为
+/// 唯一官方客户端（Work 客户端 2026-10-23 停服），主库环境绑定目录随之
+/// 切换；Work 原目录（`%APPDATA%\TRAE SOLO CN`）作为历史数据保留，不再
+/// 被本函数返回。日常从官方快捷方式启动即使用主库，App 负责切号
+/// （关实例 → 备份 → 凭据互换 → 记录交接 → 重启）。
 /// APPDATA 环境变量缺失时报 Io（fail-closed，不猜路径）。
 pub fn master_data_dir() -> Result<PathBuf, EnvironmentRegistryError> {
     let appdata = std::env::var("APPDATA").map_err(|_| EnvironmentRegistryError::Io)?;
@@ -160,9 +163,7 @@ pub fn master_data_dir() -> Result<PathBuf, EnvironmentRegistryError> {
 ///
 /// 默认入口仍固定使用 Work CN；CN 适配必须显式选择产品，避免在两套
 /// 官方数据库之间发生静默串用。
-pub fn master_data_dir_for(
-    product: TraeProduct,
-) -> Result<PathBuf, EnvironmentRegistryError> {
+pub fn master_data_dir_for(product: TraeProduct) -> Result<PathBuf, EnvironmentRegistryError> {
     let appdata = std::env::var("APPDATA").map_err(|_| EnvironmentRegistryError::Io)?;
     Ok(product_data_dir_from_appdata(Path::new(&appdata), product))
 }
@@ -174,8 +175,9 @@ pub fn product_data_dir_from_appdata(appdata: &Path, product: TraeProduct) -> Pa
 }
 
 /// 纯函数形态（单测用）：由 APPDATA 根拼出官方目录。
+/// 融合版 TRAE 是当前唯一默认主库目标（ADR-0035）。
 fn official_data_dir_from_appdata(appdata: &Path) -> PathBuf {
-    official_data_dir_from_appdata_for(appdata, TraeProduct::WorkCn)
+    official_data_dir_from_appdata_for(appdata, TraeProduct::TraeCn)
 }
 
 /// 纯函数形态：由 APPDATA 根和产品形态拼出官方目录。
@@ -239,12 +241,16 @@ impl EnvironmentRegistry {
 
     /// 读取主库档案（V1 兼容入口；不存在返回 None）。
     pub fn load(&self) -> Result<Option<EnvironmentRecord>, EnvironmentRegistryError> {
-        Ok(self.load_all()?.into_iter().find(|record| record.is_master()))
+        Ok(self
+            .load_all()?
+            .into_iter()
+            .find(|record| record.is_master()))
     }
 
     /// 确保主库档案在位：缺失则以当前时间建档（幂等；已存在时不变，
     /// 其余副环境档案保持原样）。
     pub fn ensure_master(&self) -> Result<EnvironmentRecord, EnvironmentRegistryError> {
+        let _lock = self.write_lock()?;
         let mut environments = self.load_all()?;
         if let Some(record) = environments.iter().find(|record| record.is_master()) {
             return Ok(record.clone());
@@ -261,7 +267,10 @@ impl EnvironmentRegistry {
     }
 
     /// 按 env_id 查找档案。
-    pub fn find(&self, env_id: &str) -> Result<Option<EnvironmentRecord>, EnvironmentRegistryError> {
+    pub fn find(
+        &self,
+        env_id: &str,
+    ) -> Result<Option<EnvironmentRecord>, EnvironmentRegistryError> {
         Ok(self
             .load_all()?
             .into_iter()
@@ -279,11 +288,9 @@ impl EnvironmentRegistry {
         if name == MASTER_ENV_NAME {
             return Err(EnvironmentRegistryError::InvalidRecord);
         }
+        let _lock = self.write_lock()?;
         let mut environments = self.load_all()?;
-        if environments
-            .iter()
-            .any(|record| record.name.trim() == name)
-        {
+        if environments.iter().any(|record| record.name.trim() == name) {
             return Err(EnvironmentRegistryError::NameTaken);
         }
         let record = EnvironmentRecord {
@@ -314,6 +321,7 @@ impl EnvironmentRegistry {
         if name == MASTER_ENV_NAME {
             return Err(EnvironmentRegistryError::InvalidRecord);
         }
+        let _lock = self.write_lock()?;
         let mut environments = self.load_all()?;
         let index = environments
             .iter()
@@ -337,6 +345,7 @@ impl EnvironmentRegistry {
         if env_id == MASTER_ENV_ID {
             return Err(EnvironmentRegistryError::MasterImmutable);
         }
+        let _lock = self.write_lock()?;
         let mut environments = self.load_all()?;
         let index = environments
             .iter()
@@ -358,6 +367,7 @@ impl EnvironmentRegistry {
         if profile_id.is_empty() || profile_id.len() > MAX_TEXT_FIELD_BYTES {
             return Err(EnvironmentRegistryError::InvalidRecord);
         }
+        let _lock = self.write_lock()?;
         let mut environments = self.load_all()?;
         let index = match environments
             .iter()
@@ -366,8 +376,14 @@ impl EnvironmentRegistry {
             Some(index) => index,
             // 主库档案缺失时自动建档（兼容旧调用点）；副环境必须先创建。
             None if env_id == MASTER_ENV_ID => {
-                self.ensure_master()?;
-                return self.set_current_profile(env_id, profile_id);
+                environments.push(EnvironmentRecord {
+                    env_id: MASTER_ENV_ID.to_string(),
+                    name: MASTER_ENV_NAME.to_string(),
+                    current_profile_id: Some(profile_id.to_string()),
+                    created_at_unix_seconds: current_unix_seconds(),
+                });
+                self.write(&environments)?;
+                return Ok(true);
             }
             None => return Err(EnvironmentRegistryError::NotFound),
         };
@@ -395,19 +411,17 @@ impl EnvironmentRegistry {
             mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D049BB133111EB);
             mixed ^= mixed >> 31;
-            let candidate = format!(
-                "env-{}-{:x}",
-                current_unix_seconds(),
-                mixed & 0xFFFF
-            );
-            if !environments
-                .iter()
-                .any(|record| record.env_id == candidate)
-            {
+            let candidate = format!("env-{}-{:x}", current_unix_seconds(), mixed & 0xFFFF);
+            if !environments.iter().any(|record| record.env_id == candidate) {
                 return Ok(candidate);
             }
         }
         Err(EnvironmentRegistryError::Io)
+    }
+
+    fn write_lock(&self) -> Result<FileOperationLock, EnvironmentRegistryError> {
+        FileOperationLock::acquire_sibling_resource(&self.path)
+            .map_err(|_| EnvironmentRegistryError::Io)
     }
 
     /// 原子写入：失败时保留原文件。全部记录整体校验后落盘。
@@ -461,13 +475,37 @@ fn current_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    /// 子进程等待共同起跑信号后执行注册表写入。
+    #[test]
+    fn child_process_creates_registry_row_after_shared_start_signal() {
+        let (Ok(root), Ok(name), Ok(ready_path), Ok(start_path)) = (
+            std::env::var("TRAE_SYNC_REGISTRY_CHILD_ROOT"),
+            std::env::var("TRAE_SYNC_REGISTRY_CHILD_NAME"),
+            std::env::var("TRAE_SYNC_REGISTRY_CHILD_READY"),
+            std::env::var("TRAE_SYNC_REGISTRY_CHILD_START"),
+        ) else {
+            return;
+        };
+        std::fs::write(&ready_path, b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !Path::new(&start_path).is_file() {
+            assert!(Instant::now() < deadline, "并发注册表测试启动信号超时");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        EnvironmentRegistry::new(root).create(&name).unwrap();
+    }
 
     #[test]
     fn master_data_dir_shape() {
-        // 官方目录 = APPDATA 下 TRAE SOLO CN（与 work_cn_location 固定发现同源）。
+        // 2026-10-13 主库目标切换（ADR-0035）：官方目录 = APPDATA 下融合版
+        // Trae CN；Work 原目录不再作为主库目标。
         let dir = official_data_dir_from_appdata(Path::new("C:/Users/u/AppData/Roaming"));
-        assert_eq!(dir, Path::new("C:/Users/u/AppData/Roaming/TRAE SOLO CN"));
+        assert_eq!(dir, Path::new("C:/Users/u/AppData/Roaming/Trae CN"));
     }
 
     #[test]
@@ -523,9 +561,14 @@ mod tests {
         let environments = registry.load_all().unwrap();
         assert_eq!(environments.len(), 1);
         assert_eq!(environments[0].name, "主库");
-        assert_eq!(environments[0].current_profile_id.as_deref(), Some("checkin-abc"));
+        assert_eq!(
+            environments[0].current_profile_id.as_deref(),
+            Some("checkin-abc")
+        );
         // V1 档案的写入操作落盘为 V2 格式（单向迁移）。
-        registry.set_current_profile(MASTER_ENV_ID, "checkin-def").unwrap();
+        registry
+            .set_current_profile(MASTER_ENV_ID, "checkin-def")
+            .unwrap();
         let content = std::fs::read_to_string(registry_path(root.path())).unwrap();
         assert!(content.contains("\"format_version\": 2"));
         assert!(content.contains("\"environments\""));
@@ -588,7 +631,9 @@ mod tests {
             EnvironmentRegistryError::InvalidRecord
         );
         assert_eq!(
-            registry.create(&"长".repeat(MAX_ENV_NAME_CHARS + 1)).unwrap_err(),
+            registry
+                .create(&"长".repeat(MAX_ENV_NAME_CHARS + 1))
+                .unwrap_err(),
             EnvironmentRegistryError::InvalidRecord
         );
         // 保留名「主库」与重名。
@@ -652,7 +697,9 @@ mod tests {
 
         // 副环境：登录账号写回该环境档案行（多对多：各环境各自记忆）。
         let env = registry.create("副环境").unwrap();
-        assert!(registry.set_current_profile(&env.env_id, "checkin-xyz").unwrap());
+        assert!(registry
+            .set_current_profile(&env.env_id, "checkin-xyz")
+            .unwrap());
         let all = EnvironmentRegistry::new(root.path()).load_all().unwrap();
         assert_eq!(
             all.iter()
@@ -673,7 +720,9 @@ mod tests {
         );
         // 不存在的副环境写回报 NotFound。
         assert_eq!(
-            registry.set_current_profile("env-none", "checkin-abc").unwrap_err(),
+            registry
+                .set_current_profile("env-none", "checkin-abc")
+                .unwrap_err(),
             EnvironmentRegistryError::NotFound
         );
     }
@@ -683,7 +732,9 @@ mod tests {
         let root = tempdir().unwrap();
         let registry = EnvironmentRegistry::new(root.path());
         assert_eq!(
-            registry.set_current_profile(MASTER_ENV_ID, "   ").unwrap_err(),
+            registry
+                .set_current_profile(MASTER_ENV_ID, "   ")
+                .unwrap_err(),
             EnvironmentRegistryError::InvalidRecord
         );
     }
@@ -735,6 +786,129 @@ mod tests {
             registry.set_current_profile(MASTER_ENV_ID, "checkin-abc"),
             Err(EnvironmentRegistryError::Invalid)
         );
+    }
+
+    #[test]
+    fn concurrent_creates_preserve_both_registry_updates() {
+        let root = tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = ["环境甲", "环境乙"]
+            .into_iter()
+            .map(|name| {
+                let root = root.path().to_path_buf();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    EnvironmentRegistry::new(root).create(name).unwrap()
+                })
+            })
+            .collect();
+        let created: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+
+        let all = EnvironmentRegistry::new(root.path()).load_all().unwrap();
+        for record in created {
+            assert!(all.iter().any(|saved| saved.env_id == record.env_id));
+        }
+    }
+
+    /// 两个独立进程同时创建环境时，两个注册表行都必须保留。
+    #[test]
+    fn concurrent_process_creates_preserve_both_registry_updates() {
+        let root = tempdir().unwrap();
+        let start_path = root.path().join("children-start");
+        let names = ["跨进程甲", "跨进程乙"];
+        let children: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let ready_path = root.path().join(format!("child-{index}-ready"));
+                Command::new(std::env::current_exe().unwrap())
+                    .env("TRAE_SYNC_REGISTRY_CHILD_ROOT", root.path())
+                    .env("TRAE_SYNC_REGISTRY_CHILD_NAME", name)
+                    .env("TRAE_SYNC_REGISTRY_CHILD_READY", &ready_path)
+                    .env("TRAE_SYNC_REGISTRY_CHILD_START", &start_path)
+                    .args([
+                        "--exact",
+                        "environment_registry::tests::child_process_creates_registry_row_after_shared_start_signal",
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let ready_paths: Vec<_> = (0..names.len())
+            .map(|index| root.path().join(format!("child-{index}-ready")))
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ready_paths.iter().any(|path| !path.is_file()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(&start_path, b"start").unwrap();
+        for child in children {
+            assert!(child.wait_with_output().unwrap().status.success());
+        }
+        assert!(ready_paths.iter().all(|path| path.is_file()));
+
+        let records = EnvironmentRegistry::new(root.path()).load_all().unwrap();
+        for name in names {
+            assert!(records.iter().any(|record| record.name == name));
+        }
+    }
+
+    #[test]
+    fn concurrent_profile_updates_preserve_other_environment_rows() {
+        let root = tempdir().unwrap();
+        let registry = EnvironmentRegistry::new(root.path());
+        let first = registry.create("环境甲").unwrap();
+        let second = registry.create("环境乙").unwrap();
+        let first_id = first.env_id.clone();
+        let second_id = second.env_id.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = [(first_id, "checkin-a"), (second_id, "checkin-b")]
+            .into_iter()
+            .map(|(env_id, profile_id)| {
+                let root = root.path().to_path_buf();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    EnvironmentRegistry::new(root)
+                        .set_current_profile(&env_id, profile_id)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let all = registry.load_all().unwrap();
+        assert_eq!(
+            all.iter()
+                .find(|record| record.env_id == first.env_id)
+                .and_then(|record| record.current_profile_id.as_deref()),
+            Some("checkin-a")
+        );
+        assert_eq!(
+            all.iter()
+                .find(|record| record.env_id == second.env_id)
+                .and_then(|record| record.current_profile_id.as_deref()),
+            Some("checkin-b")
+        );
+    }
+
+    /// 原子发布期间的只读加载不等待注册表 sidecar 写锁。
+    #[test]
+    fn reads_remain_available_while_a_registry_writer_holds_its_sidecar_lock() {
+        let root = tempdir().unwrap();
+        let registry = EnvironmentRegistry::new(root.path());
+        registry.ensure_master().unwrap();
+        let _writer = registry.write_lock().unwrap();
+
+        assert_eq!(registry.load_all().unwrap().len(), 1);
     }
 
     /// 注册表文件路径（测试辅助）。

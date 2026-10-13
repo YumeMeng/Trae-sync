@@ -64,6 +64,7 @@ async function mockInvoke(command, args) {
       env_id: "master",
       current_profile_id: "p1",
       current_account_name: "账号M",
+      observed_profile_id: "p1",
       data_dir: "C:\\TraeSync\\data\\environments\\master",
       running: false,
       login_state: "logged_in",

@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use traesync_infrastructure::trae_instance::{
-    self as trae_instance_module, discover_trae_executable, focus_instance_windows,
-    instance_data_dir, list_trae_processes, seed_login_state,
+    self as trae_instance_module, default_product_data_dir, discover_trae_executable_for,
+    focus_instance_windows, instance_data_dir, list_trae_processes, matched_product_process_ids,
+    seed_login_state, TraeProcessInfo,
 };
 use traesync_infrastructure::{
     get_user_info_full, trae_http_client, AccountRegistry, CheckinCredentialStore,
-    CheckinHttpError, CheckinProfileBinding, UserInfoFull,
+    CheckinHttpError, CheckinProfileBinding, TraeProduct, UserInfoFull,
 };
 
 use crate::{checkin_material_root, run_blocking, AppState, RuntimeMode};
@@ -121,37 +122,71 @@ pub(crate) fn trae_instance_account_id(
 /// 实例启动公共链路（P5-0 抽出，主库与账号实例共用）：
 /// 进程查询 → 已运行则聚焦返回 → exe 发现 →（可选登录态种子）→ 建目录
 /// → 窗口标题写入 → spawn。
-/// matcher 决定「已运行」的判定口径：账号实例用带参匹配
-/// （`command_line_uses_data_dir`），主库（官方目录）额外覆盖官方
-/// 快捷方式无参启动的主进程（`command_line_matches_master`）。
+/// 产品与数据目录共同决定实例归属；无法确认任一 TRAE 候选时停止，避免重复启动。
 pub(crate) fn launch_instance_common(
+    product: TraeProduct,
     instance_dir: &Path,
     window_title: &str,
     seed_account_id: Option<&str>,
-    matcher: fn(&str, &Path) -> bool,
 ) -> Result<TraeInstanceLaunchDto, String> {
     let processes = list_trae_processes().map_err(|e| e.code().to_string())?;
+    launch_instance_common_with_processes(
+        product,
+        instance_dir,
+        window_title,
+        seed_account_id,
+        &processes,
+    )
+}
 
-    // 已在运行：聚焦已有实例，不重复启动（同目录幂等）。
-    let running_pids: Vec<u32> = processes
-        .iter()
-        .filter(|process| {
-            process
-                .command_line
-                .as_deref()
-                .is_some_and(|line| matcher(line, instance_dir))
-        })
-        .map(|process| process.pid)
-        .collect();
+/// 使用同一条启动编排消费进程快照，便于离线验证未知身份时不触发启动副作用。
+fn launch_instance_common_with_processes(
+    product: TraeProduct,
+    instance_dir: &Path,
+    window_title: &str,
+    seed_account_id: Option<&str>,
+    processes: &[TraeProcessInfo],
+) -> Result<TraeInstanceLaunchDto, String> {
+    launch_instance_common_with_processes_and_focus(
+        product,
+        instance_dir,
+        window_title,
+        seed_account_id,
+        processes,
+        focus_instance_windows,
+    )
+}
+
+/// 将聚焦动作作为输入，便于测试验证 matcher 选出的 PID；生产入口仍传入系统聚焦函数。
+fn launch_instance_common_with_processes_and_focus<F>(
+    product: TraeProduct,
+    instance_dir: &Path,
+    window_title: &str,
+    seed_account_id: Option<&str>,
+    processes: &[TraeProcessInfo],
+    mut focus_windows: F,
+) -> Result<TraeInstanceLaunchDto, String>
+where
+    F: FnMut(&[u32]) -> bool,
+{
+    // 已在运行：聚焦目标进程；任何无法归属的候选都阻止新启动。
+    let default_data_dir = default_product_data_dir(product);
+    let running_pids = matched_product_process_ids(
+        processes,
+        product,
+        instance_dir,
+        default_data_dir.as_deref(),
+    )
+    .map_err(|_| "process_state_unknown".to_string())?;
     if !running_pids.is_empty() {
-        focus_instance_windows(&running_pids);
+        focus_windows(&running_pids);
         return Ok(TraeInstanceLaunchDto {
             outcome: "focused",
             login_state: trae_instance_module::instance_login_state(instance_dir),
         });
     }
 
-    let exe = discover_trae_executable(&processes).map_err(|e| e.code().to_string())?;
+    let exe = discover_trae_executable_for(product, processes).map_err(|e| e.code().to_string())?;
     // 登录态种子仅账号实例使用；主库不播种（Q2 新建空主库：首启进 TRAE
     // 登录页登录一次，此后登录态由切号流程的凭据互换维护，P5-1）。
     let seed = seed_account_id
@@ -205,6 +240,121 @@ pub(crate) fn launch_instance_common(
         // seed 之后判定：播种成功即已登录；NativeMissing/空壳目录即待登录引导。
         login_state: trae_instance_module::instance_login_state(instance_dir),
     })
+}
+
+#[cfg(test)]
+mod launch_process_guard_tests {
+    use super::*;
+
+    /// P14-2：聚焦回调只能收到匹配所选 Work 数据目录的 PID。
+    #[test]
+    fn focus_receives_only_pids_matching_the_selected_work_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let instance_dir = root.path().join("selected-instance");
+        let other_instance_dir = root.path().join("other-instance");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        let processes = [
+            TraeProcessInfo {
+                pid: 51,
+                exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+                command_line: Some(format!(
+                    r#""E:\TRAE SOLO CN.exe" --user-data-dir="{}""#,
+                    instance_dir.display()
+                )),
+            },
+            TraeProcessInfo {
+                pid: 52,
+                exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+                command_line: Some(format!(
+                    r#""E:\TRAE SOLO CN.exe" --user-data-dir="{}""#,
+                    other_instance_dir.display()
+                )),
+            },
+        ];
+        let mut focused_pids = Vec::new();
+        let focus = |pids: &[u32]| {
+            focused_pids.extend_from_slice(pids);
+            true
+        };
+
+        let result = launch_instance_common_with_processes_and_focus(
+            TraeProduct::WorkCn,
+            &instance_dir,
+            "测试环境",
+            None,
+            &processes,
+            focus,
+        )
+        .unwrap();
+
+        assert_eq!(result.outcome, "focused");
+        assert_eq!(focused_pids, vec![51]);
+    }
+
+    /// P14-2：其他产品声称占用 Work 目录时必须 fail-closed，不能聚焦。
+    #[test]
+    fn cross_product_process_claiming_work_directory_blocks_focus() {
+        let root = tempfile::tempdir().unwrap();
+        let instance_dir = root.path().join("selected-instance");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        let processes = [
+            TraeProcessInfo {
+                pid: 61,
+                exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+                command_line: Some(format!(
+                    r#""E:\TRAE SOLO CN.exe" --user-data-dir="{}""#,
+                    instance_dir.display()
+                )),
+            },
+            TraeProcessInfo {
+                pid: 63,
+                exe_path: Some(r"E:\Trae CN\Trae CN.exe".to_string()),
+                command_line: Some(format!(
+                    r#""E:\Trae CN\Trae CN.exe" --user-data-dir="{}""#,
+                    instance_dir.display()
+                )),
+            },
+        ];
+        let mut focused_pids = Vec::new();
+        let focus = |pids: &[u32]| {
+            focused_pids.extend_from_slice(pids);
+            true
+        };
+
+        let result = launch_instance_common_with_processes_and_focus(
+            TraeProduct::WorkCn,
+            &instance_dir,
+            "测试环境",
+            None,
+            &processes,
+            focus,
+        );
+
+        assert!(matches!(result, Err(error) if error == "process_state_unknown"));
+        assert!(focused_pids.is_empty());
+    }
+
+    #[test]
+    fn unknown_work_process_identity_stops_before_creating_instance_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let instance_dir = root.path().join("new-instance");
+        let processes = [TraeProcessInfo {
+            pid: 42,
+            exe_path: Some(r"E:\TRAE SOLO CN.exe".to_string()),
+            command_line: None,
+        }];
+
+        let result = launch_instance_common_with_processes(
+            TraeProduct::WorkCn,
+            &instance_dir,
+            "测试环境",
+            Some("profile-a"),
+            &processes,
+        );
+
+        assert!(matches!(result, Err(error) if error == "process_state_unknown"));
+        assert!(!instance_dir.exists());
+    }
 }
 
 /// 批量查询账号登录凭据健康度（P7-5 凭据包实调判定）：

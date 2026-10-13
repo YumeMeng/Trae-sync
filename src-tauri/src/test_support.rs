@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use traesync_domain::AuthorizationState;
 use traesync_infrastructure::{
-    AccountRegistry, AccountEvidenceReader, FixedProcessController, SqlCipherProbe,
+    AccountEvidenceReader, AccountRegistry, FixedProcessController, SqlCipherProbe,
     StaticWorkspaceStateProvider,
 };
 
@@ -39,12 +39,16 @@ pub(crate) fn make_real_mode_state(storage_root: &Path) -> AppState {
         pending_deletion_plan: Arc::new(Mutex::new(None)),
         managed_account_runtime: Arc::new(Mutex::new(ManagedAccountRuntimeSlot::default())),
         checkin_cancellation: Arc::new(AtomicBool::new(false)),
-        pending_login: Arc::new(Mutex::new(None)),
-        active_oauth_profile: Arc::new(Mutex::new(None)),
-        login_cancel: Arc::new(AtomicBool::new(false)),
-        active_login_browser: Arc::new(Mutex::new(None)),
+        active_login_attempt: Arc::new(Mutex::new(None)),
         checkin_execution_lock: Arc::new(Mutex::new(())),
     }
+}
+
+/// 构造 fixture 模式状态，用于确认普通操作门禁早于真实读写门禁。
+pub(crate) fn make_fixture_mode_state(storage_root: &Path) -> AppState {
+    let mut state = make_real_mode_state(storage_root);
+    state.runtime_mode = RuntimeMode::Fixture;
+    state
 }
 
 /// 写入一条已登录账号的注册表档案（设备公钥为真实 P-256 SPKI PEM）。

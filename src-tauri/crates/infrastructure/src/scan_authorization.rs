@@ -74,9 +74,10 @@ impl ScanAuthorizationStore {
         if !metadata.is_file() || metadata.len() > MAX_STORE_BYTES {
             return Err(ScanAuthorizationStoreError::Invalid);
         }
-        let content = fs::read_to_string(&self.path).map_err(|_| ScanAuthorizationStoreError::Io)?;
-        let store: StoreFile = serde_json::from_str(&content)
-            .map_err(|_| ScanAuthorizationStoreError::Invalid)?;
+        let content =
+            fs::read_to_string(&self.path).map_err(|_| ScanAuthorizationStoreError::Io)?;
+        let store: StoreFile =
+            serde_json::from_str(&content).map_err(|_| ScanAuthorizationStoreError::Invalid)?;
         if store.format_version != 1 {
             return Err(ScanAuthorizationStoreError::Invalid);
         }

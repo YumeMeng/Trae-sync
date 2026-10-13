@@ -2,8 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ProductId } from "./productRegistry";
 import type {
   ProductIdentityStateDto,
-  TraeCnCredentialRefreshEntryDto,
-  ProductLoginBeginDto,
   TraeCnAccountDto,
   TraeCnHealthEntryDto,
   TraeCnLoginReceiptDto,
@@ -13,8 +11,7 @@ import type {
 export type AccountCapability =
   | "login"
   | "relogin"
-  | "switch"
-  | "refreshCredential"
+  | "toolSelection"
   | "checkin"
   | "credits"
   | "health"
@@ -26,22 +23,20 @@ export interface AccountView {
   readonly displayName: string;
   readonly status: "active" | "expired" | "unknown";
   readonly lastVerifiedAt: string | null;
-  readonly isCurrent: boolean;
+  readonly isToolSelected: boolean;
 }
 
 /** 适配器返回给共享账号工作台的快照；不携带令牌或本地凭据。 */
 export interface AccountSnapshot {
+  /** 快照来源产品；用于丢弃切产品后迟到的读取结果。 */
   readonly productId: ProductId;
-  readonly productName: string;
   readonly statusLabel: string;
   readonly accounts: readonly AccountView[];
-  readonly currentAccountId: string | null;
-  readonly capabilities: readonly AccountCapability[];
-  readonly identityLabel: string;
-  readonly identityMessage: string;
+  readonly officialIdentityLabel: string;
+  readonly officialIdentityMessage: string;
 }
 
-export type AccountAction = "refreshCredential" | "checkin" | "credits" | "health";
+export type AccountAction = "checkin" | "credits" | "health";
 
 export interface AccountActionIssue {
   readonly id: string;
@@ -66,15 +61,15 @@ export interface AccountAdapter {
   readonly productName: string;
   readonly capabilities: readonly AccountCapability[];
   loadSnapshot(): Promise<AccountSnapshot>;
-  login(): Promise<{
+  login(onAttemptStarted: (attemptId: number) => void): Promise<{
     readonly displayName: string;
     /** 首登可持续性验收结果（ADR-0027）：failed = 账号已保存但同设备换发未通过。 */
     readonly acceptance: "passed" | "failed";
     /** 验收失败的稳定错误码；通过时为 null。 */
     readonly acceptanceErrorCode: string | null;
   }>;
-  cancelLogin(): Promise<void>;
-  switchAccount(accountId: string): Promise<void>;
+  cancelLogin(attemptId: number): Promise<void>;
+  selectToolAccount(accountId: string): Promise<void>;
   /**
    * targetAccountId：单账号动作目标（ADR-0031 决策 6 远程退出联动健康检查）；
    * 缺省为全部账号。仅 health 动作使用该参数。
@@ -84,20 +79,21 @@ export interface AccountAdapter {
 
 function identityCopy(
   identity: ProductIdentityStateDto | undefined,
-  accounts: readonly TraeCnAccountDto[],
-): Pick<AccountSnapshot, "identityLabel" | "identityMessage"> {
-  const currentAccount = accounts.find((account) => account.is_current) ?? null;
-  const identityLabel = currentAccount
-    ? `当前账号：${currentAccount.display_name}`
-    : identity?.identity_status === "recognized"
-      ? "已发现账号材料"
-      : "尚未识别账号";
-  const identityMessage = identity?.relation_to_work === "same_identity"
-    ? "已发现与 Work CN 相同的 TRAE 身份。"
-    : identity?.relation_to_work === "different_identity"
-      ? "已发现 Trae CN 当前保存的是另一个 TRAE 身份。"
-      : "尚未确认与 Work CN 的 TRAE 身份关系。";
-  return { identityLabel, identityMessage };
+): Pick<AccountSnapshot, "officialIdentityLabel" | "officialIdentityMessage"> {
+  const officialIdentityLabel = identity?.identity_status === "recognized"
+    ? "官方客户端身份：已识别"
+    : identity?.identity_status === "conflict"
+      ? "官方客户端身份：信息冲突"
+      : "官方客户端身份：未确认";
+  const relation = identity?.identity_status === "recognized" ? identity.relation_to_work : "unknown";
+  const officialIdentityMessage = relation === "same_identity"
+    ? "从 Trae CN 客户端数据读取到的身份与 Work CN 相同。"
+    : relation === "different_identity"
+      ? "从 Trae CN 客户端数据读取到的身份与 Work CN 不同。"
+      : relation === "current_product"
+        ? "这是 Work CN 客户端记录的身份。"
+        : "目前无法确认 Trae CN 客户端身份与 Work CN 的关系。";
+  return { officialIdentityLabel, officialIdentityMessage };
 }
 
 function toAccountView(account: TraeCnAccountDto): AccountView {
@@ -106,13 +102,14 @@ function toAccountView(account: TraeCnAccountDto): AccountView {
     displayName: account.display_name,
     status: account.status,
     lastVerifiedAt: account.last_verified_at,
-    isCurrent: account.is_current,
+    isToolSelected: account.is_current,
   };
 }
 
-/** Trae CN 的独立 OAuth、账号池和当前账号指针适配器。 */
+/** Trae CN 的独立 OAuth、账号池和工具内账号选择指针适配器。 */
 export function createTraeCnAccountAdapter(
-  productName = "Trae CN",
+  // 融合版后 TraeCn 变体即官方产品"TRAE"（ADR-0035）。
+  productName = "TRAE",
   defaultStatusLabel = "需要授权",
 ): AccountAdapter {
   const loadRawAccounts = async (): Promise<{
@@ -132,35 +129,33 @@ export function createTraeCnAccountAdapter(
   return {
     productId: "trae_cn",
     productName,
-    capabilities: ["login", "relogin", "switch", "health", "refreshCredential", "remoteDevices"],
+    capabilities: ["login", "relogin", "toolSelection", "health", "remoteDevices"],
     async loadSnapshot() {
       const { identity, accounts } = await loadRawAccounts();
-      const current = accounts.find((account) => account.is_current) ?? null;
-      const copy = identityCopy(identity, accounts);
+      const copy = identityCopy(identity);
       return {
         productId: "trae_cn",
-        productName,
         statusLabel: accounts.length > 0 ? `已保存 ${accounts.length} 个账号` : defaultStatusLabel,
         accounts: accounts.map(toAccountView),
-        currentAccountId: current?.profile_id ?? null,
-        capabilities: ["login", "relogin", "switch", "health", "refreshCredential", "remoteDevices"],
         ...copy,
       };
     },
-    async login() {
+    async login(onAttemptStarted) {
       // 复用的是浏览器网页登录会话，不是 Work CN 的本地凭据或 native storage。
-      await invoke<ProductLoginBeginDto>("begin_trae_cn_login", { useSystemBrowser: true });
-      const receipt = await invoke<TraeCnLoginReceiptDto>("complete_trae_cn_login");
+      const begin = await invoke<{ attempt_id: number }>("begin_trae_cn_login", { useSystemBrowser: true });
+      onAttemptStarted(begin.attempt_id);
+      const receipt = await invoke<TraeCnLoginReceiptDto>("complete_trae_cn_login", { attemptId: begin.attempt_id });
       return {
-        displayName: receipt.screen_name || "Trae CN 账号",
+        displayName: receipt.screen_name || "TRAE 账号",
         acceptance: receipt.acceptance,
         acceptanceErrorCode: receipt.acceptance_error_code ?? null,
       };
     },
-    async cancelLogin() {
-      await invoke("cancel_trae_cn_login");
+    async cancelLogin(attemptId) {
+      await invoke("cancel_trae_cn_login", { attemptId });
     },
-    async switchAccount(accountId) {
+    async selectToolAccount(accountId) {
+      // 只更新 Trae Sync 自有选择指针，不切换官方客户端身份。
       await invoke("switch_trae_cn_account", { profileId: accountId });
     },
     async runAction(action, targetAccountId) {
@@ -175,13 +170,7 @@ export function createTraeCnAccountAdapter(
         });
         return actionResultFromHealth(results);
       }
-      if (action === "refreshCredential") {
-        const results = await invoke<TraeCnCredentialRefreshEntryDto[]>("refresh_trae_cn_credentials", {
-          profileIds: (await loadRawAccounts()).accounts.map((account) => account.profile_id),
-        });
-        return actionResultFromCredentialRefresh(results);
-      }
-      throw new Error(`Trae CN 暂不支持“${action}”操作。`);
+      throw new Error(`TRAE 暂不支持“${action}”操作。`);
     },
   };
 }
@@ -191,21 +180,6 @@ function actionResultFromHealth(results: readonly TraeCnHealthEntryDto[]): Accou
     okCount: results.filter((item) => item.healthy).length,
     issues: results
       .filter((item) => !item.healthy)
-      .map((item) => ({
-        id: item.profile_id,
-        displayName: item.screen_name,
-        errorCode: item.error_code,
-      })),
-  };
-}
-
-function actionResultFromCredentialRefresh(
-  results: readonly TraeCnCredentialRefreshEntryDto[],
-): AccountActionResult {
-  return {
-    okCount: results.filter((item) => item.refreshed).length,
-    issues: results
-      .filter((item) => !item.refreshed)
       .map((item) => ({
         id: item.profile_id,
         displayName: item.screen_name,

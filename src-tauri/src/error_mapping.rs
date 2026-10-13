@@ -7,7 +7,7 @@
 
 use traesync_infrastructure::{
     fixture_path_error_text, CheckinCredentialError, CheckinHttpError, CredentialVaultError,
-    FixturePathError, LoginError, MasterArchiveError, TraeCnCheckinError, WorkCnReadLocationError,
+    FixturePathError, LoginError, MasterArchiveError, WorkCnReadLocationError,
 };
 
 // ============================================================================
@@ -75,24 +75,6 @@ pub(super) fn trae_cn_health_error_code(error: &CheckinHttpError) -> String {
     }
 }
 
-/// Trae CN 签到错误 → 稳定错误码（P13-1；口径对齐 trae_cn_health_error_code：
-/// 401/403 归凭据失效，业务码 `business_{code}` 原样透传不压平）。
-pub(super) fn trae_cn_checkin_error_code(error: &TraeCnCheckinError) -> String {
-    match error {
-        TraeCnCheckinError::Network => "network_error".to_string(),
-        TraeCnCheckinError::Http(401 | 403) => "credential_invalid".to_string(),
-        TraeCnCheckinError::Http(_) => "trae_cn_checkin_http_failed".to_string(),
-        TraeCnCheckinError::Business(code) => format!("business_{code}"),
-        TraeCnCheckinError::Protocol => "trae_cn_checkin_protocol".to_string(),
-        // 防御分支（命令层先校验档案与 client，正常不触达）归凭据失效；
-        // 其余凭据原因码本身就是前端词表既有形态，原样透传。
-        TraeCnCheckinError::Credential("profile_mismatch" | "client_mismatch") => {
-            "credential_invalid".to_string()
-        }
-        TraeCnCheckinError::Credential(reason) => reason.to_string(),
-    }
-}
-
 /// 归档通道错误码映射（稳定契约，前端 safeUiError 据此给文案）。
 pub(super) fn map_master_archive_error(error: MasterArchiveError) -> String {
     match error {
@@ -100,6 +82,12 @@ pub(super) fn map_master_archive_error(error: MasterArchiveError) -> String {
         MasterArchiveError::DbOpenFailed => "master_archive_open_failed".to_string(),
         MasterArchiveError::ArchiveUnsupported => "master_archive_unsupported".to_string(),
         MasterArchiveError::WriteFailed => "master_archive_write_failed".to_string(),
+        MasterArchiveError::CommitOutcomeUnknown => {
+            "master_archive_commit_outcome_unknown".to_string()
+        }
+        MasterArchiveError::CommittedNeedsAttention => {
+            "master_archive_committed_needs_attention".to_string()
+        }
         MasterArchiveError::BackupFailed => "master_archive_backup_failed".to_string(),
         MasterArchiveError::MergeInvalid => "master_merge_invalid".to_string(),
         MasterArchiveError::ArchiveConflict => "master_archive_conflict".to_string(),
@@ -117,109 +105,162 @@ mod tests {
     /// 登录域：LoginError 全变体 → 稳定错误码。
     #[test]
     fn login_error_maps_every_variant_to_stable_code() {
-        assert_eq!(login_command_error(&LoginError::InvalidCallback), "login_callback_invalid");
-        assert_eq!(login_command_error(&LoginError::ExchangeFailed), "login_exchange_failed");
+        assert_eq!(
+            login_command_error(&LoginError::InvalidCallback),
+            "login_callback_invalid"
+        );
+        assert_eq!(
+            login_command_error(&LoginError::ExchangeFailed),
+            "login_exchange_failed"
+        );
         assert_eq!(
             login_command_error(&LoginError::ExchangeDeviceLimit),
             "login_exchange_device_limit"
         );
-        assert_eq!(login_command_error(&LoginError::InvalidToken), "login_token_invalid");
-        assert_eq!(login_command_error(&LoginError::Storage), "login_storage_failed");
-        assert_eq!(login_command_error(&LoginError::Cancelled), "login_cancelled");
+        assert_eq!(
+            login_command_error(&LoginError::InvalidToken),
+            "login_token_invalid"
+        );
+        assert_eq!(
+            login_command_error(&LoginError::Storage),
+            "login_storage_failed"
+        );
+        assert_eq!(
+            login_command_error(&LoginError::Cancelled),
+            "login_cancelled"
+        );
     }
 
     /// 凭据维护域：CheckinCredentialError 全变体 → 稳定原因码。
     #[test]
     fn credential_maintenance_maps_every_variant_to_stable_code() {
-        assert_eq!(credential_maintenance_error_code(&CheckinCredentialError::BindingMismatch), "binding_mismatch");
+        assert_eq!(
+            credential_maintenance_error_code(&CheckinCredentialError::BindingMismatch),
+            "binding_mismatch"
+        );
         assert_eq!(
             credential_maintenance_error_code(&CheckinCredentialError::CredentialRefreshFailed),
             "credential_refresh_failed"
         );
-        assert_eq!(credential_maintenance_error_code(&CheckinCredentialError::AuthMismatch), "auth_mismatch");
+        assert_eq!(
+            credential_maintenance_error_code(&CheckinCredentialError::AuthMismatch),
+            "auth_mismatch"
+        );
         assert_eq!(
             credential_maintenance_error_code(&CheckinCredentialError::RecoveryRequired),
             "manual_recovery_required"
         );
-        assert_eq!(credential_maintenance_error_code(&CheckinCredentialError::Missing), "credential_missing");
-        assert_eq!(credential_maintenance_error_code(&CheckinCredentialError::Unavailable), "credential_unavailable");
-        assert_eq!(credential_maintenance_error_code(&CheckinCredentialError::Invalid), "credential_invalid");
+        assert_eq!(
+            credential_maintenance_error_code(&CheckinCredentialError::Missing),
+            "credential_missing"
+        );
+        assert_eq!(
+            credential_maintenance_error_code(&CheckinCredentialError::Unavailable),
+            "credential_unavailable"
+        );
+        assert_eq!(
+            credential_maintenance_error_code(&CheckinCredentialError::Invalid),
+            "credential_invalid"
+        );
     }
 
     /// 健康检查域：CheckinHttpError 全变体 → 稳定错误码（含 401/403 特判）。
     #[test]
     fn trae_cn_health_maps_every_variant_to_stable_code() {
-        assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Network), "network_error");
-        assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Http(401)), "credential_invalid");
-        assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Http(403)), "credential_invalid");
-        assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Http(500)), "health_check_failed");
-        assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Business(9095)), "business_9095");
-        assert_eq!(trae_cn_health_error_code(&CheckinHttpError::Protocol), "health_check_failed");
-    }
-
-    /// CN 签到域：TraeCnCheckinError 全变体 → 稳定错误码（业务码透传不压平）。
-    #[test]
-    fn trae_cn_checkin_maps_every_variant_to_stable_code() {
-        use traesync_infrastructure::TraeCnCheckinError;
         assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Network),
+            trae_cn_health_error_code(&CheckinHttpError::Network),
             "network_error"
         );
         assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Http(401)),
+            trae_cn_health_error_code(&CheckinHttpError::Http(401)),
             "credential_invalid"
         );
         assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Http(403)),
+            trae_cn_health_error_code(&CheckinHttpError::Http(403)),
             "credential_invalid"
         );
         assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Http(500)),
-            "trae_cn_checkin_http_failed"
+            trae_cn_health_error_code(&CheckinHttpError::Http(500)),
+            "health_check_failed"
         );
-        // 业务码不压平：`business_{code}` 原样带出数值。
         assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Business(9095)),
+            trae_cn_health_error_code(&CheckinHttpError::Business(9095)),
             "business_9095"
         );
         assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Protocol),
-            "trae_cn_checkin_protocol"
-        );
-        assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Credential("client_mismatch")),
-            "credential_invalid"
-        );
-        assert_eq!(
-            trae_cn_checkin_error_code(&TraeCnCheckinError::Credential("credential_missing")),
-            "credential_missing"
+            trae_cn_health_error_code(&CheckinHttpError::Protocol),
+            "health_check_failed"
         );
     }
 
     /// 归档通道域：MasterArchiveError 全变体 → 稳定错误码。
     #[test]
     fn master_archive_maps_every_variant_to_stable_code() {
-        assert_eq!(map_master_archive_error(MasterArchiveError::DbUnavailable), "master_archive_no_data");
-        assert_eq!(map_master_archive_error(MasterArchiveError::DbOpenFailed), "master_archive_open_failed");
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::DbUnavailable),
+            "master_archive_no_data"
+        );
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::DbOpenFailed),
+            "master_archive_open_failed"
+        );
         assert_eq!(
             map_master_archive_error(MasterArchiveError::ArchiveUnsupported),
             "master_archive_unsupported"
         );
-        assert_eq!(map_master_archive_error(MasterArchiveError::WriteFailed), "master_archive_write_failed");
-        assert_eq!(map_master_archive_error(MasterArchiveError::BackupFailed), "master_archive_backup_failed");
-        assert_eq!(map_master_archive_error(MasterArchiveError::MergeInvalid), "master_merge_invalid");
-        assert_eq!(map_master_archive_error(MasterArchiveError::ArchiveConflict), "master_archive_conflict");
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::WriteFailed),
+            "master_archive_write_failed"
+        );
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::CommitOutcomeUnknown),
+            "master_archive_commit_outcome_unknown"
+        );
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::CommittedNeedsAttention),
+            "master_archive_committed_needs_attention"
+        );
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::BackupFailed),
+            "master_archive_backup_failed"
+        );
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::MergeInvalid),
+            "master_merge_invalid"
+        );
+        assert_eq!(
+            map_master_archive_error(MasterArchiveError::ArchiveConflict),
+            "master_archive_conflict"
+        );
     }
 
     /// 凭据库域：显式映射的变体保持稳定码；未列出的变体走 Display 兜底。
     #[test]
     fn credential_vault_maps_listed_variants_and_display_fallback() {
-        assert_eq!(credential_error_text(CredentialVaultError::Missing), "credential_missing");
-        assert_eq!(credential_error_text(CredentialVaultError::BindingMismatch), "credential_binding_mismatch");
-        assert_eq!(credential_error_text(CredentialVaultError::TraeNotClosed), "process_running");
-        assert_eq!(credential_error_text(CredentialVaultError::StorageInvalid), "storage_json_invalid");
-        assert_eq!(credential_error_text(CredentialVaultError::StorageTooLarge), "storage_json_too_large");
-        assert_eq!(credential_error_text(CredentialVaultError::UnsupportedAuthKey), "unsupported_login_bundle");
+        assert_eq!(
+            credential_error_text(CredentialVaultError::Missing),
+            "credential_missing"
+        );
+        assert_eq!(
+            credential_error_text(CredentialVaultError::BindingMismatch),
+            "credential_binding_mismatch"
+        );
+        assert_eq!(
+            credential_error_text(CredentialVaultError::TraeNotClosed),
+            "process_running"
+        );
+        assert_eq!(
+            credential_error_text(CredentialVaultError::StorageInvalid),
+            "storage_json_invalid"
+        );
+        assert_eq!(
+            credential_error_text(CredentialVaultError::StorageTooLarge),
+            "storage_json_too_large"
+        );
+        assert_eq!(
+            credential_error_text(CredentialVaultError::UnsupportedAuthKey),
+            "unsupported_login_bundle"
+        );
         assert_eq!(
             credential_error_text(CredentialVaultError::RecoveryRequired),
             "credential_manual_recovery_required"
@@ -241,7 +282,12 @@ mod tests {
     /// Fixture 路径域：委托 fixture_path_error_text 生成脱敏文案。
     #[test]
     fn fixture_path_error_delegates_to_sanitized_text() {
-        let error = FixturePathError::OutsideFixtureRoot { raw: "C:/secrets".to_string() };
-        assert_eq!(fixture_path_command_error(error.clone()), fixture_path_error_text(&error));
+        let error = FixturePathError::OutsideFixtureRoot {
+            raw: "C:/secrets".to_string(),
+        };
+        assert_eq!(
+            fixture_path_command_error(error.clone()),
+            fixture_path_error_text(&error)
+        );
     }
 }

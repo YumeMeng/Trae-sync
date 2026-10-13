@@ -30,7 +30,7 @@ use traesync_ports::CheckinDeviceRemint;
 use crate::account_registry::{AccountRecord, AccountRegistry};
 use crate::checkin_credential::{
     generate_device_keypair, CheckinCredentialBundle, CheckinCredentialStore,
-    CheckinProfileBinding,
+    CheckinProfileBinding, CheckinProfileOperationLease,
 };
 use crate::checkin_http::{
     exchange_token_by_auth_code, get_pc_auth_code, trae_http_client, OAuthClient, TokenGrant,
@@ -90,6 +90,10 @@ impl DeviceRemintService {
     ///
     /// 网络类失败单次重试（GetPCAuthCode/ExchangeToken；缓解临时 IP 限流）。
     pub fn remint(&self, profile_id: &str) -> Result<String, RemintError> {
+        let lease = self
+            .store
+            .lock_profile(profile_id)
+            .map_err(|_| RemintError::CredentialUnavailable)?;
         let record = self
             .registry
             .load()
@@ -103,8 +107,8 @@ impl DeviceRemintService {
             .map_err(|_| RemintError::CredentialUnavailable)?;
 
         // ---- 全新设备四件套（成套生成，绝不复用旧值） ----
-        let new_device_id = generate_virtual_device_id()
-            .map_err(|_| RemintError::AuthCodeFailed)?;
+        let new_device_id =
+            generate_virtual_device_id().map_err(|_| RemintError::AuthCodeFailed)?;
         let new_machine_id = random_machine_id().map_err(|_| RemintError::AuthCodeFailed)?;
         let (new_private_key, new_public_key) =
             generate_device_keypair().map_err(|_| RemintError::AuthCodeFailed)?;
@@ -114,17 +118,16 @@ impl DeviceRemintService {
         let client = trae_http_client();
         // 全链路唯一形态：SOLO（ADR-0019 v6）。
         let oauth_client = OAuthClient::Solo;
-        let auth_code =
-            with_network_retry(|| {
-                get_pc_auth_code(
-                    &client,
-                    &bundle.access_token,
-                    &pkce.code_challenge,
-                    &new_device_id,
-                    oauth_client,
-                )
-            })
-            .map_err(|_| RemintError::AuthCodeFailed)?;
+        let auth_code = with_network_retry(|| {
+            get_pc_auth_code(
+                &client,
+                &bundle.access_token,
+                &pkce.code_challenge,
+                &new_device_id,
+                oauth_client,
+            )
+        })
+        .map_err(|_| RemintError::AuthCodeFailed)?;
         let device_info =
             oauth_client.device_info(&new_device_id, &new_machine_id, &new_public_key);
         let grant = with_network_retry(|| {
@@ -146,13 +149,23 @@ impl DeviceRemintService {
         }
 
         // ---- 凭据包 + 注册表原子写回 ----
-        self.write_back(&record, &grant, &new_device_id, &new_machine_id, &new_public_key, &new_private_key, oauth_client)?;
+        self.write_back(
+            &lease,
+            &record,
+            &grant,
+            &new_device_id,
+            &new_machine_id,
+            &new_public_key,
+            &new_private_key,
+            oauth_client,
+        )?;
         Ok(new_device_id)
     }
 
     /// 写回新凭据与注册表档案；失败时保留旧凭据。
     fn write_back(
         &self,
+        lease: &CheckinProfileOperationLease,
         record: &AccountRecord,
         grant: &TokenGrant,
         new_device_id: &str,
@@ -161,15 +174,22 @@ impl DeviceRemintService {
         new_private_key: &str,
         oauth_client: OAuthClient,
     ) -> Result<(), RemintError> {
-        // 重铸保留已补录的完整手机号（与新设备无绑定关系；旧包读取失败按未补录）。
-        let previous_mobile_full = self
+        // 网络等待期间档案可能被删除或偏好被更新；只基于当前仍存在的档案写回。
+        let current_record = self
+            .registry
+            .find(&record.profile_id)
+            .map_err(|_| RemintError::WriteBackFailed)?
+            .ok_or(RemintError::ProfileNotFound)?;
+        if current_record.account_id != record.account_id {
+            return Err(RemintError::AccountMismatch);
+        }
+        let current_bundle = self
             .store
-            .load(&CheckinProfileBinding::from(record))
-            .ok()
-            .and_then(|bundle| bundle.mobile_full);
+            .load(&CheckinProfileBinding::from(&current_record))
+            .map_err(|_| RemintError::CredentialUnavailable)?;
         let bundle = CheckinCredentialBundle {
-            profile_id: record.profile_id.clone(),
-            account_id: record.account_id.clone(),
+            profile_id: current_record.profile_id.clone(),
+            account_id: current_record.account_id.clone(),
             device_id: new_device_id.to_string(),
             machine_id: new_machine_id.to_string(),
             device_public_key: new_public_key.to_string(),
@@ -179,11 +199,11 @@ impl DeviceRemintService {
             client_id: oauth_client.client_id().to_string(),
             access_token_expires_at_unix_seconds: grant.access_token_expires_at_unix_seconds,
             refresh_token_expires_at_unix_seconds: grant.refresh_token_expires_at_unix_seconds,
-            mobile_full: previous_mobile_full,
+            mobile_full: current_bundle.mobile_full,
         };
         // save 为原子写（临时文件 + 替换）；失败时旧凭据保持不变。
         self.store
-            .save(&bundle)
+            .save_with_lease(lease, &bundle)
             .map_err(|_| RemintError::WriteBackFailed)?;
         let updated = AccountRecord {
             device_id: new_device_id.to_string(),
@@ -192,7 +212,7 @@ impl DeviceRemintService {
             // 重铸即新设备诞生：记录铸造时刻，供 9074 报错时区分
             // 「设备太新稍后重试」与「设备被拒需要重置」。
             device_created_at_unix_seconds: unix_now(),
-            ..record.clone()
+            ..current_record
         };
         self.registry
             .upsert(&updated)
@@ -236,12 +256,168 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[cfg(windows)]
+    fn writeback_fixture() -> (AccountRecord, CheckinCredentialBundle) {
+        let (private_key, public_key) = generate_device_keypair().unwrap();
+        let record = AccountRecord {
+            profile_id: "p1".to_string(),
+            account_id: "a1".to_string(),
+            screen_name: "测试账号".to_string(),
+            avatar_url: String::new(),
+            device_id: "device-old".to_string(),
+            device_public_key: public_key.clone(),
+            display_name: None,
+            masked_mobile: "138****0000".to_string(),
+            created_at_unix_seconds: 1,
+            last_verified_at_unix_seconds: 1,
+            device_created_at_unix_seconds: 1,
+            auto_checkin_enabled: true,
+            archived: false,
+        };
+        let bundle = CheckinCredentialBundle {
+            profile_id: record.profile_id.clone(),
+            account_id: record.account_id.clone(),
+            device_id: record.device_id.clone(),
+            machine_id: "machine-old".to_string(),
+            device_public_key: public_key,
+            device_private_key: private_key,
+            access_token: "old-access".to_string(),
+            refresh_token: "old-refresh".to_string(),
+            client_id: "old-client".to_string(),
+            access_token_expires_at_unix_seconds: 2_000_000_000,
+            refresh_token_expires_at_unix_seconds: 2_000_000_000,
+            mobile_full: Some("13800000000".to_string()),
+        };
+        (record, bundle)
+    }
+
+    #[test]
+    fn remint_takes_profile_lease_before_registry_read() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let lease = store.lock_profile("p1").unwrap();
+        let service = DeviceRemintService::new(root.path());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx.send(service.remint("p1")).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(lease);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(RemintError::ProfileNotFound)
+        );
+        worker.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_back_uses_latest_registry_and_bundle_under_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let service = DeviceRemintService::new(root.path());
+        let (record, old_bundle) = writeback_fixture();
+        service.registry.upsert(&record).unwrap();
+        service.store.save(&old_bundle).unwrap();
+        let lease = service.store.lock_profile(&record.profile_id).unwrap();
+        let stale_record = service.registry.find(&record.profile_id).unwrap().unwrap();
+        service
+            .registry
+            .set_display_name(&record.profile_id, Some("最新备注"))
+            .unwrap();
+        service
+            .registry
+            .set_archived(&record.profile_id, true)
+            .unwrap();
+
+        let (new_private_key, new_public_key) = generate_device_keypair().unwrap();
+        service
+            .write_back(
+                &lease,
+                &stale_record,
+                &TokenGrant {
+                    access_token: "new-access".to_string(),
+                    refresh_token: "new-refresh".to_string(),
+                    access_token_expires_at_unix_seconds: 2_100_000_000,
+                    refresh_token_expires_at_unix_seconds: 2_100_000_000,
+                },
+                "device-new",
+                "machine-new",
+                &new_public_key,
+                &new_private_key,
+                OAuthClient::Solo,
+            )
+            .unwrap();
+
+        let updated = service.registry.find(&record.profile_id).unwrap().unwrap();
+        assert_eq!(updated.display_name.as_deref(), Some("最新备注"));
+        assert!(updated.archived);
+        assert_eq!(updated.device_id, "device-new");
+        let saved = service
+            .store
+            .load(&CheckinProfileBinding::from(&updated))
+            .unwrap();
+        assert_eq!(saved.access_token, "new-access");
+        assert_eq!(saved.mobile_full.as_deref(), Some("13800000000"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_back_does_not_restore_deleted_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let service = DeviceRemintService::new(root.path());
+        let (record, old_bundle) = writeback_fixture();
+        service.registry.upsert(&record).unwrap();
+        service.store.save(&old_bundle).unwrap();
+        let lease = service.store.lock_profile(&record.profile_id).unwrap();
+        assert!(service.registry.remove(&record.profile_id).unwrap());
+        let (new_private_key, new_public_key) = generate_device_keypair().unwrap();
+
+        assert_eq!(
+            service.write_back(
+                &lease,
+                &record,
+                &TokenGrant {
+                    access_token: "new-access".to_string(),
+                    refresh_token: "new-refresh".to_string(),
+                    access_token_expires_at_unix_seconds: 2_100_000_000,
+                    refresh_token_expires_at_unix_seconds: 2_100_000_000,
+                },
+                "device-new",
+                "machine-new",
+                &new_public_key,
+                &new_private_key,
+                OAuthClient::Solo,
+            ),
+            Err(RemintError::ProfileNotFound)
+        );
+        assert!(service.registry.find(&record.profile_id).unwrap().is_none());
+        assert_eq!(
+            service
+                .store
+                .load(&CheckinProfileBinding::from(&record))
+                .unwrap()
+                .access_token,
+            "old-access"
+        );
+    }
 
     #[test]
     fn machine_id_is_32_char_lowercase_hex() {
         let machine_id = random_machine_id().unwrap();
         assert_eq!(machine_id.len(), 32);
-        assert!(machine_id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(machine_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -275,6 +451,9 @@ mod tests {
             })
             .unwrap();
         let service = DeviceRemintService::new(root.path());
-        assert_eq!(service.remint("p1"), Err(RemintError::CredentialUnavailable));
+        assert_eq!(
+            service.remint("p1"),
+            Err(RemintError::CredentialUnavailable)
+        );
     }
 }

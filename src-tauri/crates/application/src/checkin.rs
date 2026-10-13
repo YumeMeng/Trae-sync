@@ -189,7 +189,7 @@ fn error_code(error: &CheckinTransportError) -> String {
 /// 逐账号进度回调（供 UI 实时反馈）。取消只阻止尚未开始的账号。
 pub struct BatchCheckinRunner<'a> {
     /// 每账号执行前重建 transport（凭据可能在上个账号执行期间变化）。
-    transport_factory: &'a (dyn Fn() -> Box<dyn CheckinTransport> + 'a),
+    transport_factory: &'a (dyn Fn(&str) -> Box<dyn CheckinTransport> + 'a),
     /// 账号间随机等待区间（毫秒），None 表示不等待（测试用）。
     inter_account_delay_ms: Option<(u64, u64)>,
     /// 每账号完成（无论成败）后的进度回调；None 时不调用（默认，执行行为不变）。
@@ -201,7 +201,7 @@ pub struct BatchCheckinRunner<'a> {
 }
 
 impl<'a> BatchCheckinRunner<'a> {
-    pub fn new(transport_factory: &'a (dyn Fn() -> Box<dyn CheckinTransport> + 'a)) -> Self {
+    pub fn new(transport_factory: &'a (dyn Fn(&str) -> Box<dyn CheckinTransport> + 'a)) -> Self {
         Self {
             transport_factory,
             inter_account_delay_ms: None,
@@ -217,20 +217,14 @@ impl<'a> BatchCheckinRunner<'a> {
     }
 
     /// 设置逐账号进度回调：每账号完成后立即调用（含失败结果），用于 UI 实时反馈。
-    pub fn with_progress_callback(
-        mut self,
-        callback: &'a (dyn Fn(&CheckinResult) + 'a),
-    ) -> Self {
+    pub fn with_progress_callback(mut self, callback: &'a (dyn Fn(&CheckinResult) + 'a)) -> Self {
         self.progress_callback = Some(callback);
         self
     }
 
     /// 设置账号间等待回调：进入下一账号前的随机等待期调用一次
     /// （下一账号 profile_id, 等待秒数）。前端收到后本地倒计时。
-    pub fn with_inter_wait_callback(
-        mut self,
-        callback: &'a (dyn Fn(&str, u64) + 'a),
-    ) -> Self {
+    pub fn with_inter_wait_callback(mut self, callback: &'a (dyn Fn(&str, u64) + 'a)) -> Self {
         self.inter_wait_callback = Some(callback);
         self
     }
@@ -246,7 +240,7 @@ impl<'a> BatchCheckinRunner<'a> {
                 summary.cancelled += 1;
                 continue;
             }
-            let transport = (self.transport_factory)();
+            let transport = (self.transport_factory)(profile_id);
             let result = CheckinService::new(transport.as_ref()).run_one(profile_id);
             if matches!(
                 result.outcome,
@@ -265,6 +259,8 @@ impl<'a> BatchCheckinRunner<'a> {
             if let Some(on_progress) = self.progress_callback {
                 on_progress(summary.results.last().expect("just pushed"));
             }
+            // 进度回调需在账号租约内完成；账号间等待前释放 transport。
+            drop(transport);
             // 账号间随机间隔（最后一个账号后不等待）。
             if claimed && index + 1 < profile_ids.len() {
                 if let Some((lo, hi)) = self.inter_account_delay_ms {
@@ -403,7 +399,9 @@ mod tests {
         assert_eq!(result.outcome, CheckinOutcome::AlreadyCheckedIn);
         assert!(!result.claim_attempted);
         // 已签场景也必须带 after 快照，自动批次结束后积分缓存才会回写一致状态。
-        let after = result.after.expect("already-checked-in result must carry after snapshot");
+        let after = result
+            .after
+            .expect("already-checked-in result must carry after snapshot");
         assert_eq!(after.credits, Some(10));
         assert_eq!(calls.lock().unwrap().as_slice(), ["status:a"]);
     }
@@ -476,10 +474,7 @@ mod tests {
             "business_20324"
         );
         // 非业务错误分类码保持原样。
-        assert_eq!(
-            error_code(&CheckinTransportError::Network),
-            "network_error"
-        );
+        assert_eq!(error_code(&CheckinTransportError::Network), "network_error");
         assert_eq!(
             error_code(&CheckinTransportError::AuthMismatch),
             "auth_mismatch"
@@ -557,13 +552,19 @@ mod tests {
 
     struct WorldTransport {
         world: Arc<BatchWorld>,
+        drop_probe: Option<Arc<AtomicBool>>,
+    }
+
+    impl Drop for WorldTransport {
+        fn drop(&mut self) {
+            if let Some(drop_probe) = &self.drop_probe {
+                drop_probe.store(true, Ordering::Release);
+            }
+        }
     }
 
     impl CheckinTransport for WorldTransport {
-        fn status(
-            &self,
-            profile_id: &str,
-        ) -> Result<CheckinStatusSnapshot, CheckinTransportError> {
+        fn status(&self, profile_id: &str) -> Result<CheckinStatusSnapshot, CheckinTransportError> {
             let checked = self
                 .world
                 .checked
@@ -580,10 +581,7 @@ mod tests {
             })
         }
 
-        fn claim(
-            &self,
-            profile_id: &str,
-        ) -> Result<CheckinClaimSnapshot, CheckinTransportError> {
+        fn claim(&self, profile_id: &str) -> Result<CheckinClaimSnapshot, CheckinTransportError> {
             let device = self
                 .world
                 .bindings
@@ -626,9 +624,10 @@ mod tests {
     macro_rules! run_batch {
         ($world:expr, $ids:expr, $cancel:expr) => {{
             let captured = $world.clone();
-            let factory = move || -> Box<dyn CheckinTransport> {
+            let factory = move |_profile_id: &str| -> Box<dyn CheckinTransport> {
                 Box::new(WorldTransport {
                     world: captured.clone(),
+                    drop_probe: None,
                 })
             };
             let runner = BatchCheckinRunner::new(&factory);
@@ -676,9 +675,8 @@ mod tests {
     }
 
     #[test]
-    fn inter_account_wait_notifies_next_profile_before_sleeping() {
-        // 账号间等待开始即回调（下一账号 id + 秒数）：供 UI 显示
-        // "N 秒后开始"，错峰间隔不再是无反馈的盲区。
+    fn progress_callback_runs_before_transport_drop_and_wait_callback_after() {
+        // 进度回调持有账号租约；进入账号间等待前必须释放租约。
         let world = BatchWorld::new("dev-1");
         world
             .bindings
@@ -686,25 +684,49 @@ mod tests {
             .unwrap()
             .insert("b".to_string(), "dev-2".to_string());
         let waits: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
-        let factory = || -> Box<dyn CheckinTransport> {
+        let progress_profiles: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let factory_profile_ids = Mutex::new(Vec::new());
+        let drop_probe = Arc::new(AtomicBool::new(false));
+        let factory_drop_probe = drop_probe.clone();
+        let factory = |profile_id: &str| -> Box<dyn CheckinTransport> {
+            factory_profile_ids
+                .lock()
+                .unwrap()
+                .push(profile_id.to_string());
+            factory_drop_probe.store(false, Ordering::Release);
             Box::new(WorldTransport {
                 world: world.clone(),
+                drop_probe: Some(factory_drop_probe.clone()),
             })
         };
         let on_wait = |profile_id: &str, secs: u64| {
+            assert!(
+                drop_probe.load(Ordering::Acquire),
+                "transport must be dropped before inter-account wait"
+            );
             waits.lock().unwrap().push((profile_id.to_string(), secs));
+        };
+        let on_progress = |result: &CheckinResult| {
+            assert!(
+                !drop_probe.load(Ordering::Acquire),
+                "transport must stay alive during progress callback"
+            );
+            progress_profiles
+                .lock()
+                .unwrap()
+                .push(result.profile_id.clone());
         };
         let cancel = AtomicBool::new(false);
         let runner = BatchCheckinRunner::new(&factory)
             // 10ms 实际等待（测试速度），ceil 后上报 1 秒（显示语义）。
             .with_inter_account_delay((10, 10))
+            .with_progress_callback(&on_progress)
             .with_inter_wait_callback(&on_wait);
         let summary = runner.run(&["a".to_string(), "b".to_string()], &cancel);
         assert_eq!(summary.completed, 2);
-        assert_eq!(
-            waits.lock().unwrap().as_slice(),
-            [("b".to_string(), 1u64)]
-        );
+        assert_eq!(factory_profile_ids.lock().unwrap().as_slice(), ["a", "b"]);
+        assert_eq!(progress_profiles.lock().unwrap().as_slice(), ["a", "b"]);
+        assert_eq!(waits.lock().unwrap().as_slice(), [("b".to_string(), 1u64)]);
     }
 
     #[test]
@@ -721,9 +743,10 @@ mod tests {
         world.checked.lock().unwrap().insert("a".to_string(), true);
         world.checked.lock().unwrap().insert("b".to_string(), true);
         let waits: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
-        let factory = || -> Box<dyn CheckinTransport> {
+        let factory = |_profile_id: &str| -> Box<dyn CheckinTransport> {
             Box::new(WorldTransport {
                 world: world.clone(),
+                drop_probe: None,
             })
         };
         let on_wait = |profile_id: &str, secs: u64| {
@@ -766,9 +789,10 @@ mod tests {
         world.checked.lock().unwrap().insert("a".to_string(), true);
         world.checked.lock().unwrap().insert("c".to_string(), true);
         let waits: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
-        let factory = || -> Box<dyn CheckinTransport> {
+        let factory = |_profile_id: &str| -> Box<dyn CheckinTransport> {
             Box::new(WorldTransport {
                 world: world.clone(),
+                drop_probe: None,
             })
         };
         let on_wait = |profile_id: &str, secs: u64| {
@@ -784,9 +808,6 @@ mod tests {
         );
         assert_eq!(summary.completed, 3);
         // 仅 b（真正 claim）后产生一次等待，目标账号是 c；a 后零等待。
-        assert_eq!(
-            waits.lock().unwrap().as_slice(),
-            [("c".to_string(), 1u64)]
-        );
+        assert_eq!(waits.lock().unwrap().as_slice(), [("c".to_string(), 1u64)]);
     }
 }

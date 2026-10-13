@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::operation_lease::FileOperationLock;
 
 const STORE_FILE: &str = "auto_checkin.json";
+const BATCH_EXECUTION_RESOURCE: &str = "auto_checkin_batch";
 const MAX_STORE_BYTES: u64 = 64 * 1024;
 
 /// 自动签到错误；不携带敏感内容。
@@ -54,7 +56,7 @@ pub struct AutoCheckinLedger {
     pub total: usize,
     pub completed: usize,
     pub failed: usize,
-    /// 因手动批次持锁而跳过的账号数（与 skipped_ids 保持一致）。
+    /// 本批跳过的账号数；只有可顺延重试的撞锁账号会进入 skipped_ids。
     pub skipped: usize,
     /// 撞锁跳过的账号 id（按记入顺序）：当日顺延重试的目标集合（P11-2①）。
     #[serde(default)]
@@ -123,6 +125,16 @@ impl AutoCheckinStore {
         Ok((store.settings, store.ledger))
     }
 
+    /// 非阻塞获取自动签到批次租约，使用独立 sidecar 避免网络请求阻塞设置写入。
+    pub fn try_acquire_batch_execution_lease(
+        &self,
+    ) -> Result<Option<FileOperationLock>, AutoCheckinStoreError> {
+        let parent = self.path.parent().ok_or(AutoCheckinStoreError::Io)?;
+        fs::create_dir_all(parent).map_err(|_| AutoCheckinStoreError::Io)?;
+        FileOperationLock::try_acquire_sibling_resource(&parent.join(BATCH_EXECUTION_RESOURCE))
+            .map_err(|_| AutoCheckinStoreError::Io)
+    }
+
     /// 保存设置（保留现有台账）。
     pub fn save_settings(
         &self,
@@ -131,17 +143,25 @@ impl AutoCheckinStore {
         if !is_valid_hhmm(&settings.daily_time_hhmm) {
             return Err(AutoCheckinStoreError::Invalid);
         }
+        let _lock = self.acquire_write_lock()?;
         let (_, ledger) = self.load()?;
         self.write(settings, ledger.as_ref())
     }
 
     /// 写入台账（保留现有设置）。
-    pub fn save_ledger(
-        &self,
-        ledger: &AutoCheckinLedger,
-    ) -> Result<(), AutoCheckinStoreError> {
+    pub fn save_ledger(&self, ledger: &AutoCheckinLedger) -> Result<(), AutoCheckinStoreError> {
+        let _lock = self.acquire_write_lock()?;
         let (settings, _) = self.load()?;
         self.write(&settings, Some(ledger))
+    }
+
+    /// 锁住设置与台账共用的文件，避免并发读改写互相覆盖。
+    fn acquire_write_lock(&self) -> Result<FileOperationLock, AutoCheckinStoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| AutoCheckinStoreError::Io)?;
+        }
+        FileOperationLock::acquire_sibling_resource(&self.path)
+            .map_err(|_| AutoCheckinStoreError::Io)
     }
 
     fn write(
@@ -156,9 +176,6 @@ impl AutoCheckinStore {
         };
         let content =
             serde_json::to_string_pretty(&store).map_err(|_| AutoCheckinStoreError::Invalid)?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|_| AutoCheckinStoreError::Io)?;
-        }
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, content.as_bytes()).map_err(|_| AutoCheckinStoreError::Io)?;
         publish_replacing(&temporary, &self.path).map_err(|_| AutoCheckinStoreError::Io)
@@ -264,10 +281,7 @@ pub fn should_retry_skipped_checkin(
 ///
 /// 「遗留 Running」判定依据调度架构不变量：批次在调度线程内同步执行，
 /// tick 时本进程不可能有进行中的批次，观察到的 Running 必为遗留。
-pub fn should_recover_interrupted_checkin(
-    ledger: Option<&AutoCheckinLedger>,
-    today: &str,
-) -> bool {
+pub fn should_recover_interrupted_checkin(ledger: Option<&AutoCheckinLedger>, today: &str) -> bool {
     let Some(ledger) = ledger else {
         return false;
     };
@@ -277,7 +291,11 @@ pub fn should_recover_interrupted_checkin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_lease::FileOperationLock;
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     fn store(root: &Path) -> AutoCheckinStore {
         AutoCheckinStore::new(root)
@@ -320,6 +338,93 @@ mod tests {
         // 台账写入不覆盖设置。
         assert!(!settings.enabled);
         assert_eq!(loaded.unwrap(), ledger);
+    }
+
+    #[test]
+    fn save_settings_waits_for_shared_file_lock_and_preserves_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let s = store(root.path());
+        let ledger = AutoCheckinLedger {
+            date: "2026-10-02".to_string(),
+            state: AutoCheckinBatchState::Finished,
+            total: 1,
+            completed: 1,
+            failed: 0,
+            skipped: 0,
+            skipped_ids: Vec::new(),
+            last_batch_finished_at: None,
+        };
+        s.save_ledger(&ledger).unwrap();
+
+        let lock =
+            FileOperationLock::acquire_sibling_resource(&root.path().join(STORE_FILE)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(s.save_settings(&AutoCheckinSettings {
+                    enabled: false,
+                    daily_time_hhmm: "08:45".to_string(),
+                }))
+                .unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(finished_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(lock);
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+
+        let (settings, saved_ledger) = store(root.path()).load().unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.daily_time_hhmm, "08:45");
+        assert_eq!(saved_ledger, Some(ledger));
+    }
+
+    #[test]
+    fn batch_execution_lease_is_nonblocking_and_scoped_per_root() {
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let first_store = store(first_root.path());
+        let second_store = store(second_root.path());
+        let lease = first_store
+            .try_acquire_batch_execution_lease()
+            .unwrap()
+            .expect("首个同根批次应取得租约");
+
+        assert!(first_store
+            .try_acquire_batch_execution_lease()
+            .unwrap()
+            .is_none());
+        assert!(second_store
+            .try_acquire_batch_execution_lease()
+            .unwrap()
+            .is_some());
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            finished_tx
+                .send(first_store.save_settings(&AutoCheckinSettings {
+                    enabled: false,
+                    daily_time_hhmm: "08:45".to_string(),
+                }))
+                .unwrap();
+        });
+        let early_result = finished_rx.recv_timeout(Duration::from_millis(100));
+        let completed_while_batch_lease_held = early_result.is_ok();
+        drop(lease);
+        early_result
+            .or_else(|_| finished_rx.recv_timeout(Duration::from_secs(5)))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert!(completed_while_batch_lease_held);
     }
 
     #[test]
@@ -376,11 +481,21 @@ mod tests {
         };
 
         // 未到点（09:59）不触发。
-        assert!(!should_trigger_auto_checkin(&settings, None, today, 9 * 60 + 59));
+        assert!(!should_trigger_auto_checkin(
+            &settings,
+            None,
+            today,
+            9 * 60 + 59
+        ));
         // 到点（10:00）触发。
         assert!(should_trigger_auto_checkin(&settings, None, today, 10 * 60));
         // 补偿语义：下午打开（14:23）触发。
-        assert!(should_trigger_auto_checkin(&settings, None, today, 14 * 60 + 23));
+        assert!(should_trigger_auto_checkin(
+            &settings,
+            None,
+            today,
+            14 * 60 + 23
+        ));
         // 今日已发起（任意状态）不重复触发。
         assert!(!should_trigger_auto_checkin(
             &settings,
@@ -426,37 +541,67 @@ mod tests {
 
         // 恰好满 30 分钟（1800s）→ 触发。
         assert!(should_retry_skipped_checkin(
-            Some(&ledger_with(AutoCheckinBatchState::Finished, 2, 2, Some(1000))),
+            Some(&ledger_with(
+                AutoCheckinBatchState::Finished,
+                2,
+                2,
+                Some(1000)
+            )),
             today,
             1000 + 1800
         ));
         // 差 1 秒 → 不触发（间隔未满）。
         assert!(!should_retry_skipped_checkin(
-            Some(&ledger_with(AutoCheckinBatchState::Finished, 2, 2, Some(1000))),
+            Some(&ledger_with(
+                AutoCheckinBatchState::Finished,
+                2,
+                2,
+                Some(1000)
+            )),
             today,
             1000 + 1799
         ));
         // skipped 计数为 0 → 不触发（无待重试账号）。
         assert!(!should_retry_skipped_checkin(
-            Some(&ledger_with(AutoCheckinBatchState::Finished, 0, 0, Some(1000))),
+            Some(&ledger_with(
+                AutoCheckinBatchState::Finished,
+                0,
+                0,
+                Some(1000)
+            )),
             today,
             1000 + 9999
         ));
         // skipped 计数与 id 集合不一致（异常态）→ fail-safe 不触发。
         assert!(!should_retry_skipped_checkin(
-            Some(&ledger_with(AutoCheckinBatchState::Finished, 2, 0, Some(1000))),
+            Some(&ledger_with(
+                AutoCheckinBatchState::Finished,
+                2,
+                0,
+                Some(1000)
+            )),
             today,
             1000 + 9999
         ));
         // 批次仍 Running → 不触发（重试只面向已完成批次）。
         assert!(!should_retry_skipped_checkin(
-            Some(&ledger_with(AutoCheckinBatchState::Running, 2, 2, Some(1000))),
+            Some(&ledger_with(
+                AutoCheckinBatchState::Running,
+                2,
+                2,
+                Some(1000)
+            )),
             today,
             1000 + 9999
         ));
         // 台账非今日（已跨日）→ 不触发（次日走正常首发触发）。
         assert!(!should_retry_skipped_checkin(
-            Some(&ledger_with(AutoCheckinBatchState::Finished, 2, 2, Some(1000))),
+            Some(&ledger_with(
+                AutoCheckinBatchState::Finished,
+                2,
+                2,
+                Some(1000)
+            )),
             "2026-09-29",
             1000 + 9999
         ));

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::operation_lease::FileOperationLock;
 
 const LEDGER_FILE: &str = "relay-ledger.json";
 const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
@@ -137,6 +138,11 @@ impl RelayLedger {
         for entry in new_entries {
             entry.validate()?;
         }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| RelayLedgerError::Io)?;
+        }
+        let _lock = FileOperationLock::acquire_sibling_resource(&self.path)
+            .map_err(|_| RelayLedgerError::Io)?;
         let mut entries = self.load()?;
         if entries.len() + new_entries.len() > MAX_LEDGER_ENTRIES {
             return Err(RelayLedgerError::InvalidEntry);
@@ -151,8 +157,7 @@ impl RelayLedger {
             format_version: 1,
             entries: entries.to_vec(),
         };
-        let content =
-            serde_json::to_string(&ledger).map_err(|_| RelayLedgerError::Invalid)?;
+        let content = serde_json::to_string(&ledger).map_err(|_| RelayLedgerError::Invalid)?;
         if content.len() as u64 > MAX_LEDGER_BYTES {
             return Err(RelayLedgerError::Invalid);
         }
@@ -168,7 +173,32 @@ impl RelayLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    /// 子进程等待共同起跑信号后追加一条台账记录。
+    #[test]
+    fn child_process_appends_ledger_entry_after_shared_start_signal() {
+        let (Ok(root), Ok(session_id), Ok(ready_path), Ok(start_path)) = (
+            std::env::var("TRAE_SYNC_LEDGER_CHILD_ROOT"),
+            std::env::var("TRAE_SYNC_LEDGER_CHILD_SESSION"),
+            std::env::var("TRAE_SYNC_LEDGER_CHILD_READY"),
+            std::env::var("TRAE_SYNC_LEDGER_CHILD_START"),
+        ) else {
+            return;
+        };
+        std::fs::write(&ready_path, b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::path::Path::new(&start_path).is_file() {
+            assert!(Instant::now() < deadline, "并发台账测试启动信号超时");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        RelayLedger::new(root)
+            .append(&[sample_entry(&session_id, "222", 1)])
+            .unwrap();
+    }
 
     fn sample_entry(session_id: &str, to_user: &str, count: i64) -> RelayLedgerEntry {
         RelayLedgerEntry {
@@ -194,7 +224,8 @@ mod tests {
         let root = tempdir().unwrap();
         let ledger = RelayLedger::new(root.path());
         ledger.append(&[sample_entry("s1", "222", 10)]).unwrap();
-        ledger.append(&[sample_entry("s2", "333", 20), sample_entry("s3", "333", 5)])
+        ledger
+            .append(&[sample_entry("s2", "333", 20), sample_entry("s3", "333", 5)])
             .unwrap();
         let entries = ledger.load().unwrap();
         assert_eq!(entries.len(), 3);
@@ -202,6 +233,89 @@ mod tests {
         assert_eq!(entries[2].to_user_id, "333");
         // 跨实例恢复（App 重启后台账不丢）。
         assert_eq!(RelayLedger::new(root.path()).load().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn concurrent_appends_preserve_every_entry() {
+        let root = tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|index| {
+                let root = root.path().to_path_buf();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    RelayLedger::new(root).append(&[sample_entry(
+                        &format!("session-{index}"),
+                        "222",
+                        index,
+                    )])
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+
+        let entries = RelayLedger::new(root.path()).load().unwrap();
+        assert_eq!(entries.len(), 16);
+    }
+
+    /// 两个独立进程并发追加后，两条台账记录都必须保留。
+    #[test]
+    fn concurrent_process_appends_preserve_both_ledger_entries() {
+        let root = tempdir().unwrap();
+        let start_path = root.path().join("children-start");
+        let session_ids = ["cross-process-a", "cross-process-b"];
+        let children: Vec<_> = session_ids
+            .iter()
+            .enumerate()
+            .map(|(index, session_id)| {
+                let ready_path = root.path().join(format!("child-{index}-ready"));
+                Command::new(std::env::current_exe().unwrap())
+                    .env("TRAE_SYNC_LEDGER_CHILD_ROOT", root.path())
+                    .env("TRAE_SYNC_LEDGER_CHILD_SESSION", session_id)
+                    .env("TRAE_SYNC_LEDGER_CHILD_READY", &ready_path)
+                    .env("TRAE_SYNC_LEDGER_CHILD_START", &start_path)
+                    .args([
+                        "--exact",
+                        "relay_ledger::tests::child_process_appends_ledger_entry_after_shared_start_signal",
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let ready_paths: Vec<_> = (0..session_ids.len())
+            .map(|index| root.path().join(format!("child-{index}-ready")))
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ready_paths.iter().any(|path| !path.is_file()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(&start_path, b"start").unwrap();
+        for child in children {
+            assert!(child.wait_with_output().unwrap().status.success());
+        }
+        assert!(ready_paths.iter().all(|path| path.is_file()));
+
+        let entries = RelayLedger::new(root.path()).load().unwrap();
+        assert_eq!(entries.len(), 2);
+        for session_id in session_ids {
+            assert!(entries.iter().any(|entry| entry.session_id == session_id));
+        }
+    }
+
+    /// 短时追加锁不阻止读者读取上一个原子发布版本。
+    #[test]
+    fn reads_remain_available_while_an_append_holds_its_sidecar_lock() {
+        let root = tempdir().unwrap();
+        let ledger = RelayLedger::new(root.path());
+        ledger.append(&[sample_entry("s1", "222", 1)]).unwrap();
+        let _writer = FileOperationLock::acquire_sibling_resource(&ledger.path).unwrap();
+
+        assert_eq!(ledger.load().unwrap().len(), 1);
     }
 
     #[test]
@@ -218,10 +332,7 @@ mod tests {
         let ledger = RelayLedger::new(root.path());
         let mut entry = sample_entry("s1", "222", 1);
         entry.session_id = String::new();
-        assert_eq!(
-            ledger.append(&[entry]),
-            Err(RelayLedgerError::InvalidEntry)
-        );
+        assert_eq!(ledger.append(&[entry]), Err(RelayLedgerError::InvalidEntry));
         let mut zero_time = sample_entry("s1", "222", 1);
         zero_time.switched_at_unix_seconds = 0;
         assert_eq!(
@@ -285,9 +396,6 @@ mod tests {
         // 空串 from_session_id 视为非法（缺失与空串语义区分）。
         let mut bad = sample_entry("s3", "222", 1);
         bad.from_session_id = Some(String::new());
-        assert_eq!(
-            ledger.append(&[bad]),
-            Err(RelayLedgerError::InvalidEntry)
-        );
+        assert_eq!(ledger.append(&[bad]), Err(RelayLedgerError::InvalidEntry));
     }
 }

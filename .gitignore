@@ -46,6 +46,7 @@ src-tauri/.git-lib-*.rs
 
 # ---- AI 工具本地配置（开源仓库不入库，本地保留）----
 .claude/
+.trae/
 .codebuddy/
 .gemini/
 .qoder/

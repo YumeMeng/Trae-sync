@@ -304,7 +304,13 @@ mod tests {
         conn.execute_batch(sql).unwrap();
     }
 
-    fn entry(session_id: &str, from: Option<&str>, to: &str, count: i64, at: u64) -> RelayLedgerEntry {
+    fn entry(
+        session_id: &str,
+        from: Option<&str>,
+        to: &str,
+        count: i64,
+        at: u64,
+    ) -> RelayLedgerEntry {
         RelayLedgerEntry {
             session_id: session_id.to_string(),
             from_session_id: from.map(str::to_string),

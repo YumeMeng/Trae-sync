@@ -2,7 +2,7 @@
 
 > 2026-08-22 建立并清理。本目录只保留与现行方向一致的决策文档。
 
-## 现行 ADR（共 16 份，全部必读）
+## 现行 ADR（共 17 份，全部必读）
 
 | ADR | 主题 | 约束什么 |
 |-----|------|---------|
@@ -17,11 +17,13 @@
 | [0026](0026-plugin-sync-policy.md) | 插件同步策略 | 新增零确认、移除单确认且全账号传播、切号静默应用（含移除才单确认）；取代 ADR-0023 决策 2 确认语义；对账条移除 |
 | [0027](0027-first-login-credential-acceptance.md) | 首次登录凭据验收与一次 OAuth 约束 | access 未过期时同设备 AuthCode 滚动换发；不自动重铸签到设备；禁止静默第二次 OAuth；失败保留证据 |
 | [0028](0028-archived-session-freeze-boundary.md) | 归档会话冻结与账号切换边界 | 正常会话随账号交接；归档会话留在主库且不改写；归档/取消归档先编辑后一次提交；不可即时完成时必须显式刷新并回执 |
-| [0029](0029-multi-product-workbench-boundary.md) | 多产品工作台边界与产品适配状态 | 产品/账号切换分离；能力清单驱动导航；身份与产品凭据分离；跨产品凭据和数据库默认隔离；Trae CN 先身份发现与重新授权 |
+| [0029](0029-multi-product-workbench-boundary.md) | 多产品工作台边界与产品适配状态 | 产品/账号切换分离；凭据和数据库隔离；页面策略见 ADR-0032，本产品原生激活与验收门槛见 ADR-0034；跨产品复制禁令保留 |
 | [0030](0030-trae-cn-credential-maintenance-boundary.md) | Trae CN 凭据维护边界 | Trae CN 使用独立 OAuth/client/凭据根；健康检测与续期进入共享账号模块；不继承 Work 签到/额度；真实续期需独立验收 |
 | [0031](0031-account-remote-device-management.md) | 账号级远程设备管理能力 | 设备列表/退出是账号级共享能力（能力清单声明接入）；原生 ListDevices 主路径 + 官方页兜底；本机禁退（UI 隐藏 + 后端拒绝双防线）；退出逐台单次确认；协议独立 `remote_device` 模块；remint 语义不动 |
-| [0032](0032-product-ui-capability-tri-state.md) | 产品化界面适配与能力三态 | 导航五页全产品开放、页面本体一致；区块按 ready/pending/absent 三态诚实渲染；Trae CN 签到探针门禁（只读先行）；主库只读浏览复用 Library 抽象；文案单一事实源。局部取代 ADR-0029 决策 4/9 与 ADR-0030 决策 5 |
+| [0032](0032-product-ui-capability-tri-state.md) | 产品化界面适配与能力三态 | 导航五页全产品开放；区块三态；ready 门槛见 ADR-0034；主库写入范围见 ADR-0033；局部取代 ADR-0029 决策 4/9 与 ADR-0030 决策 5 |
 | [0033](0033-trae-cn-library-selective-write.md) | Trae CN 库选择性写边界 | 修订 ADR-0032 决策 5：CN 库从全只读升级为选择性写（项目归并+归档/恢复两类；删除/合并仍拒）；依据=交接原语已被 CN 客户端真实容忍（09-28 三次授权交接）；三步真机验收为可用性前置门禁；无路径 empty 项目不参与 |
+| [0034](0034-product-operation-boundaries-and-native-switch.md) | 产品操作边界、能力验收与真实账号切换 | 保留五层与共享页面；操作级验收、产品进程/数据/凭据隔离；工具选择与官方身份分开且并发按最新有效选择意图决胜；Work 切换提交/恢复安全；CN 原生切换先独立验证且不自动交接历史；Phase 14 |
+| [0035](0035-unified-trae-product-and-credential-migration.md) | 融合版 TRAE 产品合并与账号迁移 | 融合版为唯一产品目标（取代旧独立 CN 适配目标）；双通道凭据（登录代次 TRAE 通道 + 签到代次 SOLO 通道）；铸造迁移路径与切号融合版变体；主库目标切换；旧 CN 模块移除（协议层保留）；Phase 15 |
 
 配套决策记录：`docs/DECISIONS-20260822-GRILL.md`（项目方向历史锚点，九问九答全量；部分决策已被本表 ADR 取代，见其头部标注）。
 

@@ -16,7 +16,7 @@ use traesync_infrastructure::environment_registry::master_data_dir;
 use traesync_infrastructure::{
     fetch_installed_plugins, fetch_market_plugins, find_uninstall_target, install_market_plugin,
     uninstall_cloud_plugin, AccountRegistry, CheckinCredentialStore, CheckinProfileBinding,
-    CloudPluginItem, MarketPluginItem, PluginManifest, PluginManifestEntry,
+    CloudPluginItem, MarketPluginItem, PluginManifest, PluginManifestEntry, PluginManifestError,
 };
 
 use crate::{
@@ -142,9 +142,8 @@ pub(crate) async fn get_plugin_tab_state(
                 // 首次启用：当前账号云端现状即基线。
                 let imported = manifest_entries_from_cloud(&installed);
                 manifest
-                    .save(&imported)
-                    .map_err(|_| "plugin_manifest_write_failed".to_string())?;
-                imported
+                    .initialize(&imported)
+                    .map_err(|_| "plugin_manifest_write_failed".to_string())?
             }
         };
         let manifest_ids: std::collections::HashSet<&str> = entries
@@ -279,15 +278,12 @@ pub(crate) async fn install_plugin(
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
         let manifest = PluginManifest::new(&storage_root);
-        let mut entries = manifest
-            .load()
-            .map_err(|_| "plugin_manifest_invalid".to_string())?
-            .unwrap_or_default();
-        entries.retain(|existing| existing.marketplace_plugin_id != entry.marketplace_plugin_id);
-        entries.push(entry);
-        manifest
-            .save(&entries)
-            .map_err(|_| "plugin_manifest_write_failed".to_string())
+        manifest.upsert(&entry).map_err(|error| match error {
+            PluginManifestError::Invalid | PluginManifestError::InvalidEntry => {
+                "plugin_manifest_invalid".to_string()
+            }
+            PluginManifestError::Io => "plugin_manifest_write_failed".to_string(),
+        })
     })
     .await
 }
@@ -359,15 +355,12 @@ pub(crate) async fn uninstall_plugin_everywhere(
         // 清单移除该插件（无市场 UUID 的自装条目本就不在清单内）。
         if let Some(market_id) = &item.marketplace_plugin_id {
             let manifest = PluginManifest::new(&storage_root);
-            if let Some(mut entries) = manifest
-                .load()
-                .map_err(|_| "plugin_manifest_invalid".to_string())?
-            {
-                entries.retain(|entry| &entry.marketplace_plugin_id != market_id);
-                manifest
-                    .save(&entries)
-                    .map_err(|_| "plugin_manifest_write_failed".to_string())?;
-            }
+            manifest.remove(market_id).map_err(|error| match error {
+                PluginManifestError::Invalid | PluginManifestError::InvalidEntry => {
+                    "plugin_manifest_invalid".to_string()
+                }
+                PluginManifestError::Io => "plugin_manifest_write_failed".to_string(),
+            })?;
             // 传播到其他已知账号：逐账号尽力，失败不中断（fail-soft）。
             let records = AccountRegistry::new(&material_root)
                 .load()

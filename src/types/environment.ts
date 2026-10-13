@@ -1,5 +1,7 @@
 import type { TraeInstanceLoginState } from "./account_switch";
 
+export type EnvironmentProcessState = "running" | "not_running" | "unknown";
+
 /**
  * P5-0/P5-2 主库环境状态（get_environment_state 返回）。
  * 字段与 src-tauri/src/lib.rs 的 EnvironmentStateDto（serde 命名）一致。
@@ -7,14 +9,18 @@ import type { TraeInstanceLoginState } from "./account_switch";
 export interface EnvironmentStateDto {
   /** 环境标识；V1 恒为 "master"（主库）。 */
   readonly env_id: string;
-  /** 当前登录主库的账号 profile_id；null = 主库尚未登录任何账号。 */
+  /** 环境档案记住的账号；身份不可实测时可能是最近一次确认的账号。 */
   readonly current_profile_id: string | null;
-  /** 当前账号显示名（备注名优先）；null = 尚未登录。 */
+  /** 环境档案账号的显示名（备注名优先）；不单独证明实时登录。 */
   readonly current_account_name: string | null;
+  /** 本次从 Work CN 登录材料实测并映射到档案的账号；null = 未能确认当前身份。 */
+  readonly observed_profile_id: string | null;
   /** 主库 data_dir 绝对路径（展示与排障用）。 */
   readonly data_dir: string;
   /** 主库 TRAE 实例是否运行中（进程命令行含主库 data_dir 判定）。 */
   readonly running: boolean;
+  /** 进程查询的三态结果；兼容字段 running 在 unknown 时为 false。 */
+  readonly process_state?: EnvironmentProcessState;
   /** 主库实例登录态（与账号实例同口径）。 */
   readonly login_state: TraeInstanceLoginState;
   readonly created_at_unix_seconds: number;
@@ -33,6 +39,8 @@ export interface EnvironmentListItemDto {
   readonly current_account_name: string | null;
   readonly data_dir: string;
   readonly running: boolean;
+  /** 进程查询的三态结果；兼容字段 running 在 unknown 时为 false。 */
+  readonly process_state?: EnvironmentProcessState;
   readonly login_state: TraeInstanceLoginState;
   readonly created_at_unix_seconds: number;
   /** 环境体积（include_size=true 时返回；轮询不带，保留旧值）。 */
@@ -65,4 +73,6 @@ export interface EnvironmentLoginReceiptDto {
   readonly transferred_projects: number;
   readonly switched_sessions: number;
   readonly removed_mirror_rows: number;
+  /** 环境档案是否已记住本次切换的账号。 */
+  readonly current_profile_saved: boolean;
 }

@@ -202,7 +202,7 @@ export interface MasterIncorporateResultDto {
   readonly backup_path: string;
   /** 接力台账写入结果（false 只影响轨迹展示）。 */
   readonly relay_ledger_written: boolean;
-  /** 主库重启结果。 */
+  /** 收编后库实例的重启结果；failed 表示数据已收编但需要手动启动。 */
   readonly relaunch_outcome: string;
 }
 

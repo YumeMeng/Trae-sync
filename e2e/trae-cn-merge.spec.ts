@@ -19,7 +19,7 @@ import { installMockBridge, type MockScenario } from "./mock-bridge";
 
 // CN 详情页 region（LibrarySessionsPanel 的 embedded 宿主）。
 function detail(page: Page): Locator {
-  return page.getByRole("region", { name: "Trae CN 数据根详情" });
+  return page.getByRole("region", { name: "TRAE 数据根详情" });
 }
 
 // 全局通知 toast（sonner）：回执类提示的统一断言目标。
@@ -29,7 +29,11 @@ function notifyToast(page: Page, text: string | RegExp): Locator {
 
 // 安装 mock bridge → 切到 Trae CN → 总览页「浏览 Trae CN 数据」进详情页。
 async function setup(page: Page, scenario: MockScenario = {}) {
-  await installMockBridge(page, { traeCnAccounts: true, ...scenario });
+  await installMockBridge(page, {
+    traeCnAccounts: true,
+    operationReadiness: { "library.archive": "ready" },
+    ...scenario,
+  });
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
   await page.getByRole("combobox", { name: "当前产品" }).selectOption("trae_cn");
@@ -54,7 +58,13 @@ test.describe("Trae CN 项目归并（P13-2）", () => {
   });
 
   test("入口 → 规模预览弹层 → 单次确认 → 回执通知 → 入口消失", async ({ page }) => {
-    await setup(page, { traeCnMergeEntry: true });
+    await setup(page, {
+      traeCnMergeEntry: true,
+      operationReadiness: {
+        "library.archive": "ready",
+        "library.trae_cn_project_merge": "ready",
+      },
+    });
     const panel = detail(page);
 
     // 树末位「其他账号的项目」组：行 + 归并入口可见。

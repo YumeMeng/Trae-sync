@@ -35,10 +35,11 @@ use traesync_infrastructure::{
     capture_location_witness, compare_location_identity, open_or_initialize_production_catalog,
     resolve_current_catalog_path, storage_space_status, user_id_binding_fingerprint,
     user_id_display_fingerprint, AccountEvidenceReader, AccountRecord, AccountRegistry,
-    FixturePathGuard, FixtureWorkspaceStateProvider,
-    PlatformFileIdentityProvider, ProductionCatalogError, ProductionCatalogRuntime,
+    FixturePathGuard, FixtureWorkspaceStateProvider, PlatformFileIdentityProvider,
+    ProductAccountStateStore, ProductionCatalogError, ProductionCatalogRuntime,
     RealReadWorkspaceStateProvider, SqlCipherProbe, StorageDeletionPlan, StorageMigrationResult,
-    StorageRootBinding, WorkCnProcessController, WorkCnReadLocation, DEFAULT_STORAGE_WARNING_BYTES,
+    StorageRootBinding, WorkCnProcessController, WorkCnReadLocation,
+    product_state_root_from, DEFAULT_STORAGE_WARNING_BYTES,
 };
 
 #[cfg(test)]
@@ -51,11 +52,11 @@ use traesync_infrastructure::{
 // P13-5：get_user_info_full / trae_http_client / CheckinHttpError / UserInfoFull
 // 随实例工具族迁 instance_tools；get_user_info_full_for_oauth_client 随凭据域
 // 迁 credential_handover（P12-R3）。
-use traesync_infrastructure::{LoginSession, OAuthClient};
+use traesync_infrastructure::OAuthClient;
 // P2-2 TRAE 实例管理原语：P13-5 实例工具族（路径发现、进程状态、窗口聚焦、
 // 登录态种子与 trae_instance_module 别名）随迁 instance_tools；
-// close_instance / seed_login_state_from_donor / CloseOutcome / close_master_instance /
-// command_line_uses_data_dir / dir_size_recursive / native_account_dir 经
+// close_instance / seed_login_state_from_donor / CloseOutcome /
+// dir_size_recursive / native_account_dir 经
 // 环境/库/凭据域模块引用（P12-R3）。
 // P5-0 主库环境注册表（环境模型 grill Q1/Q2/Q7：V1 单主库环境档案持久化）。
 // P12-R3：environment_registry_error_code / master_data_dir_for /
@@ -65,7 +66,9 @@ use traesync_infrastructure::environment_registry::{master_data_dir, MASTER_ENV_
 // P12-R1b：产品×库 → 当前账号解析（原组合根 resolve_library_account 系下沉）。
 // P12-R3：observed_profile_id / trae_cn_material_root_from 随凭据域迁
 // credential_handover，经该模块引用。
-use traesync_infrastructure::library_account::{self, TraeCnPointerLookup};
+// P15-7：融合版远程设备路由的指针根派生单点在 infrastructure；
+// resolve_trae_cn_pointer 改双根（档案+指针）签名随旧池移除适配。
+use traesync_infrastructure::library_account;
 
 // 仅给 Windows unit-test 二进制声明 Common Controls v6，避免 tao 启动时找不到 TaskDialogIndirect。
 #[cfg(all(test, windows))]
@@ -85,6 +88,8 @@ mod error_mapping;
 mod remote_devices;
 // P12-R3：OAuth 登录命令链（M4/P6-3/P7-4）自 lib.rs 纯移动；命令注册改路径形式。
 mod oauth_login;
+mod process_guard;
+mod product_operations;
 // P12-R3：环境注册与实例生命周期域（P5-0 主库实例 + P6-4 多环境）自 lib.rs
 // 纯移动；登录事务引用的库备份工具经 crate::library_archive 引用。
 mod environment;
@@ -95,6 +100,11 @@ mod library_archive;
 // P12-R3：账号/凭据/切号域（账号中心 + 账号增删改查 + 凭据刷新三链 + Trae CN
 // 健康检测 + 主库切号五步 + G18 自检 + 设备重铸 + 占用统计/彻底删除）自 lib.rs
 // 纯移动；命令注册改路径形式。
+/// 真机切号探针（feature=probe 门控）需经 examples 访问；生产构建模块
+/// 本身不编译，pub 无暴露面变化。
+#[cfg(feature = "probe")]
+pub mod credential_handover;
+#[cfg(not(feature = "probe"))]
 mod credential_handover;
 // P12-R3：插件域（P5-8b 插件 tab：ADR-0023 环境插件清单 + ADR-0026 实时同步）
 // 自 lib.rs 纯移动；命令注册改路径形式。
@@ -127,7 +137,8 @@ use operation_contract::CommandErrorDto;
 // 组合根不再直接引用 LibraryContext。
 
 /// 已验证 Work CN 版本的 SQLCipher 技术参数；不属于登录凭证或目录库密钥。
-const WORK_CN_SOURCE_RAW_KEY: &str =
+/// pub(crate)：真机切号探针（feature=probe）与组合根共用同源密钥。
+pub(crate) const WORK_CN_SOURCE_RAW_KEY: &str =
     "3605f6691095a993f03d5009c918352ef5be31ae31e8f000212b81ff058da773";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,19 +266,9 @@ struct AppState {
     managed_account_runtime: Arc<Mutex<ManagedAccountRuntimeSlot>>,
     /// 签到批量任务取消标记；只阻止尚未开始的 fixture 任务。
     checkin_cancellation: Arc<AtomicBool>,
-    /// OAuth 登录进行中的会话（PKCE verifier + 回调监听 socket 只在后端内存）；
-    /// begin 产出、complete 一次性消费，重复 begin 覆盖旧会话。
-    pending_login: Arc<Mutex<Option<LoginSession>>>,
-    /// P6-3：当次隔离登录的临时浏览器档案目录（begin 记录、complete 消费后清理）；
-    /// 登录进行中不清理（浏览器可能正占用），失败静默留待启动兜底。
-    active_oauth_profile: Arc<Mutex<Option<std::path::PathBuf>>>,
-    /// P7-4：当次登录的取消标记；cancel 命令置位，complete 的等待循环
-    /// 周期检查（同一时间只有一个登录会话，begin 时复位）。
-    login_cancel: Arc<AtomicBool>,
-    /// P7-4：当次隔离登录的浏览器子进程（仅隔离模式持有，用于「浏览器已
-    /// 关闭 → 终止等待」的进程退出检测与取消时结束进程）。本机浏览器模式
-    /// 下进程可能委托给已运行实例后立即退出，退出不等于放弃登录，故不持有。
-    active_login_browser: Arc<Mutex<Option<std::process::Child>>>,
+    /// 单个 OAuth attempt 连同产品、会话、取消阶段与浏览器资源一起持有；
+    /// 完成或取消收尾前拒绝新的 begin，避免跨产品取消及迟到清理误伤。
+    active_login_attempt: Arc<Mutex<Option<oauth_login::ActiveLoginAttempt>>>,
     /// 签到执行互斥：手动批次整批持有（阻塞等待，最多等自动单账号几秒）；
     /// 自动批次逐账号短持有（try_lock 失败即跳过该账号，grill 2026-08-23 决策 5）。
     checkin_execution_lock: Arc<Mutex<()>>,
@@ -728,7 +729,8 @@ fn spawn_oauth_profile_cleanup_scheduler() {
 
 /// 产品账号路由（list_remote_devices / clear_remote_device 共用，ADR-0031）：
 /// work_cn → 主库登录态解析（指定 profile 或主库当前账号）+ OAuthClient::Solo；
-/// trae_cn → 产品账号池当前指针（或指定 profile）+ OAuthClient::TraeCn；
+/// trae_cn → 融合版账号档案（Work 签到注册表；指定 profile 或 product-state
+/// 工具选择指针）+ OAuthClient::TraeCn（P15-7 迁出旧 CN 产品池，ADR-0035）；
 /// 其他产品 → unknown_product。
 fn resolve_remote_device_account(
     material_root: &Path,
@@ -736,44 +738,55 @@ fn resolve_remote_device_account(
     product_id: &str,
     profile_id: Option<&str>,
 ) -> Result<(AccountRecord, OAuthClient), String> {
-    match product_id {
-        // Work CN：默认账号走主库登录态实测解析（与环境页/插件 tab 同一路径）。
-        "work_cn" => {
-            let account = match profile_id {
-                Some(profile) => {
-                    let records = AccountRegistry::new(material_root)
-                        .load()
-                        .map_err(|_| "checkin_registry_invalid".to_string())?;
-                    records
-                        .into_iter()
-                        .find(|record| record.profile_id == profile)
-                        .ok_or_else(|| "account_not_found".to_string())?
-                }
-                None => {
-                    let master_dir = master_data_dir()
-                        .map_err(|_| "environment_registry_invalid".to_string())?;
-                    resolve_actual_master_account(material_root, Path::new(storage_root), &master_dir)?
-                        .ok_or_else(|| "current_account_unresolved".to_string())?
-                }
-            };
-            Ok((account, OAuthClient::Solo))
-        }
-        // Trae CN：默认账号取产品账号池当前指针（switch 命令写入的同一状态）。
-        // P12-R1b：指针→档案查找下沉 library_account（与库作用域同源），
-        // 未选择/悬空两种空形态在此映射为各自的稳定错误码。
-        "trae_cn" => {
-            let account = match library_account::resolve_trae_cn_pointer(material_root, profile_id)?
-            {
-                TraeCnPointerLookup::Registered(account) => account,
-                TraeCnPointerLookup::NoSelection => {
-                    return Err("current_account_unresolved".to_string())
-                }
-                TraeCnPointerLookup::Dangling => return Err("account_not_found".to_string()),
-            };
-            Ok((account, OAuthClient::TraeCn))
-        }
-        _ => Err("unknown_product".to_string()),
-    }
+    // 融合版与 Work 账号同源：档案都在 Work 签到注册表（16 迁移账号），
+    // 差异只在默认账号来源（product-state 工具选择指针）与通道形态。
+    let account = match product_id {
+        "work_cn" | "trae_cn" => match profile_id {
+            Some(profile) => {
+                let records = AccountRegistry::new(material_root)
+                    .load()
+                    .map_err(|_| "checkin_registry_invalid".to_string())?;
+                records
+                    .into_iter()
+                    .find(|record| record.profile_id == profile)
+                    .ok_or_else(|| "account_not_found".to_string())?
+            }
+            None if product_id == "work_cn" => {
+                let master_dir = master_data_dir()
+                    .map_err(|_| "environment_registry_invalid".to_string())?;
+                resolve_actual_master_account(
+                    material_root,
+                    Path::new(storage_root),
+                    &master_dir,
+                )?
+                .ok_or_else(|| "current_account_unresolved".to_string())?
+            }
+            // 融合版默认账号：product-state 工具选择指针（switch 命令写入的
+            // 同一状态；未选择/悬空分别映射为各自稳定错误码）。
+            None => {
+                let target = ProductAccountStateStore::new(product_state_root_from(Path::new(
+                    storage_root,
+                )))
+                .load()
+                .map_err(|_| "trae_cn_account_state_invalid".to_string())?
+                .ok_or_else(|| "current_account_unresolved".to_string())?;
+                let records = AccountRegistry::new(material_root)
+                    .load()
+                    .map_err(|_| "checkin_registry_invalid".to_string())?;
+                records
+                    .into_iter()
+                    .find(|record| record.profile_id == target)
+                    .ok_or_else(|| "account_not_found".to_string())?
+            }
+        },
+        _ => return Err("unknown_product".to_string()),
+    };
+    let oauth_client = if product_id == "trae_cn" {
+        OAuthClient::TraeCn
+    } else {
+        OAuthClient::Solo
+    };
+    Ok((account, oauth_client))
 }
 
 // P12-R3：login_receipt_wire_tests 三例随登录回执 DTO 迁至 oauth_login 模块。
@@ -1228,10 +1241,7 @@ pub fn run() {
             pending_deletion_plan: Arc::new(Mutex::new(None)),
             managed_account_runtime: Arc::new(Mutex::new(initial_managed_account_runtime)),
             checkin_cancellation: Arc::new(AtomicBool::new(false)),
-            pending_login: Arc::new(Mutex::new(None)),
-            active_oauth_profile: Arc::new(Mutex::new(None)),
-            login_cancel: Arc::new(AtomicBool::new(false)),
-            active_login_browser: Arc::new(Mutex::new(None)),
+            active_login_attempt: Arc::new(Mutex::new(None)),
             checkin_execution_lock: Arc::new(Mutex::new(())),
         })
         .setup({
@@ -1251,6 +1261,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_workspace_state,
+            product_operations::get_product_operation_states,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,
             read_work_cn_state,
@@ -1280,10 +1291,11 @@ pub fn run() {
             // M4：OAuth 登录两段式命令（P12-R3 命令迁 oauth_login）。
             oauth_login::begin_checkin_login,
             oauth_login::complete_checkin_login,
+            oauth_login::cancel_checkin_login,
             oauth_login::begin_trae_cn_login,
             oauth_login::complete_trae_cn_login,
             oauth_login::cancel_trae_cn_login,
-            // 账号列表 / Trae CN 账号池 / 健康检测随凭据域迁移（P12-R3）。
+            // 账号列表 / 融合版账号 / 健康检测随凭据域迁移（P12-R3）。
             credential_handover::list_checkin_accounts,
             credential_handover::list_trae_cn_accounts,
             credential_handover::check_trae_cn_account_health,
@@ -1294,13 +1306,9 @@ pub fn run() {
             // ADR-0031 决策 2：原生列表失败时的官方设备管理页兜底入口。
             remote_devices::open_device_management_docs,
             checkin_schedule::get_checkin_overview,
-            // P13-1：Trae CN 签到（单账号手动 status/claim，无批量无调度）。
-            checkin_schedule::get_trae_cn_checkin_status,
-            checkin_schedule::run_trae_cn_checkin,
             // 凭据刷新三链随凭据域迁移（P12-R3）。
             credential_handover::refresh_checkin_credits,
             credential_handover::refresh_checkin_credentials,
-            credential_handover::refresh_trae_cn_credentials,
             credential_handover::remove_checkin_account,
             // ADR-0019 v4：手动重置签到设备（生成新随机设备并设为 home）。
             credential_handover::reset_checkin_device,
@@ -1348,9 +1356,7 @@ pub fn run() {
             library_archive::set_backup_dir,
             library_archive::migrate_master_backups,
             library_archive::get_master_verification,
-            // P5-8a 会话归档通道（ADR-0022）：归档/恢复/真实删除。
-            library_archive::archive_master_sessions,
-            library_archive::restore_master_sessions,
+            // P5-8a 会话归档通道（ADR-0022）：归档/恢复统一走批量编排；真实删除独立提交。
             library_archive::apply_master_archive_changes,
             library_archive::delete_master_sessions,
             library_archive::merge_master_projects,
@@ -1436,10 +1442,7 @@ mod command_shell_tests {
             pending_deletion_plan: Arc::new(Mutex::new(None)),
             managed_account_runtime: Arc::new(Mutex::new(ManagedAccountRuntimeSlot::default())),
             checkin_cancellation: Arc::new(AtomicBool::new(false)),
-            pending_login: Arc::new(Mutex::new(None)),
-            active_oauth_profile: Arc::new(Mutex::new(None)),
-            login_cancel: Arc::new(AtomicBool::new(false)),
-            active_login_browser: Arc::new(Mutex::new(None)),
+            active_login_attempt: Arc::new(Mutex::new(None)),
             checkin_execution_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -1502,7 +1505,10 @@ mod command_shell_tests {
         assert_eq!(ok, Ok(7));
 
         let inner_err = tauri::async_runtime::block_on(async {
-            run_blocking("test_join_failed", || Err::<u8, String>("inner_code".to_string())).await
+            run_blocking("test_join_failed", || {
+                Err::<u8, String>("inner_code".to_string())
+            })
+            .await
         });
         assert_eq!(inner_err, Err("inner_code".to_string()));
     }
@@ -1520,4 +1526,3 @@ mod command_shell_tests {
         assert_eq!(joined, Err("test_join_failed".to_string()));
     }
 }
-

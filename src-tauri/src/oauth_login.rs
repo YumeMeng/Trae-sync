@@ -5,17 +5,20 @@
 //! 与 infrastructure 的 checkin_login 模块边界保持现状（本模块只做命令壳与编排）。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use traesync_infrastructure::{
     begin_login_for, complete_login, trae_http_client, AccountRegistry, CheckinCredentialStore,
-    LoginProduct, LoginSession, ProductAccountStateStore, CALLBACK_TIMEOUT_SECONDS,
+    LoginAttemptControl, LoginCancelResult, LoginProduct, LoginSession, ProductAccountStateStore,
+    CALLBACK_TIMEOUT_SECONDS,
 };
 
 use crate::{checkin_material_root, ensure_login_real_mode, run_blocking, AppState};
 // P12-R3：Trae CN 材料根随凭据域迁 credential_handover。
-use crate::credential_handover::trae_cn_material_root;
+use crate::credential_handover::{product_account_state_root, trae_cn_material_root};
 use crate::error_mapping::login_command_error;
 
 /// 登录开始结果；login_url 同时返回给前端展示（浏览器唤起失败时用户可手动复制）。
@@ -23,6 +26,7 @@ use crate::error_mapping::login_command_error;
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CheckinLoginBeginWireDto {
     login_url: String,
+    attempt_id: u64,
 }
 
 /// 登录完成回执（非敏感白名单）。
@@ -56,6 +60,20 @@ pub(crate) struct TraeCnLoginReceiptWireDto {
     acceptance_error_code: Option<&'static str>,
 }
 
+/// 活动登录的产品、一次性会话、取消阶段与浏览器资源必须同进同出。
+pub(crate) struct ActiveLoginAttempt {
+    attempt_id: u64,
+    product: LoginProduct,
+    /// 登录开始时取得的当前账号选择代次；CN 完成后仅在代次未改变时更新指针。
+    selection_intent: Option<u64>,
+    session: Option<LoginSession>,
+    control: LoginAttemptControl,
+    profile_dir: Option<PathBuf>,
+    browser: Option<std::process::Child>,
+}
+
+static NEXT_LOGIN_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+
 /// 生成新登录会话的 profile_id（时间 + 进程指纹哈希；同一账号重复登录
 /// 在入库时复用已有档案的 profile_id，这里只需保证新账号间不冲突）。
 fn generate_login_profile_id() -> String {
@@ -86,15 +104,19 @@ fn oauth_browser_profile_root() -> std::path::PathBuf {
         .join("oauth-browser-profiles")
 }
 
-/// 隔离浏览器 profile 目录：每次登录使用独立时间戳子目录，
+/// 隔离浏览器 profile 目录：包含秒、亚秒、进程和 attempt 标识，
 /// 授权页 cookie 与本机默认浏览器环境完全隔离（添加新账号无需退出已有账号）。
 #[cfg(windows)]
-fn oauth_browser_profile_dir() -> std::path::PathBuf {
+fn oauth_browser_profile_dir(attempt_id: u64) -> std::path::PathBuf {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    oauth_browser_profile_root().join(timestamp.to_string())
+        .unwrap_or_default();
+    oauth_browser_profile_root().join(format!(
+        "{}-{}-{}-{attempt_id}",
+        timestamp.as_secs(),
+        timestamp.subsec_nanos(),
+        std::process::id()
+    ))
 }
 
 /// 清理超龄的 OAuth 临时浏览器档案（P6-3 核心逻辑，供包装与测试复用）：
@@ -108,7 +130,8 @@ fn cleanup_expired_oauth_profiles_in_root(root: &Path, now_secs: u64) {
         let created_at = entry
             .file_name()
             .to_str()
-            .and_then(|name| name.parse::<u64>().ok());
+            .and_then(|name| name.split('-').next())
+            .and_then(|created| created.parse::<u64>().ok());
         if let Some(created) = created_at {
             if now_secs.saturating_sub(created) >= OAUTH_PROFILE_MAX_AGE_SECONDS {
                 let _ = std::fs::remove_dir_all(entry.path());
@@ -177,6 +200,15 @@ pub(crate) fn open_login_url_in_browser(
     url: &str,
     use_system_browser: bool,
 ) -> (Option<std::path::PathBuf>, Option<std::process::Child>) {
+    open_login_url_in_browser_for_attempt(url, use_system_browser, 0)
+}
+
+#[cfg(windows)]
+fn open_login_url_in_browser_for_attempt(
+    url: &str,
+    use_system_browser: bool,
+    attempt_id: u64,
+) -> (Option<std::path::PathBuf>, Option<std::process::Child>) {
     if let Some(browser) = locate_chromium_browser() {
         if use_system_browser {
             // 不带 --user-data-dir：使用系统默认 profile 的登录态。
@@ -187,7 +219,7 @@ pub(crate) fn open_login_url_in_browser(
                 return (None, None);
             }
         } else {
-            let profile_dir = oauth_browser_profile_dir();
+            let profile_dir = oauth_browser_profile_dir(attempt_id);
             // 目录创建失败不阻塞登录：浏览器会按需自建或落到默认行为。
             let _ = std::fs::create_dir_all(&profile_dir);
             let launched = std::process::Command::new(&browser)
@@ -219,13 +251,18 @@ fn begin_checkin_login_inner(state: &AppState) -> Result<(String, LoginSession),
 
 /// 开始 Trae CN 独立 OAuth 登录；浏览器会话可复用，但认证参数和落盘账号池
 /// 与 Work CN 完全不同。
-fn begin_trae_cn_login_inner(state: &AppState) -> Result<(String, LoginSession), String> {
+fn begin_trae_cn_login_inner(state: &AppState) -> Result<(String, LoginSession, u64), String> {
     ensure_login_real_mode(state)?;
-    trae_cn_material_root(state)?;
+    // 选择意图登记在 product-state 根（P15-7 迁出旧 CN 产品池目录）。
+    let state_root = product_account_state_root(state)?;
     let profile_id = generate_login_profile_id();
     let handoff = begin_login_for(&profile_id, LoginProduct::TraeCn)
         .map_err(|_| "trae_cn_login_begin_failed".to_string())?;
-    Ok((handoff.login_url, handoff.session))
+    // 会话成功建立后登记账号选择意图；无效 begin 不影响已有选择操作。
+    let selection_intent = ProductAccountStateStore::new(&state_root)
+        .begin_selection_intent()
+        .map_err(|_| "trae_cn_account_state_invalid".to_string())?;
+    Ok((handoff.login_url, handoff.session, selection_intent))
 }
 
 /// 开始 OAuth 登录：生成虚拟设备与 PKCE，按选择打开浏览器并返回登录 URL。
@@ -237,27 +274,7 @@ pub(crate) fn begin_checkin_login(
     use_system_browser: Option<bool>,
     state: tauri::State<AppState>,
 ) -> Result<CheckinLoginBeginWireDto, String> {
-    let (login_url, session) = begin_checkin_login_inner(&state)?;
-    // 新登录会话开始：清除上一会话可能遗留的取消标记（P7-4）。
-    state
-        .login_cancel
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    *state.pending_login.lock().unwrap() = Some(session);
-    // 隔离模式启动成功才记录当次临时档案（本机/回退模式无隔离档案）；
-    // 重复 begin 覆盖旧记录，被覆盖目录由周期清理按超龄回收。
-    #[cfg(windows)]
-    {
-        let (profile, browser) =
-            open_login_url_in_browser(&login_url, use_system_browser.unwrap_or(false));
-        *state.active_oauth_profile.lock().unwrap() = profile;
-        *state.active_login_browser.lock().unwrap() = browser;
-    }
-    #[cfg(not(windows))]
-    {
-        // 非 Windows 平台不由后端拉起浏览器（前端用返回的 URL 自行打开）。
-        *state.active_login_browser.lock().unwrap() = None;
-    }
-    Ok(CheckinLoginBeginWireDto { login_url })
+    begin_product_login(&state, LoginProduct::WorkCn, use_system_browser)
 }
 
 /// 开始 Trae CN OAuth 登录。默认使用本机浏览器 profile，方便复用网页端已有的
@@ -267,85 +284,150 @@ pub(crate) fn begin_trae_cn_login(
     use_system_browser: Option<bool>,
     state: tauri::State<AppState>,
 ) -> Result<CheckinLoginBeginWireDto, String> {
-    let (login_url, session) = begin_trae_cn_login_inner(&state)?;
-    state
-        .login_cancel
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    *state.pending_login.lock().unwrap() = Some(session);
-    #[cfg(windows)]
-    {
-        let (profile, browser) =
-            open_login_url_in_browser(&login_url, use_system_browser.unwrap_or(true));
-        *state.active_oauth_profile.lock().unwrap() = profile;
-        *state.active_login_browser.lock().unwrap() = browser;
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = use_system_browser;
-        *state.active_login_browser.lock().unwrap() = None;
-    }
-    Ok(CheckinLoginBeginWireDto { login_url })
+    begin_product_login(&state, LoginProduct::TraeCn, use_system_browser)
 }
 
-/// 取出进行中的登录会话（一次性消费）；无会话时立即失败。
-#[cfg(test)]
-fn take_pending_login(state: &AppState) -> Result<LoginSession, String> {
-    take_pending_login_for(state, LoginProduct::WorkCn)
-}
-
-/// 只允许与命令产品一致的会话完成，防止 Work/CN 两个完成命令交叉消费。
-fn take_pending_login_for(
+/// 单槽持有真实 attempt；重复 begin 在创建新 socket/浏览器前拒绝。
+fn begin_product_login(
     state: &AppState,
     product: LoginProduct,
-) -> Result<LoginSession, String> {
-    let mut pending = state.pending_login.lock().unwrap();
-    let Some(session) = pending.as_ref() else {
+    use_system_browser: Option<bool>,
+) -> Result<CheckinLoginBeginWireDto, String> {
+    let mut active = state
+        .active_login_attempt
+        .lock()
+        .map_err(|_| "login_state_unavailable".to_string())?;
+    if active.is_some() {
+        return Err("login_already_in_progress".to_string());
+    }
+    let (login_url, session, selection_intent) = match product {
+        LoginProduct::WorkCn => {
+            let (login_url, session) = begin_checkin_login_inner(state)?;
+            (login_url, session, None)
+        }
+        LoginProduct::TraeCn => {
+            let (login_url, session, intent) = begin_trae_cn_login_inner(state)?;
+            (login_url, session, Some(intent))
+        }
+    };
+    let attempt_id = NEXT_LOGIN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
+    #[cfg(windows)]
+    let (profile_dir, browser) = open_login_url_in_browser_for_attempt(
+        &login_url,
+        use_system_browser.unwrap_or(product == LoginProduct::TraeCn),
+        attempt_id,
+    );
+    #[cfg(not(windows))]
+    let (profile_dir, browser) = {
+        let _ = use_system_browser;
+        (None, None)
+    };
+    *active = Some(ActiveLoginAttempt {
+        attempt_id,
+        product,
+        selection_intent,
+        session: Some(session),
+        control: LoginAttemptControl::new(),
+        profile_dir,
+        browser,
+    });
+    Ok(CheckinLoginBeginWireDto {
+        login_url,
+        attempt_id,
+    })
+}
+
+/// 领取一次性会话但保留活动 attempt 占用，直至完成或取消清理。
+#[cfg(test)]
+fn take_pending_login(state: &AppState) -> Result<LoginSession, String> {
+    let attempt_id = state
+        .active_login_attempt
+        .lock()
+        .map_err(|_| "login_state_unavailable".to_string())?
+        .as_ref()
+        .map(|attempt| attempt.attempt_id)
+        .ok_or_else(|| "login_not_started".to_string())?;
+    take_login_session_for(state, LoginProduct::WorkCn, attempt_id)
+        .map(|(_, session, _, _)| session)
+}
+
+/// 只允许对应产品完成会话；session 被取走后仍保留同一 attempt 的取消权与占用。
+fn take_login_session_for(
+    state: &AppState,
+    product: LoginProduct,
+    attempt_id: u64,
+) -> Result<(u64, LoginSession, LoginAttemptControl, Option<u64>), String> {
+    let mut slot = state
+        .active_login_attempt
+        .lock()
+        .map_err(|_| "login_state_unavailable".to_string())?;
+    let Some(active) = slot.as_mut() else {
         return Err("login_not_started".to_string());
     };
-    if session.product != product {
+    if active.product != product {
         return Err("login_product_mismatch".to_string());
     }
-    pending
+    if active.attempt_id != attempt_id {
+        return Err("login_attempt_mismatch".to_string());
+    }
+    let session = active
+        .session
         .take()
-        .ok_or("login_not_started".to_string())
+        .ok_or_else(|| "login_already_completing".to_string())?;
+    Ok((
+        active.attempt_id,
+        session,
+        active.control.clone(),
+        active.selection_intent,
+    ))
 }
 
 /// 等待浏览器回调并完成登录（阻塞直到回调、失败、被取消或超时）。
-/// 会话一次性消费；任何失败都不产生入库副作用。
-/// 登录流程终结（无论成败）后清理当次隔离浏览器档案。
+/// 会话一次性消费； attempt 占用持续到真实结果与产品后处理均收尾。
 async fn complete_product_login_inner(
     state: &AppState,
     product: LoginProduct,
-    material_root: PathBuf,
-) -> Result<CheckinLoginReceiptWireDto, String> {
-    // 先取走会话（一次性）：没有进行中的登录立即失败，不占用阻塞线程。
-    let session = take_pending_login_for(state, product)?;
-    // 会话已消费即登录流程终结：取出当次隔离档案目录，结束后删除。
-    let finished_profile = state.active_oauth_profile.lock().unwrap().take();
-    // P7-4 中止判定的共享状态：取消标记 + 隔离浏览器子进程（克隆 Arc 进
-    // 阻塞线程；子进程退出 = 用户关闭了登录窗口，等待即时收尾）。
-    let cancel_flag = state.login_cancel.clone();
-    let browser_child = state.active_login_browser.clone();
+    attempt_id: u64,
+) -> Result<(CheckinLoginReceiptWireDto, u64, Option<u64>), String> {
+    let (attempt_id, session, attempt, selection_intent) =
+        take_login_session_for(state, product, attempt_id)?;
+    let material_root = match product {
+        LoginProduct::WorkCn => checkin_material_root(state),
+        LoginProduct::TraeCn => trae_cn_material_root(state),
+    };
+    let material_root = match material_root {
+        Ok(root) => root,
+        Err(error) => {
+            finish_active_login_attempt(state, attempt_id);
+            return Err(error);
+        }
+    };
+    let active_attempt = Arc::clone(&state.active_login_attempt);
     let result = run_blocking("login_join_failed", move || {
         let store = CheckinCredentialStore::new(&material_root);
         let registry = AccountRegistry::new(&material_root);
         let client = trae_http_client();
         let should_abort = || {
-            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return true;
-            }
-            // 锁中毒不视为中止（fail-open：宁可多等，不误杀进行中的登录）。
-            if let Ok(mut guard) = browser_child.lock() {
-                if let Some(child) = guard.as_mut() {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        return true;
-                    }
+            // 只在 callback wait 阶段观测浏览器退出；发布时不再以浏览器状态取消。
+            let Ok(mut slot) = active_attempt.lock() else {
+                return false;
+            };
+            let Some(active) = slot
+                .as_mut()
+                .filter(|active| active.attempt_id == attempt_id)
+            else {
+                return false;
+            };
+            if let Some(child) = active.browser.as_mut() {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return true;
                 }
             }
             false
         };
         let receipt = complete_login(
             session,
+            attempt,
             &store,
             &registry,
             &client,
@@ -365,40 +447,52 @@ async fn complete_product_login_inner(
         })
     })
     .await;
-    // 登录流程终结：释放浏览器子进程句柄。drop 不结束进程（正常路径浏览器
-    // 由回调页 script 自行关闭；取消路径的结束进程由 cancel 命令负责）。
-    let _ = state.active_login_browser.lock().unwrap().take();
-    // 删除放阻塞线程池（浏览器 profile 含大量小文件，不宜占 async 线程）；
-    // 浏览器仍占用时删除失败静默，由周期清理在目录超龄后兜底回收。
-    if let Some(profile_dir) = finished_profile {
-        tauri::async_runtime::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(profile_dir);
-        });
+    if result.is_err() {
+        finish_active_login_attempt(state, attempt_id);
     }
-    result
+    result.map(|receipt| (receipt, attempt_id, selection_intent))
 }
 
 #[tauri::command]
 pub(crate) async fn complete_checkin_login(
+    attempt_id: u64,
     state: tauri::State<'_, AppState>,
 ) -> Result<CheckinLoginReceiptWireDto, String> {
-    let material_root = checkin_material_root(&state)?;
-    complete_product_login_inner(&state, LoginProduct::WorkCn, material_root).await
+    let (receipt, attempt_id, _) =
+        complete_product_login_inner(&state, LoginProduct::WorkCn, attempt_id).await?;
+    finish_active_login_attempt(&state, attempt_id);
+    Ok(receipt)
 }
 
 /// 完成 Trae CN OAuth 回调并写入 Trae CN 独立账号池。
 #[tauri::command]
 pub(crate) async fn complete_trae_cn_login(
+    attempt_id: u64,
     state: tauri::State<'_, AppState>,
 ) -> Result<TraeCnLoginReceiptWireDto, String> {
-    let material_root = trae_cn_material_root(&state)?;
-    let receipt = complete_product_login_inner(&state, LoginProduct::TraeCn, material_root.clone())
-        .await?;
-    // 登录成功后把新账号设为当前 CN 账号；该指针仍属于 Trae Sync 自己的
-    // CN 账号池，不会改写官方 Trae CN 原生存储。
-    ProductAccountStateStore::new(&material_root)
-        .save(&receipt.profile_id)
-        .map_err(|_| "trae_cn_account_state_failed".to_string())?;
+    let (receipt, attempt_id, selection_intent) =
+        complete_product_login_inner(&state, LoginProduct::TraeCn, attempt_id).await?;
+    // 选择指针提交在 product-state 根（P15-7 迁出旧 CN 产品池目录）。
+    let state_root = match product_account_state_root(&state) {
+        Ok(root) => root,
+        Err(error) => {
+            finish_active_login_attempt(&state, attempt_id);
+            return Err(error);
+        }
+    };
+    // 仅当登录开始时记录的选择意图仍是最新时，才把新账号设为当前账号；
+    // 若用户后来主动切号，凭据仍保存成功，但不得覆盖较新的工具选择。
+    // 该指针属于 Trae Sync 自己的工具选择状态，不会改写官方客户端原生存储。
+    let pointer_result = selection_intent
+        .ok_or_else(|| "trae_cn_account_state_failed".to_string())
+        .and_then(|intent| {
+            ProductAccountStateStore::new(&state_root)
+                .commit_selection(&receipt.profile_id, intent)
+                .map(|_| ())
+                .map_err(|_| "trae_cn_account_state_failed".to_string())
+        });
+    finish_active_login_attempt(&state, attempt_id);
+    pointer_result?;
     Ok(TraeCnLoginReceiptWireDto {
         profile_id: receipt.profile_id,
         screen_name: receipt.screen_name,
@@ -410,34 +504,97 @@ pub(crate) async fn complete_trae_cn_login(
     })
 }
 
-/// 取消进行中的 OAuth 登录（P7-4）：
-/// - 置位取消标记 → complete 的等待循环在一个轮询周期内以 login_cancelled 收尾；
-/// - 结束隔离浏览器子进程（登录窗口随之中页关闭，不留后台浏览器）；
-/// - 兜底清理：complete 尚未被调用时（前端异常路径），顺带丢弃挂起会话
-///   与隔离档案目录，避免按钮锁死后资源滞留。
-fn cancel_login_inner(state: &AppState) -> Result<(), String> {
-    state
-        .login_cancel
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some(mut child) = state.active_login_browser.lock().unwrap().take() {
-        // kill + wait 回收：避免 Windows 上留下僵尸进程句柄。
-        let _ = child.kill();
-        let _ = child.wait();
+/// 仅取消指定产品的活动 attempt；进入发布阶段后保留真实完成/失败结果。
+fn cancel_login_inner(
+    state: &AppState,
+    product: LoginProduct,
+    attempt_id: u64,
+) -> Result<(), String> {
+    enum Cleanup {
+        Pending(ActiveLoginAttempt),
+        Completing(Option<std::process::Child>),
     }
-    // 兜底：会话仍挂起说明 complete 未在等待（异常路径），就地清理。
-    if state.pending_login.lock().unwrap().take().is_some() {
-        if let Some(profile_dir) = state.active_oauth_profile.lock().unwrap().take() {
-            tauri::async_runtime::spawn_blocking(move || {
-                let _ = std::fs::remove_dir_all(profile_dir);
-            });
+    let cleanup = {
+        let mut slot = state
+            .active_login_attempt
+            .lock()
+            .map_err(|_| "login_state_unavailable".to_string())?;
+        let Some(active) = slot.as_mut() else {
+            return Err("login_not_started".to_string());
+        };
+        if active.product != product {
+            return Err("login_product_mismatch".to_string());
         }
+        if active.attempt_id != attempt_id {
+            return Err("login_attempt_mismatch".to_string());
+        }
+        match active.control.cancel() {
+            LoginCancelResult::Cancelled | LoginCancelResult::AlreadyCancelled => {
+                if active.session.is_some() {
+                    Cleanup::Pending(slot.take().expect("活动登录状态仍存在"))
+                } else {
+                    // complete 已取走 session：保留 attempt 槽，等它报告真实结果后清理。
+                    Cleanup::Completing(active.browser.take())
+                }
+            }
+            LoginCancelResult::TooLate => return Err("login_cancel_too_late".to_string()),
+            LoginCancelResult::AlreadyFinished => return Err("login_already_finished".to_string()),
+        }
+    };
+    match cleanup {
+        Cleanup::Pending(mut attempt) => {
+            stop_login_browser(attempt.browser.take());
+            remove_oauth_profile(attempt.profile_dir.take());
+        }
+        Cleanup::Completing(browser) => stop_login_browser(browser),
     }
     Ok(())
 }
 
+fn stop_login_browser(browser: Option<std::process::Child>) {
+    if let Some(mut child) = browser {
+        // kill + wait 回收：避免 Windows 上留下僵尸浏览器句柄。
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn remove_oauth_profile(profile_dir: Option<PathBuf>) {
+    if let Some(profile_dir) = profile_dir {
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(profile_dir);
+        });
+    }
+}
+
+/// 仅清理同一 attempt 的浏览器资源；迟到的完成回调不能触碰更新后的槽。
+fn finish_active_login_attempt(state: &AppState, attempt_id: u64) {
+    let finished = state.active_login_attempt.lock().ok().and_then(|mut slot| {
+        (slot.as_ref().map(|attempt| attempt.attempt_id) == Some(attempt_id))
+            .then(|| slot.take())
+            .flatten()
+    });
+    if let Some(mut attempt) = finished {
+        remove_oauth_profile(attempt.profile_dir.take());
+        // 正常回调会关闭浏览器窗口；drop 句柄不杀掉它。
+        let _ = attempt.browser.take();
+    }
+}
+
 #[tauri::command]
-pub(crate) fn cancel_trae_cn_login(state: tauri::State<AppState>) -> Result<(), String> {
-    cancel_login_inner(&state)
+pub(crate) fn cancel_checkin_login(
+    attempt_id: u64,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    cancel_login_inner(&state, LoginProduct::WorkCn, attempt_id)
+}
+
+#[tauri::command]
+pub(crate) fn cancel_trae_cn_login(
+    attempt_id: u64,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    cancel_login_inner(&state, LoginProduct::TraeCn, attempt_id)
 }
 
 // ============================================================================
@@ -518,17 +675,23 @@ mod oauth_profile_cleanup_tests {
         let now = 10_000_u64;
         // 超龄目录（now - created = 1000 >= 600）：删除，含内容一并清掉。
         let expired = root.path().join("9000");
+        let expired_unique = root.path().join("9000-123-456-7");
         std::fs::create_dir_all(&expired).unwrap();
+        std::fs::create_dir_all(&expired_unique).unwrap();
         std::fs::write(expired.join("Cookies"), b"x").unwrap();
+        std::fs::write(expired_unique.join("Cookies"), b"x").unwrap();
         // 进行中登录目录（now - created = 100 < 600）：保留。
         std::fs::create_dir_all(root.path().join("9900")).unwrap();
+        std::fs::create_dir_all(root.path().join("9900-123-456-8")).unwrap();
         // 非时间戳命名：不猜来历，不动。
         std::fs::create_dir_all(root.path().join("not-a-timestamp")).unwrap();
 
         cleanup_expired_oauth_profiles_in_root(root.path(), now);
 
         assert!(!expired.exists());
+        assert!(!expired_unique.exists());
         assert!(root.path().join("9900").exists());
+        assert!(root.path().join("9900-123-456-8").exists());
         assert!(root.path().join("not-a-timestamp").exists());
     }
 
@@ -557,6 +720,7 @@ mod oauth_profile_cleanup_tests {
 #[cfg(test)]
 mod login_command_tests {
     use super::*;
+    use traesync_infrastructure::LoginAttemptPhase;
     // P12-R3：账号列表原语随凭据域迁 credential_handover。
     use crate::credential_handover::list_checkin_accounts_inner;
     use crate::test_support::make_real_mode_state;
@@ -597,12 +761,213 @@ mod login_command_tests {
         assert!(login_url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A"));
         assert!(!session.profile_id.is_empty());
 
-        // 会话一次性消费：第一次取走成功，第二次失败。
-        *state.pending_login.lock().unwrap() = Some(session);
+        // 会话一次性消费，但活动 attempt 仍占位直到结果收尾。
+        *state.active_login_attempt.lock().unwrap() = Some(ActiveLoginAttempt {
+            attempt_id: NEXT_LOGIN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed),
+            product: LoginProduct::WorkCn,
+            selection_intent: None,
+            session: Some(session),
+            control: LoginAttemptControl::new(),
+            profile_dir: None,
+            browser: None,
+        });
         assert!(take_pending_login(&state).is_ok());
         assert_eq!(
             take_pending_login(&state).map(|_| ()).unwrap_err(),
-            "login_not_started"
+            "login_already_completing"
+        );
+    }
+
+    #[test]
+    fn wrong_product_cancel_does_not_cancel_or_consume_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = make_real_mode_state(root.path());
+        let (_, session, selection_intent) = begin_trae_cn_login_inner(&state).unwrap();
+        let control = LoginAttemptControl::new();
+        *state.active_login_attempt.lock().unwrap() = Some(ActiveLoginAttempt {
+            attempt_id: NEXT_LOGIN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed),
+            product: LoginProduct::TraeCn,
+            selection_intent: Some(selection_intent),
+            session: Some(session),
+            control: control.clone(),
+            profile_dir: None,
+            browser: None,
+        });
+
+        assert_eq!(
+            cancel_login_inner(
+                &state,
+                LoginProduct::WorkCn,
+                NEXT_LOGIN_ATTEMPT_ID.load(Ordering::Relaxed)
+            )
+            .unwrap_err(),
+            "login_product_mismatch"
+        );
+        assert_eq!(control.phase(), LoginAttemptPhase::AwaitingCallback);
+        let attempt_id = state
+            .active_login_attempt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .attempt_id;
+        let (_, _, _, carried_intent) =
+            take_login_session_for(&state, LoginProduct::TraeCn, attempt_id).unwrap();
+        assert_eq!(carried_intent, Some(selection_intent));
+    }
+
+    #[test]
+    fn later_cn_account_switch_is_not_overwritten_by_late_oauth_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let state = make_real_mode_state(root.path());
+        let (_, _session, login_intent) = begin_trae_cn_login_inner(&state).unwrap();
+        // P15-7：选择指针统一在 product-state 根；手动切号与 OAuth 完成
+        // 的竞态判定发生在同一存储，代次才是可比的。
+        let state_root = product_account_state_root(&state).unwrap();
+        let account_state = ProductAccountStateStore::new(&state_root);
+
+        let switch_intent = account_state.begin_selection_intent().unwrap();
+        assert!(account_state
+            .commit_selection("profile-manual", switch_intent)
+            .unwrap());
+        assert!(!account_state
+            .commit_selection("profile-oauth", login_intent)
+            .unwrap());
+        assert_eq!(
+            account_state.load().unwrap(),
+            Some("profile-manual".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_attempt_id_cannot_complete_or_cancel_replacement_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = make_real_mode_state(root.path());
+        let (_, session) = begin_checkin_login_inner(&state).unwrap();
+        let control = LoginAttemptControl::new();
+        let current_id = NEXT_LOGIN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
+        *state.active_login_attempt.lock().unwrap() = Some(ActiveLoginAttempt {
+            attempt_id: current_id,
+            product: LoginProduct::WorkCn,
+            selection_intent: None,
+            session: Some(session),
+            control: control.clone(),
+            profile_dir: None,
+            browser: None,
+        });
+
+        assert!(matches!(
+            take_login_session_for(&state, LoginProduct::WorkCn, current_id - 1),
+            Err(ref error) if error == "login_attempt_mismatch"
+        ));
+        assert_eq!(
+            cancel_login_inner(&state, LoginProduct::WorkCn, current_id - 1).unwrap_err(),
+            "login_attempt_mismatch"
+        );
+        assert_eq!(control.phase(), LoginAttemptPhase::AwaitingCallback);
+        assert!(state
+            .active_login_attempt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .session
+            .is_some());
+    }
+
+    #[test]
+    fn cancel_during_publish_returns_real_completion_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let state = make_real_mode_state(root.path());
+        let (_, session) = begin_checkin_login_inner(&state).unwrap();
+        let control = LoginAttemptControl::new();
+        control.begin_exchange().unwrap();
+        control.begin_publish().unwrap();
+        let attempt_id = NEXT_LOGIN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
+        *state.active_login_attempt.lock().unwrap() = Some(ActiveLoginAttempt {
+            attempt_id,
+            product: LoginProduct::WorkCn,
+            selection_intent: None,
+            session: Some(session),
+            control: control.clone(),
+            profile_dir: None,
+            browser: None,
+        });
+
+        assert_eq!(
+            cancel_login_inner(&state, LoginProduct::WorkCn, attempt_id).unwrap_err(),
+            "login_cancel_too_late"
+        );
+        assert_eq!(control.phase(), LoginAttemptPhase::Publishing);
+        assert!(state.active_login_attempt.lock().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_profile_is_unique_per_attempt_within_same_second() {
+        assert_ne!(oauth_browser_profile_dir(10), oauth_browser_profile_dir(11));
+    }
+
+    #[test]
+    fn duplicate_begin_is_rejected_without_replacing_active_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = make_real_mode_state(root.path());
+        let (_, session) = begin_checkin_login_inner(&state).unwrap();
+        let control = LoginAttemptControl::new();
+        *state.active_login_attempt.lock().unwrap() = Some(ActiveLoginAttempt {
+            attempt_id: NEXT_LOGIN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed),
+            product: LoginProduct::WorkCn,
+            selection_intent: None,
+            session: Some(session),
+            control: control.clone(),
+            profile_dir: None,
+            browser: None,
+        });
+
+        assert_eq!(
+            begin_product_login(&state, LoginProduct::TraeCn, Some(true)).unwrap_err(),
+            "login_already_in_progress"
+        );
+        assert_eq!(control.phase(), LoginAttemptPhase::AwaitingCallback);
+        assert_eq!(
+            state
+                .active_login_attempt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .product,
+            LoginProduct::WorkCn
+        );
+    }
+
+    #[test]
+    fn finish_of_old_attempt_cannot_clear_new_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let state = make_real_mode_state(root.path());
+        let (_, session) = begin_checkin_login_inner(&state).unwrap();
+        let newer_id = NEXT_LOGIN_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed) + 100;
+        *state.active_login_attempt.lock().unwrap() = Some(ActiveLoginAttempt {
+            attempt_id: newer_id,
+            product: LoginProduct::TraeCn,
+            selection_intent: None,
+            session: Some(session),
+            control: LoginAttemptControl::new(),
+            profile_dir: None,
+            browser: None,
+        });
+
+        finish_active_login_attempt(&state, newer_id - 1);
+
+        assert_eq!(
+            state
+                .active_login_attempt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .attempt_id,
+            newer_id
         );
     }
 }

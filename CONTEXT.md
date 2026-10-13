@@ -1,16 +1,39 @@
 # Trae Sync
 
-个人使用的 TRAE 多产品渐进适配工作台，当前以 TRAE Work CN 多账号管理为完整支持面，并逐步承载 Trae CN 的独立适配能力。四个核心需求仍是 Work CN 的存在理由：**账号保存**（凭据持久化）、**对话主库**（所有账号共用一套历史记录）、**直连签到**（HTTP 完成每日签到）、**账号切换**（集中管理、快速切换、显示信息与积分）。
+2026-10-09 P14-2 最新执行：凭据捕获与已保存凭据应用 caller 的进程 Unknown 测试断言单次观察、稳定错误码及 fixture 文件树零变化；指定审查会话确认 Unknown 守卫早于账号/store、vault、lease 和业务写。启动聚焦 PID 断言区分目录匹配与跨产品同目录矛盾：目标 Work PID 才会进入 focus，CN 声称占同一 Work 目录则 Unknown 且不调用 focus；审查会话指出并确认修复首版样本的 P3 假阳性，生产接线无变化。完整 workspace 串行回归 44 个结果段 1315 通过/0 失败/25 忽略，其中根 crate 222/1 ignored、infrastructure 886/7 ignored。fake evidence 只模拟 Unknown，不证明真实 OS 错误映射；P14-2 全面验收和 P14-9 真实 Windows/TRAE 启停仍待。
 
-当前产品边界由 ADR-0029、ADR-0030 固化：产品切换、账号切换、产品能力和产品凭据分开建模；Trae CN 的健康检测与凭据维护走自己的 OAuth client、凭据根和适配命令，未适配额度/签到不显示；真实续期结果仍需独立实测验收；跨产品凭据、设备身份、数据库和会话默认隔离。
+个人使用的 TRAE 渐进适配工作台，当前唯一产品适配目标是融合版 TRAE（ADR-0035，2026-10-13：Work CN 客户端 2026-10-23 停服，旧独立 Trae CN 已被官方融合版吸收，产品层已合并）。四个核心需求不变：**账号保存**（双通道凭据持久化）、**对话主库**（所有账号共用一套历史记录）、**直连签到**（HTTP 完成每日签到）、**账号切换**（集中管理、快速切换、显示信息与积分）。
 
-项目方向最高依据：`docs/DECISIONS-20260822-GRILL.md`（2026-08-22 决策记录）。旧"受保护历史库 + Gate 体系"定位已废止，相关文档已于 2026-08-22 彻底清理（git 历史可查）。
+当前产品边界由 ADR-0029~0035 固化：产品切换、账号切换、产品能力和产品凭据分开建模；跨产品凭据、设备身份、数据库和会话隔离。融合版 TRAE 已成为唯一产品适配目标（ADR-0035，2026-10-13）：Work 客户端 2026-10-23 停服，旧独立 Trae CN 已被官方融合版吸收；工具保留 Work 界面与操作流程，底层逻辑按融合版重适配。五个导航页共享，操作是否实现、真实验收及当前环境可用分别判定。Trae CN 健康检测、库读取与一次同设备续期已有有效实测；续期重启恢复、签到 claim、应用内库写入及原生账号切换仍待对应验收。CN 原生切换使用本产品凭据，首阶段不自动交接历史。当前实施入口为 Phase 15。
+
+2026-10-01 当前任务状态：G0 准备及本次独立审核已完成；用户已授权正式执行，要求按票持续推进、必要时向审查会话提问，不再重复等待总体确认。见 [本次审核结论](.scratch/phase14-execution-review-20261001.md)。当前 WIP 缺陷按 P14-1~9 修复与验证，不视为交付；G1–G5、CN 原生事实门槛和真实破坏性操作执行点单次确认保持。旧 handoff/goal 摘要的总体等待条款已被本次授权/审核取代。
+
+2026-10-08 调度边界（最新再确认）：不派发只读调查/审计/评审子 agent；需要审核时只向用户指定审查会话 `01a0f2c4-34f7-7150-b56b-291e7820a010` 发送具体请求并等待回复，保持必要的持续进展沟通，不修改其模型设置。派发实现、测试、验证等执行子 agent 时，每次必须显式指定 `gpt-6-luna` + `xhigh`，直接及派生任务均适用，并要求 Caveman。与已有主会话交流时省略 `model` 与 `thinking`，保留用户选择。详见 `AGENTS.md`。
+
+2026-10-08 P14-8a 官方公开资料复核：设备限制文档列出 TraeCode、TraeWork 桌面端与 TRAE 移动端，但未确认本机 Trae CN 构建覆盖情况及 Work/CN 会话隔离；更新日志未解释本机客户端元数据版本或认证消费方式；社区答复仅确认 `%APPDATA%\Trae CN` 是用户数据目录，不是认证格式证据。P14-8b/8c 继续 `needs-info`，不得推断真实认证写入或会话隔离。证据链接与详细边界见 `tickets.new.md` 的 P14-8 记录及 `.scratch/phase14-cn-native-auth-investigation-20261001.md`。
+
+2026-10-03 最新执行进度：P14-4c 仍为 WIP。主库 caller 五阶段用例覆盖关闭失败、同目录冲突认证回滚、事务内 remap 失败回滚、提交后正文校验失败与启动失败回执；副环境登录另覆盖提交前冲突回滚与提交后正文校验失败。七项均经指定审查会话确认无 P1/P2。短 target `%TEMP%\tp14` 下完整串行 `cargo test --workspace --quiet -- --test-threads=1` 最新退出码 0，31 个 harness 为 1267 通过/0 失败/25 忽略（含 trybuild）；根 crate lib 为 195 通过/0 失败/1 忽略。测试均为离线合成状态验证，尚未覆盖全部 caller/恢复矩阵或真实 TRAE/CN 官方切换。P14-5a/5b、G5 与 Trae CN 官方真实切换/重启验收仍未完成；详见 `tickets.new.md` 与用户指定临时 handoff。
+
+2026-10-03 P14-4c 后续增量：新增 Work 副环境项目归并跨进程租约拒绝屏障。真实归并 caller 在子进程中与另一持锁进程竞争；caller 最长等待 10 秒，超时先释放 holder，再限时回收 caller。精确 `DataLocationBusy`、process-check=0、无备份且源项目/会话归属不变。指定审查会话发现的等待边界 P2 已关闭，无新增 P1/P2；定向父/子进程测试 1/1、rustfmt、diff check 通过。1267/0/25 是新增测试之前的 workspace 快照；P14-4c、P14-5、G5 和 CN 官方真实切换/重启验收仍未完成。详见 `tickets.new.md` 与用户指定临时 handoff。
+2026-10-03 同日后续：新增 Windows Work 既有账号 OAuth 重登与手机号并发屏障。验收闭包直接探测唯一既有 `.checkin` 实际凭据资源的 sidecar 锁，确认 profile lease 正持有同一资源；手机号写入于释放前未完成，释放后读回新 refresh token 和手机号均保留。300ms 仅是完成状态观察，锁持有证据来自直接探测。测试父进程 30 秒超时并可 kill+wait；指定审查会话确认两项 P2 已关闭、无新 P1/P2；父/子 targeted harness 各 1/1。该测试新增后 workspace 全量尚未重跑；属于 Work 合成 acceptance callback，不代表真实 OAuth HTTP 或跨进程 writer，P14-4c、P14-5、G5 和 CN 官方真实切换仍未完成。详见 `tickets.new.md` 与用户指定临时 handoff。
+2026-10-03 P14-4c Work 归档增量：父测试进程使用生产共用 helper 持有 Work 主库真实租约，子进程运行真实归档 caller；精确 `DataLocationBusy`、close/relaunch=0、拒绝前归档状态和备份不变，释放后重试成功。同步 caller 已改成 10 秒有界等待，超时先终止 caller 再释放锁。指定审查会话窄审无 P1/P2；父/子 targeted harness 各 1/1，rustfmt 与 diff check 通过。完整 workspace 1267/0/25 早于近期 Work merge、Work archive、OAuth/mobile 新测试；当前快照全量尚待重跑，P14-4c 仍 WIP。详见 `tickets.new.md` 与用户指定临时 handoff。
+2026-10-03 P14-4c CN 归档/归并增量：父测用生产共用 lease helper 锁住 CN 数据目录，子进程先后调用共用 CN 归档与项目归并 caller；精确 `DataLocationBusy`，账号解析/客户端检查/进度与提交回调均未触发，owner/隐藏状态/备份/台账保持未写。子进程 10 秒等待后 kill+wait 再释放租约；指定审查会话窄审通过，无新增 P1/P2。父/子 targeted harness 各 1/1，rustfmt、diff check 通过。1267/0/25 早于 Work merge、Work archive、OAuth/mobile 与本 CN 用例，当前 workspace 全量仍待；真实 CN 切换和 P14-4c 总验收均未完成。详见 `tickets.new.md` 与用户指定临时 handoff。
+
+2026-10-03 最新 Rust workspace 集成：在 Work 主库切号与归档跨进程测试加入后，短 target `cargo test --manifest-path src-tauri/Cargo.toml --target-dir "$env:TEMP\tp14" --workspace --quiet -- --test-threads=1` 退出码 0。根 crate lib 202 通过/0 失败/1 忽略，infrastructure lib 879 通过/0 失败/7 忽略，trybuild 与其余 workspace harness 通过。OpenSSL LNK4099 缺失 PDB 警告不影响结果。此证据仍是离线合成 caller 验证；真实 TRAE/CN 官方切换与 P14-4c、P14-5/G5 验收未完成。详见 `tickets.new.md` 与用户指定临时 handoff。
+
+2026-10-03 P14-1 账号确认意图隔离：修复 Work 批量凭据确认跨到 Trae CN 后改调用 CN 刷新的竞态。先红测证实旧确认残留并触发 CN 命令；修复后定向 Vitest 1/57 skipped、`pnpm typecheck` 和差异检查通过。指定审查会话窄审无 P1/P2。只关闭这一条确认意图要求；P14-1 其他账号详情/选择与延迟异步隔离仍未完成。
+
+2026-10-03 P14-1c 账号详情/读取隔离增量：切产品时清空选中账号与旧快照；快照提交同时受当前产品和读取代次保护，覆盖 Work→CN→Work 的迟到响应。AccountCenter Vitest 60/60、typecheck 通过，指定审查会话确认无 P1/P2。只完成账号详情选择及快照读取这一局部；共通账号契约、动作和进度事件等 P14-1c 仍未完成。
+
+2026-10-03 P14-1c 共同列表字段增量：Work 真实账号列表与卡片补入现有最近验证时间，标签、日期格式与 Trae CN 对齐，保留 Work 的手机号/额度/有效期信息。定向 Vitest 1/1、typecheck、差异检查通过，指定审查会话确认无 P1/P2；仅完成一个共同展示字段，P14-1c 其余账号契约与动作迁移待办。
+
+项目方向历史锚点：`docs/DECISIONS-20260822-GRILL.md`（注意头部取代标注）；当前决策以 ADR 索引与状态行的取代关系为权威。旧"受保护历史库 + Gate 体系"定位已废止，相关文档已于 2026-08-22 彻底清理（git 历史可查）。
 
 ## 领域语言
 
 ### 账号与凭据
 
-**账号身份**：TRAE Work CN 服务端识别的稳定账号主体，以服务端用户 ID 为核心。账号身份不因重新登录、续期或更换签到设备而改变。
+**账号身份**：认证 provider 与服务端用户 ID 确定的稳定账号主体。账号身份不因重新登录、续期或更换签到设备而改变；相同身份在不同产品中的凭据、权益与官方登录状态仍独立。
 
 **账号档案**：该账号在本 App 中的本地登记与用户偏好：展示信息、备注、自动签到设置、归档状态以及当前凭据代次的关联。不把账号档案本身当作认证材料。
 
@@ -24,25 +47,29 @@
 
 **一次 OAuth 约束**：一次用户发起的登录尝试最多消耗一次 OAuth 授权。首次授权后的自动修复只能使用当前登录结果中的 access token 走非 OAuth 路径；修复失败时保留凭据与失败证据，要求用户明确决定，不静默发起第二次 OAuth。
 
-**产品**：一个安装分发、认证通道、数据根和功能集合明确的 TRAE 客户端，例如 `work_cn` 与 `trae_cn`。产品决定数据边界和能力边界，不等同于账号。
+**产品**：一个安装分发、认证通道、数据根和功能集合明确的 TRAE 客户端。融合版 TRAE 是当前唯一产品目标（产品 ID `trae_cn`）；`work_cn` 是历史 Work CN 目标，随 ADR-0035 产品合并退役（P15-7 起仅存历史引用与旧目录数据）。产品决定数据边界和能力边界，不等同于账号。
 
-**产品上下文**：当前正在操作的产品运行上下文，包含产品 ID、数据根、数据库定位、可执行文件定位、能力清单、当前产品账号和最近页面。切换产品时销毁旧上下文中的数据库句柄、会话缓存和详情对象，再加载新上下文。
+**产品上下文**：当前正在操作的产品运行上下文，包含产品 ID、数据根、数据库定位、可执行文件定位、能力清单、当前产品账号和最近页面。切换产品时清理旧视图的数据库引用、会话缓存、详情对象和查询；已开始的写操作保留原上下文并按原产品报告结果，不因页面切换中断事务。
 
 **产品切换器**：标题栏左侧的空间级选择器，回答“我现在操作哪个 TRAE 产品”。它不改变另一个产品的当前账号，也不把另一个产品的数据库对象带入当前页面。
 
-**账号切换器**：当前产品内的账号选择器，回答“该产品使用哪个账号”。它与产品切换器使用不同状态，不改变产品能力、数据根或数据库路径。
+**账号切换器**：当前产品内的账号操作入口。工具选中账号与官方客户端已使用账号必须分开表达；真实切换成功以官方客户端目标身份确认及必要重启验证为准。它与产品切换器使用不同状态，不改变产品能力、数据根或数据库路径。
 
-**能力清单**：当前产品真实支持的功能及状态。导航由能力清单生成；能力状态至少区分 supported、unsupported、planned 和 experimental，不用点击后失败的假入口。
+**工具选中账号**：管理工具当前操作或显式库归并的目标账号，不独立证明官方客户端已登录该账号。并发登录与切号时，较晚登记的有效账号选择意图优先；无效切号不改变选择顺序，较早 OAuth 仍可保存账号与凭据，但不得覆盖较新的工具选择（ADR-0034 决策 12）。
+
+**官方客户端实测账号**：依据本产品实际认证状态或官方会话结果确认的账号；读取失败时为未知，不用工具选择或凭据健康替代。
+
+**能力清单**：当前产品逐项操作的实现、验收证据和当前环境条件。导航五页共享；区块使用 ready/pending/absent。ready 需要已实现、必要验收通过且当前环境可用；pending 不提供普通执行按钮；absent 需要事实证明不支持，操作隐藏。某个操作通过不替代其他操作的验收（ADR-0034）。
 
 **产品凭据**：某个产品对某个账号身份的认证状态，是 `productId + identityId` 的关系，不是账号本身。它可以是 `identity_recognized`、`restore_testing`、`verified`、`need_authorization` 或 `failed`。
 
 **身份可识别**：同一 provider、userId 和关键账号字段已匹配，只表示两个产品材料属于同一服务端身份，不表示目标产品已经登录。
 
-**会话可恢复**：目标产品适配器在临时隔离目录恢复有效 session，且退出重启后仍有效、未修改生产文件、未触发设备状态变化。只有达到该门槛，产品凭据才可标记为 verified。
+**会话可恢复**：目标产品适配器在临时隔离目录恢复有效 session，且退出重启后仍有效。隔离调查不改生产文件；本产品生产激活须在隔离验证后另走备份、身份校验及实际客户端验证。凭据健康、一次续期和原生会话可恢复分别验收，跨产品复制仍禁止（ADR-0034）。
 
 **产品权益**：与 `productId + identityId` 绑定的签到资格、设备额度和同步状态。签到是产品能力/产品权益，不是账号的全局布尔状态。
 
-**远程设备**：TRAE 服务端为账号登记的登录设备占用（上限默认 10 台），同一设备行可能同时绑定 TraeCode、TraeWork 桌面端和移动端等多个产品。设备占用是账号级事实，不是单一产品的本地属性；本机凭据中的 device_id 用于识别哪一行是本机。见 ADR-0031。
+**远程设备**：TRAE 服务端为账号登记的登录设备占用（上限默认 10 台），同一设备行可能同时绑定 TraeCode、TraeWork 桌面端和移动端等多个产品。设备占用是账号级事实，不是单一产品的本地属性；本机识别遵循服务端 CurrentDevice 与既有安全回退，不直接假定本地 device_id 等于服务端设备行 ID。见 ADR-0031。
 
 **远程设备管理**：查看账号的远程设备列表并退出指定设备的能力。退出是破坏性远程操作：被退出设备上绑定的全部 TRAE 产品都需要重新登录；本机设备禁止通过工具远程退出；其余设备逐台单次确认后执行。
 
@@ -65,6 +92,10 @@ access token 已过期且无法走同设备 AuthCode 时，旧 refresh 只允许
 **手动凭据刷新**：用户主动选定单个或全部账号发起的立即换发操作；每个选中账号本次最多换发一次，批量操作按账号串行执行，结果按账号分别报告，失败账号保留原当前凭据代次。
 
 **TRAE 登录存档**：账号在 App 存储根下用于 TRAE 账号切换的登录材料（`trae-instances\{profile_id}` 目录三件套），与签到凭据代次独立。切号对供体目录的全部消费仅此存档（E1 实证，ADR-0024）；存档不承担运行实例职责。
+
+**融合版登录代次**：账号在融合版 TRAE 客户端（3.4.2+，TRAE 通道 `ono9krqynydwx5`/IDE_PC）的认证材料：access/refresh token、过期时间与绑定设备身份（机器级 ICDRS 三元组：rdid、telemetry.machineId、icube-dc 键 PEM 密钥对）。由 Work 签到凭据的 access token 经 AuthCode 铸造（ADR-0035），存于登录代次容器；续期由融合版客户端自动完成，工具只做只读健康检测。
+
+**双通道凭据**：每账号两套并行独立的认证材料——登录代次（TRAE 通道，融合版客户端登录与切号用）与签到代次（SOLO 通道，现有签到凭据包，虚拟设备身份）。两套代次独立续期、独立写回、互不覆盖（ADR-0035）；跨通道复制禁令继续有效。
 
 **环境**：一个独立 TRAE 数据目录与当前登录账号的组合。主库环境绑定官方目录（默认、不可删除）；副环境由用户自建，承载隔离的任务场景。任意账号可登录到任意环境（多对多）；环境内记录单一归属当前登录账号；环境间可并行运行，环境内单实例（ADR-0024）。
 
@@ -118,7 +149,7 @@ access token 已过期且无法走同设备 AuthCode 时，旧 refresh 只允许
 
 ### 数据与存储
 
-**数据位置**：一个明确的 TRAE 产品数据目录及其数据库文件集合，具有稳定身份。当前 Work CN 是完整读写支持面；Trae CN 在首阶段只允许按产品边界进行只读定位和已验证的适配能力。
+**数据位置**：一个明确的 TRAE 产品数据目录及其数据库文件集合，具有稳定身份。当前 Work CN 是完整读写支持面；Trae CN 库读取已验收，选择性写范围由 ADR-0033 规定且必须通过各操作必要验收。原生切号与库写是独立操作；未知进程/数据身份不能授权写入（ADR-0034）。
 
 **存储根**：Trae Sync 管理自有数据（主库、目录库、备份）的物理根目录。
 
@@ -126,7 +157,7 @@ access token 已过期且无法走同设备 AuthCode 时，旧 refresh 只允许
 
 **手动备份入口**：App 内由用户主动操作的备份功能：自选位置、内容（账号凭据/历史库/主库）与时机。这是红线解除后唯一的数据安全保障形态（ADR-0018），破坏性批量操作另需单次确认。
 
-## 关键协议事实（实测固化）
+## 关键协议事实（Work CN 实测固化，CN 不据此类推）
 
 签到服务三层规则（2026-08-20/21 实验，证据 `.scratch/checkin-http/`）：
 
@@ -140,10 +171,20 @@ access token 已过期且无法走同设备 AuthCode 时，旧 refresh 只允许
 
 OAuth/ExchangeToken/GetPCAuthCode/请求头构造/byteCrypto 解密等协议细节见 `docs/TECHNICAL_BASELINE.md` 与 `.scratch/checkin-http/` 下的复现手册。
 
+2026-10-03 最新 Rust 集成：在四项跨进程 caller 测试加入后，短 target `cargo test --workspace --quiet -- --test-threads=1` 退出码 0；根 crate lib 200 通过/1 忽略，infrastructure lib 879 通过/7 忽略，其余 harness 与 trybuild 均通过。随后删除未被生产使用的 `resolve_library_dir` wrapper，并将 `LoginAttemptPhase` 移入测试模块；改后真实库上下文定向用例 1/1、`cargo check -p trae-sync --lib` 通过。workspace 全量早于这两处清理；指定审查会话窄审无行为变化、遗漏调用方或新增 P1/P2。P14-4c、P14-5、G5 与 CN 官方真实切换/重启仍未完成。详见 `tickets.new.md` 与临时 handoff。
+
+2026-10-03 前端集成回归：`pnpm typecheck`、Vitest 23 文件/378 项、Playwright E2E 44/44 通过。Vitest 有 React `act(...)` 警告，无失败；CN 签到、归档/归并 E2E 为 mock，不能当作生产操作或官方客户端真实验收。见 `tickets.new.md` 与 Phase 14 PRD。
+
+2026-10-03 P14-4c 后续：真实主库切号子进程在提交后持同一物理库租约暂停，另一进程的真实 Work 归档 caller 精确以 `DataLocationBusy` 拒绝；auth/owner、archive 状态及备份数确认归档未提交。审查发现的切号线程无界回收 P2 已改为双子进程限时等待、超时 kill+wait，并复核关闭，无新 P1/P2；父/子定向测试各 1/1、rustfmt/diff check 通过。进程检查调用次数没有动态探针，按源码顺序核实。workspace 全量早于本用例，P14-4c、P14-5 与真实 CN 切换仍未完成。详见 `tickets.new.md` 和临时 handoff。
+
+2026-10-09 Phase 14 增量：P14-1b 设置读取、P14-1d Library 迟到结果及 P14-1c 批量进度/忙碌来源三个窄切片均通过指定审查会话复核，切片内 P2/P3 已关闭、无新 P0-P3；父票各自其余验收仍未完成。启动日志中的 `ProductBatchProgressEvent: Clone` 编译错误已修复，`pnpm dev:tauri` 隔离桌面已启动且 Vite HTTP 200；这只验证隔离开发 UI，不代表真实 TRAE/CN 账号切换验收。详见 `tickets.new.md` 与临时 handoff。
+
+2026-10-09 P14-1c 账号语义增量：适配器契约明确区分 Trae Sync 工具内账号选择与官方客户端数据中的身份观察；CN 选择只写工具指针，Work 账号事务保留。快照移除未消费的产品名称/能力副本及重复选中 ID，保留产品来源代次门禁；指定审查会话源码复核未发现 P0–P3。Work 详情增加凭据健康状态和主库当前账号，未知值保持中性；设备模块移至常规操作之后、危险操作之前。AccountCenter 65 项组件测试、typecheck 和差异检查通过，详情顺序复核无 P0–P3；新增状态字段映射待复核。P14-1c 其余共同字段/动作回执矩阵及 CN 原生切换验收仍未完成。当前隔离开发预览的 Vite 返回 HTTP 200，数据根为 `.scratch/dev-tauri`。
+
 ## 架构资产现状
 
 - **crate 分层**：domain / application / infrastructure / ports + 组合根（保留，继续使用）
-- **可用实现**：签到 HTTP 协议层、OAuth 登录流程、DPAPI 凭据包、EC 设备密钥对、凭据维护状态文件与可注入换发边界、SQLCipher 读写资产、桌面 UI 四页骨架（Overview/History/Accounts/Settings）
+- **已有实现**：签到 HTTP 协议层、OAuth 登录流程、DPAPI 凭据包、EC 设备密钥对、凭据维护状态文件与可注入换发边界、SQLCipher 读写资产、五个共享导航页与 Library 详情；已实现不等于每个产品操作均已真实验收
 - **业务码透传**（2026-08-22 已修复，P0-2）：`detail_code` 以 `business_{code}` 形态直达前端（9074/9095/20324 分别可辨），claim 业务码拒绝按 `not_eligible` 分类（此前误报 `verification_failed`）；协议层注释已对齐 9074/9095 双闸门事实
 - **待清理**：Gate 证据体系代码（evidence 收集、资格判定）随模块改造逐步移除，不做一次性大删除
 
@@ -153,8 +194,45 @@ OAuth/ExchangeToken/GetPCAuthCode/请求头构造/byteCrypto 解密等协议细�
 |------|------|
 | `docs/DECISIONS-20260822-GRILL.md` | 项目方向历史锚点（九问九答全量决策；部分主库/实例决策已被 ADR-0021/0024 取代，见其头部标注） |
 | `docs/adr/README.md` | ADR 索引与维护规则（任务驱动新增） |
-| `docs/adr/0018-0030` | 现行架构决策：红线解除 / 签到虚拟设备与账号来源 / 主库与实例模型 / 主库记录单一归属 / 会话归档通道 / 环境插件清单 / 账号-环境解耦 / 多产品工作台边界 / Trae CN 凭据维护边界 |
+| `docs/adr/0018-0034` | 现行架构决策，逐份路径与取代关系见 ADR 索引；含操作级能力验收与原生切换边界 |
 | `docs/DESIGN_TOKENS.md` | UI 视觉与交互契约（毛玻璃设计系统，UI 三批改造的开发规范） |
 | `docs/TECHNICAL_BASELINE.md` | 协议与技术事实基线（含 SQLCipher 导出契约） |
-| `tickets.new.md` | Phase 0-8 与 P9/P10 实施计划（现行唯一计划文件；旧版 `tickets.md` 已于 2026-09-02 删除） |
+| `tickets.new.md` | Phase 0-14 实施计划；Phase 14 为当前架构/切换安全与 CN 原生激活任务（现行唯一计划文件） |
+| `.scratch/phase14-prd-20261001.md` | Phase 14 PRD：需求依据、需求到子票/验收追踪、操作快照与提交/恢复契约、开发/真实验收关口 |
+| `.scratch/phase14-readiness-review-20261001.md` | G0 准备质量、既有草稿评审与执行前状态快照；不是当前外部独立审查结论 |
+| `.scratch/phase14-product-comparison-20261001.md` | VS Code Profiles、GitHub CLI 多账号与 JetBrains Toolbox 官方资料对照；只作设计类比，不是 TRAE 行为或验收证据 |
+| `docs/architecture/MODULE_MAP.md` | 全量源码归属、生产流程/命令入口与当前验收缺口 |
+| `docs/architecture/PRODUCT_ONBOARDING.md` | 复用现有边界接入产品的顺序与验收检查 |
 | `.scratch/checkin-http/` | 签到实验证据与复现手册 |
+
+2026-10-09 P14-1c Work 当前账号误判修复（复审待回）：环境 DTO 区分注册表最后已知 `current_profile_id` 与本次实测 `observed_profile_id`。账号卡片和详情只以本次观测身份显示“使用中”；退出、不可读或未登记时显示未确认，不把缓存误作登录证据。产品往返的迟到环境读取按代次丢弃。前端 5 文件 132/132、typecheck、Rust 身份解析测试 5/5、定向 rustfmt 与差异检查通过；复审请求已提交指定会话，P14-1c/P14-1 仍开放。
+
+2026-10-09 P14-1c 失活期间 Work 实测身份回执竞态修复（复审待回）：窄审补充发现 AccountCenter 常驻隐藏期间可能保留此前的 observed 身份。现在在 useLayoutEffect 中同步记录活动状态；失活时清身份并递增读取代次，迟到回执提交前复核活动状态。新增刷新请求挂起后失活、旧身份回执迟到、重新激活仍保持未确认的回归。AccountCenter 67/67 与 typecheck 通过；连同前一增量未再改动的四个文件，共 5 文件 133 项均已通过。第二次指定窄审待回，P14-1c/P14-1 开放。
+
+2026-10-09 指定审查会话复核确认 Work 当前账号两处实测身份 P2 已关闭，本次无 P0–P3：环境缓存与本次观测身份分离；账号页失活立即清状态并拒绝迟到回执；重新激活首帧不复用旧身份。仅关闭该窄切片，不代表 P14-1c/P14-1 完成。
+
+2026-10-09 P14-1c 详情共通字段顺序：Work/CN 详情以测试锁定“登录状态→产品内身份/工具选择→最近验证”的共同顺序，操作/设备/技术区随后按能力展示；Work 保留原生切号流程与专属编辑/危险操作，CN 不表述成官方客户端切换。仅补顺序契约测试，没有增加通用浅组件。两组定向测试 74/74、typecheck 通过；父票仍开放。
+
+2026-10-09 隔离试用构建已同步当前 Rust 环境 DTO：运行中的 Tauri 进程从旧版本重启为 `%TEMP%\tp14\debug\trae-sync.exe`（PID 74476），Vite 1420 HTTP 200。通过仓库安全启动器，数据根仍隔离于 `.scratch/dev-tauri`；稳定安装/正式账号数据未触碰。构建仅有 OpenSSL LNK4099 缺 PDB 警告。
+
+2026-10-09 P14-2 APPDATA 进程归属修复：`default_product_data_dir` 对缺失、空或相对 `APPDATA` 返回 `None`，防止官方裸启动 Work 进程被误判为未运行并放行写守卫。`trae_instance::tests` 24/24、目标 rustfmt 与 diff check 通过；Tauri watcher 编译成功，隔离版窗口 PID 71908 响应正常，Vite HTTP 200。指定审查会话窄审无 P0–P3；P14-2 仍待其余 caller/边界验证，稳定安装和正式数据未触碰。
+
+2026-10-09 P14-2 关闭错误保真：`close_instance` 区分身份/进程状态未知与已确认关闭失败；所有已核 caller 在备份或凭据、数据库、注册信息写入前保留并返回 `process_state_unknown`。相关调用方拒绝用例通过；根 crate lib 214 通过/0 失败/1 忽略，infrastructure lib 880 通过/0 失败/7 忽略。指定审查会话复核无 P0–P3；P14-2 仍开放。
+
+2026-10-09 隔离开发版冷启动复验：`ProductBatchProgressEvent` 的 `Clone` 编译错误已消除，Rust crate `cargo check` 通过；运行仓库启动入口后 Tauri 窗口正常响应（PID 57228），Vite 1420 HTTP 200（PID 33684）。旧 CMD 乱码命令没有在当前入口复现。数据仍隔离于 `.scratch/dev-tauri`；稳定安装 PID 57080 未受影响。构建仅有 OpenSSL LNK4099 缺 PDB 警告；此结果不代表真实账号或 CN 原生切换已验收。
+
+2026-10-09 P14-2 关闭目标隔离验证：`close_instance_impl` 通过注入入口使用合成进程快照测试；Work 与 CN 同时运行只向 Work PID 发送 taskkill，初始 Unknown/查询失败时无进程动作，优雅关闭后的复查转为 Unknown 时不升级强制关闭，强制关闭只针对目标 PID。matcher 覆盖双产品同时运行均可识别、exe/命令行分别缺失均保持 Unknown。`trae_instance::tests` 29/29、根 crate `cargo check --lib` 通过，未操作真实 TRAE 进程。指定审查会话此前复核关闭生产接线和原四项断言无 P0–P3；新增 matcher 边界与剩余 caller 矩阵复核待回。Tauri watcher 热重启隔离开发版（PID 49292，窗口响应正常），Vite HTTP 200（PID 33684）；数据仍位于 `.scratch/dev-tauri`。
+
+2026-10-09 P14-2 全调用点源码复核：区分 Work-only `ProcessControllerPort`（数据库占用，只保护凭据捕获/应用/恢复标记）与 `trae_instance` 产品/目录进程 matcher（环境状态、实例启停、危险账号/库写及 keepalive）。已确认未知状态在副作用前阻断；环境列表保留 Unknown，启动在建目录/派生进程前拒绝，删除/重置/清理在注册表写、备份或删除前拒绝，库写在备份/数据库操作前关闭并确认目标进程，keepalive 遇 Unknown 跳过。重新运行基础设施 `trae_instance::tests` 29/29、根 crate `--lib` 214 通过/0 失败/1 忽略；没有真实结束 TRAE 进程。指定审查会话仍在执行其当前任务，因此这份调用矩阵独立复审待回，P14-2 仍开放。
+
+2026-10-09 集成/发布快照：指定审查会话报告 E2E 首跑 39/44，失败为脚本漏处理“关闭并应用”确认与一条过时文案；修正后受影响 5 项 5/5，完整 E2E 仍待重跑。infrastructure 库测试报告 885 通过/7 忽略，其他库 harness 通过。0.2.4 Release 首编已越过 OpenSSL、正优化 infrastructure crate；隔离安装及稳定版替换未执行。隔离开发版 PID 71820 响应正常、Vite 1420 HTTP 200；稳定版 PID 57080 响应正常，真实账号/凭据/对话数据未迁移或写入。
+
+
+2026-10-09 启动错误复验：粘贴日志是旧 0.2.2 输出；当前 0.2.4 隔离启动入口已无 CMD 乱码命令，进度事件载荷满足 Clone。经仓库启动器冷启动后 Tauri PID 53672 响应正常，Vite 1420 HTTP 200（PID 68648）；稳定版 PID 75688 仍响应，数据根隔离于 .scratch/dev-tauri。构建只有 OpenSSL LNK4099 缺少 PDB 警告；本次未运行测试或写入正式账号/对话数据。真实 CN 原生切换仍未验收。
+
+
+2026-10-09 P14-2 独立复核返回：指定审查会话未发现新增 P0–P3 生产逻辑问题；聚焦复用产品+目录 matcher 的 PID 结果，但尚无专用 caller 断言；ProcessControllerPort 的凭据捕获/应用 caller 还需补 Unknown/查询失败零业务写入覆盖。CN 作为关闭目标的对称测试已加入，待 Rust 定向验证；真实 Windows/TRAE 启停留 P14-9。P14-2 保持开放。
+2026-10-09 前端集成：pnpm typecheck 通过，Vitest 23 文件/418 项通过，修正后的 Playwright E2E 44/44 通过（2.7 分钟）。E2E 为 mock/Vite preview，不是真实 Tauri 或产品操作验收。
+2026-10-09 稳定版 0.2.4 更新核验（指定审查会话报告）：0.2.3 升级后 16 个 Work 账号仍启用；222 个签到文件与 13 个 Trae CN 文件共 235 项与更新前 SHA-256 备份一致，启动核验后文件未变化，自动签到保持关闭。备份清单位于 %LOCALAPPDATA%\Trae Sync Backups\before-update-0.2.4-20261009-073128\manifest.json；安装冒烟测试通过。未触发签到、切号或会话库写入。
+2026-10-09 P14-2/P14-3 增量复测（指定审查会话窄审中）：CN 目标关闭定向 1/1，仅向 CN PID 发关闭请求且并行 Work 保留。P14-3 共享 E2/E1 编排失败注入确认 E2 写入 B 后 VerifyFailed 不调用 E1；主库与环境登录两个真实 caller 均回滚认证并保持档案指针/会话库字节，定向 6/6。完整 `cargo test --workspace --quiet -- --test-threads=1` 在独立 `%TEMP%\p14-full` 退出码 0，主 crate 217 通过/1 忽略、infrastructure 886 通过/7 忽略，其余 harness 通过；首次尝试 `%TEMP%\tp14` 因隔离开发 exe 正运行而未启动测试。`trae_instance.rs` 格式与差异检查通过；`credential_handover.rs` 全文件格式检查只报告既有旧 WIP 格式差异。剩余 P14-2 caller 级零写与聚焦 PID 断言、P14-9 实测、P14-3 全部检查及 G5 仍待。
+2026-10-09 P14-2/P14-3 复审后复测：指定审查会话发现的唯一 P3 是 WriteOutcomeUnknown 未在共享编排器中断言 E1 调用数；已加真实编排注入用例，写入 B 后返回未知结果，E1 调用数为 0、C 未覆盖 B。主库 caller 也覆盖 WriteOutcomeUnknown 的认证回滚及档案指针/数据库字节保持；环境 caller 覆盖 VerifyFailed。复审确认 P3 关闭、无本范围剩余问题。P14-3 定向 7/7，CN close 定向 1/1；修改后的完整 `cargo test --workspace --quiet -- --test-threads=1` 退出码 0（主 crate 218/1 ignored，infrastructure 886/7 ignored，其余 harness 均通过）。P14-2/3 及 Phase 14 未关闭，剩余项见 tickets.new.md 最新记录。

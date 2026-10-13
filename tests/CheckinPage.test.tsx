@@ -8,7 +8,6 @@ import type {
   CheckinResultDto,
   ManagedAccountsViewDto,
 } from "../src/types/account_switch";
-import type { TraeCnAccountDto } from "../src/types/product";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
@@ -115,6 +114,15 @@ function summary(results: readonly CheckinResultDto[], failed = 0): CheckinBatch
     cancelled: 0,
     results,
   };
+}
+
+/** 供异步竞态用例按需释放回执。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function fixtureView(): ManagedAccountsViewDto {
@@ -357,7 +365,7 @@ describe("CheckinPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
     await waitFor(() => {
-      expect(notifyMock.warning).toHaveBeenCalledWith("部分签到未完成，请查看逐账号结果。");
+      expect(notifyMock.warning).toHaveBeenCalledWith("TRAE Work CN：部分签到未完成，请查看逐账号结果。");
     });
     expect(screen.getByText("设备刚创建，请等待约 5 分钟后重试")).toBeInTheDocument();
   });
@@ -405,7 +413,7 @@ describe("CheckinPage", () => {
       resolveRun(summary([result("profile-login-1"), result("profile-login-2")]));
     });
     await waitFor(() => {
-      expect(notifyMock.success).toHaveBeenCalledWith("签到流程已完成。");
+      expect(notifyMock.success).toHaveBeenCalledWith("TRAE Work CN：签到流程已完成。");
     });
     expect(screen.queryByTestId("checkin-inter-wait")).not.toBeInTheDocument();
   });
@@ -431,7 +439,7 @@ describe("CheckinPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
     await waitFor(() => {
-      expect(notifyMock.success).toHaveBeenCalledWith("签到流程已完成。");
+      expect(notifyMock.success).toHaveBeenCalledWith("TRAE Work CN：签到流程已完成。");
     });
     // U-3 单列表演进式：结果直接落在行内（无独立结果列表）。
     // 已签到账号显示「今日已签到」；新领取账号展示成功。
@@ -467,7 +475,7 @@ describe("CheckinPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
     await waitFor(() => {
-      expect(notifyMock.warning).toHaveBeenCalledWith("部分签到未完成，请查看逐账号结果。");
+      expect(notifyMock.warning).toHaveBeenCalledWith("TRAE Work CN：部分签到未完成，请查看逐账号结果。");
     });
     // ADR-0019：业务码原样透出，不压平为通用失败（U-3 起结果只在行内出现一次）。
     expect(screen.getAllByText(/设备信息未获服务端信任（9074）/)).toHaveLength(1);
@@ -482,8 +490,43 @@ describe("CheckinPage", () => {
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
     await waitFor(() => {
-      expect(notifyMock.error).toHaveBeenCalledWith("本机登录存储不可用，请检查磁盘后重试。");
+      expect(notifyMock.error).toHaveBeenCalledWith("TRAE Work CN：本机登录存储不可用，请检查磁盘后重试。");
     });
+  });
+
+  it("手动批次异常通知保留 Work 来源", async () => {
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
+    mockRoute("run_checkin", () => { throw new Error("unknown_checkin_failure"); });
+
+    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    await screen.findByText("登录账号甲");
+    fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
+
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith("TRAE Work CN：签到未完成，请稍后重试。");
+    });
+  });
+
+  it("Work 操作迟到通知仍标注 Work 来源且不误报其他产品", async () => {
+    const run = deferred<CheckinBatchSummaryDto>();
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
+    mockRoute("run_checkin", () => run.promise);
+
+    // P15-7：签到页统一 SOLO 单通道（旧 CN 独立签到区块已移除），
+    // 迟到回执的产品归属由通知标注承载，页面内不再跨产品换装。
+    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    await screen.findByText("登录账号甲");
+    fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("run_checkin", { profileIds: ["profile-login-1"] }));
+
+    await act(async () => {
+      run.resolve(summary([result("profile-login-1")]));
+    });
+
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("TRAE Work CN：签到流程已完成。"));
+    expect(screen.getByText("已签")).toBeInTheDocument();
   });
 
   it("没有可签到账号时显示空状态引导并可跳转账号页", async () => {
@@ -558,147 +601,5 @@ describe("CheckinPage", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
     expect(mockInvoke).not.toHaveBeenCalledWith("run_checkin", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith("refresh_checkin_credits", expect.anything());
-  });
-});
-
-// ============================================================================
-// Trae CN 签到区块（P13-1）：单账号池 + 手动 claim，mock invoke 边界。
-// ============================================================================
-describe("CheckinPage Trae CN 签到区块", () => {
-  const cnAccount: TraeCnAccountDto = {
-    profile_id: "profile-cn-1",
-    display_name: "CN 账号甲",
-    avatar_url: "",
-    last_verified_at: "2026-09-28T00:00:00.000Z",
-    status: "active",
-    is_current: true,
-  };
-
-  const cnStatusUnchecked = {
-    enable: true,
-    checked_in: false,
-    credits: 200,
-    did_checked_in: null,
-    extra_credits: 5,
-    message: "success",
-    business_code: 0,
-  };
-
-  function cnResult(overrides: Record<string, unknown> = {}) {
-    return {
-      profile_id: "profile-cn-1",
-      outcome: "claimed",
-      detail_code: null,
-      credits: 205,
-      extra_credits: 5,
-      ...overrides,
-    };
-  }
-
-  beforeEach(() => {
-    // 等价于原 mockInvoke.mockReset()：清调用历史 + 重装按路由表分发的实现。
-    resetRoutes();
-    installFakeInvoke();
-    mockListen.mockReset();
-    mockListen.mockResolvedValue(() => undefined);
-  });
-
-  afterEach(() => vi.clearAllMocks());
-
-  it("渲染 CN 账号行：今日状态徽章、额外积分与可点签到按钮", async () => {
-    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
-    mockRoute("get_trae_cn_checkin_status", () => cnStatusUnchecked);
-
-    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
-
-    expect(await screen.findByText("CN 账号甲")).toBeInTheDocument();
-    // 今日状态徽章：未签（服务端 enable=true 且 checked_in=false）。
-    expect(screen.getByText("未签")).toBeInTheDocument();
-    // CN 特有字段展示：额外积分非空非零时如实透出。
-    expect(screen.getByText(/额外积分 5/)).toBeInTheDocument();
-    // 状态查询逐账号直出（不落缓存）。
-    expect(mockInvoke).toHaveBeenCalledWith("get_trae_cn_checkin_status", { profileId: "profile-cn-1" });
-    expect(screen.getByTestId("checkin-cn-claim-profile-cn-1")).toBeEnabled();
-  });
-
-  it("已签账号显示已签徽章并禁用签到按钮", async () => {
-    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
-    mockRoute("get_trae_cn_checkin_status", () => ({ ...cnStatusUnchecked, checked_in: true }));
-
-    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
-
-    expect(await screen.findByText("已签")).toBeInTheDocument();
-    expect(screen.getByTestId("checkin-cn-claim-profile-cn-1")).toBeDisabled();
-  });
-
-  it("点击签到调用 run_trae_cn_checkin，成功后通知并重查该行状态", async () => {
-    let statusCalls = 0;
-    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
-    mockRoute("get_trae_cn_checkin_status", () => {
-      statusCalls += 1;
-      return cnStatusUnchecked;
-    });
-    mockRoute("run_trae_cn_checkin", () => cnResult());
-
-    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
-    await screen.findByText("CN 账号甲");
-
-    fireEvent.click(screen.getByTestId("checkin-cn-claim-profile-cn-1"));
-
-    await waitFor(() =>
-      expect(mockInvoke).toHaveBeenCalledWith("run_trae_cn_checkin", { profileId: "profile-cn-1" })
-    );
-    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("签到成功"));
-    // claim 后重查该行状态（结果直出，同步“今日已签”）。
-    await waitFor(() => expect(statusCalls).toBeGreaterThanOrEqual(2));
-  });
-
-  it("claim 业务拒绝透传业务码（不压平）并显示失败通知", async () => {
-    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
-    mockRoute("get_trae_cn_checkin_status", () => cnStatusUnchecked);
-    mockRoute("run_trae_cn_checkin", () =>
-      cnResult({ outcome: "not_eligible", detail_code: "business_9095", credits: null, extra_credits: null }));
-
-    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
-    await screen.findByText("CN 账号甲");
-    fireEvent.click(screen.getByTestId("checkin-cn-claim-profile-cn-1"));
-
-    await waitFor(() => expect(notifyMock.error).toHaveBeenCalledWith("该设备今日名额已用（9095），明日再试"));
-    // 行内结果同样透出业务码人话映射。
-    await screen.findByText("该设备今日名额已用（9095），明日再试");
-  });
-
-  it("状态查询失败行内可见：业务码提取数值，未知码回退词表", async () => {
-    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
-    mockRoute("get_trae_cn_checkin_status", () => {
-      throw new Error("trae_cn_checkin_business_20310");
-    });
-
-    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
-
-    // 业务码不压平：数值原样带出。
-    expect(await screen.findByText("服务端拒绝（20310）")).toBeInTheDocument();
-  });
-
-  it("网络类失败走 safeUiError 词表", async () => {
-    mockRoute("list_trae_cn_accounts", () => [cnAccount]);
-    mockRoute("get_trae_cn_checkin_status", () => {
-      throw new Error("trae_cn_checkin_network");
-    });
-
-    render(<CheckinPage active={true} onNavigate={vi.fn()} product="trae_cn" />);
-
-    expect(await screen.findByText("网络或服务暂时不可用，请稍后重试。")).toBeInTheDocument();
-  });
-
-  it("无账号时显示空状态引导并可跳转账号页", async () => {
-    const onNavigate = vi.fn();
-    mockRoute("list_trae_cn_accounts", () => []);
-
-    render(<CheckinPage active={true} onNavigate={onNavigate} product="trae_cn" />);
-
-    expect(await screen.findByText(/还没有 Trae CN 账号/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "去账号页添加" }));
-    expect(onNavigate).toHaveBeenCalledWith("accounts");
   });
 });

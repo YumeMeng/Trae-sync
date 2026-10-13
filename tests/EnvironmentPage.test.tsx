@@ -40,6 +40,7 @@ function envState(overrides: Partial<EnvironmentStateDto> = {}): EnvironmentStat
     env_id: "master",
     current_profile_id: "profile-a",
     current_account_name: "账号甲",
+    observed_profile_id: "profile-a",
     data_dir: "C:\\TraeSync\\data\\environments\\master",
     running: true,
     login_state: "logged_in",
@@ -96,6 +97,31 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     expect(screen.getByTestId("env-create-entry")).toBeInTheDocument();
     // 运行中 → 按钮为聚焦语义
     expect(screen.getByTestId("env-master-launch")).toHaveTextContent("聚焦主库");
+  });
+
+  it("进程状态未知时明确显示未知并停用环境操作", async () => {
+    mockRoute("get_environment_state", () =>
+      envState({ running: false, process_state: "unknown" }));
+    mockRoute("list_environments", () => [
+      envListItem({ running: false, process_state: "unknown" }),
+      envListItem({
+        env_id: "env-unknown",
+        name: "辅助环境",
+        is_master: false,
+        running: false,
+        process_state: "unknown",
+      }),
+    ]);
+
+    render(<EnvironmentPage active />);
+
+    expect(await screen.findByTestId("env-master-state")).toHaveTextContent("状态未知");
+    expect(screen.getByTestId("env-master-launch")).toBeDisabled();
+    expect(screen.queryByTestId("env-master-close")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("env-login-env-unknown")).toBeDisabled();
+    expect(screen.getByTestId("env-delete-env-unknown")).toBeDisabled();
+    expect(screen.getByTestId("env-launch-env-unknown")).toBeDisabled();
+    expect(screen.queryByTestId("env-close-env-unknown")).not.toBeInTheDocument();
   });
 
   it("未登录账号时提示首次登录引导，且不显示当前账号块", async () => {
@@ -364,6 +390,37 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     });
   });
 
+  it("P14-4b：清理回执成功后环境状态刷新失败仍报告已删除", async () => {
+    let mutationDone = false;
+    mockRoute("get_environment_state", () => {
+      if (mutationDone) throw new Error("environment_refresh_failed");
+      return envState();
+    });
+    mockRoute("get_master_checkup", () => ({
+      ...checkupReport(),
+      accounts: [
+        checkupReport().accounts[0],
+        { user_id: "user-c", account_name: "空项目账号", registered: true, current: false, project_count: 0, session_count: 0, empty_project_count: 1 },
+      ],
+    }));
+    mockRoute("cleanup_master_empty_projects", () => {
+      mutationDone = true;
+      return { deleted_projects: 1, backup_path: "C:\\bak\\switch-bak-901", relaunch_outcome: "launched" };
+    });
+    render(<EnvironmentPage active />);
+
+    await screen.findByTestId("env-checkup");
+    fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-entry"));
+    fireEvent.click(await screen.findByTestId("env-cleanup-empty-projects-dialog-confirm"));
+
+    await waitFor(() => {
+      expect(notifyMock.success).toHaveBeenCalledWith(
+        "已删除 1 个空项目记录（已自动备份）。环境状态刷新失败，请手动刷新。",
+      );
+    });
+    expect(notifyMock.error).not.toHaveBeenCalled();
+  });
+
   it("P5-5：清理失败走错误码映射，弹层关闭后体检区块保留", async () => {
     const reportWithEmpty = () => ({
       ...checkupReport(),
@@ -520,6 +577,39 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     });
   });
 
+  it("P14-4b：收编回执成功后环境状态刷新失败仍保留完成结果", async () => {
+    let mutationDone = false;
+    mockRoute("get_environment_state", () => {
+      if (mutationDone) throw new Error("environment_refresh_failed");
+      return envState();
+    });
+    mockRoute("get_master_checkup", () => checkupReport());
+    mockRoute("incorporate_master_records", () => {
+      mutationDone = true;
+      return {
+        merged_accounts: 2,
+        transferred_projects: 3,
+        removed_mirror_rows: 1,
+        switched_sessions: 5,
+        backup_path: "C:\\bak\\switch-bak-902",
+        relay_ledger_written: true,
+        relaunch_outcome: "launched",
+      };
+    });
+    render(<EnvironmentPage active />);
+
+    fireEvent.click(await screen.findByTestId("env-incorporate-entry"));
+    fireEvent.click(await screen.findByTestId("incorporate-confirm"));
+
+    const dialog = await screen.findByTestId("incorporate-dialog");
+    await waitFor(() => {
+      expect(dialog).toHaveTextContent("已归入 2 个账号：保留项目 3 个 · 转移会话 5 个");
+      expect(dialog).toHaveTextContent("归入已完成，但环境状态刷新失败，请手动刷新。");
+    });
+    expect(dialog).not.toHaveTextContent("归入未完成");
+    expect(notifyMock.error).not.toHaveBeenCalled();
+  });
+
   it("P5-5：收编失败显示错误文案（错误码映射），可关闭弹层", async () => {
     mockRoute("get_environment_state", () => envState());
     mockRoute("get_master_checkup", () => checkupReport());
@@ -634,7 +724,7 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       switched_sessions: 3,
       backup_path: "C:\\bak\\switch-bak-42",
       relay_ledger_written: true,
-      relaunch_outcome: "launched",
+      relaunch_outcome: "failed",
     }));
     const onOpenLibraryDetail = vi.fn();
     render(<EnvironmentPage active onOpenLibraryDetail={onOpenLibraryDetail} />);
@@ -652,6 +742,9 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("incorporate_master_records", { libraryId: "env-x1" });
     });
+    expect(await screen.findByRole("alert")).toHaveTextContent("归入已完成，但环境未能自动启动");
+    expect(screen.getByTestId("incorporate-dialog").querySelector('[data-stage="restarting"]'))
+      .toHaveClass("switch-step--failed");
     // 查看详情入口携带环境引用。
     fireEvent.click(screen.getByTestId("env-detail-env-x1"));
     expect(onOpenLibraryDetail).toHaveBeenCalledWith({ id: "env-x1", displayName: "测试环境" });
@@ -774,6 +867,7 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
         transferred_projects: 0,
         switched_sessions: 0,
         removed_mirror_rows: 0,
+        current_profile_saved: true,
       };
     });
     render(<EnvironmentPage active />);
@@ -820,6 +914,38 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
       return node;
     });
     expect(dialog).not.toHaveTextContent("environment_login_busy");
+  });
+
+  it("环境账号切换已完成但档案写回或后续刷新失败时保留成功结果", async () => {
+    let environmentStateCalls = 0;
+    mockRoute("get_environment_state", () => {
+      environmentStateCalls += 1;
+      if (environmentStateCalls > 1) throw new Error("environment_refresh_failed");
+      return envState();
+    });
+    mockRoute("list_environments", () => [envListItem(), secondaryEnv()]);
+    mockRoute("get_managed_account_state", () => accountView());
+    mockRoute("login_environment", () => ({
+      env_id: "env-x1",
+      profile_id: "profile-a",
+      seeded: true,
+      transferred_projects: 0,
+      switched_sessions: 0,
+      removed_mirror_rows: 0,
+      current_profile_saved: false,
+    }));
+    render(<EnvironmentPage active />);
+    fireEvent.click(await screen.findByTestId("env-login-env-x1"));
+    fireEvent.click(await screen.findByTestId("env-login-account-profile-a"));
+    fireEvent.click(screen.getByTestId("env-login-confirm"));
+
+    expect(await screen.findByTestId("env-login-receipt")).toHaveTextContent("已登录账号 账号甲");
+    expect(await screen.findByRole("alert")).toHaveTextContent("应用未能记住当前账号");
+    fireEvent.click(screen.getByTestId("env-login-done"));
+    await waitFor(() => {
+      expect(notifyMock.warning).toHaveBeenCalledWith("账号已切换，但环境状态刷新失败，请手动刷新。");
+    });
+    expect(notifyMock.error).not.toHaveBeenCalled();
   });
 
   it("P6-4：删除环境确认弹层列明规模，确认后删除并刷新列表", async () => {

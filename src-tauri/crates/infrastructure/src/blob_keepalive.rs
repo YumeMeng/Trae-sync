@@ -17,10 +17,14 @@ use std::path::Path;
 use aes::Aes128;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::{Digest, Sha512};
 
-use crate::trae_instance::{command_line_uses_data_dir, instance_data_dir, TraeProcessInfo};
+use crate::product_adapter::TraeProduct;
+use crate::trae_instance::{
+    default_product_data_dir, instance_data_dir, product_process_state, ProductProcessState,
+    TraeProcessInfo,
+};
 
 // byteCrypto 的两个 64 字节常量数组（main.js 逆向，手册 §3.3）。
 const KIE: [u8; 64] = [
@@ -54,6 +58,8 @@ pub enum KeepaliveOutcome {
     Skipped,
     /// 该实例 TRAE 正在运行（并发写风险），本次放弃，等下个周期。
     SkippedInstanceRunning,
+    /// 进程身份或查询结果未知，不能确认写入安全，本次放弃。
+    SkippedProcessStateUnknown,
 }
 
 /// 保活写回失败（全部非敏感；不含 token 或文件内容）。
@@ -131,15 +137,15 @@ pub fn writeback_auth_blob(
     refresh_expired_at_unix_seconds: u64,
 ) -> Result<KeepaliveOutcome, KeepaliveError> {
     // 生产入口：真实查询 TRAE 进程（PowerShell 阻塞调用，调用方应在阻塞线程）。
-    // 查询失败按"运行中"处理：宁可少写一次，不冒并发覆盖风险。
-    // 非 Windows 平台无 TRAE 进程语义，空列表直通（本项目生产环境为 Windows）。
+    // 查询失败或非 Windows 平台无法确认进程身份：宁可少写一次，不冒并发覆盖风险。
     #[cfg(windows)]
     let processes = match crate::trae_instance::list_trae_processes() {
         Ok(processes) => processes,
-        Err(_) => return Ok(KeepaliveOutcome::SkippedInstanceRunning),
+        Err(_) => return Ok(KeepaliveOutcome::SkippedProcessStateUnknown),
     };
     #[cfg(not(windows))]
-    let processes: Vec<TraeProcessInfo> = Vec::new();
+    return Ok(KeepaliveOutcome::SkippedProcessStateUnknown);
+    #[cfg(windows)]
     writeback_auth_blob_with_processes(
         instance_dir,
         token,
@@ -175,15 +181,17 @@ pub fn writeback_auth_blob_with_processes(
         return Ok(KeepaliveOutcome::Skipped);
     };
 
-    // 互斥检查：该实例目录上有任何 TRAE 进程即放弃写回。
-    let running = processes.iter().any(|process| {
-        process
-            .command_line
-            .as_deref()
-            .is_some_and(|line| command_line_uses_data_dir(line, instance_dir))
-    });
-    if running {
-        return Ok(KeepaliveOutcome::SkippedInstanceRunning);
+    // 保活只维护 Work CN 账号实例的登录文件；Unknown 不能被当成目录未运行。
+    let default_data_dir = default_product_data_dir(TraeProduct::WorkCn);
+    match product_process_state(
+        processes,
+        TraeProduct::WorkCn,
+        instance_dir,
+        default_data_dir.as_deref(),
+    ) {
+        ProductProcessState::NotRunning => {}
+        ProductProcessState::Running => return Ok(KeepaliveOutcome::SkippedInstanceRunning),
+        ProductProcessState::Unknown => return Ok(KeepaliveOutcome::SkippedProcessStateUnknown),
     }
 
     // 解密链失败时文件未动（所有写动作都在校验之后）。
@@ -209,8 +217,7 @@ pub fn writeback_auth_blob_with_processes(
     }
 
     // preserve_order 下重序列化只变被更新字段的值，顺序与未动字段字节不变。
-    let new_plain =
-        serde_json::to_vec(&plaintext).map_err(|_| KeepaliveError::AuthBlobInvalid)?;
+    let new_plain = serde_json::to_vec(&plaintext).map_err(|_| KeepaliveError::AuthBlobInvalid)?;
     let new_b64 = reencrypt_blob(&key_material, &new_plain);
 
     // 纯值替换：旧 Base64 在文件中恰好出现一次时，其余键字节级原样。
@@ -265,6 +272,8 @@ pub enum AuthSwitchError {
     AmbiguousBlobValue,
     /// 写后自验证失败（写已发生，调用方应从备份恢复）。
     VerifyFailed,
+    /// 登录材料文件写调用失败，可能已部分写入，调用方不得自动切换到其他写法。
+    WriteOutcomeUnknown,
     /// 文件读写失败。
     Io,
 }
@@ -279,6 +288,7 @@ impl std::fmt::Display for AuthSwitchError {
             Self::SameAccount => "供体与目标为同一账号",
             Self::AmbiguousBlobValue => "目标登录 blob 值在文件中不唯一",
             Self::VerifyFailed => "身份互换写后自验证失败",
+            Self::WriteOutcomeUnknown => "身份互换写入结果不确定",
             Self::Io => "身份互换文件读写失败",
         };
         formatter.write_str(message)
@@ -341,7 +351,11 @@ fn read_auth_storage(instance_dir: &Path) -> Result<Option<String>, AuthSwitchEr
     };
     let root: serde_json::Value =
         serde_json::from_str(&raw).map_err(|_| AuthSwitchError::TargetAuthInvalid)?;
-    if root.get(AUTH_KEY).and_then(|value| value.as_str()).is_none() {
+    if root
+        .get(AUTH_KEY)
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
         return Ok(None);
     }
     Ok(Some(raw))
@@ -351,10 +365,7 @@ fn read_auth_storage(instance_dir: &Path) -> Result<Option<String>, AuthSwitchEr
 ///
 /// 用途：诊断/实验探针按需解密任意 iCube 键（如 `iCubeAuthInfo://usertag`），
 /// 与 `decrypt_auth_blob_raw` 同一解密链，仅键名可指定。生产切换链路不使用。
-pub fn decrypt_named_blob(
-    instance_dir: &Path,
-    key: &str,
-) -> Result<Vec<u8>, KeepaliveError> {
+pub fn decrypt_named_blob(instance_dir: &Path, key: &str) -> Result<Vec<u8>, KeepaliveError> {
     let storage_path = instance_dir
         .join("User")
         .join("globalStorage")
@@ -406,21 +417,133 @@ pub fn switch_auth_identity(
     donor_instance_dir: &Path,
     target_instance_dir: &Path,
 ) -> Result<AuthIdentitySwitch, AuthSwitchError> {
+    switch_auth_identity_inner(donor_instance_dir, target_instance_dir, None)
+}
+
+/// 在同一份解密供体材料上校验注册表目标账号，再执行 E1 移植。
+pub fn switch_auth_identity_for_account(
+    donor_instance_dir: &Path,
+    target_instance_dir: &Path,
+    expected_user_id: &str,
+) -> Result<AuthIdentitySwitch, AuthSwitchError> {
+    switch_auth_identity_inner(
+        donor_instance_dir,
+        target_instance_dir,
+        Some(expected_user_id),
+    )
+}
+
+// ===== P15-5 切出回存（ADR-0035 融合版切号模型）=====
+
+/// 主库当前登录材料（切出回存的最小字段集；不含设备材料）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterLoginMaterial {
+    pub user_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    /// blob 明文的 expiredAt/refreshExpiredAt（ISO8601 字符串）换算的 Unix 秒。
+    pub access_token_expires_at_unix_seconds: u64,
+    pub refresh_token_expires_at_unix_seconds: u64,
+}
+
+/// 读取主库当前登录 blob 的完整材料（只读）。任何环节不可用返回 None
+/// （无登录态/损坏/字段缺失——调用方按「无身份可回存」处理）。
+pub fn master_login_material(instance_dir: &Path) -> Option<MasterLoginMaterial> {
+    let raw = read_auth_storage(instance_dir).ok()??;
+    let (plain, _, _) = decrypt_auth_blob_raw(&raw).ok()?;
+    let auth: serde_json::Value = serde_json::from_slice(&plain).ok()?;
+    let user_id = auth.get("userId").and_then(|v| v.as_str())?.to_string();
+    let access_token = auth.get("token").and_then(|v| v.as_str())?.to_string();
+    let refresh_token = auth
+        .get("refreshToken")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let access_expires = auth
+        .get("expiredAt")
+        .and_then(|v| v.as_str())
+        .and_then(iso8601_utc_to_unix_seconds)?;
+    let refresh_expires = auth
+        .get("refreshExpiredAt")
+        .and_then(|v| v.as_str())
+        .and_then(iso8601_utc_to_unix_seconds)?;
+    Some(MasterLoginMaterial {
+        user_id,
+        access_token,
+        refresh_token,
+        access_token_expires_at_unix_seconds: access_expires,
+        refresh_token_expires_at_unix_seconds: refresh_expires,
+    })
+}
+
+/// ISO8601 UTC（TRAE blob 时间格式 `YYYY-MM-DDTHH:MM:SS(.mmm)?Z`）→ Unix 秒。
+/// 毫秒存在时被截断（容器时间戳为秒级精度，与正向 `iso8601_utc` 对称）。
+pub fn iso8601_utc_to_unix_seconds(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    // 宽松长度：20（无毫秒）或 24（毫秒 .mmm）。
+    if bytes.len() != 20 && bytes.len() != 24 {
+        return None;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    // 尾部：20 长度须以 Z 结尾；24 长度须为 `.mmmZ`。
+    match (&value[19..], bytes.len()) {
+        ("Z", 20) => {}
+        (tail, 24) if tail.starts_with('.') && tail.ends_with('Z') => {}
+        _ => return None,
+    }
+    let year: i64 = value[0..4].parse().ok()?;
+    let month: u32 = value[5..7].parse().ok()?;
+    let day: u32 = value[8..10].parse().ok()?;
+    let hour: i64 = value[11..13].parse().ok()?;
+    let minute: i64 = value[14..16].parse().ok()?;
+    let second: i64 = value[17..19].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    if seconds < 0 {
+        return None;
+    }
+    Some(seconds as u64)
+}
+
+/// Howard Hinnant `days_from_civil`：公历日期 → 自 unix 纪元的天数。
+/// 与本模块 `civil_from_days` 互逆（覆盖公历全程，纯整数运算）。
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = i64::from(month);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn switch_auth_identity_inner(
+    donor_instance_dir: &Path,
+    target_instance_dir: &Path,
+    expected_user_id: Option<&str>,
+) -> Result<AuthIdentitySwitch, AuthSwitchError> {
     // ===== 供体：登录身份来源（目标账号的专属实例目录）=====
-    let Some(donor_raw) = read_auth_storage(donor_instance_dir)
-        .map_err(|_| AuthSwitchError::DonorAuthInvalid)?
+    let Some(donor_raw) =
+        read_auth_storage(donor_instance_dir).map_err(|_| AuthSwitchError::DonorAuthInvalid)?
     else {
         return Err(AuthSwitchError::DonorAuthUnavailable);
     };
     let (donor_plain, _donor_km, _) =
         decrypt_auth_blob_raw(&donor_raw).map_err(|_| AuthSwitchError::DonorAuthInvalid)?;
-    let donor_auth: serde_json::Value = serde_json::from_slice(&donor_plain)
-        .map_err(|_| AuthSwitchError::DonorAuthInvalid)?;
+    let donor_auth: serde_json::Value =
+        serde_json::from_slice(&donor_plain).map_err(|_| AuthSwitchError::DonorAuthInvalid)?;
     let donor_user = donor_auth
         .get("userId")
         .and_then(|value| value.as_str())
         .unwrap_or("?")
         .to_string();
+    if expected_user_id.is_some_and(|expected| donor_user != expected) {
+        return Err(AuthSwitchError::DonorAuthUnavailable);
+    }
     let donor_account = donor_auth
         .get("account")
         .and_then(|value| value.as_str())
@@ -428,15 +551,15 @@ pub fn switch_auth_identity(
         .to_string();
 
     // ===== 目标（主库）：密钥材料保留方 =====
-    let Some(target_raw) = read_auth_storage(target_instance_dir)
-        .map_err(|_| AuthSwitchError::TargetAuthInvalid)?
+    let Some(target_raw) =
+        read_auth_storage(target_instance_dir).map_err(|_| AuthSwitchError::TargetAuthInvalid)?
     else {
         return Err(AuthSwitchError::TargetAuthUnavailable);
     };
     let (target_plain, target_km, target_b64) =
         decrypt_auth_blob_raw(&target_raw).map_err(|_| AuthSwitchError::TargetAuthInvalid)?;
-    let target_auth: serde_json::Value = serde_json::from_slice(&target_plain)
-        .map_err(|_| AuthSwitchError::TargetAuthInvalid)?;
+    let target_auth: serde_json::Value =
+        serde_json::from_slice(&target_plain).map_err(|_| AuthSwitchError::TargetAuthInvalid)?;
     let target_user = target_auth
         .get("userId")
         .and_then(|value| value.as_str())
@@ -528,8 +651,8 @@ pub fn construct_auth_identity(
     // 自带材料解密；同文件 usertag/cloudide 两 blob 密钥材料互不相同 =
     // per-blob 随机生成，无外部交叉校验——全新材料构造与 TRAE 首次登录
     // 自生成的 blob 形态一致。
-    let target_raw = read_auth_storage(target_instance_dir)
-        .map_err(|_| AuthSwitchError::TargetAuthInvalid)?;
+    let target_raw =
+        read_auth_storage(target_instance_dir).map_err(|_| AuthSwitchError::TargetAuthInvalid)?;
 
     // ===== 构造明文（字段顺序 = E2 实验验证的字段映射表）=====
     let now_unix = std::time::SystemTime::now()
@@ -615,23 +738,24 @@ pub fn construct_auth_identity(
                 return Err(AuthSwitchError::AmbiguousBlobValue);
             }
             let new_raw = target_raw.replacen(&target_b64, &new_b64, 1);
-            std::fs::write(&target_storage_path, &new_raw).map_err(|_| AuthSwitchError::Io)?;
+            std::fs::write(&target_storage_path, &new_raw)
+                .map_err(|_| AuthSwitchError::WriteOutcomeUnknown)?;
 
             // ===== 写后三重自验证：构造明文 / 密钥材料 / icube-dc 设备键 =====
             let verify_raw = std::fs::read_to_string(&target_storage_path)
                 .map_err(|_| AuthSwitchError::VerifyFailed)?;
-            let (verify_plain, verify_km, _) = decrypt_auth_blob_raw(&verify_raw)
-                .map_err(|_| AuthSwitchError::VerifyFailed)?;
+            let (verify_plain, verify_km, _) =
+                decrypt_auth_blob_raw(&verify_raw).map_err(|_| AuthSwitchError::VerifyFailed)?;
             if verify_plain != constructed_plain {
                 return Err(AuthSwitchError::VerifyFailed);
             }
             if verify_km != target_km {
                 return Err(AuthSwitchError::VerifyFailed);
             }
-            let verify_root: serde_json::Value = serde_json::from_str(&verify_raw)
-                .map_err(|_| AuthSwitchError::VerifyFailed)?;
-            let target_root: serde_json::Value = serde_json::from_str(&target_raw)
-                .map_err(|_| AuthSwitchError::VerifyFailed)?;
+            let verify_root: serde_json::Value =
+                serde_json::from_str(&verify_raw).map_err(|_| AuthSwitchError::VerifyFailed)?;
+            let target_root: serde_json::Value =
+                serde_json::from_str(&target_raw).map_err(|_| AuthSwitchError::VerifyFailed)?;
             if verify_root.get("icube-dc") != target_root.get("icube-dc") {
                 return Err(AuthSwitchError::VerifyFailed);
             }
@@ -658,21 +782,22 @@ pub fn construct_auth_identity(
             let new_b64 = reencrypt_blob(&fresh_km, &constructed_plain);
             let new_raw = insert_auth_key_or_create(&target_storage_path, &new_b64, &existing_raw)
                 .map_err(|_| AuthSwitchError::Io)?;
-            std::fs::write(&target_storage_path, &new_raw).map_err(|_| AuthSwitchError::Io)?;
+            std::fs::write(&target_storage_path, &new_raw)
+                .map_err(|_| AuthSwitchError::WriteOutcomeUnknown)?;
 
             // ===== 写后自验证：明文一致 + 既有其他键值原样保留 =====
             let verify_raw = std::fs::read_to_string(&target_storage_path)
                 .map_err(|_| AuthSwitchError::VerifyFailed)?;
-            let (verify_plain, _, _) = decrypt_auth_blob_raw(&verify_raw)
-                .map_err(|_| AuthSwitchError::VerifyFailed)?;
+            let (verify_plain, _, _) =
+                decrypt_auth_blob_raw(&verify_raw).map_err(|_| AuthSwitchError::VerifyFailed)?;
             if verify_plain != constructed_plain {
                 return Err(AuthSwitchError::VerifyFailed);
             }
-            let verify_root: serde_json::Value = serde_json::from_str(&verify_raw)
-                .map_err(|_| AuthSwitchError::VerifyFailed)?;
+            let verify_root: serde_json::Value =
+                serde_json::from_str(&verify_raw).map_err(|_| AuthSwitchError::VerifyFailed)?;
             if let Some(before) = &existing_raw {
-                let before_root: serde_json::Value = serde_json::from_str(before)
-                    .map_err(|_| AuthSwitchError::VerifyFailed)?;
+                let before_root: serde_json::Value =
+                    serde_json::from_str(before).map_err(|_| AuthSwitchError::VerifyFailed)?;
                 // 登出态写回只新增登录键：既有全部键值必须原样（含设备键）。
                 if let (Some(before_map), Some(after_map)) =
                     (before_root.as_object(), verify_root.as_object())
@@ -858,8 +983,9 @@ mod tests {
 
     use super::{
         archive_login_user_id, construct_auth_identity, decrypt_auth_blob, iso8601_utc,
-        reencrypt_blob, switch_auth_identity, writeback_auth_blob_with_processes,
-        AuthSwitchError, ConstructAuthInput, KeepaliveError, KeepaliveOutcome, AUTH_KEY,
+        iso8601_utc_to_unix_seconds, master_login_material, reencrypt_blob, switch_auth_identity,
+        switch_auth_identity_for_account, writeback_auth_blob_with_processes, AuthSwitchError,
+        ConstructAuthInput, KeepaliveError, KeepaliveOutcome, AUTH_KEY,
     };
     use crate::trae_instance::TraeProcessInfo;
 
@@ -887,8 +1013,63 @@ mod tests {
     }
 
     fn read_storage(instance_dir: &Path) -> String {
-        fs::read_to_string(instance_dir.join("User").join("globalStorage").join("storage.json"))
-            .unwrap()
+        fs::read_to_string(
+            instance_dir
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
+        )
+        .unwrap()
+    }
+
+    // ===== P15-5 切出回存原语测试 =====
+
+    #[test]
+    fn iso8601_utc_to_unix_seconds_roundtrips_with_forward_format() {
+        // 正逆互逆：iso8601_utc(X) 解析回 X（毫秒截断不影响秒级结果）。
+        for unix in [0u64, 1_800_000_000, 1_791_859_200, 1_731_568_000, 4_102_444_800] {
+            let formatted = iso8601_utc(unix);
+            assert_eq!(
+                iso8601_utc_to_unix_seconds(&formatted),
+                Some(unix),
+                "roundtrip failed for {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn iso8601_utc_to_unix_seconds_accepts_second_precision_and_rejects_junk() {
+        // 无毫秒形态（20 长度）与毫秒形态同一秒值。
+        assert_eq!(
+            iso8601_utc_to_unix_seconds("2026-08-01T00:00:00Z"),
+            iso8601_utc_to_unix_seconds("2026-08-01T00:00:00.000Z")
+        );
+        // 闰年/世纪边界：2000-02-29 存在，1900-02-29 不存在。
+        assert!(iso8601_utc_to_unix_seconds("2000-02-29T12:00:00Z").is_some());
+        assert!(iso8601_utc_to_unix_seconds("1900-02-29T12:00:00Z").is_none());
+        // 垃圾输入。
+        assert!(iso8601_utc_to_unix_seconds("").is_none());
+        assert!(iso8601_utc_to_unix_seconds("not-a-date").is_none());
+        assert!(iso8601_utc_to_unix_seconds("2026-13-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn master_login_material_reads_full_blob_material() {
+        let instance_dir = write_instance(&make_storage(PLAIN, &TEST_KEY));
+        let material = master_login_material(&instance_dir).expect("material");
+        assert_eq!(material.user_id, "123");
+        assert_eq!(material.access_token, "old-token");
+        assert_eq!(material.refresh_token, "old-refresh");
+        // 时间字段非零且与 expiredAt 字符串自洽（毫秒形态解析成功）。
+        assert!(material.access_token_expires_at_unix_seconds > 1_700_000_000);
+        assert!(material.refresh_token_expires_at_unix_seconds > material.access_token_expires_at_unix_seconds);
+    }
+
+    #[test]
+    fn master_login_material_returns_none_without_login_key() {
+        // 无登录键的 storage（登出态）→ None。
+        let instance_dir = write_instance(r#"{"theme":"dark"}"#);
+        assert!(master_login_material(&instance_dir).is_none());
     }
 
     #[test]
@@ -908,7 +1089,10 @@ mod tests {
         // 写回后解密：四个凭据字段为新值。
         let raw = read_storage(&instance_dir);
         let (plain, _) = decrypt_auth_blob(&raw).unwrap();
-        assert_eq!(plain.get("token").and_then(|v| v.as_str()), Some("new-token"));
+        assert_eq!(
+            plain.get("token").and_then(|v| v.as_str()),
+            Some("new-token")
+        );
         assert_eq!(
             plain.get("refreshToken").and_then(|v| v.as_str()),
             Some("new-refresh")
@@ -980,8 +1164,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let empty_instance = dir.path().join("inst");
         fs::create_dir_all(empty_instance.join("User").join("globalStorage")).unwrap();
-        let outcome = writeback_auth_blob_with_processes(&empty_instance, "t", "r", 1, 2, &[])
-            .unwrap();
+        let outcome =
+            writeback_auth_blob_with_processes(&empty_instance, "t", "r", 1, 2, &[]).unwrap();
         assert_eq!(outcome, KeepaliveOutcome::Skipped);
     }
 
@@ -1015,7 +1199,7 @@ mod tests {
     #[test]
     fn skips_running_instance_by_command_line() {
         let instance_dir = write_instance(&make_storage(PLAIN, &TEST_KEY));
-        // TRAE 主进程命令行含该实例目录（command_line_uses_data_dir 归一化引号与大小写）。
+        // TRAE 主进程命令行含该实例目录（进程 matcher 会归一化引号与大小写）。
         let processes = [TraeProcessInfo {
             pid: 4242,
             exe_path: Some(r"E:\TRAE\TRAE SOLO CN.exe".to_string()),
@@ -1038,7 +1222,7 @@ mod tests {
         // 无关目录的进程不影响写回。
         let other = [TraeProcessInfo {
             pid: 4243,
-            exe_path: None,
+            exe_path: Some(r"E:\TRAE\TRAE SOLO CN.exe".to_string()),
             command_line: Some(
                 r#""E:\TRAE\TRAE SOLO CN.exe" --user-data-dir=D:\other"#.to_string(),
             ),
@@ -1049,23 +1233,43 @@ mod tests {
     }
 
     #[test]
-    fn missing_plaintext_fields_are_not_added() {
-        // 明文缺 refreshToken：更新不得新增字段（只更新已存在字段）。
-        let plain = r#"{"token":"old-token","expiredAt":"2026-08-01T00:00:00.000Z"}"#;
-        let instance_dir = write_instance(&make_storage(plain, &TEST_KEY));
-        writeback_auth_blob_with_processes(
+    fn skips_writeback_when_process_identity_is_unknown() {
+        let instance_dir = write_instance(&make_storage(PLAIN, &TEST_KEY));
+        let before = read_storage(&instance_dir);
+        let processes = [TraeProcessInfo {
+            pid: 4244,
+            exe_path: None,
+            command_line: None,
+        }];
+
+        let outcome = writeback_auth_blob_with_processes(
             &instance_dir,
             "new-token",
             "new-refresh",
             1,
             2,
-            &[],
+            &processes,
         )
         .unwrap();
+
+        assert_eq!(outcome, KeepaliveOutcome::SkippedProcessStateUnknown);
+        assert_eq!(read_storage(&instance_dir), before);
+    }
+
+    #[test]
+    fn missing_plaintext_fields_are_not_added() {
+        // 明文缺 refreshToken：更新不得新增字段（只更新已存在字段）。
+        let plain = r#"{"token":"old-token","expiredAt":"2026-08-01T00:00:00.000Z"}"#;
+        let instance_dir = write_instance(&make_storage(plain, &TEST_KEY));
+        writeback_auth_blob_with_processes(&instance_dir, "new-token", "new-refresh", 1, 2, &[])
+            .unwrap();
         let (after, _) = decrypt_auth_blob(&read_storage(&instance_dir)).unwrap();
         assert!(after.get("refreshToken").is_none());
         assert!(after.get("refreshExpiredAt").is_none());
-        assert_eq!(after.get("token").and_then(|v| v.as_str()), Some("new-token"));
+        assert_eq!(
+            after.get("token").and_then(|v| v.as_str()),
+            Some("new-token")
+        );
     }
 
     #[test]
@@ -1111,7 +1315,7 @@ mod tests {
         let target_dir = write_instance(&make_storage(PLAIN, &TEST_KEY));
         let target_before = read_storage(&target_dir);
 
-        let report = switch_auth_identity(&donor_dir, &target_dir).unwrap();
+        let report = switch_auth_identity_for_account(&donor_dir, &target_dir, "456").unwrap();
         assert_eq!(report.from_user_id, "123");
         assert_eq!(report.to_user_id, "456");
         assert_eq!(report.to_account, "139****0000");
@@ -1137,9 +1341,25 @@ mod tests {
         );
         assert_eq!(root.get("theme").and_then(|v| v.as_str()), Some("dark"));
         // 供体文件只读不写。
-        assert_eq!(read_storage(&donor_dir), make_storage(DONOR_PLAIN, &[8u8; 32]));
+        assert_eq!(
+            read_storage(&donor_dir),
+            make_storage(DONOR_PLAIN, &[8u8; 32])
+        );
         // 目标确有变化（非同文件幂等误判）。
         assert_ne!(raw_after, target_before);
+    }
+
+    #[test]
+    fn checked_switch_rejects_wrong_donor_before_target_write() {
+        let donor_dir = write_instance(&make_storage(DONOR_PLAIN, &[8u8; 32]));
+        let target_dir = write_instance(&make_storage(PLAIN, &TEST_KEY));
+        let target_before = read_storage(&target_dir);
+
+        assert_eq!(
+            switch_auth_identity_for_account(&donor_dir, &target_dir, "999").unwrap_err(),
+            AuthSwitchError::DonorAuthUnavailable
+        );
+        assert_eq!(read_storage(&target_dir), target_before);
     }
 
     #[test]
@@ -1173,7 +1393,10 @@ mod tests {
             let instance_dir = dir.path().join("inst");
             fs::create_dir_all(instance_dir.join("User").join("globalStorage")).unwrap();
             fs::write(
-                instance_dir.join("User").join("globalStorage").join("storage.json"),
+                instance_dir
+                    .join("User")
+                    .join("globalStorage")
+                    .join("storage.json"),
                 r#"{"icube-dc":"device-blob"}"#,
             )
             .unwrap();
@@ -1199,13 +1422,7 @@ mod tests {
     }
 
     /// E2 构造输入 fixture：账号 B（userId=456）的凭据包 + GetUserInfo 资料。
-    fn make_construct_input() -> (
-        String,
-        String,
-        u64,
-        u64,
-        crate::checkin_http::UserInfoFull,
-    ) {
+    fn make_construct_input() -> (String, String, u64, u64, crate::checkin_http::UserInfoFull) {
         let user_info = crate::checkin_http::UserInfoFull {
             user_id: "456".to_string(),
             screen_name: "用户B".to_string(),
@@ -1231,8 +1448,7 @@ mod tests {
         // E2 构造：目标（主库，账号 A=123）→ 凭据包构造的账号 B 登录态。
         let target_dir = write_instance(&make_storage(PLAIN, &TEST_KEY));
         let target_before = read_storage(&target_dir);
-        let (account_id, access_token, access_exp, refresh_exp, user_info) =
-            make_construct_input();
+        let (account_id, access_token, access_exp, refresh_exp, user_info) = make_construct_input();
 
         let input = ConstructAuthInput {
             account_id: &account_id,
@@ -1267,7 +1483,9 @@ mod tests {
             Some("用户B")
         );
         assert_eq!(
-            plain.pointer("/account/nonPlainTextMobile").and_then(|v| v.as_str()),
+            plain
+                .pointer("/account/nonPlainTextMobile")
+                .and_then(|v| v.as_str()),
             Some("139****0000")
         );
         assert_eq!(
@@ -1275,7 +1493,10 @@ mod tests {
             Some("CN")
         );
         // TRAE CN 恒定值。
-        assert_eq!(plain.get("host").and_then(|v| v.as_str()), Some("https://api.trae.cn"));
+        assert_eq!(
+            plain.get("host").and_then(|v| v.as_str()),
+            Some("https://api.trae.cn")
+        );
         assert_eq!(
             plain.pointer("/account/scope").and_then(|v| v.as_str()),
             Some("marscode")
@@ -1292,8 +1513,7 @@ mod tests {
 
     #[test]
     fn construct_identity_rejects_same_account_and_missing_target() {
-        let (account_id, access_token, access_exp, refresh_exp, user_info) =
-            make_construct_input();
+        let (account_id, access_token, access_exp, refresh_exp, user_info) = make_construct_input();
 
         // 同账号：主库已是账号 B（构造输入 userId）→ SameAccount，文件不动。
         let target_b = write_instance(&make_storage(DONOR_PLAIN, &TEST_KEY));
@@ -1311,6 +1531,31 @@ mod tests {
             AuthSwitchError::SameAccount
         );
         assert_eq!(read_storage(&target_b), before);
+    }
+
+    #[test]
+    fn construct_identity_reports_uncertain_result_when_write_fails() {
+        let (account_id, access_token, access_exp, refresh_exp, user_info) = make_construct_input();
+        let dir = tempdir().unwrap();
+        let instance_dir = dir.path().join("env");
+        let storage_path = instance_dir
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        fs::create_dir_all(&storage_path).unwrap();
+        let input = ConstructAuthInput {
+            account_id: &account_id,
+            access_token: &access_token,
+            refresh_token: "constructed-refresh",
+            access_token_expires_at_unix_seconds: access_exp,
+            refresh_token_expires_at_unix_seconds: refresh_exp,
+            user_info: &user_info,
+        };
+
+        assert_eq!(
+            construct_auth_identity(&input, &instance_dir).unwrap_err(),
+            AuthSwitchError::WriteOutcomeUnknown
+        );
     }
 
     #[test]
@@ -1332,8 +1577,7 @@ mod tests {
             .unwrap();
             dir.keep().join("inst")
         };
-        let (account_id, access_token, access_exp, refresh_exp, user_info) =
-            make_construct_input();
+        let (account_id, access_token, access_exp, refresh_exp, user_info) = make_construct_input();
         let input = ConstructAuthInput {
             account_id: &account_id,
             access_token: &access_token,
@@ -1373,10 +1617,12 @@ mod tests {
         // 构造应创建文件并只写登录键。
         let instance_dir = {
             let dir = tempdir().unwrap();
-            dir.keep().join("fresh-env").join("User").join("globalStorage")
+            dir.keep()
+                .join("fresh-env")
+                .join("User")
+                .join("globalStorage")
         };
-        let (account_id, access_token, access_exp, refresh_exp, user_info) =
-            make_construct_input();
+        let (account_id, access_token, access_exp, refresh_exp, user_info) = make_construct_input();
         let input = ConstructAuthInput {
             account_id: &account_id,
             access_token: &access_token,

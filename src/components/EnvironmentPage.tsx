@@ -17,7 +17,9 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import type {
+  EnvironmentProcessState,
   EnvironmentListItemDto,
+  EnvironmentLoginReceiptDto,
   EnvironmentStateDto,
 } from "../types/environment";
 import type {
@@ -47,6 +49,13 @@ interface EnvironmentPageProps {
   product?: ProductId;
 }
 
+function environmentProcessState(
+  environment: { readonly process_state?: EnvironmentProcessState; readonly running: boolean } | null,
+): EnvironmentProcessState {
+  if (!environment) return "unknown";
+  return environment.process_state ?? (environment.running ? "running" : "not_running");
+}
+
 /**
  * 环境页 V2（P5-2 + P6-4，ADR-0024）：
  * 主库环境卡（默认环境，置顶不可删）+ 辅助环境列表（创建/登录账号/
@@ -60,6 +69,7 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
   // 产品事实源：区块三态来自注册表，组件内不做 productId 判断。
   const sectionState = sectionStateOf(product, "environment");
   const [state, setState] = useState<EnvironmentStateDto | null>(null);
+  const masterProcessState = environmentProcessState(state);
   // P5-5 主库体检：同读同刷；失败静默降级为 null（库内容分组显示降级提示）。
   const [checkup, setCheckup] = useState<MasterCheckupDto | null>(null);
   // P11-5 收官 副环境体检：按 env_id 存报告（仅手动刷新/进页时读取，
@@ -295,9 +305,15 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
         "incorporate_master_records",
         target.isMaster ? undefined : { libraryId: target.envId },
       );
-      setIncorporating({ target, phase: { kind: "done", receipt } });
       // 收编完成即刷新体检与统计（滞留行清零，区块自然消失）。
-      await load();
+      let refreshFailed = false;
+      try {
+        await load();
+      } catch {
+        // 收编回执已确认写入，状态刷新失败不能覆盖已完成结果。
+        refreshFailed = true;
+      }
+      setIncorporating({ target, phase: { kind: "done", receipt, refreshFailed } });
     } catch (reason: unknown) {
       setIncorporating({
         target,
@@ -329,16 +345,24 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
       const receipt = await invoke<MasterEmptyProjectCleanupDto>("cleanup_master_empty_projects");
       setCleanupDialogOpen(false);
       // 清理完成即刷新体检（空项目清零，诊断行自然消失）。
-      await load();
+      let refreshFailed = false;
+      try {
+        await load();
+      } catch {
+        // 删除回执已确认提交，不能把后续读取失败改报为清理失败。
+        refreshFailed = true;
+      }
       // 重启失败不回滚删除：删除已提交且已备份，据实提示而非"清理未完成"。
       if (receipt.deleted_projects > 0) {
         notify.success(
-          receipt.relaunch_outcome === "failed"
+          `${receipt.relaunch_outcome === "failed"
             ? `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）；主库 TRAE 未能自动启动，可从环境页重新打开。`
-            : `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）。`,
+            : `已删除 ${receipt.deleted_projects} 个空项目记录（已自动备份）。`}${refreshFailed ? "环境状态刷新失败，请手动刷新。" : ""}`,
         );
       } else {
-        notify.info("没有可清理的空项目记录。");
+        notify.info(
+          `没有可清理的空项目记录。${refreshFailed ? "环境状态刷新失败，请手动刷新。" : ""}`,
+        );
       }
     } catch (reason: unknown) {
       // 失败关闭弹层，错误走全局通知（ConfirmDialog 无内嵌错误插槽）。
@@ -395,7 +419,11 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
                 <span className="env-card__badge">默认环境</span>
               </div>
               <div className="env-card__status" data-testid="env-master-state">
-                <InstanceSlotBadge running={state?.running === true} loginState={state?.login_state} />
+                <InstanceSlotBadge
+                  running={masterProcessState === "running"}
+                  processState={masterProcessState}
+                  loginState={state?.login_state}
+                />
               </div>
             </div>
             {currentName && (
@@ -592,7 +620,7 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
                 <Database size={15} aria-hidden="true" />详情
               </button>
               {/* P11-5：关闭实例（仅运行中显示；确认弹层防误触）。 */}
-              {state?.running === true && (
+              {masterProcessState === "running" && (
                 <button
                   className="btn"
                   type="button"
@@ -608,12 +636,16 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
                 className="btn btn--primary"
                 type="button"
                 onClick={() => void handleLaunch()}
-                disabled={launching}
+                disabled={launching || masterProcessState === "unknown"}
                 data-testid="env-master-launch"
-                title={state?.running ? "把主库 TRAE 窗口带到前台" : "启动主库 TRAE 实例"}
+                title={masterProcessState === "unknown"
+                  ? "无法确认主库 TRAE 是否正在运行，实例操作暂不可用"
+                  : masterProcessState === "running"
+                    ? "把主库 TRAE 窗口带到前台"
+                    : "启动主库 TRAE 实例"}
               >
                 <MonitorPlay size={15} aria-hidden="true" />
-                {launching ? "处理中…" : state?.running ? "聚焦主库" : "启动主库"}
+                {launching ? "处理中…" : masterProcessState === "unknown" ? "状态未知" : masterProcessState === "running" ? "聚焦主库" : "启动主库"}
               </button>
             </div>
           </div>
@@ -772,7 +804,11 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
           onClose={() => setLoginDialogEnv(null)}
           onDone={async () => {
             setLoginDialogEnv(null);
-            await load();
+            try {
+              await load();
+            } catch {
+              notify.warning("账号已切换，但环境状态刷新失败，请手动刷新。");
+            }
           }}
         />
       )}
@@ -909,6 +945,7 @@ function SecondaryEnvCard({
   onIncorporate: (targetAccountName: string | null) => void;
 }) {
   const view = deriveCheckupView(checkup);
+  const processState = environmentProcessState(env);
   // 有差异才显示体检区块（与主库口径一致：滞留/空项目/孤儿行任一存在；
   // 体检读取失败或无差异时静默——卡片本身已有登录入口与运行态）。
   const showCheckup =
@@ -925,7 +962,11 @@ function SecondaryEnvCard({
             <span className="env-card__badge">辅助环境</span>
           </div>
           <div className="env-card__status">
-            <InstanceSlotBadge running={env.running} loginState={env.login_state} />
+            <InstanceSlotBadge
+              running={processState === "running"}
+              processState={processState}
+              loginState={env.login_state}
+            />
           </div>
         </div>
         {env.current_account_name && (
@@ -1032,8 +1073,9 @@ function SecondaryEnvCard({
             className="btn"
             type="button"
             onClick={onLogin}
+            disabled={processState === "unknown"}
             data-testid={`env-login-${env.env_id}`}
-            title="选择一个账号登录该环境"
+            title={processState === "unknown" ? "无法确认该环境是否正在运行，暂不能登录" : "选择一个账号登录该环境"}
           >
             <LogIn size={15} aria-hidden="true" />登录账号
           </button>
@@ -1050,13 +1092,14 @@ function SecondaryEnvCard({
             className="btn btn--danger"
             type="button"
             onClick={onDelete}
+            disabled={processState === "unknown"}
             data-testid={`env-delete-${env.env_id}`}
-            title="删除该环境（删除前会列出数据规模）"
+            title={processState === "unknown" ? "无法确认该环境是否正在运行，暂不能删除" : "删除该环境（删除前会列出数据规模）"}
           >
             <Trash2 size={15} aria-hidden="true" />删除
           </button>
           {/* P11-5：关闭实例（仅运行中显示，与启动/聚焦同区）。 */}
-          {env.running && (
+          {processState === "running" && (
             <button
               className="btn"
               type="button"
@@ -1073,12 +1116,16 @@ function SecondaryEnvCard({
             className="btn btn--primary"
             type="button"
             onClick={onLaunch}
-            disabled={launching}
+            disabled={launching || processState === "unknown"}
             data-testid={`env-launch-${env.env_id}`}
-            title={env.running ? "把该环境的 TRAE 窗口带到前台" : "启动该环境的 TRAE 实例"}
+            title={processState === "unknown"
+              ? "无法确认该环境是否正在运行，实例操作暂不可用"
+              : processState === "running"
+                ? "把该环境的 TRAE 窗口带到前台"
+                : "启动该环境的 TRAE 实例"}
           >
             <MonitorPlay size={15} aria-hidden="true" />
-            {launching ? "处理中…" : env.running ? "聚焦" : "启动"}
+            {launching ? "处理中…" : processState === "unknown" ? "状态未知" : processState === "running" ? "聚焦" : "启动"}
           </button>
         </div>
       </div>
@@ -1188,7 +1235,13 @@ function EnvironmentLoginDialog({
   const [selected, setSelected] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [receipt, setReceipt] = useState<{ accountName: string; seeded: boolean; transferredProjects: number; switchedSessions: number } | null>(null);
+  const [receipt, setReceipt] = useState<{
+    accountName: string;
+    seeded: boolean;
+    transferredProjects: number;
+    switchedSessions: number;
+    currentProfileSaved: boolean;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -1213,16 +1266,16 @@ function EnvironmentLoginDialog({
     setBusy(true);
     setError(null);
     try {
-      const result = await invoke<{
-        seeded: boolean;
-        transferred_projects: number;
-        switched_sessions: number;
-      }>("login_environment", { envId: env.env_id, profileId: selected });
+      const result = await invoke<EnvironmentLoginReceiptDto>("login_environment", {
+        envId: env.env_id,
+        profileId: selected,
+      });
       setReceipt({
         accountName,
         seeded: result.seeded,
         transferredProjects: result.transferred_projects,
         switchedSessions: result.switched_sessions,
+        currentProfileSaved: result.current_profile_saved,
       });
     } catch (reason: unknown) {
       setError(safeUiErrorMessage(reason, "环境账号切换未完成，请稍后重试。"));
@@ -1255,6 +1308,12 @@ function EnvironmentLoginDialog({
                   : `；随行项目 ${receipt.transferredProjects} 个 · 会话 ${receipt.switchedSessions} 个`}
               </span>
             </div>
+            {!receipt.currentProfileSaved && (
+              <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+                <TriangleAlert size={18} aria-hidden="true" />
+                <p>账号已切换，但应用未能记住当前账号；请刷新环境页，问题持续时重启应用。</p>
+              </div>
+            )}
             <div className="switch-dialog__actions">
               <button
                 className="btn btn--primary"
@@ -1442,7 +1501,7 @@ function formatBytes(value: number): string {
 type IncorporatePhase =
   | { kind: "confirm" }
   | { kind: "running"; stage: string }
-  | { kind: "done"; receipt: MasterIncorporateResultDto }
+  | { kind: "done"; receipt: MasterIncorporateResultDto; refreshFailed: boolean }
   | { kind: "failed"; message: string };
 
 /**
@@ -1610,17 +1669,35 @@ function IncorporateDialog({
                 </span>
               </div>
             )}
+            {phase.kind === "done" && phase.refreshFailed && (
+              <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+                <TriangleAlert size={18} aria-hidden="true" />
+                <p>归入已完成，但环境状态刷新失败，请手动刷新。</p>
+              </div>
+            )}
+            {phase.kind === "done" && phase.receipt.relaunch_outcome === "failed" && (
+              <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+                <TriangleAlert size={18} aria-hidden="true" />
+                <p>归入已完成，但环境未能自动启动；可从环境页手动启动。</p>
+              </div>
+            )}
             <div className="switch-dialog__bar" aria-hidden="true">
               <div className="switch-dialog__bar-fill" style={{ width: `${progressPercent}%` }} />
             </div>
             <ol className="switch-dialog__steps">
               {stages.map((item, index) => {
-                const state = phase.kind === "done" || index < stageIndex ? "done"
+                const restartFailed = phase.kind === "done"
+                  && item.stage === "restarting"
+                  && phase.receipt.relaunch_outcome === "failed";
+                const state = restartFailed ? "failed"
+                  : phase.kind === "done" || index < stageIndex ? "done"
                   : phase.kind === "running" && index === stageIndex ? "run" : "idle";
                 return (
                   <li key={item.stage} className={`switch-step switch-step--${state}`} data-stage={item.stage}>
                     <span className="switch-step__icon" aria-hidden="true">
-                      {state === "done" ? <CheckCircle2 size={16} /> : <span className="switch-step__ring" />}
+                      {state === "done" ? <CheckCircle2 size={16} />
+                        : state === "failed" ? <TriangleAlert size={16} />
+                          : <span className="switch-step__ring" />}
                     </span>
                     <span className="switch-step__label">{item.label}</span>
                   </li>

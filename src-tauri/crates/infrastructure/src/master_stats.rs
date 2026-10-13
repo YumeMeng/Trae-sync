@@ -113,9 +113,7 @@ fn read_total_scale_inner(conn: &Connection) -> Option<TotalLibraryScale> {
     };
     let session_count = conn
         .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM chat_session s WHERE {session_deleted_expr} = 0"
-            ),
+            &format!("SELECT COUNT(*) FROM chat_session s WHERE {session_deleted_expr} = 0"),
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -173,15 +171,13 @@ pub fn read_master_stats(
     let Ok(conn) = open_with_key_readonly(&db_path, raw_key) else {
         return MasterStatsStatus::ReadFailed;
     };
-    read_master_stats_inner(&conn, current_user_id).map_or(MasterStatsStatus::ReadFailed, MasterStatsStatus::Ready)
+    read_master_stats_inner(&conn, current_user_id)
+        .map_or(MasterStatsStatus::ReadFailed, MasterStatsStatus::Ready)
 }
 
 /// 内层聚合：任一 SQL 失败整体 ReadFailed（聚合统计不做半套降级，
 /// 与明细读取的列级降级不同——统计数字半缺比没有更误导）。
-fn read_master_stats_inner(
-    conn: &Connection,
-    current_user_id: &str,
-) -> Option<MasterLibraryStats> {
+fn read_master_stats_inner(conn: &Connection, current_user_id: &str) -> Option<MasterLibraryStats> {
     let has_project_deleted = column_exists(conn, "project", "deleted_at");
     let project_deleted_expr = if has_project_deleted {
         "COALESCE(p.deleted_at, 0)"

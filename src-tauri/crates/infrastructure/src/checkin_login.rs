@@ -20,6 +20,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -31,12 +33,13 @@ use sha2::{Digest, Sha256};
 use crate::account_registry::{AccountRecord, AccountRegistry};
 use crate::checkin_credential::{
     generate_device_keypair, CheckinCredentialBundle, CheckinCredentialError,
-    CheckinProfileBinding, CheckinCredentialStore,
+    CheckinCredentialStore, CheckinProfileBinding, CheckinProfileOperationLease,
 };
 use crate::checkin_http::{
     exchange_token_by_auth_code, get_user_info_for_oauth_client, CheckinHttpError, OAuthClient,
     RealCheckinRenewalService, TokenGrant, UserInfoSummary,
 };
+use crate::operation_lease::FileOperationLock;
 
 /// 登录页地址（Trae CN v3.3.74 `bootConfig.consoleHost` + `/authorization`）。
 pub const LOGIN_HOST: &str = "https://www.trae.cn/authorization";
@@ -94,6 +97,209 @@ pub enum LoginError {
     /// 等待回调期间被外部中止（用户取消 / 登录浏览器已关闭）。
     /// P7-4：等待不再只能靠超时兜底，浏览器一关即可收尾。
     Cancelled,
+}
+
+/// OAuth attempt 的可观察阶段。
+///
+/// 取消只能在线程尚未进入发布阶段时赢得线性化点；进入发布阶段后，
+/// 取消请求必须等待真实完成结果，不能把已经写入的结果伪装成已取消。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LoginAttemptPhase {
+    /// 等待浏览器回调，尚未开始换取凭据。
+    AwaitingCallback = 0,
+    /// 已经取得换取资格，正在执行 AuthCode ExchangeToken。
+    Exchanging = 1,
+    /// 已经取得发布资格，正在写入凭据与账号档案。
+    Publishing = 2,
+    /// 发布完成且登录返回成功回执。
+    Completed = 3,
+    /// 登录已结束并报告真实失败。
+    Failed = 4,
+    /// 取消在线性化点生效，后续不得换取或发布凭据。
+    Cancelled = 5,
+}
+
+/// 登录 attempt 的取消结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginCancelResult {
+    /// 取消在等待回调或 ExchangeToken 阶段取得线性化点。
+    Cancelled,
+    /// attempt 已经取消。
+    AlreadyCancelled,
+    /// 发布阶段已经取得线性化点，取消来得太晚。
+    TooLate,
+    /// attempt 已完成或已失败，保留真实结果。
+    AlreadyFinished,
+}
+
+/// 取消已赢得阶段竞争；`complete_login` 将其映射为既有 `LoginError::Cancelled`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginAttemptCancelled;
+
+/// 登录 attempt 的真实收尾结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginAttemptResult {
+    /// 凭据与账号档案发布完成，登录返回回执。
+    Completed,
+    /// 登录在发布前或发布后真实失败。
+    Failed,
+}
+
+/// OAuth attempt 控制原语。
+///
+/// 所有跨线程竞争均通过同一个原子阶段完成线性化：
+/// AwaitingCallback → Exchanging → Publishing → Completed/Failed；取消可以从
+/// AwaitingCallback 或 Exchanging 进入 Cancelled。使用 `Arc` 只共享阶段，
+/// 不共享 Token 或会话正文。
+#[derive(Clone, Debug)]
+pub struct LoginAttemptControl {
+    phase: Arc<AtomicU8>,
+}
+
+impl Default for LoginAttemptControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoginAttemptControl {
+    /// 创建一个尚未收到回调的新 attempt。
+    pub fn new() -> Self {
+        Self {
+            phase: Arc::new(AtomicU8::new(LoginAttemptPhase::AwaitingCallback as u8)),
+        }
+    }
+
+    /// 读取当前阶段，供取消命令和结果测试观察。
+    pub fn phase(&self) -> LoginAttemptPhase {
+        match self.phase.load(Ordering::Acquire) {
+            value if value == LoginAttemptPhase::AwaitingCallback as u8 => {
+                LoginAttemptPhase::AwaitingCallback
+            }
+            value if value == LoginAttemptPhase::Exchanging as u8 => LoginAttemptPhase::Exchanging,
+            value if value == LoginAttemptPhase::Publishing as u8 => LoginAttemptPhase::Publishing,
+            value if value == LoginAttemptPhase::Completed as u8 => LoginAttemptPhase::Completed,
+            value if value == LoginAttemptPhase::Failed as u8 => LoginAttemptPhase::Failed,
+            value if value == LoginAttemptPhase::Cancelled as u8 => LoginAttemptPhase::Cancelled,
+            _ => LoginAttemptPhase::Failed,
+        }
+    }
+
+    /// 等待浏览器回调时是否应中止；回调返回后不再读取此状态，
+    /// 由 `begin_exchange` 与 `cancel` 的 CAS 决定先后。
+    pub fn should_abort_waiting(&self) -> bool {
+        self.phase() == LoginAttemptPhase::Cancelled
+    }
+
+    /// 取消等待中的 attempt，或取消正在 ExchangeToken 但尚未发布的 attempt。
+    ///
+    /// 与 `begin_exchange`、`begin_publish` 共享原子 CAS，因此调用结果就是
+    /// 取消和登录阶段之间的确定性线性化结果。
+    pub fn cancel(&self) -> LoginCancelResult {
+        loop {
+            let current = self.phase.load(Ordering::Acquire);
+            match current {
+                value if value == LoginAttemptPhase::AwaitingCallback as u8 => {
+                    if self
+                        .phase
+                        .compare_exchange(
+                            current,
+                            LoginAttemptPhase::Cancelled as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return LoginCancelResult::Cancelled;
+                    }
+                }
+                value if value == LoginAttemptPhase::Exchanging as u8 => {
+                    if self
+                        .phase
+                        .compare_exchange(
+                            current,
+                            LoginAttemptPhase::Cancelled as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return LoginCancelResult::Cancelled;
+                    }
+                }
+                value if value == LoginAttemptPhase::Publishing as u8 => {
+                    return LoginCancelResult::TooLate;
+                }
+                value if value == LoginAttemptPhase::Cancelled as u8 => {
+                    return LoginCancelResult::AlreadyCancelled;
+                }
+                _ => return LoginCancelResult::AlreadyFinished,
+            }
+        }
+    }
+
+    /// 取得 ExchangeToken 资格；取消先赢时不会启动网络换取。
+    pub fn begin_exchange(&self) -> Result<(), LoginAttemptCancelled> {
+        self.advance(
+            LoginAttemptPhase::AwaitingCallback,
+            LoginAttemptPhase::Exchanging,
+        )
+    }
+
+    /// 取得凭据发布资格；取消在 ExchangeToken 期间先赢时不能进入发布。
+    pub fn begin_publish(&self) -> Result<(), LoginAttemptCancelled> {
+        self.advance(LoginAttemptPhase::Exchanging, LoginAttemptPhase::Publishing)
+    }
+
+    /// 结束 attempt，保留已发生的取消结果；发布后失败必须显式记录 Failed。
+    pub fn finish(&self, result: LoginAttemptResult) {
+        let next = match result {
+            LoginAttemptResult::Completed => LoginAttemptPhase::Completed,
+            LoginAttemptResult::Failed => LoginAttemptPhase::Failed,
+        } as u8;
+        let _ = self.phase.compare_exchange(
+            LoginAttemptPhase::Publishing as u8,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        // 回调解析/ExchangeToken 失败也要结束 attempt；Cancelled 状态不能被
+        // 失败收尾覆盖，否则取消回执会失去真实线性化结果。
+        let _ = self.phase.compare_exchange(
+            LoginAttemptPhase::Exchanging as u8,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.phase.compare_exchange(
+            LoginAttemptPhase::AwaitingCallback as u8,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// 用 CAS 推进阶段，避免以普通读写破坏取消竞态的线性化顺序。
+    fn advance(
+        &self,
+        expected_phase: LoginAttemptPhase,
+        next_phase: LoginAttemptPhase,
+    ) -> Result<(), LoginAttemptCancelled> {
+        let current = self.phase.load(Ordering::Acquire);
+        if current != expected_phase as u8 {
+            return Err(LoginAttemptCancelled);
+        }
+        match self.phase.compare_exchange(
+            expected_phase as u8,
+            next_phase as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(LoginAttemptCancelled),
+        }
+    }
 }
 
 /// PKCE 密钥对；verifier 保存在后端内存直到回调完成。
@@ -544,9 +750,12 @@ pub fn begin_login_for(
 /// `timeout` 为回调等待上限（正式调用传 `CALLBACK_TIMEOUT_SECONDS`；
 /// 测试可传短超时验证失败路径）。`should_abort` 在等待回调期间被周期求值，
 /// 返回 true 即以 `Cancelled` 终止（P7-4：取消登录 / 浏览器退出即时收尾）。
-/// 任何失败都不产生入库副作用。
+/// `attempt` 是共享取消控制；它把回调、ExchangeToken 与凭据发布串成一个
+/// 线性化边界，避免迟到回调继续消费已取消的登录。
+/// 任何取消在发布前生效时都不产生入库副作用；发布阶段已开始则返回真实结果。
 pub fn complete_login(
     session: LoginSession,
+    attempt: LoginAttemptControl,
     store: &CheckinCredentialStore,
     registry: &AccountRegistry,
     client: &reqwest::blocking::Client,
@@ -554,9 +763,36 @@ pub fn complete_login(
     should_abort: &dyn Fn() -> bool,
 ) -> Result<LoginReceipt, LoginError> {
     // 8. 阻塞等待浏览器回调（listener 存活在 session 中）。
-    let query = session.callback.wait_for_callback(timeout, should_abort)?;
+    let should_stop = || should_abort() || attempt.should_abort_waiting();
+    let query = match session.callback.wait_for_callback(timeout, &should_stop) {
+        Ok(query) => query,
+        Err(error) => {
+            if error == LoginError::Cancelled {
+                // 外部取消只在 attempt 尚未发布时改变阶段；已发布状态由
+                // finish 保留，避免把已完成结果改写成取消。
+                let _ = attempt.cancel();
+            } else {
+                attempt.finish(LoginAttemptResult::Failed);
+            }
+            return Err(error);
+        }
+    };
     // 2. 解析一次性 AuthCode（含 error_code/结构异常拒绝）。
-    let auth_code = parse_authorize_callback(&query)?;
+    let auth_code = match parse_authorize_callback(&query) {
+        Ok(auth_code) => auth_code,
+        Err(error) => {
+            attempt.finish(LoginAttemptResult::Failed);
+            return Err(error);
+        }
+    };
+    // 回调返回后立即以同一个 CAS 争夺 ExchangeToken 资格；取消若先赢，
+    // 这里失败且不会发起网络换取。
+    if let Err(error) = attempt.begin_exchange() {
+        attempt.finish(LoginAttemptResult::Failed);
+        return Err(match error {
+            LoginAttemptCancelled => LoginError::Cancelled,
+        });
+    }
     // 3. 构造与授权 URL 同一产品形态的设备信息块；不能把 Work 的 SOLO
     //    client 或设备形态套到 Trae CN。
     let oauth_client = session.product.oauth_client();
@@ -567,19 +803,27 @@ pub fn complete_login(
     );
     // 4. AuthCode 模式换凭证（免 DeviceProof 签名）；设备上限（20401/20408）
     //    单独归类，登录 UI 能给出针对性提示而非笼统的「换取失败」。
-    let grant = exchange_token_by_auth_code(
+    let grant = match exchange_token_by_auth_code(
         client,
         &auth_code,
         &session.code_verifier,
         &device_info,
         oauth_client,
-    )
-    .map_err(|error| {
-        // 诊断日志：记录错误类别/码与服务端响应摘要（失败响应体不含
-        // Token），用于排查个别账号被服务端拒绝的真实原因。
-        append_exchange_diagnostic(store.root(), &session.profile_id, &error);
-        map_exchange_login_error(&error)
-    })?;
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            // 诊断日志：记录错误类别/码与服务端响应摘要（失败响应体不含
+            // Token），用于排查个别账号被服务端拒绝的真实原因。
+            append_exchange_diagnostic(store.root(), &session.profile_id, &error);
+            let result = if attempt.phase() == LoginAttemptPhase::Cancelled {
+                LoginError::Cancelled
+            } else {
+                map_exchange_login_error(&error)
+            };
+            attempt.finish(LoginAttemptResult::Failed);
+            return Err(result);
+        }
+    };
     // 5. GetUserInfo 补脱敏资料；失败降级（账号 ID 已可从 JWT 解出）。
     let user_info = get_user_info_for_oauth_client(client, &grant.access_token, oauth_client)
         .unwrap_or_default();
@@ -588,12 +832,14 @@ pub fn complete_login(
     // ExchangeToken 路径，自带 journal 原子发布与身份校验）。验收通过才算
     // 登录完成；失败不回滚登录，候选凭据与失败证据保留，回执如实带出结果。
     // 一次 OAuth 约束：失败不重试、不重铸设备、不发起第二次授权。
-    let acceptance_renew = |binding: &CheckinProfileBinding, now: u64| {
-        RealCheckinRenewalService::new_for_oauth_client(store, oauth_client)
-            .renew_now(binding, now)
-            .map(|_| ())
-    };
-    let receipt = persist_and_accept_login(
+    let acceptance_renew =
+        |binding: &CheckinProfileBinding, now: u64, lease: &CheckinProfileOperationLease| {
+            RealCheckinRenewalService::new_for_oauth_client(store, oauth_client)
+                .renew_now_with_lease(binding, now, lease)
+                .map(|_| ())
+        };
+    let receipt = match persist_and_accept_login(
+        &attempt,
         session.product,
         &session.profile_id,
         &session.device_id,
@@ -605,7 +851,15 @@ pub fn complete_login(
         store,
         registry,
         &acceptance_renew,
-    )?;
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            // 发布阶段已赢，取消不能覆盖真实的持久化失败结果。
+            attempt.finish(LoginAttemptResult::Failed);
+            return Err(error);
+        }
+    };
+    attempt.finish(LoginAttemptResult::Completed);
     // Work 的 Solo 登录与 Trae CN 的独立登录都在各自产品账号池中收口；
     // Trae CN 不进入 Work 的签到/重铸调度。
     Ok(receipt)
@@ -616,6 +870,7 @@ pub fn complete_login(
 /// 独立成函数以便 fixture 测试：注入 `renew` 闭包覆盖验收通过/失败两路径，
 /// 失败时断言候选凭据保留、回执带稳定错误码、换发只执行一次（无第二次 OAuth）。
 fn persist_and_accept_login(
+    attempt: &LoginAttemptControl,
     product: LoginProduct,
     session_profile_id: &str,
     device_id: &str,
@@ -626,9 +881,14 @@ fn persist_and_accept_login(
     user_info: &UserInfoSummary,
     store: &CheckinCredentialStore,
     registry: &AccountRegistry,
-    renew: &dyn Fn(&CheckinProfileBinding, u64) -> Result<(), CheckinCredentialError>,
+    renew: &dyn Fn(
+        &CheckinProfileBinding,
+        u64,
+        &CheckinProfileOperationLease,
+    ) -> Result<(), CheckinCredentialError>,
 ) -> Result<LoginReceipt, LoginError> {
-    let receipt = persist_login_result_for(
+    persist_and_accept_login_inner(
+        attempt,
         product,
         session_profile_id,
         device_id,
@@ -639,6 +899,53 @@ fn persist_and_accept_login(
         user_info,
         store,
         registry,
+        renew,
+        &|_| {},
+    )
+}
+
+fn persist_and_accept_login_inner(
+    attempt: &LoginAttemptControl,
+    product: LoginProduct,
+    session_profile_id: &str,
+    device_id: &str,
+    machine_id: &str,
+    device_public_key_pem: &str,
+    device_private_key_pem: &str,
+    grant: TokenGrant,
+    user_info: &UserInfoSummary,
+    store: &CheckinCredentialStore,
+    registry: &AccountRegistry,
+    renew: &dyn Fn(
+        &CheckinProfileBinding,
+        u64,
+        &CheckinProfileOperationLease,
+    ) -> Result<(), CheckinCredentialError>,
+    after_profile_resolved: &dyn Fn(&str),
+) -> Result<LoginReceipt, LoginError> {
+    let (account_id, _) = decode_account_from_jwt(&grant.access_token)?;
+    // 产品根由 store 提供；同账号登录共锁，不同账号及 Work/CN 根各自并行。
+    let _account_lease = lock_login_account(store, &account_id)?;
+    let (effective_profile_id, had_existing_profile) =
+        resolve_login_profile(registry, &account_id, session_profile_id)?;
+    after_profile_resolved(&effective_profile_id);
+    let lease = store
+        .lock_profile(&effective_profile_id)
+        .map_err(|_| LoginError::Storage)?;
+    let receipt = persist_login_result_for_with_lease(
+        Some(attempt),
+        product,
+        &effective_profile_id,
+        had_existing_profile,
+        device_id,
+        machine_id,
+        device_public_key_pem,
+        device_private_key_pem,
+        grant,
+        user_info,
+        store,
+        registry,
+        &lease,
     )?;
     // 验收 binding 用入库后的有效 profile_id（重复登录复用旧档案）与会话设备材料。
     let binding = CheckinProfileBinding::new(
@@ -647,7 +954,7 @@ fn persist_and_accept_login(
         device_id,
         device_public_key_pem,
     );
-    let acceptance = match renew(&binding, unix_now()) {
+    let acceptance = match renew(&binding, unix_now(), &lease) {
         Ok(()) => LoginAcceptance::passed(),
         Err(error) => {
             // 失败证据：追加诊断日志（不含 token 正文），与换取失败共用文件。
@@ -663,6 +970,30 @@ fn persist_and_accept_login(
         screen_name: receipt.screen_name,
         avatar_url: receipt.avatar_url,
     })
+}
+
+/// 按产品凭据根和账号 ID 取得跨进程 OAuth 登录归属锁；磁盘名只含摘要。
+fn lock_login_account(
+    store: &CheckinCredentialStore,
+    account_id: &str,
+) -> Result<FileOperationLock, LoginError> {
+    // 首次登录时产品物料根可能尚不存在，先创建根再取得 sidecar 锁。
+    std::fs::create_dir_all(store.root()).map_err(|_| LoginError::Storage)?;
+    FileOperationLock::acquire_sibling_resource(&login_account_lock_resource(store, account_id))
+        .map_err(|_| LoginError::Storage)
+}
+
+fn login_account_lock_resource(
+    store: &CheckinCredentialStore,
+    account_id: &str,
+) -> std::path::PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(b"traesync/oauth-login-account-lease/v1\0");
+    digest.update(account_id.as_bytes());
+    store.root().join(format!(
+        "oauth-account-{}.lease",
+        hex::encode(digest.finalize())
+    ))
 }
 
 /// 验收失败诊断日志：与换取失败共用 `login-diagnostics.log`，
@@ -687,7 +1018,11 @@ fn append_acceptance_failure(
         detail
     );
     let path = root.join("login-diagnostics.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -722,7 +1057,11 @@ fn append_exchange_diagnostic(root: &std::path::Path, profile_id: &str, error: &
         detail
     );
     let path = root.join("login-diagnostics.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -744,6 +1083,7 @@ fn persist_login_result(
     registry: &AccountRegistry,
 ) -> Result<LoginReceipt, LoginError> {
     persist_login_result_for(
+        None,
         LoginProduct::WorkCn,
         profile_id,
         device_id,
@@ -758,7 +1098,9 @@ fn persist_login_result(
 }
 
 /// 将指定产品换得的凭据与资料写入该产品自己的加密账号池。
+#[cfg(test)]
 fn persist_login_result_for(
+    attempt: Option<&LoginAttemptControl>,
     product: LoginProduct,
     profile_id: &str,
     device_id: &str,
@@ -770,37 +1112,93 @@ fn persist_login_result_for(
     store: &CheckinCredentialStore,
     registry: &AccountRegistry,
 ) -> Result<LoginReceipt, LoginError> {
+    let (account_id, _) = decode_account_from_jwt(&grant.access_token)?;
+    let (effective_profile_id, had_existing_profile) =
+        resolve_login_profile(registry, &account_id, profile_id)?;
+    let lease = store
+        .lock_profile(&effective_profile_id)
+        .map_err(|_| LoginError::Storage)?;
+    persist_login_result_for_with_lease(
+        attempt,
+        product,
+        &effective_profile_id,
+        had_existing_profile,
+        device_id,
+        machine_id,
+        device_public_key_pem,
+        device_private_key_pem,
+        grant,
+        user_info,
+        store,
+        registry,
+        &lease,
+    )
+}
+
+/// 先定位要锁的档案；入锁后会再次核对，避免删除/并发登录后的旧快照复活档案。
+fn resolve_login_profile(
+    registry: &AccountRegistry,
+    account_id: &str,
+    session_profile_id: &str,
+) -> Result<(String, bool), LoginError> {
+    let records = registry.load().map_err(|_| LoginError::Storage)?;
+    Ok(records
+        .iter()
+        .find(|record| record.account_id == account_id)
+        .map(|record| (record.profile_id.clone(), true))
+        .unwrap_or_else(|| (session_profile_id.to_string(), false)))
+}
+
+/// 在调用者已持有档案租约时写入；偏好与手机号只从锁内重读的档案保留。
+fn persist_login_result_for_with_lease(
+    attempt: Option<&LoginAttemptControl>,
+    product: LoginProduct,
+    effective_profile_id: &str,
+    had_existing_profile: bool,
+    device_id: &str,
+    machine_id: &str,
+    device_public_key_pem: &str,
+    device_private_key_pem: &str,
+    grant: TokenGrant,
+    user_info: &UserInfoSummary,
+    store: &CheckinCredentialStore,
+    registry: &AccountRegistry,
+    lease: &CheckinProfileOperationLease,
+) -> Result<LoginReceipt, LoginError> {
     // JWT payload `data.id` 即服务端账号 ID；顺带校验 token 结构。
     let (account_id, _) = decode_account_from_jwt(&grant.access_token)?;
-    // 同一账号重复登录：复用已有档案的 profile_id 覆盖更新（凭据密文与档案都
-    // 原地覆盖），避免同一账号出现多条档案、多个虚拟设备重复领取积分。
-    let effective_profile_id = match registry.load() {
-        Ok(records) => records
-            .iter()
-            .find(|record| record.account_id == account_id)
-            .map(|record| record.profile_id.clone())
-            .unwrap_or_else(|| profile_id.to_string()),
-        Err(_) => return Err(LoginError::Storage),
-    };
+    let records = registry.load().map_err(|_| LoginError::Storage)?;
+    let current_profile = records
+        .iter()
+        .find(|record| record.account_id == account_id)
+        .map(|record| record.profile_id.as_str());
+    if (had_existing_profile && current_profile != Some(effective_profile_id))
+        || (!had_existing_profile && current_profile.is_some())
+    {
+        return Err(LoginError::Storage);
+    }
+    let previous = records
+        .iter()
+        .find(|record| record.profile_id == effective_profile_id);
+    if previous.is_some_and(|record| record.account_id != account_id) {
+        return Err(LoginError::Storage);
+    }
     let now = unix_now();
     // 旧档案先读：重复登录时用于保留既有本地偏好（自动签到开关、备注名、
     // 归档标记、脱敏手机号）与凭据包中已补录的完整手机号（G88）。
-    let previous = registry
-        .find(&effective_profile_id)
-        .map_err(|_| LoginError::Storage)?;
     // 已补录的完整手机号跟随旧凭据包：重复登录覆盖凭据时不丢（用户手工录入
     // 的数据，与新令牌无绑定关系）。读取失败（首次登录/旧包不可用）按未补录。
     let previous_mobile_full = previous
-        .as_ref()
-        .and_then(|old| {
-            store
-                .load(&CheckinProfileBinding::from(old))
-                .ok()
-        })
+        .and_then(|old| store.load(&CheckinProfileBinding::from(old)).ok())
         .and_then(|bundle| bundle.mobile_full);
+    // 发布资格必须紧贴第一次持久化写入：取消若在此之前赢得 CAS，
+    // 交换得到的候选凭据只留在内存，不能进入本地凭据包。
+    if let Some(attempt) = attempt {
+        attempt.begin_publish().map_err(|_| LoginError::Cancelled)?;
+    }
     // 6. 凭据包加密入库（DPAPI；敏感字段只在密文中落盘）。
     let bundle = CheckinCredentialBundle {
-        profile_id: effective_profile_id.clone(),
+        profile_id: effective_profile_id.to_string(),
         account_id: account_id.clone(),
         device_id: device_id.to_string(),
         machine_id: machine_id.to_string(),
@@ -814,18 +1212,16 @@ fn persist_login_result_for(
         refresh_token_expires_at_unix_seconds: grant.refresh_token_expires_at_unix_seconds,
         mobile_full: previous_mobile_full,
     };
-    store.save(&bundle).map_err(|_| LoginError::Storage)?;
+    store
+        .save_with_lease(lease, &bundle)
+        .map_err(|_| LoginError::Storage)?;
     // 7. 非敏感档案 upsert（profile_id 唯一，重复登录覆盖旧记录；
     //    保留既有自动签到开关、本地备注名与归档标记——均为用户本地偏好；
     //    脱敏手机号取服务端最新值，服务端未返回时保留已采值）。
-    let previous_auto_enabled = previous
-        .as_ref()
-        .map(|old| old.auto_checkin_enabled)
-        .unwrap_or(true);
-    let previous_display_name = previous.as_ref().and_then(|old| old.display_name.clone());
-    let previous_archived = previous.as_ref().map(|old| old.archived).unwrap_or(false);
+    let previous_auto_enabled = previous.map(|old| old.auto_checkin_enabled).unwrap_or(true);
+    let previous_display_name = previous.and_then(|old| old.display_name.clone());
+    let previous_archived = previous.map(|old| old.archived).unwrap_or(false);
     let previous_mobile = previous
-        .as_ref()
         .map(|old| old.masked_mobile.clone())
         .unwrap_or_default();
     let masked_mobile = if user_info.masked_mobile.is_empty() {
@@ -835,7 +1231,7 @@ fn persist_login_result_for(
     };
     let screen_name = display_name(&account_id, user_info);
     let record = AccountRecord {
-        profile_id: effective_profile_id,
+        profile_id: effective_profile_id.to_string(),
         account_id,
         screen_name: screen_name.clone(),
         avatar_url: user_info.avatar_url.clone(),
@@ -892,6 +1288,63 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_before_exchange_prevents_token_exchange() {
+        let attempt = LoginAttemptControl::new();
+
+        assert_eq!(
+            attempt.cancel(),
+            LoginCancelResult::Cancelled,
+            "等待回调阶段取消必须取得线性化点"
+        );
+        assert_eq!(attempt.phase(), LoginAttemptPhase::Cancelled);
+        assert_eq!(
+            attempt.begin_exchange(),
+            Err(LoginAttemptCancelled),
+            "取消后不得启动 ExchangeToken"
+        );
+    }
+
+    #[test]
+    fn cancel_during_exchange_prevents_credential_publish() {
+        let attempt = LoginAttemptControl::new();
+
+        assert_eq!(attempt.begin_exchange(), Ok(()));
+        assert_eq!(attempt.phase(), LoginAttemptPhase::Exchanging);
+        assert_eq!(
+            attempt.cancel(),
+            LoginCancelResult::Cancelled,
+            "ExchangeToken 未取得发布资格时取消必须生效"
+        );
+        assert_eq!(
+            attempt.begin_publish(),
+            Err(LoginAttemptCancelled),
+            "取消赢得 ExchangeToken 竞态后不得发布凭据"
+        );
+        assert_eq!(attempt.phase(), LoginAttemptPhase::Cancelled);
+    }
+
+    #[test]
+    fn publish_phase_wins_cancel_and_preserves_completion_result() {
+        let attempt = LoginAttemptControl::new();
+
+        assert_eq!(attempt.begin_exchange(), Ok(()));
+        assert_eq!(attempt.begin_publish(), Ok(()));
+        assert_eq!(attempt.phase(), LoginAttemptPhase::Publishing);
+        assert_eq!(
+            attempt.cancel(),
+            LoginCancelResult::TooLate,
+            "发布阶段已赢时取消不能报告已取消"
+        );
+        attempt.finish(LoginAttemptResult::Completed);
+        assert_eq!(attempt.phase(), LoginAttemptPhase::Completed);
+        assert_eq!(
+            attempt.cancel(),
+            LoginCancelResult::AlreadyFinished,
+            "完成后取消必须保留真实完成结果"
+        );
+    }
 
     #[test]
     fn pkce_challenge_is_verifiable_sha256() {
@@ -1126,6 +1579,7 @@ mod tests {
             refresh_token_expires_at_unix_seconds: 1_800_800_000,
         };
         let receipt = persist_login_result_for(
+            None,
             LoginProduct::TraeCn,
             "profile-cn",
             "1234567890123457",
@@ -1246,8 +1700,12 @@ mod tests {
         )
         .unwrap();
         // 用户设置本地备注名 + 健康检测补采手机号（服务端未在登录时返回）。
-        registry.set_display_name("profile-a", Some("主力号")).unwrap();
-        registry.backfill_masked_mobile("profile-a", "138****0000").unwrap();
+        registry
+            .set_display_name("profile-a", Some("主力号"))
+            .unwrap();
+        registry
+            .backfill_masked_mobile("profile-a", "138****0000")
+            .unwrap();
         // 重新登录（服务端这次返回了手机号但没返回备注名——备注名本就纯本地）。
         let user_info_again = UserInfoSummary {
             masked_mobile: "138****0000".to_string(),
@@ -1368,6 +1826,7 @@ mod tests {
         // 零超时：无回调立即失败，且不产生任何入库副作用。
         let result = complete_login(
             handoff.session,
+            LoginAttemptControl::new(),
             &store,
             &registry,
             &client,
@@ -1394,22 +1853,208 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn concurrent_first_login_same_account_reuses_profile_and_other_account_progresses() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let root = tempfile::tempdir().unwrap();
+        let work_root = root.path().join("work");
+        let cn_root = root.path().join("cn");
+        let work_store = CheckinCredentialStore::new(&work_root);
+        let registry = AccountRegistry::new(&work_root);
+        let account_id = "1800000000000191";
+        let other_account_id = "1800000000000192";
+
+        // 同账号锁名只保留摘要，且产品物料根不同就天然分锁。
+        let work_lock = login_account_lock_resource(&work_store, account_id);
+        let cn_lock =
+            login_account_lock_resource(&CheckinCredentialStore::new(&cn_root), account_id);
+        assert_ne!(work_lock, cn_lock);
+        assert!(!work_lock.to_string_lossy().contains(account_id));
+
+        let (first_resolved_tx, first_resolved_rx) = mpsc::channel();
+        let (release_first_resolve_tx, release_first_resolve_rx) = mpsc::channel();
+        let (first_acceptance_tx, first_acceptance_rx) = mpsc::channel();
+        let (release_first_acceptance_tx, release_first_acceptance_rx) = mpsc::channel();
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_resolved_tx, second_resolved_rx) = mpsc::channel();
+        let (release_second_resolve_tx, release_second_resolve_rx) = mpsc::channel();
+        let (other_done_tx, other_done_rx) = mpsc::channel();
+
+        let first_store = CheckinCredentialStore::new(&work_root);
+        let first_registry = AccountRegistry::new(&work_root);
+        let (first_private, first_public) = generate_device_keypair().unwrap();
+        let first = thread::spawn(move || {
+            let attempt = LoginAttemptControl::new();
+            assert_eq!(attempt.begin_exchange(), Ok(()));
+            persist_and_accept_login_inner(
+                &attempt,
+                LoginProduct::WorkCn,
+                "oauth-session-first",
+                "device-first-1234",
+                "machine-first",
+                &first_public,
+                &first_private,
+                acceptance_grant(account_id, "refresh-first"),
+                &UserInfoSummary::default(),
+                &first_store,
+                &first_registry,
+                &|_binding, _now, _lease| {
+                    first_acceptance_tx.send(()).unwrap();
+                    release_first_acceptance_rx.recv().unwrap();
+                    Ok(())
+                },
+                &|profile_id| {
+                    first_resolved_tx.send(profile_id.to_string()).unwrap();
+                    release_first_resolve_rx.recv().unwrap();
+                },
+            )
+        });
+        assert_eq!(
+            first_resolved_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            "oauth-session-first"
+        );
+
+        let second_store = CheckinCredentialStore::new(&work_root);
+        let second_registry = AccountRegistry::new(&work_root);
+        let (second_private, second_public) = generate_device_keypair().unwrap();
+        let second = thread::spawn(move || {
+            let attempt = LoginAttemptControl::new();
+            assert_eq!(attempt.begin_exchange(), Ok(()));
+            second_started_tx.send(()).unwrap();
+            persist_and_accept_login_inner(
+                &attempt,
+                LoginProduct::WorkCn,
+                "oauth-session-second",
+                "device-second-1234",
+                "machine-second",
+                &second_public,
+                &second_private,
+                acceptance_grant(account_id, "refresh-second"),
+                &UserInfoSummary::default(),
+                &second_store,
+                &second_registry,
+                &|_binding, _now, _lease| Ok(()),
+                &|profile_id| {
+                    second_resolved_tx.send(profile_id.to_string()).unwrap();
+                    release_second_resolve_rx.recv().unwrap();
+                },
+            )
+        });
+        second_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let resolved_before_first_publish = second_resolved_rx
+            .recv_timeout(Duration::from_millis(300))
+            .ok();
+
+        // A 不得占住产品根互斥；不同账号 B 必须先于 A 的验收结束完成。
+        let other_store = CheckinCredentialStore::new(&work_root);
+        let other_registry = AccountRegistry::new(&work_root);
+        let (other_private, other_public) = generate_device_keypair().unwrap();
+        let other = thread::spawn(move || {
+            let attempt = LoginAttemptControl::new();
+            assert_eq!(attempt.begin_exchange(), Ok(()));
+            let result = persist_and_accept_login(
+                &attempt,
+                LoginProduct::WorkCn,
+                "oauth-session-other",
+                "device-other-1234",
+                "machine-other",
+                &other_public,
+                &other_private,
+                acceptance_grant(other_account_id, "refresh-other"),
+                &UserInfoSummary::default(),
+                &other_store,
+                &other_registry,
+                &|_binding, _now, _lease| Ok(()),
+            );
+            other_done_tx.send(result).unwrap();
+        });
+        let other_result = other_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        release_first_resolve_tx.send(()).unwrap();
+        first_acceptance_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let resolved_during_acceptance = second_resolved_rx
+            .recv_timeout(Duration::from_millis(300))
+            .ok();
+        release_first_acceptance_tx.send(()).unwrap();
+
+        let resolved_after_acceptance = if resolved_before_first_publish.is_some() {
+            release_second_resolve_tx.send(()).unwrap();
+            None
+        } else if resolved_during_acceptance.is_some() {
+            release_second_resolve_tx.send(()).unwrap();
+            None
+        } else {
+            let profile_id = second_resolved_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            release_second_resolve_tx.send(()).unwrap();
+            Some(profile_id)
+        };
+
+        let first_receipt = first.join().unwrap().unwrap();
+        let second_receipt = second.join().unwrap().unwrap();
+        other.join().unwrap();
+        assert!(other_result.is_ok());
+        assert!(resolved_before_first_publish.is_none());
+        assert!(resolved_during_acceptance.is_none());
+        assert_eq!(
+            resolved_after_acceptance.as_deref(),
+            Some("oauth-session-first")
+        );
+        assert_eq!(first_receipt.profile_id, "oauth-session-first");
+        assert_eq!(second_receipt.profile_id, first_receipt.profile_id);
+        let records = registry.load().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.account_id == account_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.account_id == account_id)
+                .unwrap()
+                .profile_id,
+            "oauth-session-first"
+        );
+        assert!(records
+            .iter()
+            .any(|record| record.account_id == other_account_id));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn first_login_acceptance_passed_rotates_candidate_once() {
         let root = tempfile::tempdir().unwrap();
         let store = CheckinCredentialStore::new(root.path());
         let registry = AccountRegistry::new(root.path());
         let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let attempt = LoginAttemptControl::new();
+        // 回调返回后先进入 Exchanging，符合发布函数的阶段前置条件。
+        assert_eq!(attempt.begin_exchange(), Ok(()));
+        assert_eq!(attempt.phase(), LoginAttemptPhase::Exchanging);
         let calls = std::cell::Cell::new(0usize);
         // fixture 验收：只记录调用次数与绑定，不触网、不改写凭据。
-        let renew = |binding: &CheckinProfileBinding, now: u64| {
-            calls.set(calls.get() + 1);
-            // 验收目标必须是刚入库的候选代次。
-            assert_eq!(binding.profile_id, "profile-accept");
-            assert_eq!(binding.account_id, "1800000000000101");
-            assert!(now > 0);
-            Ok(())
-        };
+        let renew =
+            |binding: &CheckinProfileBinding, now: u64, _lease: &CheckinProfileOperationLease| {
+                calls.set(calls.get() + 1);
+                // 验收目标必须是刚入库的候选代次。
+                assert_eq!(binding.profile_id, "profile-accept");
+                assert_eq!(binding.account_id, "1800000000000101");
+                assert!(now > 0);
+                Ok(())
+            };
         let receipt = persist_and_accept_login(
+            &attempt,
             LoginProduct::WorkCn,
             "profile-accept",
             "1234567890123456",
@@ -1433,17 +2078,212 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn first_login_acceptance_holds_profile_lease_against_mobile_update() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        // 将可能因锁回归而阻塞的线程隔离到子进程，由父测负责限时终止。
+        if std::env::var("TRAE_SYNC_OAUTH_MOBILE_LEASE_TEST")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            use std::process::{Command, Stdio};
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .env("TRAE_SYNC_OAUTH_MOBILE_LEASE_TEST", "1")
+                .args([
+                    "--exact",
+                    "checkin_login::tests::first_login_acceptance_holds_profile_lease_against_mobile_update",
+                    "--nocapture",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("启动 OAuth/手机号竞争测试子进程失败");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "OAuth/手机号竞争测试子进程失败：{status}");
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("OAuth/手机号竞争测试子进程 30 秒内未结束，已 kill+wait");
+                    }
+                }
+            }
+        }
+
+        struct ReleaseAcceptanceOnDrop(mpsc::Sender<()>);
+        impl Drop for ReleaseAcceptanceOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let registry = AccountRegistry::new(root.path());
+        let account_id = "1800000000000101";
+        let (old_private, old_public) = generate_device_keypair().unwrap();
+        let old_receipt = persist_login_result(
+            "profile-mobile-barrier",
+            "device-old-1234",
+            "machine-old",
+            &old_public,
+            &old_private,
+            acceptance_grant(account_id, "refresh-before-oauth"),
+            &UserInfoSummary::default(),
+            &store,
+            &registry,
+        )
+        .unwrap();
+        let old_record = registry.find(&old_receipt.profile_id).unwrap().unwrap();
+        let old_binding = CheckinProfileBinding::from(&old_record);
+        store
+            .set_mobile_full(&old_binding, Some("13800000000"))
+            .unwrap();
+        let credential_path = std::fs::read_dir(store.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension() == Some(std::ffi::OsStr::new("checkin")))
+            .expect("已存在账号应有一个真实凭据包");
+
+        let (new_private, new_public) = generate_device_keypair().unwrap();
+        let new_binding = CheckinProfileBinding::new(
+            &old_receipt.profile_id,
+            account_id,
+            "device-new-1234",
+            &new_public,
+        );
+        let (acceptance_entered_tx, acceptance_entered_rx) = mpsc::channel();
+        let (release_acceptance_tx, release_acceptance_rx) = mpsc::channel();
+        let release_acceptance = ReleaseAcceptanceOnDrop(release_acceptance_tx);
+        let (login_done_tx, login_done_rx) = mpsc::channel();
+        let (mobile_started_tx, mobile_started_rx) = mpsc::channel();
+        let (mobile_done_tx, mobile_done_rx) = mpsc::channel();
+
+        let login_store = store.clone();
+        let login_registry = AccountRegistry::new(root.path());
+        let probe_path = credential_path.clone();
+        let login = thread::spawn(move || {
+            let attempt = LoginAttemptControl::new();
+            let _ = attempt.begin_exchange();
+            let result = persist_and_accept_login_inner(
+                &attempt,
+                LoginProduct::WorkCn,
+                "oauth-session-mobile",
+                "device-new-1234",
+                "machine-new",
+                &new_public,
+                &new_private,
+                acceptance_grant(account_id, "refresh-after-oauth"),
+                &UserInfoSummary::default(),
+                &login_store,
+                &login_registry,
+                &|binding, _now, _lease| {
+                    let profile_lock_probe =
+                        FileOperationLock::try_acquire_sibling_resource(&probe_path)
+                            .map_err(|_| CheckinCredentialError::Unavailable)?;
+                    let profile_lock_is_busy = profile_lock_probe.is_none();
+                    drop(profile_lock_probe);
+                    acceptance_entered_tx
+                        .send((binding.profile_id.clone(), profile_lock_is_busy))
+                        .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)?;
+                    release_acceptance_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .map(|_| ())
+                        .map_err(|_| CheckinCredentialError::CredentialRefreshFailed)
+                },
+                &|_| {},
+            );
+            let _ = login_done_tx.send(result);
+        });
+
+        let acceptance_profile = acceptance_entered_rx.recv_timeout(Duration::from_secs(5));
+        let mobile_store = store.clone();
+        let mobile_binding = new_binding.clone();
+        let mobile_writer = thread::spawn(move || {
+            let _ = mobile_started_tx.send(());
+            let result = mobile_store.set_mobile_full(&mobile_binding, Some("13812345678"));
+            let _ = mobile_done_tx.send(result);
+        });
+        let mobile_started = mobile_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .is_ok();
+        let mobile_done_before_release =
+            mobile_done_rx.recv_timeout(Duration::from_millis(300)).ok();
+        let mobile_finished_before_release = mobile_done_before_release.is_some();
+
+        // 即使后续断言失败，Drop 也会释放验收 gate，避免遗留阻塞线程。
+        drop(release_acceptance);
+        let login_result = login_done_rx.recv_timeout(Duration::from_secs(5));
+        let mobile_result = mobile_done_before_release
+            .or_else(|| mobile_done_rx.recv_timeout(Duration::from_secs(5)).ok());
+        assert!(login_result.is_ok(), "OAuth caller 未在 gate 释放后完成");
+        assert!(
+            mobile_result.is_some(),
+            "手机号 writer 未在 gate 释放后完成"
+        );
+        let login_joined = login.join().is_ok();
+        let mobile_writer_joined = mobile_writer.join().is_ok();
+
+        assert_eq!(
+            acceptance_profile
+                .as_ref()
+                .ok()
+                .map(|(profile_id, _)| profile_id.as_str()),
+            Some("profile-mobile-barrier"),
+            "验收应复用既有账号凭据档案"
+        );
+        assert_eq!(
+            acceptance_profile
+                .as_ref()
+                .ok()
+                .map(|(_, profile_lock_is_busy)| *profile_lock_is_busy),
+            Some(true),
+            "验收期间同一实际凭据资源必须处于租约保护中"
+        );
+        assert!(mobile_started);
+        assert!(!mobile_finished_before_release);
+        assert!(login_joined);
+        assert!(mobile_writer_joined);
+        let receipt = login_result.unwrap().unwrap();
+        assert!(receipt.acceptance.passed);
+        mobile_result.unwrap().unwrap();
+
+        // 从 DPAPI 凭据包读回，确认 OAuth 新令牌与并发手机号更新同时保留。
+        let bundle = store.load(&new_binding).unwrap();
+        assert_eq!(bundle.refresh_token, "refresh-after-oauth");
+        assert_eq!(bundle.mobile_full.as_deref(), Some("13812345678"));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn first_login_acceptance_failure_keeps_candidate_and_reports_code() {
         let root = tempfile::tempdir().unwrap();
         let store = CheckinCredentialStore::new(root.path());
         let registry = AccountRegistry::new(root.path());
         let (private_pem, public_pem) = generate_device_keypair().unwrap();
+        let attempt = LoginAttemptControl::new();
+        // 回调返回后先进入 Exchanging，符合发布函数的阶段前置条件。
+        assert_eq!(attempt.begin_exchange(), Ok(()));
+        assert_eq!(attempt.phase(), LoginAttemptPhase::Exchanging);
         let calls = std::cell::Cell::new(0usize);
-        let renew = |_binding: &CheckinProfileBinding, _now: u64| {
-            calls.set(calls.get() + 1);
-            Err(CheckinCredentialError::CredentialRefreshFailed)
-        };
+        let renew =
+            |_binding: &CheckinProfileBinding, _now: u64, _lease: &CheckinProfileOperationLease| {
+                calls.set(calls.get() + 1);
+                Err(CheckinCredentialError::CredentialRefreshFailed)
+            };
         let receipt = persist_and_accept_login(
+            &attempt,
             LoginProduct::WorkCn,
             "profile-accept",
             "1234567890123456",
@@ -1480,6 +2320,50 @@ mod tests {
         assert!(registry.find("profile-accept").unwrap().is_some());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn first_login_acceptance_cancelled_before_publish_skips_renew_and_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckinCredentialStore::new(root.path());
+        let registry = AccountRegistry::new(root.path());
+        let attempt = LoginAttemptControl::new();
+        assert_eq!(attempt.begin_exchange(), Ok(()));
+        assert_eq!(attempt.cancel(), LoginCancelResult::Cancelled);
+        let calls = std::cell::Cell::new(0usize);
+        let renew =
+            |_binding: &CheckinProfileBinding, _now: u64, _lease: &CheckinProfileOperationLease| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            };
+
+        // 取消先赢时不得续期，也不得写入凭据包或账号档案。
+        let result = persist_and_accept_login(
+            &attempt,
+            LoginProduct::WorkCn,
+            "profile-accept",
+            "1234567890123456",
+            "machine-accept",
+            "public-cancel",
+            "private-cancel",
+            acceptance_grant("1800000000000101", "refresh-accept"),
+            &UserInfoSummary::default(),
+            &store,
+            &registry,
+            &renew,
+        );
+
+        assert_eq!(result.err(), Some(LoginError::Cancelled));
+        assert_eq!(calls.get(), 0);
+        let binding = CheckinProfileBinding::new(
+            "profile-accept",
+            "1800000000000101",
+            "1234567890123456",
+            "public-cancel",
+        );
+        assert!(store.load(&binding).is_err());
+        assert!(registry.find("profile-accept").unwrap().is_none());
+    }
+
     // P7-4：等待期间外部中止（用户取消 / 浏览器退出）→ 立即以 Cancelled
     // 终止，不受总超时约束，且不产生任何入库副作用。
     #[test]
@@ -1492,6 +2376,7 @@ mod tests {
         let started = Instant::now();
         let result = complete_login(
             handoff.session,
+            LoginAttemptControl::new(),
             &store,
             &registry,
             &client,

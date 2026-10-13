@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::master_archive::{MasterArchiveError, open_with_key_readwrite, verify_key_readable};
+use crate::master_archive::{open_with_key_readwrite, verify_key_readable, MasterArchiveError};
 use crate::master_handover::master_database_path;
 use crate::sqlcipher::open_with_key_readonly;
 
@@ -370,7 +370,10 @@ mod tests {
                 assert_eq!(stale.empty_project_count, 0, "软删项目残留不应计为空项目");
                 // p4（deleted_at=0，无会话）是真实空项目，保留诊断。
                 let zero = report.accounts.iter().find(|r| r.user_id == "333").unwrap();
-                assert_eq!(zero.empty_project_count, 1, "未删除的零会话项目仍应计为空项目");
+                assert_eq!(
+                    zero.empty_project_count, 1,
+                    "未删除的零会话项目仍应计为空项目"
+                );
                 assert_eq!(report.empty_project_total(), 1);
             }
             other => panic!("期望 Ready，实际 {:?}", other),

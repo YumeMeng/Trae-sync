@@ -124,7 +124,14 @@ pub fn sync_account_cloud_plugins(
             continue;
         };
         let raw = cloud_item_install_source(item);
-        match install_one(&client, source_token, target_token, &raw, id, &item.registry) {
+        match install_one(
+            &client,
+            source_token,
+            target_token,
+            &raw,
+            id,
+            &item.registry,
+        ) {
             Ok(true) => outcome.installed += 1,
             Ok(false) => outcome.failed += 1,
             Err(_) => outcome.failed += 1,
@@ -638,7 +645,14 @@ pub fn install_market_plugin(token: &str, plugin: &MarketPluginItem) -> Result<b
         "display_name": plugin.display_name,
         "registry": plugin.registry,
     });
-    install_one(&client, token, token, &item, &plugin.plugin_id, &plugin.registry)
+    install_one(
+        &client,
+        token,
+        token,
+        &item,
+        &plugin.plugin_id,
+        &plugin.registry,
+    )
 }
 
 #[cfg(test)]
@@ -688,7 +702,10 @@ mod tests {
     fn install_body_matches_frontend_constructor() {
         let body = build_install_body(&sample_item(), &sample_detail());
         // 与 m() 构造器逐字段对齐（288.e82102fe.mjs @4512333）
-        assert_eq!(body["marketplace_plugin_id"], "42ef9a5d-9586-4445-93e8-37155ac24caa");
+        assert_eq!(
+            body["marketplace_plugin_id"],
+            "42ef9a5d-9586-4445-93e8-37155ac24caa"
+        );
         assert_eq!(body["version"], "1.0.1");
         assert_eq!(body["name"], "trae-remote-official:seedream");
         assert_eq!(body["uri"], "https://example/package.zip");
@@ -705,7 +722,8 @@ mod tests {
     #[test]
     fn install_body_falls_back_to_item_fields() {
         // 详情缺 plugin 子对象时回退已装列表条目字段（与 m() 的 e.* 回退一致）
-        let detail = json!({"download_url": "https://example/pkg.zip", "checksum": "abc", "file_size": 1});
+        let detail =
+            json!({"download_url": "https://example/pkg.zip", "checksum": "abc", "file_size": 1});
         let body = build_install_body(&sample_item(), &detail);
         assert_eq!(body["name"], "trae-remote-official:seedream");
         assert_eq!(body["version"], "1.0.1");
@@ -797,11 +815,9 @@ mod tests {
         assert_eq!(github.category_key, "development_tools");
         assert_eq!(github.category_name, "开发工具");
         // 无分类条目：主分组为空（前端归「其他」）。
-        let bare = market_item_from_raw(
-            &json!({"plugin_id": "x", "display_name": "y"}),
-            &categories,
-        )
-        .unwrap();
+        let bare =
+            market_item_from_raw(&json!({"plugin_id": "x", "display_name": "y"}), &categories)
+                .unwrap();
         assert_eq!(bare.category_key, "");
         assert_eq!(bare.category_name, "");
     }

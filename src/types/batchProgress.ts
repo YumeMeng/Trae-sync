@@ -1,3 +1,5 @@
+import type { ProductId } from "../platform/productRegistry";
+
 /**
  * 批量操作逐账号进度事件统一契约（P12-R2 Q2 定案）。
  *
@@ -6,8 +8,8 @@
  * BatchProgressEvent：serde `tag = "kind"` 区分链路，公共字段 +
  * 各链特有字段（serde default，向后兼容）。
  *
- * 过渡约定：后端 R2b 落地前载荷可能暂无 kind 字段，前端解析层按
- * 事件名降级推断（视为预期链）；带 kind 时校验，未知 kind 静默丢弃。
+ * 每条载荷都带产品来源；前端缺少来源或来源与当前账号页不符时丢弃。
+ * kind 仍兼容 R2b 之前的载荷；存在时按事件名校验，不匹配则丢弃。
  */
 
 /** 批量进度事件链类型（serde tag="kind" 的取值）。 */
@@ -15,6 +17,8 @@ export type BatchProgressKind = "credential_refresh" | "health_check" | "credits
 
 /** 批量操作逐账号进度事件载荷（三链统一，非敏感白名单）。 */
 export interface BatchProgressEvent {
+  /** 进度所属产品；账号页只接受当前产品的事件。 */
+  product_id: ProductId;
   /** 事件链类型；R2b 落地前的过渡期载荷可能缺省（前端按事件名降级推断）。 */
   kind?: BatchProgressKind;
   profile_id: string;

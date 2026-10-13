@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
+use crate::operation_lease::FileOperationLock;
 
 const REGISTRY_FILE: &str = "accounts.json";
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
@@ -142,6 +143,7 @@ impl AccountRegistry {
     /// 插入或更新一条档案；原子写入，失败时保留原文件。
     pub fn upsert(&self, record: &AccountRecord) -> Result<(), AccountRegistryError> {
         record.validate()?;
+        let _lock = self.acquire_write_lock()?;
         let mut accounts = self.load()?;
         let mut index = accounts.len();
         for (position, existing) in accounts.iter().enumerate() {
@@ -169,6 +171,7 @@ impl AccountRegistry {
     /// 按 profile_id 移除档案；不存在返回 false（幂等区分），存在且删除成功返回 true。
     /// 原子写入：失败时保留原文件。
     pub fn remove(&self, profile_id: &str) -> Result<bool, AccountRegistryError> {
+        let _lock = self.acquire_write_lock()?;
         let accounts = self.load()?;
         let remaining: Vec<AccountRecord> = accounts
             .iter()
@@ -259,6 +262,7 @@ impl AccountRegistry {
         profile_id: &str,
         mutate: impl Fn(&mut AccountRecord) -> bool,
     ) -> Result<bool, AccountRegistryError> {
+        let _lock = self.acquire_write_lock()?;
         let mut accounts = self.load()?;
         let Some(record) = accounts
             .iter_mut()
@@ -271,6 +275,15 @@ impl AccountRegistry {
         }
         self.write_all(&accounts)?;
         Ok(true)
+    }
+
+    /// 锁住同一账号档案文件，覆盖完整读改写过程。
+    fn acquire_write_lock(&self) -> Result<FileOperationLock, AccountRegistryError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| AccountRegistryError::Io)?;
+        }
+        FileOperationLock::acquire_sibling_resource(&self.path)
+            .map_err(|_| AccountRegistryError::Io)
     }
 
     /// 生成凭据绑定集合（profile_id -> CheckinProfileBinding），供真实签到
@@ -286,9 +299,6 @@ impl AccountRegistry {
         let bytes = content.as_bytes();
         if bytes.len() as u64 > MAX_REGISTRY_BYTES {
             return Err(AccountRegistryError::Invalid);
-        }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|_| AccountRegistryError::Io)?;
         }
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, bytes).map_err(|_| AccountRegistryError::Io)?;
@@ -314,6 +324,10 @@ pub fn registry_path(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_lease::FileOperationLock;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn sample_record(profile_id: &str) -> AccountRecord {
@@ -365,13 +379,78 @@ mod tests {
         assert!(registry.find("profile-b").unwrap().is_some());
     }
 
+    /// 子进程通过账号档案公开写接口更新同一 JSON 文件。
+    #[test]
+    fn child_process_upserts_account_registry_record() {
+        let (Ok(root), Ok(profile_id), Ok(started), Ok(completed)) = (
+            std::env::var("TRAE_SYNC_ACCOUNT_REGISTRY_ROOT"),
+            std::env::var("TRAE_SYNC_ACCOUNT_REGISTRY_PROFILE"),
+            std::env::var("TRAE_SYNC_ACCOUNT_REGISTRY_STARTED"),
+            std::env::var("TRAE_SYNC_ACCOUNT_REGISTRY_COMPLETED"),
+        ) else {
+            return;
+        };
+        fs::write(started, b"ready").unwrap();
+        AccountRegistry::new(root)
+            .upsert(&sample_record(&profile_id))
+            .unwrap();
+        fs::write(completed, b"done").unwrap();
+    }
+
+    /// 并发进程的 upsert 必须等待同一账号注册表的 sidecar 锁。
+    #[test]
+    fn cross_process_upsert_waits_for_registry_lock_and_preserves_records() {
+        let root = tempdir().unwrap();
+        let registry = AccountRegistry::new(root.path());
+        registry.upsert(&sample_record("profile-existing")).unwrap();
+        let started = root.path().join("writer-started");
+        let completed = root.path().join("writer-completed");
+        let registry_lock =
+            FileOperationLock::acquire_sibling_resource(&registry_path(root.path())).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .env("TRAE_SYNC_ACCOUNT_REGISTRY_ROOT", root.path())
+            .env("TRAE_SYNC_ACCOUNT_REGISTRY_PROFILE", "profile-child")
+            .env("TRAE_SYNC_ACCOUNT_REGISTRY_STARTED", &started)
+            .env("TRAE_SYNC_ACCOUNT_REGISTRY_COMPLETED", &completed)
+            .args([
+                "--exact",
+                "account_registry::tests::child_process_upserts_account_registry_record",
+                "--nocapture",
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "子进程应开始更新账号注册表");
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(), "写入应等待 sidecar 锁");
+        assert!(!completed.exists(), "锁释放前不应报告写入完成");
+
+        drop(registry_lock);
+        assert!(child.wait().unwrap().success());
+        let profiles: Vec<_> = registry
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.profile_id)
+            .collect();
+        assert!(profiles.contains(&"profile-existing".to_string()));
+        assert!(profiles.contains(&"profile-child".to_string()));
+    }
+
     #[test]
     fn set_auto_checkin_enabled_updates_and_is_idempotent() {
         let root = tempdir().unwrap();
         let registry = AccountRegistry::new(root.path());
         registry.upsert(&sample_record("profile-a")).unwrap();
         // 默认开启 -> 关闭。
-        assert!(registry.set_auto_checkin_enabled("profile-a", false).unwrap());
+        assert!(registry
+            .set_auto_checkin_enabled("profile-a", false)
+            .unwrap());
         assert!(
             !registry
                 .find("profile-a")
@@ -380,9 +459,13 @@ mod tests {
                 .auto_checkin_enabled
         );
         // 幂等：同值再写不报错、不改内容。
-        assert!(registry.set_auto_checkin_enabled("profile-a", false).unwrap());
+        assert!(registry
+            .set_auto_checkin_enabled("profile-a", false)
+            .unwrap());
         // 不存在的账号返回 false。
-        assert!(!registry.set_auto_checkin_enabled("profile-404", true).unwrap());
+        assert!(!registry
+            .set_auto_checkin_enabled("profile-404", true)
+            .unwrap());
     }
 
     #[test]
@@ -424,13 +507,22 @@ mod tests {
         let registry = AccountRegistry::new(root.path());
         registry.upsert(&sample_record("profile-a")).unwrap();
         // 设置：trim 后非空才生效。
-        assert!(registry.set_display_name("profile-a", Some("  主力号 ")).unwrap());
+        assert!(registry
+            .set_display_name("profile-a", Some("  主力号 "))
+            .unwrap());
         assert_eq!(
-            registry.find("profile-a").unwrap().unwrap().display_name.as_deref(),
+            registry
+                .find("profile-a")
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
             Some("主力号")
         );
         // 同值幂等；空串等价清除。
-        assert!(registry.set_display_name("profile-a", Some("主力号")).unwrap());
+        assert!(registry
+            .set_display_name("profile-a", Some("主力号"))
+            .unwrap());
         assert!(registry.set_display_name("profile-a", Some("   ")).unwrap());
         assert_eq!(
             registry.find("profile-a").unwrap().unwrap().display_name,
@@ -484,13 +576,17 @@ mod tests {
         let registry = AccountRegistry::new(root.path());
         registry.upsert(&sample_record("profile-a")).unwrap();
         // 首采：空值 + 非空入参 -> 写入。
-        assert!(registry.backfill_masked_mobile("profile-a", "138****0000").unwrap());
+        assert!(registry
+            .backfill_masked_mobile("profile-a", "138****0000")
+            .unwrap());
         assert_eq!(
             registry.find("profile-a").unwrap().unwrap().masked_mobile,
             "138****0000"
         );
         // 已有值不覆盖（首采语义）；空入参不写入。
-        assert!(registry.backfill_masked_mobile("profile-a", "139****9999").unwrap());
+        assert!(registry
+            .backfill_masked_mobile("profile-a", "139****9999")
+            .unwrap());
         assert_eq!(
             registry.find("profile-a").unwrap().unwrap().masked_mobile,
             "138****0000"

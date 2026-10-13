@@ -141,7 +141,7 @@ export default function App() {
       const suffix = failed > 0
         ? `（失败 ${failed}${skipped > 0 ? `，跳过 ${skipped}` : ""}）`
         : skipped > 0 ? `（跳过 ${skipped}）` : "";
-      notify.summary(`今日自动签到完成${suffix}`, [], completed);
+      notify.summary(`TRAE Work CN：今日自动签到完成${suffix}`, [], completed);
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -266,7 +266,6 @@ export default function App() {
             <CheckinPage
               active={activePage === "checkin"}
               onNavigate={handlePageChange}
-              product={selectedProductId}
             />
           </div>
           <div className="app-page" hidden={activePage !== "environment"}>
@@ -285,7 +284,7 @@ export default function App() {
             />
           </div>
           <div className="app-page" hidden={activePage !== "settings"}>
-            <SettingsPanel active={activePage === "settings"} />
+            <SettingsPanel active={activePage === "settings"} product={selectedProductId} />
           </div>
         </main>
       </div>

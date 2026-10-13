@@ -604,6 +604,15 @@
   color: var(--accent);
 }
 
+.switch-step--failed {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.switch-step--failed .switch-step__icon {
+  color: var(--danger);
+}
+
 .switch-step__ring {
   width: 12px;
   height: 12px;

@@ -15,39 +15,39 @@ vi.mock("@tauri-apps/api/core", async () => {
 
 const mockInvoke = vi.mocked(invoke);
 
-/** 适配器账号视图：默认非当前账号（当前账号用例单独覆盖）。 */
+/** 适配器账号视图：默认未在工具内选中（已选账号用例单独覆盖）。 */
 function account(overrides: Partial<AccountView> = {}): AccountView {
   return {
     id: "cn-a",
     displayName: "CN 主账号",
     status: "active",
     lastVerifiedAt: "2026-09-01T08:00:00.000Z",
-    isCurrent: false,
+    isToolSelected: false,
     ...overrides,
   };
 }
 
 function renderDetail(overrides: {
   account?: AccountView;
-  canSwitch?: boolean;
+  canSelectToolAccount?: boolean;
   onSignedOut?: () => void;
 } = {}) {
   const onBack = vi.fn();
-  const onSwitch = vi.fn();
+  const onSelectToolAccount = vi.fn();
   const onSignedOut = overrides.onSignedOut ?? vi.fn();
   render(
     <AdapterAccountDetail
       account={overrides.account ?? account()}
       productId="trae_cn"
       productName="Trae CN"
-      canSwitch={overrides.canSwitch ?? true}
-      switchBusy={false}
-      onSwitch={onSwitch}
+      canSelectToolAccount={overrides.canSelectToolAccount ?? true}
+      toolSelectionBusy={false}
+      onSelectToolAccount={onSelectToolAccount}
       onSignedOut={onSignedOut}
       onBack={onBack}
     />,
   );
-  return { onBack, onSwitch, onSignedOut };
+  return { onBack, onSelectToolAccount, onSignedOut };
 }
 
 describe("AdapterAccountDetail", () => {
@@ -59,13 +59,23 @@ describe("AdapterAccountDetail", () => {
 
   afterEach(() => vi.clearAllMocks());
 
-  it("基础信息渲染：显示名标题、状态徽章、当前使用标记、最近验证", () => {
+  it("基础信息渲染：显示名标题、状态徽章、工具选择状态、最近验证", () => {
     renderDetail();
     expect(screen.getByRole("heading", { name: "CN 主账号" })).toBeInTheDocument();
     expect(screen.getByTestId("adapter-account-detail-status")).toHaveTextContent("登录有效");
-    expect(screen.getByTestId("adapter-account-detail-current")).toHaveTextContent("否");
+    expect(screen.getByTestId("adapter-account-detail-current")).toHaveTextContent("工具内未选");
     // 展示名作为归属标注传入设备面板。
     expect(screen.getByTestId("adapter-account-detail-verified")).toHaveTextContent("2026/09/01");
+    const commonFields = [
+      screen.getByTestId("adapter-account-detail-status"),
+      screen.getByTestId("adapter-account-detail-current"),
+      screen.getByTestId("adapter-account-detail-verified"),
+    ];
+    for (let index = 0; index < commonFields.length - 1; index += 1) {
+      expect(
+        commonFields[index].compareDocumentPosition(commonFields[index + 1]) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+    }
   });
 
   it("设备模块挂载：默认折叠未触网，展开后按详情账号拉取列表", async () => {
@@ -96,23 +106,36 @@ describe("AdapterAccountDetail", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  it("切换操作区：仅非当前账号且具备 switch 能力时出现", () => {
-    const { onSwitch } = renderDetail();
-    expect(screen.getByTestId("adapter-account-detail-switch")).toBeInTheDocument();
+  it("工具账号选择区：仅未选账号且具备能力时出现", () => {
+    const { onSelectToolAccount } = renderDetail();
+    const button = screen.getByTestId("adapter-account-detail-tool-select");
+    expect(button).toHaveTextContent("设置工具当前账号");
+    expect(button).toHaveAttribute("title", expect.stringContaining("不会改变官方 Trae CN 客户端登录状态"));
 
-    fireEvent.click(screen.getByTestId("adapter-account-detail-switch"));
-    expect(onSwitch).toHaveBeenCalledTimes(1);
+    fireEvent.click(button);
+    expect(onSelectToolAccount).toHaveBeenCalledTimes(1);
+
+    const actionSection = button.closest("section");
+    const deviceSection = screen.getByTestId("remote-devices-panel");
+    const technicalDetails = screen.getByText("技术细节").closest("details");
+    const orderedSections = [actionSection, deviceSection, technicalDetails];
+    expect(orderedSections.every((section) => section !== null)).toBe(true);
+    for (let index = 0; index < orderedSections.length - 1; index += 1) {
+      const current = orderedSections[index];
+      const next = orderedSections[index + 1];
+      expect(current!.compareDocumentPosition(next!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    }
   });
 
-  it("当前账号不渲染切换按钮，但保留「使用中」标记", () => {
-    renderDetail({ account: account({ isCurrent: true }) });
-    expect(screen.queryByTestId("adapter-account-detail-switch")).not.toBeInTheDocument();
-    expect(screen.getByTestId("adapter-account-detail-current")).toHaveTextContent("使用中");
+  it("工具内已选账号不渲染选择按钮，但保留选择标记", () => {
+    renderDetail({ account: account({ isToolSelected: true }) });
+    expect(screen.queryByTestId("adapter-account-detail-tool-select")).not.toBeInTheDocument();
+    expect(screen.getByTestId("adapter-account-detail-current")).toHaveTextContent("工具内已选");
   });
 
-  it("适配器无 switch 能力时不渲染切换操作区", () => {
-    renderDetail({ canSwitch: false });
-    expect(screen.queryByTestId("adapter-account-detail-switch")).not.toBeInTheDocument();
+  it("适配器无工具账号选择能力时不渲染操作区", () => {
+    renderDetail({ canSelectToolAccount: false });
+    expect(screen.queryByTestId("adapter-account-detail-tool-select")).not.toBeInTheDocument();
   });
 
   it("状态徽章三态：过期账号显示「登录已过期」", () => {

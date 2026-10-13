@@ -14,40 +14,75 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use traesync_infrastructure::{
-    AccountRegistry, AuthSwitchError, MasterHandoverError, backup_master_trio_to,
-    handover_master_records, master_database_path, master_db_activity_detected,
-};
 use traesync_infrastructure::environment_registry::{
     self as environment_registry_module, environment_registry_error_code, master_data_dir,
-    secondary_data_dir, EnvironmentRegistry, MASTER_ENV_ID,
+    secondary_data_dir, EnvironmentRecord, EnvironmentRegistry, MASTER_ENV_ID,
 };
 use traesync_infrastructure::library_account::observed_profile_id;
 use traesync_infrastructure::trae_instance::{
-    self as trae_instance_module, close_instance, close_master_instance,
-    command_line_uses_data_dir, dir_size_recursive, instance_data_dir, list_trae_processes,
-    seed_login_state_from_donor, CloseOutcome,
+    self as trae_instance_module, close_instance, current_product_process_state,
+    default_product_data_dir, dir_size_recursive, instance_data_dir, list_trae_processes,
+    product_process_state, seed_login_state_from_donor, CloseOutcome, ProductProcessState,
+};
+use traesync_infrastructure::TraeProduct;
+use traesync_infrastructure::{
+    archive_login_user_id, backup_master_trio_to, handover_master_records, master_database_path,
+    master_db_activity_detected, AccountRegistry, AuthSwitchError, MasterHandoverError,
+    OperationLease,
 };
 
 use crate::{checkin_material_root, ensure_real_preview, run_blocking, AppState, RuntimeMode};
 // P12-R3：切号凭据互换双路径与回滚还原随凭据域迁 credential_handover。
-use crate::credential_handover::{rollback_master_login_bytes, switch_login_identity_dual_path};
+use crate::credential_handover::{
+    finalize_handover_failure, rollback_master_login_bytes, switch_login_identity_dual_path,
+};
 // P13-5：实例工具族随迁 instance_tools。
 use crate::instance_tools::{
     launch_instance_common, trae_instance_account_id, TraeInstanceLaunchDto,
 };
 
+fn acquire_environment_lease(
+    recovery_root: &Path,
+    resource_path: &Path,
+) -> Result<OperationLease, String> {
+    OperationLease::acquire_shared_for_path(recovery_root, resource_path)
+        .map_err(|error| format!("operation_lease_unavailable:{error}"))
+}
+
+/// 副环境先锁定容器生命周期，再读取档案并锁定单个数据目录；取得单环境锁后释放容器锁。
+fn acquire_secondary_environment_lease(
+    recovery_root: &Path,
+    storage_root: &Path,
+    env_id: &str,
+) -> Result<(EnvironmentRecord, OperationLease), String> {
+    let lifecycle_lease =
+        acquire_environment_lease(recovery_root, &storage_root.join("environments"))?;
+    let registry = EnvironmentRegistry::new(storage_root);
+    let record = registry
+        .find(env_id)
+        .map_err(environment_registry_error_code)?
+        .ok_or_else(|| "environment_not_found".to_string())?;
+    let env_dir = secondary_data_dir(storage_root, &record.env_id);
+    let operation_lease = acquire_environment_lease(recovery_root, &env_dir)?;
+    drop(lifecycle_lease);
+    Ok((record, operation_lease))
+}
+
 /// 主库环境状态 DTO（P5-0；环境页主库实例卡数据源，前端 P5-2 接线）。
 #[derive(Clone, Serialize)]
 pub(crate) struct EnvironmentStateDto {
     env_id: String,
-    /// 当前登录主库的账号 profile_id；None = 尚未登录任何账号。
+    /// 环境注册表当前记录的账号；无法读取实测身份时保留最后已知值。
     current_profile_id: Option<String>,
-    /// 当前账号显示名（备注名优先，缺省服务端昵称）；None = 尚未登录。
+    /// 与 current_profile_id 对应的显示名；这是环境记录，不单独证明实时登录。
     current_account_name: Option<String>,
+    /// 从 Work CN 登录材料中实测并映射到账号档案的身份；None 表示登出、不可读或未登记。
+    observed_profile_id: Option<String>,
     /// 主库 data_dir 绝对路径（展示与排障用）。
     data_dir: String,
     running: bool,
+    /// 三态进程结论；未知时界面不得显示为未运行。
+    process_state: ProductProcessState,
     login_state: trae_instance_module::InstanceLoginState,
     created_at_unix_seconds: u64,
 }
@@ -64,7 +99,11 @@ pub(crate) async fn launch_master_library(
     ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
+    let recovery_root = PathBuf::from(&state.recovery_root);
     run_blocking("trae_launch_join_failed", move || {
+        let master_dir =
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let _lease = acquire_environment_lease(&recovery_root, &master_dir)?;
         launch_master_library_inner(&material_root, &storage_root)
     })
     .await
@@ -89,7 +128,8 @@ fn launch_master_library_inner(
         &accounts,
         &instance_dir,
         record.current_profile_id.as_deref(),
-    );
+    )
+    .current_profile_id;
     let window_title = current_profile_id
         .as_deref()
         .and_then(|profile_id| {
@@ -106,12 +146,7 @@ fn launch_master_library_inner(
         .unwrap_or_else(|| "主库".to_string());
     // 主库 = 官方目录（2026-08-31 修订）：用户官方启动的实例也算「已运行」，
     // 聚焦它而不是再起一个。
-    launch_instance_common(
-        &instance_dir,
-        &window_title,
-        None,
-        trae_instance_module::command_line_matches_master,
-    )
+    launch_instance_common(TraeProduct::WorkCn, &instance_dir, &window_title, None)
 }
 
 /// 查询主库环境状态（档案 + 运行态 + 登录态）。
@@ -125,8 +160,10 @@ pub(crate) async fn get_environment_state(
             env_id: environment_registry_module::MASTER_ENV_ID.to_string(),
             current_profile_id: None,
             current_account_name: None,
+            observed_profile_id: None,
             data_dir: String::new(),
             running: false,
+            process_state: ProductProcessState::Unknown,
             login_state: trae_instance_module::InstanceLoginState::Uninitialized,
             created_at_unix_seconds: 0,
         });
@@ -146,20 +183,32 @@ pub(crate) async fn get_environment_state(
 /// - 实测不可用（登出/blob 不可读/账号未登记）→ 保留注册表缓存
 ///   （最后已知账号，不写垃圾值）。
 /// P12-R1b：实测源（`observed_profile_id`）随解析模块下沉共用。
+struct MasterCurrentProfileResolution {
+    /// 实测身份可用时取实测值，否则保留注册表中的最后已知账号。
+    current_profile_id: Option<String>,
+    /// 仅包含本次从登录材料中实测确认的账号。
+    observed_profile_id: Option<String>,
+}
+
 fn reconcile_master_current_profile(
     registry: &EnvironmentRegistry,
     accounts: &[traesync_infrastructure::account_registry::AccountRecord],
     master_instance_dir: &Path,
     cached_profile_id: Option<&str>,
-) -> Option<String> {
-    match observed_profile_id(accounts, master_instance_dir) {
+) -> MasterCurrentProfileResolution {
+    let observed_profile_id = observed_profile_id(accounts, master_instance_dir);
+    let current_profile_id = match observed_profile_id.as_deref() {
         Some(observed) => {
-            if cached_profile_id != Some(observed.as_str()) {
-                let _ = registry.set_current_profile(MASTER_ENV_ID, &observed);
+            if cached_profile_id != Some(observed) {
+                let _ = registry.set_current_profile(MASTER_ENV_ID, observed);
             }
-            Some(observed)
+            Some(observed.to_string())
         }
         None => cached_profile_id.map(str::to_string),
+    };
+    MasterCurrentProfileResolution {
+        current_profile_id,
+        observed_profile_id,
     }
 }
 
@@ -173,26 +222,20 @@ fn get_environment_state_inner(
         .map_err(|_| "environment_registry_invalid".to_string())?;
     let instance_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
     // 运行态：主库 = 官方目录，官方快捷方式无参启动的实例同样算运行中。
-    let running = list_trae_processes()
-        .map(|processes| {
-            processes.iter().any(|process| {
-                process.command_line.as_deref().is_some_and(|line| {
-                    trae_instance_module::command_line_matches_master(line, &instance_dir)
-                })
-            })
-        })
-        .unwrap_or(false);
+    let process_state = current_product_process_state(TraeProduct::WorkCn, &instance_dir);
     // 当前账号实测优先（官方登录/登出后注册表缓存过期）：
     // 账号注册表一次加载，供 userId 反查 profile 与显示名解析。
     let accounts = AccountRegistry::new(material_root)
         .load()
         .map_err(|_| "checkin_registry_invalid".to_string())?;
-    let current_profile_id = reconcile_master_current_profile(
+    let current_profile_resolution = reconcile_master_current_profile(
         &registry,
         &accounts,
         &instance_dir,
         record.current_profile_id.as_deref(),
     );
+    let observed_profile_id = current_profile_resolution.observed_profile_id;
+    let current_profile_id = current_profile_resolution.current_profile_id;
     let current_account_name = current_profile_id.as_deref().and_then(|profile_id| {
         accounts
             .iter()
@@ -208,8 +251,10 @@ fn get_environment_state_inner(
         env_id: record.env_id,
         current_profile_id,
         current_account_name,
+        observed_profile_id,
         data_dir: instance_dir.display().to_string(),
-        running,
+        running: process_state == ProductProcessState::Running,
+        process_state,
         login_state: trae_instance_module::instance_login_state(&instance_dir),
         created_at_unix_seconds: record.created_at_unix_seconds,
     })
@@ -249,6 +294,8 @@ pub(crate) struct EnvironmentListItemDto {
     current_account_name: Option<String>,
     data_dir: String,
     running: bool,
+    /// 三态进程结论；未知时界面不得显示为未运行。
+    process_state: ProductProcessState,
     login_state: trae_instance_module::InstanceLoginState,
     created_at_unix_seconds: u64,
     /// 环境体积（仅 include_size=true 时返回；目录遍历较重，轮询不带）。
@@ -288,6 +335,8 @@ pub(crate) struct EnvironmentLoginReceiptDto {
     switched_sessions: usize,
     /// 自动清理的目标账号空镜像行数（E5 坑位）。
     removed_mirror_rows: usize,
+    /// 环境档案是否已记住本次切换的账号。
+    current_profile_saved: bool,
 }
 
 // P12-R1b：`environment_registry_error_code` 下沉
@@ -311,6 +360,7 @@ pub(crate) async fn list_environments(
             current_account_name: None,
             data_dir: String::new(),
             running: false,
+            process_state: ProductProcessState::Unknown,
             login_state: trae_instance_module::InstanceLoginState::Uninitialized,
             created_at_unix_seconds: 0,
             size_bytes: None,
@@ -363,12 +413,9 @@ fn list_environments_inner(
             })
     };
 
-    // 进程快照一次：主库用官方目录口径（含无参启动），副环境用带参匹配。
-    let processes = list_trae_processes().unwrap_or_default();
-    let command_lines: Vec<&str> = processes
-        .iter()
-        .filter_map(|process| process.command_line.as_deref())
-        .collect();
+    // 列表共享一次进程快照；查询失败时各环境状态保留 unknown。
+    let processes = list_trae_processes().ok();
+    let default_data_dir = default_product_data_dir(TraeProduct::WorkCn);
     let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
     // 主库当前账号实测优先（官方登录/登出后注册表缓存过期）；
     // 副环境登录由工具托管，注册表值即权威，不做实测纠正。
@@ -380,23 +427,28 @@ fn list_environments_inner(
             .iter()
             .find(|record| record.is_master())
             .and_then(|record| record.current_profile_id.as_deref()),
-    );
+    )
+    .current_profile_id;
 
     let items = records
         .into_iter()
         .map(|record| {
-            let (data_dir, running) = if record.is_master() {
-                let running = command_lines.iter().any(|line| {
-                    trae_instance_module::command_line_matches_master(line, &master_dir)
-                });
-                (master_dir.clone(), running)
+            let data_dir = if record.is_master() {
+                master_dir.clone()
             } else {
-                let env_dir = secondary_data_dir(storage_root, &record.env_id);
-                let running = command_lines
-                    .iter()
-                    .any(|line| command_line_uses_data_dir(line, &env_dir));
-                (env_dir, running)
+                secondary_data_dir(storage_root, &record.env_id)
             };
+            let process_state = processes
+                .as_deref()
+                .map(|processes| {
+                    product_process_state(
+                        processes,
+                        TraeProduct::WorkCn,
+                        &data_dir,
+                        default_data_dir.as_deref(),
+                    )
+                })
+                .unwrap_or(ProductProcessState::Unknown);
             // 体积口径：主库三件套（轻，metadata 求和）；副环境整目录递归。
             let size_bytes = if include_size {
                 Some(if record.is_master() {
@@ -422,7 +474,8 @@ fn list_environments_inner(
                 current_account_name: current_profile_id.as_deref().and_then(account_name),
                 current_profile_id,
                 data_dir: data_dir.display().to_string(),
-                running,
+                running: process_state == ProductProcessState::Running,
+                process_state,
                 login_state: trae_instance_module::instance_login_state(&data_dir),
                 created_at_unix_seconds: record.created_at_unix_seconds,
                 size_bytes,
@@ -440,7 +493,10 @@ pub(crate) async fn create_environment(
 ) -> Result<EnvironmentRecordDto, String> {
     ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
+    let recovery_root = PathBuf::from(&state.recovery_root);
     run_blocking("environment_create_join_failed", move || {
+        let _lifecycle_lease =
+            acquire_environment_lease(&recovery_root, &storage_root.join("environments"))?;
         let registry = EnvironmentRegistry::new(&storage_root);
         let record = registry
             .create(&name)
@@ -469,7 +525,10 @@ pub(crate) async fn rename_environment(
 ) -> Result<EnvironmentRecordDto, String> {
     ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
+    let recovery_root = PathBuf::from(&state.recovery_root);
     run_blocking("environment_rename_join_failed", move || {
+        let _lifecycle_lease =
+            acquire_environment_lease(&recovery_root, &storage_root.join("environments"))?;
         let registry = EnvironmentRegistry::new(&storage_root);
         let record = registry
             .rename(&env_id, &name)
@@ -530,11 +589,36 @@ pub(crate) async fn delete_environment(
 ) -> Result<bool, String> {
     ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
-    run_blocking("environment_delete_join_failed", move || delete_environment_inner(&storage_root, &env_id))
-        .await
+    let recovery_root = PathBuf::from(&state.recovery_root);
+    run_blocking("environment_delete_join_failed", move || {
+        delete_environment_inner(&storage_root, &recovery_root, &env_id)
+    })
+    .await
 }
 
-fn delete_environment_inner(storage_root: &Path, env_id: &str) -> Result<bool, String> {
+fn delete_environment_inner(
+    storage_root: &Path,
+    recovery_root: &Path,
+    env_id: &str,
+) -> Result<bool, String> {
+    delete_environment_inner_with_process_check(storage_root, recovery_root, env_id, &|env_dir| {
+        crate::process_guard::ensure_product_stopped(
+            TraeProduct::WorkCn,
+            env_dir,
+            "environment_delete_running",
+        )
+    })
+}
+
+/// 删除时容器锁只保护环境身份解析和档案行删除；目标目录锁贯穿检查与删目录。
+pub(crate) fn delete_environment_inner_with_process_check(
+    storage_root: &Path,
+    recovery_root: &Path,
+    env_id: &str,
+    ensure_stopped: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<bool, String> {
+    let lifecycle_lease =
+        acquire_environment_lease(recovery_root, &storage_root.join("environments"))?;
     let registry = EnvironmentRegistry::new(storage_root);
     let record = registry
         .find(env_id)
@@ -544,26 +628,28 @@ fn delete_environment_inner(storage_root: &Path, env_id: &str) -> Result<bool, S
         return Err("environment_master_immutable".to_string());
     }
     let env_dir = secondary_data_dir(storage_root, &record.env_id);
-    // 运行中禁止删除（数据目录被进程占用，强删必产生半删状态）。
-    let running = list_trae_processes()
-        .map(|processes| {
-            processes.iter().any(|process| {
-                process
-                    .command_line
-                    .as_deref()
-                    .is_some_and(|line| command_line_uses_data_dir(line, &env_dir))
-            })
-        })
-        .unwrap_or(false);
-    if running {
-        return Err("environment_delete_running".to_string());
+    let _lease = acquire_environment_lease(recovery_root, &env_dir)?;
+    drop(lifecycle_lease);
+
+    // 长时间进程观测和递归删除不占用整个环境容器。
+    ensure_stopped(&env_dir)?;
+
+    // 删除档案行前重新取得容器锁并复核，避免并发改名/删除绕过生命周期边界。
+    let lifecycle_lease =
+        acquire_environment_lease(recovery_root, &storage_root.join("environments"))?;
+    let current_record = registry
+        .find(env_id)
+        .map_err(environment_registry_error_code)?
+        .ok_or_else(|| "environment_not_found".to_string())?;
+    if current_record.is_master() {
+        return Err("environment_master_immutable".to_string());
     }
-    // 先删档案行（原子写）再删目录：目录删除失败时环境已从列表消失，
-    // 残留目录交用户手动清理——错误信息携带完整路径（P11-5），供前端
-    // 提示用户定位；路径不属于敏感信息（用户自己机器上的可见目录）。
     registry
         .remove(env_id)
         .map_err(environment_registry_error_code)?;
+    drop(lifecycle_lease);
+
+    // 档案行先移除，再删目录；失败时保留残留供用户手动处理。
     std::fs::remove_dir_all(&env_dir)
         .map_err(|_| format!("environment_delete_failed_residue:{}", env_dir.display()))?;
     Ok(true)
@@ -579,19 +665,20 @@ pub(crate) async fn launch_environment(
     ensure_real_preview(&state)?;
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
+    let recovery_root = PathBuf::from(&state.recovery_root);
     run_blocking("environment_launch_join_failed", move || {
         // 主库：官方目录口径 + 当前账号窗口标题（P5-0 编排原样复用）。
         if env_id == environment_registry_module::MASTER_ENV_ID {
+            let master_dir =
+                master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+            let _lease = acquire_environment_lease(&recovery_root, &master_dir)?;
             return launch_master_library_inner(&material_root, &storage_root);
         }
-        let registry = EnvironmentRegistry::new(&storage_root);
-        let record = registry
-            .find(&env_id)
-            .map_err(environment_registry_error_code)?
-            .ok_or_else(|| "environment_not_found".to_string())?;
+        let (record, _lease) =
+            acquire_secondary_environment_lease(&recovery_root, &storage_root, &env_id)?;
         let env_dir = secondary_data_dir(&storage_root, &record.env_id);
         // 窗口标题用环境名（并行环境按名区分；账号名可能未登录或跨环境重复）。
-        launch_instance_common(&env_dir, &record.name, None, command_line_uses_data_dir)
+        launch_instance_common(TraeProduct::WorkCn, &env_dir, &record.name, None)
     })
     .await
 }
@@ -608,7 +695,7 @@ pub(crate) struct EnvironmentCloseDto {
 /// 按各环境既有的进程匹配口径（主库官方目录口径 / 副环境带参匹配）定位
 /// 实例进程树，taskkill /T（WM_CLOSE 优雅关闭）先行，TRAE 驻留托盘时再
 /// /T /F 强制兜底；未运行幂等返回 not_running。主库/副环境复用同一套
-/// 关闭原语（trae_instance::close_master_instance / close_instance）。
+/// 关闭原语按 Work 产品与目标目录显式匹配。
 #[tauri::command]
 pub(crate) async fn close_environment_instance(
     env_id: String,
@@ -616,8 +703,18 @@ pub(crate) async fn close_environment_instance(
 ) -> Result<EnvironmentCloseDto, String> {
     ensure_real_preview(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
+    let recovery_root = PathBuf::from(&state.recovery_root);
     run_blocking("environment_close_join_failed", move || {
-        close_environment_instance_inner(&storage_root, &env_id)
+        if env_id == environment_registry_module::MASTER_ENV_ID {
+            let master_dir =
+                master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+            let _lease = acquire_environment_lease(&recovery_root, &master_dir)?;
+            close_environment_instance_inner(&storage_root, &env_id)
+        } else {
+            let (_record, _lease) =
+                acquire_secondary_environment_lease(&recovery_root, &storage_root, &env_id)?;
+            close_environment_instance_inner(&storage_root, &env_id)
+        }
     })
     .await
 }
@@ -626,28 +723,42 @@ fn close_environment_instance_inner(
     storage_root: &Path,
     env_id: &str,
 ) -> Result<EnvironmentCloseDto, String> {
+    let close = |instance_dir: &Path| close_instance(TraeProduct::WorkCn, instance_dir);
+    close_environment_instance_inner_with(storage_root, env_id, &close)
+}
+
+/// 关闭编排可注入结果，单测据此验证拒绝路径而不操作本机 TRAE 进程。
+fn close_environment_instance_inner_with(
+    storage_root: &Path,
+    env_id: &str,
+    close: &dyn Fn(&Path) -> Result<CloseOutcome, trae_instance_module::TraeInstanceCloseError>,
+) -> Result<EnvironmentCloseDto, String> {
     // 主库：官方目录口径（覆盖官方无参启动的主进程形态）；副环境：
     // 带参匹配口径（--user-data-dir 指向环境目录）。档案不存在先拒绝，
     // 不做任何进程操作。
-    let outcome = if env_id == environment_registry_module::MASTER_ENV_ID {
-        let instance_dir =
-            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-        close_master_instance(&instance_dir)
+    let instance_dir = if env_id == environment_registry_module::MASTER_ENV_ID {
+        master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?
     } else {
         let record = EnvironmentRegistry::new(storage_root)
             .find(env_id)
             .map_err(environment_registry_error_code)?
             .ok_or_else(|| "environment_not_found".to_string())?;
-        close_instance(&secondary_data_dir(storage_root, &record.env_id))
+        secondary_data_dir(storage_root, &record.env_id)
     };
+    let outcome = close(&instance_dir);
     match outcome {
         Ok(CloseOutcome::Closed) => Ok(EnvironmentCloseDto { outcome: "closed" }),
         Ok(CloseOutcome::ForceClosed) => Ok(EnvironmentCloseDto {
             outcome: "force_closed",
         }),
-        Ok(CloseOutcome::NotRunning) => Ok(EnvironmentCloseDto { outcome: "not_running" }),
+        Ok(CloseOutcome::NotRunning) => Ok(EnvironmentCloseDto {
+            outcome: "not_running",
+        }),
         // 强制结束后进程仍存在（如权限不足）：稳定错误码，前端提示手动关闭。
-        Err(_) => Err("environment_close_failed".to_string()),
+        Err(error) => Err(crate::process_guard::close_failure_code(
+            error,
+            "environment_close_failed",
+        )),
     }
 }
 
@@ -671,11 +782,13 @@ pub(crate) async fn login_environment(
     }
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
+    let recovery_root = PathBuf::from(&state.recovery_root);
     let raw_key = state.source_raw_key.clone();
     run_blocking("environment_login_join_failed", move || {
         login_environment_inner(
             &material_root,
             &storage_root,
+            &recovery_root,
             &raw_key,
             &env_id,
             &profile_id,
@@ -687,9 +800,46 @@ pub(crate) async fn login_environment(
 fn login_environment_inner(
     material_root: &Path,
     storage_root: &Path,
+    recovery_root: &Path,
     raw_key: &str,
     env_id: &str,
     profile_id: &str,
+) -> Result<EnvironmentLoginReceiptDto, String> {
+    let close_environment =
+        |env_dir: &Path| close_instance(TraeProduct::WorkCn, env_dir).map(|_| ());
+    let switch_identity = |record: &traesync_infrastructure::account_registry::AccountRecord,
+                           donor_dir: &Path,
+                           env_dir: &Path| {
+        switch_login_identity_dual_path(material_root, record, donor_dir, env_dir).map(|_| ())
+    };
+    login_environment_inner_with_ops(
+        material_root,
+        storage_root,
+        recovery_root,
+        raw_key,
+        env_id,
+        profile_id,
+        &close_environment,
+        &switch_identity,
+        &|| {},
+    )
+}
+
+/// 环境登录生产/合成数据共用编排；目标租约在主体内覆盖全部副作用。
+pub(crate) fn login_environment_inner_with_ops(
+    material_root: &Path,
+    storage_root: &Path,
+    recovery_root: &Path,
+    raw_key: &str,
+    env_id: &str,
+    profile_id: &str,
+    close_environment: &dyn Fn(&Path) -> Result<(), trae_instance_module::TraeInstanceCloseError>,
+    switch_identity: &dyn Fn(
+        &traesync_infrastructure::account_registry::AccountRecord,
+        &Path,
+        &Path,
+    ) -> Result<(), AuthSwitchError>,
+    before_return: &dyn Fn(),
 ) -> Result<EnvironmentLoginReceiptDto, String> {
     // 库作用域备份工具随库域下沉：P12-R3 起经 crate::library_archive 引用
     // （与切号/收编/清理共用同一套备份目录解析与裁剪实现）。
@@ -709,12 +859,10 @@ fn login_environment_inner(
         .ok_or_else(|| "trae_profile_invalid".to_string())?;
     let target_user_id = record.account_id.clone();
 
-    let registry = EnvironmentRegistry::new(storage_root);
-    let env_record = registry
-        .find(env_id)
-        .map_err(environment_registry_error_code)?
-        .ok_or_else(|| "environment_not_found".to_string())?;
+    let (env_record, _operation_lease) =
+        acquire_secondary_environment_lease(recovery_root, storage_root, env_id)?;
     let env_dir = secondary_data_dir(storage_root, &env_record.env_id);
+    let registry = EnvironmentRegistry::new(storage_root);
     let donor_dir =
         instance_data_dir(storage_root, profile_id).map_err(|e| e.code().to_string())?;
     let db_path = master_database_path(&env_dir);
@@ -726,7 +874,9 @@ fn login_environment_inner(
         return Err("environment_login_busy".to_string());
     }
     // 关闭环境实例（幂等；凭据写库前目录必须静止）。
-    close_master_instance(&env_dir).map_err(|_| "environment_login_close_failed".to_string())?;
+    close_environment(&env_dir).map_err(|error| {
+        crate::process_guard::close_failure_code(error, "environment_login_close_failed")
+    })?;
 
     let mut seeded = false;
     let (mut transferred_projects, mut switched_sessions, mut removed_mirror_rows) = (0, 0, 0);
@@ -740,8 +890,7 @@ fn login_environment_inner(
             if db_path.is_file() {
                 // P11-4①/P11-5⑤：写入库作用域活动备份目录——副环境链落在
                 // 覆盖目录的环境子目录（未覆盖时 db 同目录），不与主库链混放。
-                let backup_dir =
-                    resolve_library_backup_dir(storage_root, &db_path, env_id);
+                let backup_dir = resolve_library_backup_dir(storage_root, &db_path, env_id);
                 backup_master_trio_to(&db_path, Some(&backup_dir))
                     .map_err(|_| "environment_login_backup_failed".to_string())?;
                 // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动该库链）。
@@ -763,16 +912,14 @@ fn login_environment_inner(
                     None => code.to_string(),
                 }
             };
-            let identity =
-                switch_login_identity_dual_path(material_root, record, &donor_dir, &env_dir);
-            let _identity = match identity {
-                Ok(identity) => identity,
+            match switch_identity(record, &donor_dir, &env_dir) {
+                Ok(()) => {}
                 Err(AuthSwitchError::DonorAuthUnavailable) => {
                     return Err(rollback("switch_donor_login_missing"))
                 }
                 // 环境内互换极少出现的其余形态（目标 blob 损坏等）：统一失败码。
                 Err(_) => return Err(rollback("environment_login_failed")),
-            };
+            }
             // 记录交接（单一归属泛化：库内记录随登录归一到目标账号）。
             if db_path.is_file() {
                 match handover_master_records(&db_path, raw_key, &target_user_id) {
@@ -782,13 +929,16 @@ fn login_environment_inner(
                         removed_mirror_rows = handover.removed_mirror_rows;
                     }
                     Err(error) => {
-                        let code = match error {
+                        let code = match &error {
+                            MasterHandoverError::CommittedNeedsAttention => {
+                                "environment_login_committed_needs_attention"
+                            }
+                            MasterHandoverError::CommitOutcomeUnknown => {
+                                "environment_login_commit_outcome_unknown"
+                            }
                             MasterHandoverError::DbUnavailable => "environment_login_db_missing",
                             MasterHandoverError::DbOpenFailed => "environment_login_db_open_failed",
                             MasterHandoverError::TargetConflict(_) => "environment_login_conflict",
-                            MasterHandoverError::IntegrityFailed => {
-                                "environment_login_integrity_failed"
-                            }
                             // P13-2 新增变体只在 CN 归并路径产生，环境登录
                             // 不会遇到；归入统一失败码保持穷尽匹配。
                             MasterHandoverError::ProjectNotFound
@@ -796,7 +946,7 @@ fn login_environment_inner(
                             | MasterHandoverError::NothingToMerge => "environment_login_failed",
                             MasterHandoverError::Io => "environment_login_failed",
                         };
-                        return Err(rollback(code));
+                        return Err(finalize_handover_failure(&error, code, rollback));
                     }
                 }
             }
@@ -805,16 +955,20 @@ fn login_environment_inner(
         | trae_instance_module::InstanceLoginState::LoggedOut => {
             // 空环境首登（或启动过未登录）：从账号登录存档播种三件套，
             // 移植即登录——无互换对象，无记录可交接（空库跳过）。
-            seed_login_state_from_donor(&env_dir, &donor_dir)
-                .map_err(|_| "environment_seed_unavailable".to_string())?;
+            seed_environment_login_from_donor(&env_dir, &donor_dir, &target_user_id)?;
             seeded = true;
         }
     }
 
     // 档案写回当前登录账号（各环境各自记忆，多对多）。
-    registry
-        .set_current_profile(env_id, profile_id)
-        .map_err(environment_registry_error_code)?;
+    let current_profile_saved = match registry.set_current_profile(env_id, profile_id) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("[environment-login] 环境档案写回失败（账号切换已完成）：{error:?}");
+            false
+        }
+    };
+    before_return();
     Ok(EnvironmentLoginReceiptDto {
         env_id: env_id.to_string(),
         profile_id: profile_id.to_string(),
@@ -822,7 +976,23 @@ fn login_environment_inner(
         transferred_projects,
         switched_sessions,
         removed_mirror_rows,
+        current_profile_saved,
     })
+}
+
+fn seed_environment_login_from_donor(
+    environment_dir: &Path,
+    donor_dir: &Path,
+    expected_user_id: &str,
+) -> Result<(), String> {
+    if expected_user_id.is_empty()
+        || archive_login_user_id(donor_dir).as_deref() != Some(expected_user_id)
+    {
+        return Err("environment_seed_unavailable".to_string());
+    }
+    seed_login_state_from_donor(environment_dir, donor_dir)
+        .map(|_| ())
+        .map_err(|_| "environment_seed_unavailable".to_string())
 }
 
 // ============================================================================
@@ -832,9 +1002,9 @@ fn login_environment_inner(
 #[cfg(test)]
 mod master_current_account_reconcile_tests {
     use super::*;
+    use crate::resolve_actual_master_account;
     use traesync_infrastructure::account_registry::AccountRecord;
     use traesync_infrastructure::{construct_auth_identity, ConstructAuthInput, UserInfoFull};
-    use crate::resolve_actual_master_account;
 
     /// 构造测试账号档案（仅身份字段有意义，其余填合法占位）。
     fn account(profile_id: &str, account_id: &str, screen_name: &str) -> AccountRecord {
@@ -939,7 +1109,8 @@ mod master_current_account_reconcile_tests {
             &fixture.master_dir(),
             Some("checkin-a"),
         );
-        assert_eq!(resolved.as_deref(), Some("checkin-b"));
+        assert_eq!(resolved.current_profile_id.as_deref(), Some("checkin-b"));
+        assert_eq!(resolved.observed_profile_id.as_deref(), Some("checkin-b"));
         // 注册表被纠正为实测值（插件同步预检等消费方随注册表一并修正）。
         let persisted = fixture.registry().load().unwrap().unwrap();
         assert_eq!(persisted.current_profile_id.as_deref(), Some("checkin-b"));
@@ -961,7 +1132,8 @@ mod master_current_account_reconcile_tests {
             &fixture.master_dir(),
             Some("checkin-a"),
         );
-        assert_eq!(resolved.as_deref(), Some("checkin-a"));
+        assert_eq!(resolved.current_profile_id.as_deref(), Some("checkin-a"));
+        assert_eq!(resolved.observed_profile_id, None);
         // 注册表不动（最后已知账号保留，不写垃圾值）。
         let persisted = fixture.registry().load().unwrap().unwrap();
         assert_eq!(persisted.current_profile_id.as_deref(), Some("checkin-a"));
@@ -1004,7 +1176,8 @@ mod master_current_account_reconcile_tests {
             &fixture.master_dir(),
             Some("checkin-a"),
         );
-        assert_eq!(resolved.as_deref(), Some("checkin-a"));
+        assert_eq!(resolved.current_profile_id.as_deref(), Some("checkin-a"));
+        assert_eq!(resolved.observed_profile_id, None);
         // 注册表不动（不把未登记账号写进档案）。
         let persisted = fixture.registry().load().unwrap().unwrap();
         assert_eq!(persisted.current_profile_id.as_deref(), Some("checkin-a"));
@@ -1027,7 +1200,8 @@ mod master_current_account_reconcile_tests {
             &fixture.master_dir(),
             Some("checkin-a"),
         );
-        assert_eq!(resolved.as_deref(), Some("checkin-a"));
+        assert_eq!(resolved.current_profile_id.as_deref(), Some("checkin-a"));
+        assert_eq!(resolved.observed_profile_id.as_deref(), Some("checkin-a"));
     }
 }
 
@@ -1040,6 +1214,44 @@ mod master_current_account_reconcile_tests {
 #[cfg(test)]
 mod environment_commands_tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    fn poll_child_until_exit(
+        child: &mut Child,
+        timeout: std::time::Duration,
+    ) -> Option<ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    fn kill_and_reap_child(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn release_and_reap_lease_holder(
+        child: &mut Child,
+        mut stdin: ChildStdin,
+    ) -> Option<ExitStatus> {
+        let _ = stdin.write_all(b"\n");
+        drop(stdin);
+        let status = poll_child_until_exit(child, std::time::Duration::from_secs(5));
+        if status.is_none() {
+            kill_and_reap_child(child);
+        }
+        status
+    }
 
     /// 测试根：storage_root + 按需登记的副环境档案。
     struct EnvFixture {
@@ -1053,9 +1265,360 @@ mod environment_commands_tests {
             }
         }
 
-        fn create_env(&self, name: &str) -> traesync_infrastructure::environment_registry::EnvironmentRecord {
-            EnvironmentRegistry::new(self.root.path()).create(name).unwrap()
+        fn create_env(
+            &self,
+            name: &str,
+        ) -> traesync_infrastructure::environment_registry::EnvironmentRecord {
+            EnvironmentRegistry::new(self.root.path())
+                .create(name)
+                .unwrap()
         }
+    }
+
+    fn save_test_account(material_root: &Path, profile_id: &str, account_id: &str) {
+        let record = traesync_infrastructure::account_registry::AccountRecord {
+            profile_id: profile_id.to_string(),
+            account_id: account_id.to_string(),
+            screen_name: "测试账号".to_string(),
+            avatar_url: String::new(),
+            device_id: format!("device-{profile_id}"),
+            device_public_key: format!("pub-{profile_id}"),
+            display_name: None,
+            masked_mobile: String::new(),
+            created_at_unix_seconds: 1,
+            last_verified_at_unix_seconds: 1,
+            device_created_at_unix_seconds: 0,
+            auto_checkin_enabled: false,
+            archived: false,
+        };
+        AccountRegistry::new(material_root).upsert(&record).unwrap();
+    }
+
+    /// 子进程持有副环境数据目录租约，供真实 caller 的跨进程屏障测试使用。
+    #[test]
+    fn child_process_holds_secondary_environment_lease_for_caller_test() {
+        let (Ok(recovery_root), Ok(storage_root), Ok(env_id)) = (
+            std::env::var("TRAE_SYNC_ENV_CALLER_LOCK_ROOT"),
+            std::env::var("TRAE_SYNC_ENV_CALLER_LOCK_STORAGE_ROOT"),
+            std::env::var("TRAE_SYNC_ENV_CALLER_LOCK_ENV_ID"),
+        ) else {
+            return;
+        };
+        let env_dir = secondary_data_dir(std::path::Path::new(&storage_root), &env_id);
+        let _lease =
+            acquire_environment_lease(std::path::Path::new(&recovery_root), &env_dir).unwrap();
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "ENVIRONMENT_CALLER_LOCK_READY").unwrap();
+        stdout.flush().unwrap();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+    }
+
+    /// 子进程执行真实环境删除 caller，断言锁竞争先于进程检查和删除。
+    #[test]
+    fn child_runs_environment_delete_caller_for_cross_process_test() {
+        if std::env::var("TRAE_SYNC_ENV_DELETE_CALLER_RUN")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let recovery_root = std::path::PathBuf::from(
+            std::env::var("TRAE_SYNC_ENV_DELETE_CALLER_RUN_RECOVERY_ROOT").unwrap(),
+        );
+        let storage_root = std::path::PathBuf::from(
+            std::env::var("TRAE_SYNC_ENV_DELETE_CALLER_RUN_STORAGE_ROOT").unwrap(),
+        );
+        let env_id = std::env::var("TRAE_SYNC_ENV_DELETE_CALLER_RUN_ENV_ID").unwrap();
+        let env_dir = secondary_data_dir(&storage_root, &env_id);
+        let process_checks = AtomicUsize::new(0);
+        let result = delete_environment_inner_with_process_check(
+            &storage_root,
+            &recovery_root,
+            &env_id,
+            &|_| {
+                process_checks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("其他进程持有副环境租约时不应删除环境"),
+        };
+        let expected = format!(
+            "operation_lease_unavailable:{}",
+            traesync_infrastructure::operation_lease::OperationLeaseError::DataLocationBusy
+        );
+        assert_eq!(error, expected);
+        assert_eq!(process_checks.load(Ordering::SeqCst), 0);
+        assert!(EnvironmentRegistry::new(&storage_root)
+            .find(&env_id)
+            .unwrap()
+            .is_some());
+        assert!(env_dir.join("keep.txt").is_file());
+    }
+
+    /// 子进程执行真实环境登录 caller，断言锁竞争早于关闭和认证写入。
+    #[test]
+    fn child_runs_environment_login_caller_for_cross_process_test() {
+        if std::env::var("TRAE_SYNC_ENV_LOGIN_CALLER_RUN")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let recovery_root = std::path::PathBuf::from(
+            std::env::var("TRAE_SYNC_ENV_LOGIN_CALLER_RUN_RECOVERY_ROOT").unwrap(),
+        );
+        let storage_root = std::path::PathBuf::from(
+            std::env::var("TRAE_SYNC_ENV_LOGIN_CALLER_RUN_STORAGE_ROOT").unwrap(),
+        );
+        let material_root = std::path::PathBuf::from(
+            std::env::var("TRAE_SYNC_ENV_LOGIN_CALLER_RUN_MATERIAL_ROOT").unwrap(),
+        );
+        let env_id = std::env::var("TRAE_SYNC_ENV_LOGIN_CALLER_RUN_ENV_ID").unwrap();
+        let profile_id = std::env::var("TRAE_SYNC_ENV_LOGIN_CALLER_RUN_PROFILE_ID").unwrap();
+        let close_calls = AtomicUsize::new(0);
+        let identity_switch_calls = AtomicUsize::new(0);
+        let before_return_calls = AtomicUsize::new(0);
+        let result = login_environment_inner_with_ops(
+            &material_root,
+            &storage_root,
+            &recovery_root,
+            "unused-test-key",
+            &env_id,
+            &profile_id,
+            &|_| {
+                close_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            &|_, _, _| {
+                identity_switch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            &|| {
+                before_return_calls.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("其他进程持有副环境租约时不应执行环境登录"),
+        };
+        let expected = format!(
+            "operation_lease_unavailable:{}",
+            traesync_infrastructure::operation_lease::OperationLeaseError::DataLocationBusy
+        );
+        assert_eq!(error, expected);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(identity_switch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(before_return_calls.load(Ordering::SeqCst), 0);
+        let env_dir = secondary_data_dir(&storage_root, &env_id);
+        assert!(env_dir.join("keep.txt").is_file());
+        assert!(EnvironmentRegistry::new(&storage_root)
+            .find(&env_id)
+            .unwrap()
+            .is_some());
+    }
+
+    /// 删除与登录 caller 的跨进程锁等待、执行和退出都必须有时限及回收路径。
+    #[test]
+    fn environment_callers_reject_cross_process_lease_before_side_effects() {
+        let fixture = EnvFixture::new();
+        let environment = fixture.create_env("跨进程删除测试");
+        let env_dir = secondary_data_dir(fixture.root.path(), &environment.env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(env_dir.join("keep.txt"), "keep").unwrap();
+        let recovery_root = tempfile::tempdir().unwrap();
+        let material_root = tempfile::tempdir().unwrap();
+        let profile_id = "checkin-target";
+        save_test_account(material_root.path(), profile_id, "777");
+        let test_exe = std::env::current_exe().unwrap();
+
+        let mut holder = Command::new(&test_exe)
+            .env("TRAE_SYNC_ENV_CALLER_LOCK_ROOT", recovery_root.path())
+            .env(
+                "TRAE_SYNC_ENV_CALLER_LOCK_STORAGE_ROOT",
+                fixture.root.path(),
+            )
+            .env("TRAE_SYNC_ENV_CALLER_LOCK_ENV_ID", &environment.env_id)
+            .args([
+                "--exact",
+                "environment::environment_commands_tests::child_process_holds_secondary_environment_lease_for_caller_test",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let holder_stdin = holder.stdin.take().unwrap();
+        let stdout = holder.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let mut ready_sent = false;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        if !ready_sent {
+                            let _ = ready_tx.send(false);
+                        }
+                        return;
+                    }
+                    Ok(_) if !ready_sent && line.trim() == "ENVIRONMENT_CALLER_LOCK_READY" => {
+                        let _ = ready_tx.send(true);
+                        ready_sent = true;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+        if ready_rx.recv_timeout(std::time::Duration::from_secs(10)) != Ok(true) {
+            let _ = release_and_reap_lease_holder(&mut holder, holder_stdin);
+            panic!("持锁子进程未在 10 秒内报告就绪");
+        }
+
+        let caller = Command::new(&test_exe)
+            .env("TRAE_SYNC_ENV_DELETE_CALLER_RUN", "1")
+            .env(
+                "TRAE_SYNC_ENV_DELETE_CALLER_RUN_RECOVERY_ROOT",
+                recovery_root.path(),
+            )
+            .env(
+                "TRAE_SYNC_ENV_DELETE_CALLER_RUN_STORAGE_ROOT",
+                fixture.root.path(),
+            )
+            .env("TRAE_SYNC_ENV_DELETE_CALLER_RUN_ENV_ID", &environment.env_id)
+            .args([
+                "--exact",
+                "environment::environment_commands_tests::child_runs_environment_delete_caller_for_cross_process_test",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn();
+        let mut caller = match caller {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = release_and_reap_lease_holder(&mut holder, holder_stdin);
+                panic!("无法启动环境删除 caller 测试子进程：{error}");
+            }
+        };
+
+        let caller_status = poll_child_until_exit(&mut caller, std::time::Duration::from_secs(10));
+        if caller_status.is_none() {
+            let _ = release_and_reap_lease_holder(&mut holder, holder_stdin);
+            let _ = poll_child_until_exit(&mut caller, std::time::Duration::from_secs(5));
+            if caller.try_wait().ok().flatten().is_none() {
+                kill_and_reap_child(&mut caller);
+            }
+            panic!("环境删除 caller 未在持锁期间 10 秒内返回；已释放并回收测试子进程");
+        }
+
+        let login_caller = Command::new(&test_exe)
+            .env("TRAE_SYNC_ENV_LOGIN_CALLER_RUN", "1")
+            .env(
+                "TRAE_SYNC_ENV_LOGIN_CALLER_RUN_RECOVERY_ROOT",
+                recovery_root.path(),
+            )
+            .env(
+                "TRAE_SYNC_ENV_LOGIN_CALLER_RUN_STORAGE_ROOT",
+                fixture.root.path(),
+            )
+            .env(
+                "TRAE_SYNC_ENV_LOGIN_CALLER_RUN_MATERIAL_ROOT",
+                material_root.path(),
+            )
+            .env(
+                "TRAE_SYNC_ENV_LOGIN_CALLER_RUN_ENV_ID",
+                &environment.env_id,
+            )
+            .env("TRAE_SYNC_ENV_LOGIN_CALLER_RUN_PROFILE_ID", profile_id)
+            .args([
+                "--exact",
+                "environment::environment_commands_tests::child_runs_environment_login_caller_for_cross_process_test",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn();
+        let mut login_caller = match login_caller {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = release_and_reap_lease_holder(&mut holder, holder_stdin);
+                panic!("无法启动环境登录 caller 测试子进程：{error}");
+            }
+        };
+        let login_status =
+            poll_child_until_exit(&mut login_caller, std::time::Duration::from_secs(10));
+        if login_status.is_none() {
+            let _ = release_and_reap_lease_holder(&mut holder, holder_stdin);
+            let _ = poll_child_until_exit(&mut login_caller, std::time::Duration::from_secs(5));
+            if login_caller.try_wait().ok().flatten().is_none() {
+                kill_and_reap_child(&mut login_caller);
+            }
+            panic!("环境登录 caller 未在持锁期间 10 秒内返回；已释放并回收测试子进程");
+        }
+
+        let holder_status = release_and_reap_lease_holder(&mut holder, holder_stdin);
+        assert!(holder_status.is_some_and(|status| status.success()));
+        assert!(caller_status.unwrap().success());
+        assert!(login_status.unwrap().success());
+        assert!(env_dir.join("keep.txt").is_file());
+        assert!(EnvironmentRegistry::new(fixture.root.path())
+            .find(&environment.env_id)
+            .unwrap()
+            .is_some());
+    }
+
+    /// 生命周期根锁保护创建/删除窗口，单环境锁允许其他环境并行。
+    #[test]
+    fn secondary_environment_leases_guard_lifecycle_and_allow_other_environments() {
+        let fixture = EnvFixture::new();
+        let first = fixture.create_env("测试环境甲");
+        let second = fixture.create_env("测试环境乙");
+        std::fs::create_dir_all(secondary_data_dir(fixture.root.path(), &first.env_id)).unwrap();
+        std::fs::create_dir_all(secondary_data_dir(fixture.root.path(), &second.env_id)).unwrap();
+        let recovery_root = tempfile::tempdir().unwrap();
+
+        let lifecycle_lease = acquire_environment_lease(
+            recovery_root.path(),
+            &fixture.root.path().join("environments"),
+        )
+        .unwrap();
+        assert!(acquire_secondary_environment_lease(
+            recovery_root.path(),
+            fixture.root.path(),
+            &first.env_id,
+        )
+        .is_err());
+        drop(lifecycle_lease);
+
+        let (_first_record, first_lease) = acquire_secondary_environment_lease(
+            recovery_root.path(),
+            fixture.root.path(),
+            &first.env_id,
+        )
+        .unwrap();
+        assert!(acquire_secondary_environment_lease(
+            recovery_root.path(),
+            fixture.root.path(),
+            &first.env_id,
+        )
+        .is_err());
+        let (_second_record, second_lease) = acquire_secondary_environment_lease(
+            recovery_root.path(),
+            fixture.root.path(),
+            &second.env_id,
+        )
+        .unwrap();
+        drop(second_lease);
+        drop(first_lease);
     }
 
     #[test]
@@ -1064,8 +1627,15 @@ mod environment_commands_tests {
         let record = fixture.create_env("测试环境");
         let env_dir = secondary_data_dir(fixture.root.path(), &record.env_id);
         std::fs::create_dir_all(&env_dir).unwrap();
+        let recovery_root = tempfile::tempdir().unwrap();
 
-        delete_environment_inner(fixture.root.path(), &record.env_id).unwrap();
+        delete_environment_inner_with_process_check(
+            fixture.root.path(),
+            recovery_root.path(),
+            &record.env_id,
+            &|_| Ok(()),
+        )
+        .unwrap();
 
         // 档案行与目录一并移除。
         assert!(!env_dir.exists());
@@ -1076,20 +1646,136 @@ mod environment_commands_tests {
     }
 
     #[test]
+    fn deleting_one_environment_keeps_its_lock_and_allows_another_environment() {
+        let fixture = EnvFixture::new();
+        let first = fixture.create_env("测试环境甲");
+        let second = fixture.create_env("测试环境乙");
+        let first_dir = secondary_data_dir(fixture.root.path(), &first.env_id);
+        let second_dir = secondary_data_dir(fixture.root.path(), &second.env_id);
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        std::fs::write(first_dir.join("keep.txt"), "keep").unwrap();
+        let recovery_root = tempfile::tempdir().unwrap();
+        let storage_path = fixture.root.path().to_path_buf();
+        let recovery_path = recovery_root.path().to_path_buf();
+        let first_id = first.env_id.clone();
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_delete = std::thread::spawn(move || {
+            delete_environment_inner_with_process_check(
+                &storage_path,
+                &recovery_path,
+                &first_id,
+                &|_| {
+                    first_started_tx.send(()).unwrap();
+                    release_first_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|_| "test release timeout".to_string())?;
+                    Ok(())
+                },
+            )
+        });
+        first_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        // 相同数据目录仍被保护，但其他环境可越过短暂的容器锁继续删除。
+        assert!(acquire_secondary_environment_lease(
+            recovery_root.path(),
+            fixture.root.path(),
+            &first.env_id,
+        )
+        .is_err());
+        assert!(first_dir.join("keep.txt").is_file());
+        assert!(EnvironmentRegistry::new(fixture.root.path())
+            .find(&first.env_id)
+            .unwrap()
+            .is_some());
+
+        let storage_path = fixture.root.path().to_path_buf();
+        let recovery_path = recovery_root.path().to_path_buf();
+        let second_id = second.env_id.clone();
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let second_delete = std::thread::spawn(move || {
+            delete_environment_inner_with_process_check(
+                &storage_path,
+                &recovery_path,
+                &second_id,
+                &|_| {
+                    second_started_tx.send(()).unwrap();
+                    Ok(())
+                },
+            )
+        });
+        second_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        second_delete.join().unwrap().unwrap();
+        assert!(!second_dir.exists());
+
+        release_first_tx.send(()).unwrap();
+        first_delete.join().unwrap().unwrap();
+        assert!(!first_dir.exists());
+        assert!(EnvironmentRegistry::new(fixture.root.path())
+            .find(&first.env_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn delete_environment_rejects_master_and_missing() {
         let fixture = EnvFixture::new();
+        let recovery_root = tempfile::tempdir().unwrap();
         // 主库先建档：命中「主库不可删除」而非「档案不存在」。
         EnvironmentRegistry::new(fixture.root.path())
             .ensure_master()
             .unwrap();
         assert_eq!(
-            delete_environment_inner(fixture.root.path(), MASTER_ENV_ID).unwrap_err(),
+            delete_environment_inner_with_process_check(
+                fixture.root.path(),
+                recovery_root.path(),
+                MASTER_ENV_ID,
+                &|_| panic!("主库档案不应查询进程"),
+            )
+            .unwrap_err(),
             "environment_master_immutable"
         );
         assert_eq!(
-            delete_environment_inner(fixture.root.path(), "env-none").unwrap_err(),
+            delete_environment_inner_with_process_check(
+                fixture.root.path(),
+                recovery_root.path(),
+                "env-none",
+                &|_| panic!("缺失档案不应查询进程"),
+            )
+            .unwrap_err(),
             "environment_not_found"
         );
+    }
+
+    #[test]
+    fn delete_environment_unknown_process_state_preserves_record_and_directory() {
+        let fixture = EnvFixture::new();
+        let record = fixture.create_env("测试环境");
+        let env_dir = secondary_data_dir(fixture.root.path(), &record.env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(env_dir.join("keep.txt"), "keep").unwrap();
+        let recovery_root = tempfile::tempdir().unwrap();
+
+        let error = delete_environment_inner_with_process_check(
+            fixture.root.path(),
+            recovery_root.path(),
+            &record.env_id,
+            &|_| Err("process_state_unknown".to_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "process_state_unknown");
+        assert!(env_dir.join("keep.txt").is_file());
+        assert!(EnvironmentRegistry::new(fixture.root.path())
+            .find(&record.env_id)
+            .unwrap()
+            .is_some());
+        assert!(acquire_environment_lease(recovery_root.path(), &env_dir).is_ok());
     }
 
     #[test]
@@ -1101,8 +1787,15 @@ mod environment_commands_tests {
         let env_dir = secondary_data_dir(fixture.root.path(), &record.env_id);
         std::fs::create_dir_all(env_dir.parent().unwrap()).unwrap();
         std::fs::write(&env_dir, "not a directory").unwrap();
+        let recovery_root = tempfile::tempdir().unwrap();
 
-        let error = delete_environment_inner(fixture.root.path(), &record.env_id).unwrap_err();
+        let error = delete_environment_inner_with_process_check(
+            fixture.root.path(),
+            recovery_root.path(),
+            &record.env_id,
+            &|_| Ok(()),
+        )
+        .unwrap_err();
 
         // P11-5：稳定错误码 + 完整残留路径（冒号后为路径），供前端提示
         // 用户手动清理定位。
@@ -1112,6 +1805,7 @@ mod environment_commands_tests {
         );
         // 残留物仍在（不静默删除，铁律）。
         assert!(env_dir.exists());
+        assert!(acquire_environment_lease(recovery_root.path(), &env_dir).is_ok());
     }
 
     /// close 原语仅 Windows（taskkill）；进程列表查询只读安全。
@@ -1119,21 +1813,108 @@ mod environment_commands_tests {
     #[test]
     fn close_environment_missing_reports_not_found_without_process_actions() {
         let fixture = EnvFixture::new();
+        let process_actions = std::sync::atomic::AtomicUsize::new(0);
+        let close = |_dir: &Path| {
+            process_actions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CloseOutcome::NotRunning)
+        };
         // 档案不存在：先拒绝，不做任何进程操作。
         assert_eq!(
-            close_environment_instance_inner(fixture.root.path(), "env-none").unwrap_err(),
+            close_environment_instance_inner_with(fixture.root.path(), "env-none", &close)
+                .unwrap_err(),
             "environment_not_found"
         );
+        assert_eq!(process_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
-    /// close 原语仅 Windows（taskkill）；tempdir data_dir 不会有真实
-    /// TRAE 进程使用，走 NotRunning 幂等分支（无 taskkill、无等待）。
+    /// 未运行的关闭回执可重复得到，测试不查询或结束系统进程。
     #[cfg(windows)]
     #[test]
     fn close_environment_not_running_is_idempotent() {
         let fixture = EnvFixture::new();
         let record = fixture.create_env("测试环境");
-        let receipt = close_environment_instance_inner(fixture.root.path(), &record.env_id).unwrap();
-        assert_eq!(receipt.outcome, "not_running");
+        let process_checks = std::sync::atomic::AtomicUsize::new(0);
+        let close = |_dir: &Path| {
+            process_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CloseOutcome::NotRunning)
+        };
+        for _ in 0..2 {
+            let receipt =
+                close_environment_instance_inner_with(fixture.root.path(), &record.env_id, &close)
+                    .unwrap();
+            assert_eq!(receipt.outcome, "not_running");
+        }
+        assert_eq!(process_checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// 无法确认候选进程身份时保留未知原因，且不谎报未运行。
+    #[cfg(windows)]
+    #[test]
+    fn close_environment_unknown_process_state_is_reported() {
+        let fixture = EnvFixture::new();
+        let record = fixture.create_env("测试环境");
+        let process_checks = std::sync::atomic::AtomicUsize::new(0);
+        let close = |_dir: &Path| {
+            process_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(trae_instance_module::TraeInstanceCloseError::ProcessStateUnknown)
+        };
+
+        assert_eq!(
+            close_environment_instance_inner_with(fixture.root.path(), &record.env_id, &close)
+                .unwrap_err(),
+            "process_state_unknown"
+        );
+        assert_eq!(process_checks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod environment_seed_identity_tests {
+    use super::seed_environment_login_from_donor;
+    use std::path::Path;
+    use traesync_infrastructure::{construct_auth_identity, ConstructAuthInput, UserInfoFull};
+
+    fn seed_donor(instance_dir: &Path, user_id: &str) {
+        let info = UserInfoFull {
+            user_id: user_id.to_string(),
+            screen_name: format!("用户{user_id}"),
+            ..Default::default()
+        };
+        let input = ConstructAuthInput {
+            account_id: user_id,
+            access_token: "test-token",
+            refresh_token: "test-refresh",
+            access_token_expires_at_unix_seconds: 4_000_000_000,
+            refresh_token_expires_at_unix_seconds: 4_100_000_000,
+            user_info: &info,
+        };
+        construct_auth_identity(&input, instance_dir).unwrap();
+    }
+
+    #[test]
+    fn first_environment_login_rejects_wrong_donor_before_copying() {
+        let root = tempfile::tempdir().unwrap();
+        let donor = root.path().join("donor");
+        let environment = root.path().join("environment");
+        seed_donor(&donor, "account-c");
+
+        assert_eq!(
+            seed_environment_login_from_donor(&environment, &donor, "account-b").unwrap_err(),
+            "environment_seed_unavailable"
+        );
+        assert!(!environment.join("User/globalStorage/storage.json").exists());
+    }
+
+    #[test]
+    fn first_environment_login_copies_matching_donor() {
+        let root = tempfile::tempdir().unwrap();
+        let donor = root.path().join("donor");
+        let environment = root.path().join("environment");
+        seed_donor(&donor, "account-b");
+
+        seed_environment_login_from_donor(&environment, &donor, "account-b").unwrap();
+        assert!(environment
+            .join("User/globalStorage/storage.json")
+            .is_file());
     }
 }

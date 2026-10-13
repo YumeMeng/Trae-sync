@@ -8,12 +8,12 @@ interface AdapterAccountDetailProps {
   /** 面板归属产品（workbench 当前 adapter 的产品），由父层传入。 */
   productId: string;
   productName: string;
-  /** 适配器是否声明 switch 能力；不含能力时操作区不渲染。 */
-  canSwitch: boolean;
-  /** 切换事务进行中（同一时刻只允许一个切换）。 */
-  switchBusy: boolean;
-  /** 切换到此账号（父层接 handleAdapterSwitch）。 */
-  onSwitch: () => void;
+  /** 适配器是否声明工具账号选择能力；不含能力时操作区不渲染。 */
+  canSelectToolAccount: boolean;
+  /** 设置工具账号进行中（同一时刻只允许一个选择动作）。 */
+  toolSelectionBusy: boolean;
+  /** 设置工具当前账号（父层接账号选择处理器）。 */
+  onSelectToolAccount: () => void;
   /** 退出登录设备成功后联动：父层注入单账号健康检测。 */
   onSignedOut: () => void;
   /** 返回账号列表。 */
@@ -21,7 +21,7 @@ interface AdapterAccountDetailProps {
 }
 
 /**
- * 适配器产品的轻量账号详情（P10-5）：基础信息 + 可选切换 + 登录设备。
+ * 适配器产品的轻量账号详情（P10-5）：基础信息 + 可选工具账号选择 + 登录设备。
  * 设备管理绑定在每个账号上，不在账号列表页另设独立模块。
  * 信息字段只用适配器快照已有数据（AccountView），不发明新数据；
  * 内部标识收进默认折叠的技术细节区（界面表达纪律）。
@@ -30,9 +30,9 @@ export function AdapterAccountDetail({
   account,
   productId,
   productName,
-  canSwitch,
-  switchBusy,
-  onSwitch,
+  canSelectToolAccount,
+  toolSelectionBusy,
+  onSelectToolAccount,
   onSignedOut,
   onBack,
 }: AdapterAccountDetailProps) {
@@ -62,7 +62,7 @@ export function AdapterAccountDetail({
         </div>
       </header>
 
-      {/* 基础信息：状态徽章、当前使用标记、最近验证（全部来自适配器快照）。 */}
+      {/* 基础信息：凭据状态、工具内选择状态、最近验证（全部来自适配器快照）。 */}
       <section className="account-detail__section" aria-labelledby="adapter-account-detail-basic">
         <h2 id="adapter-account-detail-basic"><Coins size={16} aria-hidden="true" />基础信息</h2>
         <dl className="account-detail__facts">
@@ -75,14 +75,14 @@ export function AdapterAccountDetail({
             </dd>
           </div>
           <div className="account-detail__fact">
-            <dt>当前使用</dt>
+            <dt>工具内选择</dt>
             <dd data-testid="adapter-account-detail-current">
-              {account.isCurrent ? (
-                <span className="account-item__current-chip" title="当前产品正在使用的账号">
-                  使用中
+              {account.isToolSelected ? (
+                <span className="account-item__current-chip" title="仅表示 Trae Sync 工具内选择，不代表官方客户端登录状态">
+                  工具内已选
                 </span>
               ) : (
-                "否"
+                "工具内未选"
               )}
             </dd>
           </div>
@@ -93,21 +93,21 @@ export function AdapterAccountDetail({
         </dl>
       </section>
 
-      {/* 可选操作区：仅当适配器支持切换且目标不是当前账号时出现。 */}
-      {canSwitch && !account.isCurrent && (
+      {/* 可选操作区：仅当适配器支持工具账号选择且目标未选中时出现。 */}
+      {canSelectToolAccount && !account.isToolSelected && (
         <section className="account-detail__section" aria-labelledby="adapter-account-detail-actions">
           <h2 id="adapter-account-detail-actions">操作</h2>
           <div className="account-detail__actions">
             <button
               className="btn btn--primary"
               type="button"
-              disabled={switchBusy}
-              onClick={onSwitch}
-              data-testid="adapter-account-detail-switch"
-              title={`切换当前产品到 ${displayName}`}
+              disabled={toolSelectionBusy}
+              onClick={onSelectToolAccount}
+              data-testid="adapter-account-detail-tool-select"
+              title="只设置 Trae Sync 工具当前账号，不会改变官方 Trae CN 客户端登录状态"
             >
               <ArrowLeftRight size={15} aria-hidden="true" />
-              {switchBusy ? "切换中…" : "切换到此账号"}
+              {toolSelectionBusy ? "设置中…" : "设置工具当前账号"}
             </button>
           </div>
         </section>
