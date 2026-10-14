@@ -310,7 +310,7 @@ export function AccountDetail({
               {currentAccountStatus === "current" ? (
                 <span
                   className="account-item__current-chip"
-                  title="这是从 TRAE Work CN 登录材料中识别到的账号，不表示客户端进程此刻正在运行。"
+                  title="这是从 TRAE 登录材料中识别到的账号，不表示客户端进程此刻正在运行。"
                 >
                   使用中
                 </span>
@@ -488,7 +488,7 @@ export function AccountDetail({
       {/* P10-5 登录设备模块：设备操作排在常规操作之后、危险操作之前。 */}
       <RemoteDevicesPanel
         productId="work_cn"
-        productName="TRAE Work CN"
+        productName="TRAE"
         profileId={entry.profile_id}
         accountLabel={effectiveDisplayName(entry)}
         onSignedOut={() => {

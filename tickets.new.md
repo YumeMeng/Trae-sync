@@ -1338,6 +1338,14 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - 语义澄清（设计行为非故障）：① 客户端运行中（= 用户日常编辑器）时「可切换」栏恒 Blocked +「请先关闭主库 TRAE 窗口」——切号前必须关客户端的既有纪律；② 强制重置账号在客户端运行时被守卫拒绝（master_self_check_instance_running）——防把运行中状态写乱；主库自检每次读取都会实测纠正账号缓存（reconcile），一般无需手动重置。
 - 加载耗时实测（perf 探针，客户端运行中）：主库体检 4.0s/次（1.6GB 库 SQLCipher 打开 + 账号聚合，进页与每次动作后 load 触发）；进程状态查询 1.3-1.7s/次（PowerShell 子进程，环境页轮询每 5s 两个命令）；融合版整目录递归统计 8.3s（仅副环境 size 口径，主库行用三件套求和不受影响）；锁全部非阻塞 try_lock、HTTP 15s 超时、无死锁。性能优化（体检查询减负/进程查询缓存）留待独立票评估。
 
+**全面核查第二批修复（2026-10-14，用户要求全链路排查）**：
+- 历史页缓存失效根因（「很多地方加载很久无法完成」的核心机制）：`stat_master_fingerprint` 原含 -wal/-shm 的 mtime——主库=用户日常使用的融合版客户端（WAL 模式），任何写入活动（含 telemetry）都持续更新 wal，指纹永远变化 → 前端每次轮询判定「数据已变」全量重读（SQLCipher 打开+全表查询数秒），Work 时代主库客户端不常开故未暴露。已改指纹只认 db 主文件（WAL checkpoint 才触发重读，浏览场景接受分钟级延迟），模块头语义同步更新。唯一生产调用方 get_master_history，影响面收敛。
+- 签到通知前缀描述对象错误：`checkinNotification("work_cn", ...)` 硬编码取 Work CN displayName（「TRAE Work CN：签到流程已完成」），但签到实际是融合版账号的 SOLO 通道签到——CheckinPage 4 处改 `trae_cn`、App.tsx 自动签到摘要改「TRAE：」、测试断言 8 处同步（App.test 1 + CheckinPage.test 7）。
+- 账号指纹标签残留：`account_registry_display_label`/`managed_current_evidence`/browse 账号节点 3 处「TRAE Work CN · 指纹」→ `TraeProduct::TraeCn.display_name() · 指纹`（无 Rust 测试断言牵连）；AccountDetail「TRAE Work CN 登录材料」提示与 RemoteDevicesPanel productName 2 处改「TRAE」。
+- 核查确认正常（非漏网）：CN 归并/归档守卫（P13 实装即 TraeCn）、签到域（SOLO 通道凭据包无主库交互）、插件域（主库实测账号+凭据包，产品无关）、purge 主库租约、get_trae_instance_states（签到代次健康，archive_available 为 Work 时代次要悬浮信息保留）、process_controller（Work 凭据域，迁移后不再触达）、blob_keepalive（keepalive 原语未接线，P15-4 设计确认后实施）、lib.rs work_cn 分支路由（产品模型收口债项）。
+- 留债项（产品模型收口票）：productRegistry 双产品条目与 work_cn displayName、问候语「TRAE Work CN 工作台」、SettingsPanel origin 前缀逻辑、CheckinPage `sectionStateOf("work_cn")`/`product="work_cn"` 结构语义。
+- 验证：根 crate lib 220/0 全绿、typecheck 通过、Vitest 402/402 全绿。
+
 ### P15-9 文档收口
 
 **交付：** README/CONTEXT/ADR-0035 实施备注/模块矩阵与实际验收状态一致；Phase 14/15 遗留债项逐个有归属与下一任务理由。

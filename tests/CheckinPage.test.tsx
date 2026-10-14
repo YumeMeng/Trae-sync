@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+﻿import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { CheckinPage } from "../src/components/CheckinPage";
@@ -365,7 +365,7 @@ describe("CheckinPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
     await waitFor(() => {
-      expect(notifyMock.warning).toHaveBeenCalledWith("TRAE Work CN：部分签到未完成，请查看逐账号结果。");
+      expect(notifyMock.warning).toHaveBeenCalledWith("TRAE：部分签到未完成，请查看逐账号结果。");
     });
     expect(screen.getByText("设备刚创建，请等待约 5 分钟后重试")).toBeInTheDocument();
   });
@@ -413,7 +413,7 @@ describe("CheckinPage", () => {
       resolveRun(summary([result("profile-login-1"), result("profile-login-2")]));
     });
     await waitFor(() => {
-      expect(notifyMock.success).toHaveBeenCalledWith("TRAE Work CN：签到流程已完成。");
+      expect(notifyMock.success).toHaveBeenCalledWith("TRAE：签到流程已完成。");
     });
     expect(screen.queryByTestId("checkin-inter-wait")).not.toBeInTheDocument();
   });
@@ -439,7 +439,7 @@ describe("CheckinPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
     await waitFor(() => {
-      expect(notifyMock.success).toHaveBeenCalledWith("TRAE Work CN：签到流程已完成。");
+      expect(notifyMock.success).toHaveBeenCalledWith("TRAE：签到流程已完成。");
     });
     // U-3 单列表演进式：结果直接落在行内（无独立结果列表）。
     // 已签到账号显示「今日已签到」；新领取账号展示成功。
@@ -475,7 +475,7 @@ describe("CheckinPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
     await waitFor(() => {
-      expect(notifyMock.warning).toHaveBeenCalledWith("TRAE Work CN：部分签到未完成，请查看逐账号结果。");
+      expect(notifyMock.warning).toHaveBeenCalledWith("TRAE：部分签到未完成，请查看逐账号结果。");
     });
     // ADR-0019：业务码原样透出，不压平为通用失败（U-3 起结果只在行内出现一次）。
     expect(screen.getAllByText(/设备信息未获服务端信任（9074）/)).toHaveLength(1);
@@ -490,7 +490,7 @@ describe("CheckinPage", () => {
     render(<CheckinPage active={true} onNavigate={vi.fn()} />);
 
     await waitFor(() => {
-      expect(notifyMock.error).toHaveBeenCalledWith("TRAE Work CN：本机登录存储不可用，请检查磁盘后重试。");
+      expect(notifyMock.error).toHaveBeenCalledWith("TRAE：本机登录存储不可用，请检查磁盘后重试。");
     });
   });
 
@@ -504,7 +504,7 @@ describe("CheckinPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
     await waitFor(() => {
-      expect(notifyMock.error).toHaveBeenCalledWith("TRAE Work CN：签到未完成，请稍后重试。");
+      expect(notifyMock.error).toHaveBeenCalledWith("TRAE：签到未完成，请稍后重试。");
     });
   });
 
@@ -525,7 +525,7 @@ describe("CheckinPage", () => {
       run.resolve(summary([result("profile-login-1")]));
     });
 
-    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("TRAE Work CN：签到流程已完成。"));
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("TRAE：签到流程已完成。"));
     expect(screen.getByText("已签")).toBeInTheDocument();
   });
 

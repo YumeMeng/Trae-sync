@@ -343,7 +343,8 @@ fn managed_accounts_wire_view(
 
 fn account_registry_display_label(account: &BrowseAccountNode) -> String {
     UserId::from_verified(&account.user_id)
-        .map(|value| format!("TRAE Work CN · {}", user_id_display_fingerprint(&value)))
+        // P15-6：融合版账号卡的来源标注（Work CN 客户端已停服迁移）。
+        .map(|value| format!("{} · {}", TraeProduct::TraeCn.display_name(), user_id_display_fingerprint(&value)))
         .unwrap_or_else(|_| {
             let label = account.display_label.trim();
             if label.is_empty() {
@@ -627,7 +628,8 @@ fn managed_current_evidence(
         .map(|fingerprint| managed_profile_id(&data_location_id, fingerprint));
     let display_name = user_fingerprint
         .as_deref()
-        .map(|fingerprint| format!("TRAE Work CN · {}", &fingerprint[..16]));
+        // P15-6：融合版账号显示名（Work CN 客户端已停服迁移）。
+        .map(|fingerprint| format!("{} · {}", TraeProduct::TraeCn.display_name(), &fingerprint[..16]));
     let verification_state = managed_verification_state(account);
     CurrentAccountEvidence {
         profile_id,
@@ -5439,8 +5441,10 @@ fn browse_history_inner(state: &AppState) -> Result<BrowseResult, String> {
                 if let Some(uid) = account.user_id.as_ref() {
                     accounts.push(BrowseAccountNode {
                         user_id: uid.as_str().to_string(),
+                        // P15-6：融合版来源标注。
                         display_label: format!(
-                            "TRAE Work CN · {}",
+                            "{} · {}",
+                            TraeProduct::TraeCn.display_name(),
                             user_id_display_fingerprint(uid)
                         ),
                         project_count: 0,

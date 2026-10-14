@@ -141,7 +141,7 @@ export default function App() {
       const suffix = failed > 0
         ? `（失败 ${failed}${skipped > 0 ? `，跳过 ${skipped}` : ""}）`
         : skipped > 0 ? `（跳过 ${skipped}）` : "";
-      notify.summary(`TRAE Work CN：今日自动签到完成${suffix}`, [], completed);
+      notify.summary(`TRAE：今日自动签到完成${suffix}`, [], completed);
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;

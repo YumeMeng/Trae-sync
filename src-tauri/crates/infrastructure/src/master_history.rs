@@ -10,9 +10,14 @@
 //! - 只读打开复用 `sqlcipher::open_with_key_readonly` 的隔离三件套机制
 //!   （WAL 兼容，主库实例运行中可随时读取，不阻塞 TRAE 写入）。
 //!
-//! 准实时新鲜度：`stat_master_fingerprint` 只 stat 三件套 mtime/size
-//! （不复制不读取），前端轮询比对，变化才触发 `read_master_history` 全量
-//! 重读——主库按正常/归档状态读取，无需高水位增量。
+//! 准实时新鲜度：`stat_master_fingerprint` 只 stat 主库 db 主文件的
+//! mtime/size（不复制不读取），前端轮询比对，变化才触发
+//! `read_master_history` 全量重读——主库按正常/归档状态读取，无需高水位增量。
+//! P15-6：主库 = 用户日常使用的融合版客户端（WAL 模式），-wal/-shm 的
+//! mtime 随客户端任何写入活动（含 telemetry）持续变化；若纳入指纹，客户端
+//! 运行期间历史页会永远判定「数据已变」而每次轮询全量重读（SQLCipher 打开
+//! + 全表查询数秒），缓存机制失效（2026-10-14 用户实测「加载很久无法完成」）。
+//! 指纹只认 db 主文件：WAL checkpoint 时才触发重读，浏览场景接受分钟级延迟。
 
 use std::path::Path;
 
@@ -407,19 +412,16 @@ fn read_master_history_inner(
     Some((projects, sessions))
 }
 
-/// stat 主库三件套指纹（只 stat，不复制不读取；轮询预检用）。
+/// stat 主库指纹（只 stat，不复制不读取；轮询预检用）。
+///
+/// 只认 db 主文件（checkpoint 才变），wal/shm 置 None——客户端运行中
+/// WAL 侧文件持续变化，纳入指纹会让历史页缓存失效（见模块头 P15-6 说明）。
 pub fn stat_master_fingerprint(master_data_dir: &Path) -> InstanceFingerprint {
     let db_path = master_database_path(master_data_dir);
     InstanceFingerprint {
         db: stat_file_fingerprint(&db_path),
-        wal: stat_file_fingerprint(&db_path.with_file_name(format!(
-            "{}-wal",
-            db_path.file_name().unwrap_or_default().to_string_lossy()
-        ))),
-        shm: stat_file_fingerprint(&db_path.with_file_name(format!(
-            "{}-shm",
-            db_path.file_name().unwrap_or_default().to_string_lossy()
-        ))),
+        wal: None,
+        shm: None,
     }
 }
 

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+﻿import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import type { WorkspaceStateDto } from "../src/types/workspace";
@@ -133,7 +133,7 @@ describe("应用工作区入口", () => {
 
     // 跨页摘要：失败/跳过计数收进标题，成功数经 notify.summary 的 okCount 承载。
     await waitFor(() => {
-      expect(notifyMock.summary).toHaveBeenCalledWith("TRAE Work CN：今日自动签到完成（失败 1，跳过 1）", [], 2);
+      expect(notifyMock.summary).toHaveBeenCalledWith("TRAE：今日自动签到完成（失败 1，跳过 1）", [], 2);
     });
   });
 

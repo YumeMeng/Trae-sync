@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -125,7 +125,7 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
           // 读取失败必须可见：静默置空会把真实故障伪装成“还没有账号”。
           if (!cancelled) {
             setOverview([]);
-            notify.error(checkinNotification("work_cn", safeUiErrorMessage(reason, "账号总览读取失败。")));
+            notify.error(checkinNotification("trae_cn", safeUiErrorMessage(reason, "账号总览读取失败。")));
           }
         });
     } else if (capability.transport === "fixture") {
@@ -267,15 +267,15 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
       const next = await invoke<CheckinBatchSummaryDto>("run_checkin", { profileIds: [...ids] });
       setSummary(next);
       // 批次结果走全局通知：全成功按成功档，部分失败按警告档（异常原因仍在逐行结果里）。
-      if (next.failed === 0) notify.success(checkinNotification("work_cn", "签到流程已完成。"));
-      else notify.warning(checkinNotification("work_cn", "部分签到未完成，请查看逐账号结果。"));
+      if (next.failed === 0) notify.success(checkinNotification("trae_cn", "签到流程已完成。"));
+      else notify.warning(checkinNotification("trae_cn", "部分签到未完成，请查看逐账号结果。"));
       // 签到会更新积分缓存（后端写回）；刷新总览让“今日已签/积分”同步。
       if (realMode) {
         const entries = await invoke<CheckinOverviewEntryDto[]>("get_checkin_overview").catch(() => null);
         if (entries) setOverview(entries);
       }
     } catch (reason: unknown) {
-      notify.error(checkinNotification("work_cn", safeUiErrorMessage(reason, "签到未完成，请稍后重试。")));
+      notify.error(checkinNotification("trae_cn", safeUiErrorMessage(reason, "签到未完成，请稍后重试。")));
     } finally {
       setBusy(false);
       setRunIds([]);
