@@ -1334,6 +1334,9 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - 修复 14 处（全部切 TraeProduct::TraeCn）：environment.rs 6（主库聚焦启动/主库状态/列表默认目录与逐行状态/删除守卫/副环境启动/副环境登录关停/主副关闭）；library_archive.rs 5（ctx 关闭与重启/备份守卫/删除守卫/合并守卫）；credential_handover.rs 3（自检状态/重置默认目录/重置守卫）。
 - 保留 WorkCn（Work 语义非漏网）：双产品身份发现（530-583）、purge 旧原生目录（5162-5173）、work_cn library_id 反查（library_archive 266）、instance_tools 测试参数（281/325/348）。
 - 验证：根 crate lib 220/0 全绿；诊断探针实测修复后语义 `TraeCn×融合版=Running`；一次性探针已清理。
+- 补充修复（同日，用户回报「可切换」持续异常）：`get_master_self_check_inner` 的 `donor_available` 仍检查 Work 时代 `trae-instances\{profile_id}` 存档目录（16 账号仅 6 个有旧目录，含 2 个已删账号残留），而融合版切号真实依赖 `.fused` 容器（16/16 齐全）——多数账号关掉客户端后仍误报「当前账号没有可用的登录存档」。已改按 `FusedLoginStore::exists(profile_id)` 判定。
+- 语义澄清（设计行为非故障）：① 客户端运行中（= 用户日常编辑器）时「可切换」栏恒 Blocked +「请先关闭主库 TRAE 窗口」——切号前必须关客户端的既有纪律；② 强制重置账号在客户端运行时被守卫拒绝（master_self_check_instance_running）——防把运行中状态写乱；主库自检每次读取都会实测纠正账号缓存（reconcile），一般无需手动重置。
+- 加载耗时实测（perf 探针，客户端运行中）：主库体检 4.0s/次（1.6GB 库 SQLCipher 打开 + 账号聚合，进页与每次动作后 load 触发）；进程状态查询 1.3-1.7s/次（PowerShell 子进程，环境页轮询每 5s 两个命令）；融合版整目录递归统计 8.3s（仅副环境 size 口径，主库行用三件套求和不受影响）；锁全部非阻塞 try_lock、HTTP 15s 超时、无死锁。性能优化（体检查询减负/进程查询缓存）留待独立票评估。
 
 ### P15-9 文档收口
 

@@ -3825,12 +3825,12 @@ fn get_master_self_check_inner(
     let donor_profile_id = observed_profile_id
         .as_deref()
         .or(record.current_profile_id.as_deref());
+    // P15-6：融合版切号的真实依赖是 `.fused` 登录容器（P15-1 铸造，16/16
+    // 齐全）；Work 时代的 trae-instances 存档目录只覆盖少量旧实例，按它
+    // 判定会让多数账号误报「没有可用的登录存档」（用户实测 2026-10-14）。
+    let fused_root = storage_root.join("fused-login");
     let donor_available = donor_profile_id
-        .map(|profile_id| {
-            instance_data_dir(storage_root, profile_id)
-                .map(|path| path.is_dir())
-                .unwrap_or(false)
-        })
+        .map(|profile_id| FusedLoginStore::new(&fused_root).exists(profile_id))
         .unwrap_or(true);
     let ledger_valid = RelayLedger::new(storage_root.join("environments"))
         .load()
