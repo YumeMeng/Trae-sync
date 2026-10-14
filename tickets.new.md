@@ -1356,8 +1356,47 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - [x] 遗留债项清单（含 Work 目录清理、旧客户端卸载等用户后续动作）逐项登记
   - P15-7 移交：① 前端产品模型收口（切换器隐藏 + 三态翻转 + ProductId 塌缩 + 惰性 `checkin.claim` 注册表条目清理）；② 融合版新账号登录闭环（`complete_trae_cn_login` 保存目标从旧池根改造为 Work 档案登记 + 融合容器铸造）；③ `TraeProduct::WorkCn` 变体处置评估（Work 停服、迁移验收后随旧目录清理定案）
 
+### P15-10 前端产品模型收口（单产品塌缩）
+
+**交付：** 前端产品模型从双产品（work_cn/trae_cn）塌缩为单产品（融合版 TRAE），界面、通知、问候语零「TRAE Work CN」表述；产品切换器死代码移除；E2E 产品切换器 spec 重写为单产品断言。10-23 Work 停服前完成（停服后界面残留 Work CN 表述即纯误导）。
+
+**Blocked by:** P15-8（已完成）。实现建议：新会话从本票 `/implement`，内部走 `/tdd`，收尾 `/code-review`。
+
+**设计决策（预答，实现时不再摇摆）：**
+- 协议值稳定、展示层塌缩：后端命令参数 `product_id`、product-state 指针值（已是 `trae_cn`）、`library_id`（master/trae_cn 库实例引用）**保持现有字符串不动**；塌缩只发生在前端类型与展示层。
+- `ProductId` 联合类型删除，需要产品标识处用常量 `CURRENT_PRODUCT_ID = "trae_cn"`（types/product.ts 同步）。
+- 账号域语义与产品身份分离：accountAdapter/签到域内部的 Work 账号档案标识（Work 迁移账号池）不是产品切换概念，其内部字符串值保留；仅对外展示名统一「TRAE」。
+- 三态退化：`PRODUCT_SECTION_STATES` 双产品映射 → 单产品对象（六区块全 ready），`sectionStateOf` 简化为直查；`workspaceStateForProduct` 的诚实空上下文分支删除（融合版数据已 ready）。
+- `library_id` 模型保留：`TRAE_CN_LIBRARY_ID` 只读根引用、`detailLibraryRefFor` 主库注入是库实例概念，不在本票范围。
+- 后端死分支清理：lib.rs `product_id == "work_cn"` 主库实测分支（前端塌缩后不可达）删除，Rust lib 测试同步；`get_product_identity_state`/`operation_states` DTO 结构不动（后端注册表保持结构化返回）。
+- `checkin.claim` 惰性注册表条目清理（P15-7 债项 ③ 随本票落地）。
+
+**改造清单（2026-10-14 摸底，16 文件约 120 处 work_cn/ProductId 引用）：**
+1. `productRegistry.ts`（13 处）：PRODUCT_DEFINITIONS/SECTION_STATES/sectionStateOf/workspaceStateForProduct 塌缩；displayName 单条目「TRAE」。
+2. `App.tsx`/`TitleBar.tsx`（6 处）：产品切换器死代码移除；问候语「TRAE Work CN 工作台」→「TRAE 工作台」。
+3. `SettingsPanel.tsx`（18 处）：`origin === "work_cn"` 通知前缀分支塌缩。
+4. `AccountCenter.tsx`（40 处）+ `AccountDetail`/`AdapterAccountDetail`/`RemoteDevicesPanel`（11 处）：productId props、bound_products 消费、`sectionStateOf` 引用跟随。
+5. `CheckinPage.tsx`（4 处）：`sectionStateOf` 直查、通知前缀直取单产品。
+6. `EnvironmentPage.tsx`（4 处）/`LibrarySessionsPanel.tsx`（3 处）/`CapabilitySection.tsx`（2 处）：三态消费跟随。
+7. `accountAdapter.ts`（11 处）：适配器产品路由塌缩（账号域内部标识值保留）。
+8. `types/`（batchProgress 2/product 4/workspace 1）：类型定义收敛。
+9. 测试同步：Vitest 断言（OverviewPage 问候语/SettingsPanel origin/App/AccountCenter bound_products）、e2e mock-bridge 3 处 display_name、ui-acceptance.spec.ts:207 产品切换器 spec 重写为「单产品五页全开放」。
+10. 后端：lib.rs 死分支删除 + `checkin.claim` 注册表条目清理 + Rust lib 测试同步。
+
+**验收标准：**
+- `grep -r "work_cn" src/` 仅剩协议值常量与注释（零字面量散落）；用户可见文案零「TRAE Work CN」/「Work CN」。
+- `pnpm typecheck` 通过、Vitest 全绿（含改造后断言）、Playwright E2E 全绿（spec 重写后）。
+- Rust lib 测试全绿（死分支清理后）。
+- 手动冒烟：五页导航正常、签到/账号/环境/历史/设置功能与塌缩前一致。
+
+### P15-11 主库体检性能优化（方案先定再实现）
+
+**交付：** 主库体检 4.0s/次（1.6GB 库 SQLCipher 打开 ~1s + 账号聚合 ~3s）与环境页进程查询 1.4s/次的感知优化。**Blocked by:** P15-5 真实切号验收完成（避免验收期间引入行为变量）。
+
+**前置：** 先 grill 定方案再实现——方案空间：连接缓存（SQLCipher 打开成本复用，需管理生命周期与失效）/ 预聚合（体检结果落缓存，指纹失效）/ 拆分按需（体检拆为轻量摘要 + 重查询懒加载）/ 进程查询缓存（PowerShell 结果 TTL 复用）。约束：不改变体检语义与回执形状（前端契约测试锁定）；客户端运行中场景正确（WAL 并发读）。
+
 ### 执行批次与边界（Phase 15）
 
-推荐批次：P15-0 → P15-1（阶段一，10-18 前）→ P15-2（用户确认）→ P15-3 与 P15-4 并行（文件不重叠）→ P15-5、P15-6 → P15-7 → P15-8 → P15-9。Blocked by 才是真正依赖；真实破坏性操作（数据删除、主库绑定切换、首次真实切号）执行点单次确认保持。执行纪律沿用 Phase 14 末段（子 agent 调度限制、文件责任串行、证据分账）。
+推荐批次：P15-0 → P15-1（阶段一，10-18 前）→ P15-2（用户确认）→ P15-3 与 P15-4 并行（文件不重叠）→ P15-5、P15-6 → P15-7 → P15-8 → P15-9 → P15-10（10-23 停服前）→ P15-11（真实切号验收后）。Blocked by 才是真正依赖；真实破坏性操作（数据删除、主库绑定切换、首次真实切号）执行点单次确认保持。执行纪律沿用 Phase 14 末段（子 agent 调度限制、文件责任串行、证据分账）。
 
 本期不做：海外版适配、融合版 Agent/IDE 功能开发、副环境扩展、Work 客户端卸载与目录清理（用户验收后另行执行）、融合版客户端原生多账号逆向（官方无此 UI）。发现阻断性事实立即更正任务与决策并同步 ADR/CONTEXT。
