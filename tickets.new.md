@@ -1328,6 +1328,13 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - 收尾：隔离目录已删除、快照还原完成、真实存储根与 fused-login 容器仅发生设计内写入（容器保鲜/构造为账号级凭据材料，属预期副作用）。
 - 遗留：真实切号（用户单次确认）、首次切号设备身份闭环、默认目录实例启停验收仍按关口执行。
 
+**P15-6 漏网修复（2026-10-14，用户实测「主库页面状态未知」触发）**：
+- 根因：P15-6 只单点切换了 `master_data_dir()`（21 个 caller 自动跟随目录），但环境域散落的 **TraeProduct 产品参数未随目录同切**——进程匹配按 WorkCn 规则（TRAE SOLO CN.exe/trae.exe）处理融合版目录：crashpad 子进程带融合版 `--user-data-dir` 且 exe 为 TraeCn → 「目录匹配但产品不匹配」→ Unknown 毒化整体状态（探针实测 `WorkCn×融合版=Unknown`，`TraeCn×融合版=Running`）。
+- 影响：主库/副环境状态恒「状态未知」；聚焦/启动按钮按 WorkCn exe 规则找不到融合版安装必失败；关闭匹配 NoMatch 关不掉；备份/删除/合并守卫 fail-closed 卡死；主库自检与强制重置同源失效。
+- 修复 14 处（全部切 TraeProduct::TraeCn）：environment.rs 6（主库聚焦启动/主库状态/列表默认目录与逐行状态/删除守卫/副环境启动/副环境登录关停/主副关闭）；library_archive.rs 5（ctx 关闭与重启/备份守卫/删除守卫/合并守卫）；credential_handover.rs 3（自检状态/重置默认目录/重置守卫）。
+- 保留 WorkCn（Work 语义非漏网）：双产品身份发现（530-583）、purge 旧原生目录（5162-5173）、work_cn library_id 反查（library_archive 266）、instance_tools 测试参数（281/325/348）。
+- 验证：根 crate lib 220/0 全绿；诊断探针实测修复后语义 `TraeCn×融合版=Running`；一次性探针已清理。
+
 ### P15-9 文档收口
 
 **交付：** README/CONTEXT/ADR-0035 实施备注/模块矩阵与实际验收状态一致；Phase 14/15 遗留债项逐个有归属与下一任务理由。

@@ -191,11 +191,12 @@ impl LibraryContextInstanceOps for LibraryContext {
         &self,
     ) -> Result<trae_instance_module::CloseOutcome, trae_instance_module::TraeInstanceCloseError>
     {
-        close_instance(TraeProduct::WorkCn, &self.dir)
+        // P15-6：库上下文实例（主库/副环境）由融合版客户端承载。
+        close_instance(TraeProduct::TraeCn, &self.dir)
     }
 
     fn relaunch(&self, window_title: &str) -> Result<TraeInstanceLaunchDto, String> {
-        launch_instance_common(TraeProduct::WorkCn, &self.dir, window_title, None)
+        launch_instance_common(TraeProduct::TraeCn, &self.dir, window_title, None)
     }
 }
 
@@ -1771,8 +1772,10 @@ pub(crate) async fn create_master_backup(
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
         let _lease = OperationLease::acquire_shared_for_path(&recovery_root, &master_dir)
             .map_err(|error| format!("operation_lease_unavailable:{error}"))?;
+        // P15-6：备份守卫针对融合版主库实例（WorkCn 规则对 Trae CN 进程
+        // 会误判 Unknown 拒绝，或客户端运行时漏判——与目录产品同源）。
         crate::process_guard::ensure_product_stopped(
-            TraeProduct::WorkCn,
+            TraeProduct::TraeCn,
             &master_dir,
             "master_backup_running",
         )?;
@@ -2649,8 +2652,9 @@ pub(crate) async fn delete_master_sessions(
             acquire_library_write_lease(&recovery_root, &storage_root, library_id.as_deref())?;
         ctx.ensure_writable()?;
         let current_account = require_library_account(&material_root, &storage_root, &ctx)?;
+        // P15-6：删除守卫针对融合版实例（与目录产品同源）。
         crate::process_guard::ensure_product_stopped(
-            TraeProduct::WorkCn,
+            TraeProduct::TraeCn,
             &ctx.dir,
             "master_delete_running",
         )?;
@@ -2727,8 +2731,9 @@ pub(crate) async fn merge_master_projects(
         let (ctx, lifecycle_lease) =
             prepare_library_write_context(&recovery_root, &storage_root, library_id.as_deref())?;
         let ensure_stopped = |ctx: &LibraryContext| {
+            // P15-6：合并守卫针对融合版实例（与目录产品同源）。
             crate::process_guard::ensure_product_stopped(
-                TraeProduct::WorkCn,
+                TraeProduct::TraeCn,
                 &ctx.dir,
                 "master_merge_running",
             )

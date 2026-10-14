@@ -3818,8 +3818,10 @@ fn get_master_self_check_inner(
         (Some(cached), Some(observed)) => cached == observed,
         _ => false,
     };
+    // P15-6：主库自检的实例状态按融合版产品判定（与 master_data_dir 同源；
+    // WorkCn 规则会把 Trae CN 客户端判为不可归属，自检恒报状态未知）。
     let process_state =
-        trae_instance_module::current_product_process_state(TraeProduct::WorkCn, &master_dir);
+        trae_instance_module::current_product_process_state(TraeProduct::TraeCn, &master_dir);
     let donor_profile_id = observed_profile_id
         .as_deref()
         .or(record.current_profile_id.as_deref());
@@ -3986,7 +3988,8 @@ pub(crate) async fn force_reset_master_current_account(
             master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
         let processes = list_trae_processes()
             .map_err(|_| "master_self_check_process_unavailable".to_string())?;
-        let default_data_dir = trae_instance_module::default_product_data_dir(TraeProduct::WorkCn);
+        // P15-6：重置守卫按融合版产品判定运行态（与 master_data_dir 同源）。
+        let default_data_dir = trae_instance_module::default_product_data_dir(TraeProduct::TraeCn);
         force_reset_master_current_account_inner(
             &storage_root,
             &master_dir,
@@ -4007,7 +4010,7 @@ fn force_reset_master_current_account_inner(
 ) -> Result<bool, String> {
     let process_state = trae_instance_module::product_process_state(
         processes,
-        TraeProduct::WorkCn,
+        TraeProduct::TraeCn,
         master_dir,
         default_data_dir,
     );

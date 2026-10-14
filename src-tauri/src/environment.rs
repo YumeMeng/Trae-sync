@@ -145,8 +145,10 @@ fn launch_master_library_inner(
         })
         .unwrap_or_else(|| "主库".to_string());
     // 主库 = 官方目录（2026-08-31 修订）：用户官方启动的实例也算「已运行」，
-    // 聚焦它而不是再起一个。
-    launch_instance_common(TraeProduct::WorkCn, &instance_dir, &window_title, None)
+    // 聚焦它而不是再起一个。P15-6：主库目标 = 融合版客户端（Trae CN.exe），
+    // exe 定位/进程匹配随目标目录同切产品（WorkCn 规则下 crashpad 子进程
+    // 带融合版 --user-data-dir 会毒化为 Unknown，实测 2026-10-14）。
+    launch_instance_common(TraeProduct::TraeCn, &instance_dir, &window_title, None)
 }
 
 /// 查询主库环境状态（档案 + 运行态 + 登录态）。
@@ -221,8 +223,9 @@ fn get_environment_state_inner(
         .ensure_master()
         .map_err(|_| "environment_registry_invalid".to_string())?;
     let instance_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
-    // 运行态：主库 = 官方目录，官方快捷方式无参启动的实例同样算运行中。
-    let process_state = current_product_process_state(TraeProduct::WorkCn, &instance_dir);
+    // 运行态：主库 = 官方目录（融合版，P15-6），产品身份与目录同源——
+    // WorkCn 规则会把 Trae CN 客户端全部判为不可归属（状态未知）。
+    let process_state = current_product_process_state(TraeProduct::TraeCn, &instance_dir);
     // 当前账号实测优先（官方登录/登出后注册表缓存过期）：
     // 账号注册表一次加载，供 userId 反查 profile 与显示名解析。
     let accounts = AccountRegistry::new(material_root)
@@ -415,7 +418,8 @@ fn list_environments_inner(
 
     // 列表共享一次进程快照；查询失败时各环境状态保留 unknown。
     let processes = list_trae_processes().ok();
-    let default_data_dir = default_product_data_dir(TraeProduct::WorkCn);
+    // P15-6：环境实例（主库 + 副环境）都由融合版客户端承载，产品身份同切。
+    let default_data_dir = default_product_data_dir(TraeProduct::TraeCn);
     let master_dir = master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
     // 主库当前账号实测优先（官方登录/登出后注册表缓存过期）；
     // 副环境登录由工具托管，注册表值即权威，不做实测纠正。
@@ -443,7 +447,7 @@ fn list_environments_inner(
                 .map(|processes| {
                     product_process_state(
                         processes,
-                        TraeProduct::WorkCn,
+                        TraeProduct::TraeCn,
                         &data_dir,
                         default_data_dir.as_deref(),
                     )
@@ -602,8 +606,9 @@ fn delete_environment_inner(
     env_id: &str,
 ) -> Result<bool, String> {
     delete_environment_inner_with_process_check(storage_root, recovery_root, env_id, &|env_dir| {
+        // P15-6：删除守卫针对融合版实例进程（与实例启动/关闭同产品语义）。
         crate::process_guard::ensure_product_stopped(
-            TraeProduct::WorkCn,
+            TraeProduct::TraeCn,
             env_dir,
             "environment_delete_running",
         )
@@ -678,7 +683,8 @@ pub(crate) async fn launch_environment(
             acquire_secondary_environment_lease(&recovery_root, &storage_root, &env_id)?;
         let env_dir = secondary_data_dir(&storage_root, &record.env_id);
         // 窗口标题用环境名（并行环境按名区分；账号名可能未登录或跨环境重复）。
-        launch_instance_common(TraeProduct::WorkCn, &env_dir, &record.name, None)
+        // P15-6：副环境实例由融合版客户端承载（--user-data-dir 并行多开）。
+        launch_instance_common(TraeProduct::TraeCn, &env_dir, &record.name, None)
     })
     .await
 }
@@ -723,7 +729,8 @@ fn close_environment_instance_inner(
     storage_root: &Path,
     env_id: &str,
 ) -> Result<EnvironmentCloseDto, String> {
-    let close = |instance_dir: &Path| close_instance(TraeProduct::WorkCn, instance_dir);
+    // P15-6：主库/副环境实例都由融合版客户端承载，关闭匹配同切产品。
+    let close = |instance_dir: &Path| close_instance(TraeProduct::TraeCn, instance_dir);
     close_environment_instance_inner_with(storage_root, env_id, &close)
 }
 
@@ -805,8 +812,10 @@ fn login_environment_inner(
     env_id: &str,
     profile_id: &str,
 ) -> Result<EnvironmentLoginReceiptDto, String> {
-    let close_environment =
-        |env_dir: &Path| close_instance(TraeProduct::WorkCn, env_dir).map(|_| ());
+    let close_environment = |env_dir: &Path| {
+        // P15-6：副环境登录前关停融合版实例（与启动/状态同产品语义）。
+        close_instance(TraeProduct::TraeCn, env_dir).map(|_| ())
+    };
     let switch_identity = |record: &traesync_infrastructure::account_registry::AccountRecord,
                            donor_dir: &Path,
                            env_dir: &Path| {
