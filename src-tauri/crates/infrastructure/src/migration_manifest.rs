@@ -149,7 +149,8 @@ pub(crate) fn freeze_unfinished(
     match fs::symlink_metadata(&root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => return Err(MigrationManifestError::RecoveryRootUnavailable),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
             return Err(MigrationManifestError::RecoveryRootUnavailable)
         }
         Ok(_) => {}
@@ -266,7 +267,8 @@ fn ensure_directory_chain(path: &Path) -> Result<(), MigrationManifestError> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            // P16-T6：防逃逸判定统一走 link_guard。
+            Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
                 return Err(MigrationManifestError::RecoveryRootUnavailable)
             }
             Ok(_) => {}

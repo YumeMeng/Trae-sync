@@ -238,7 +238,8 @@ fn map_catalog_error(error: CatalogPathError) -> ProductionCatalogError {
 fn recovery_has_non_lock_entries(path: &Path) -> Result<bool, ProductionCatalogError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|_| ProductionCatalogError::ExistingStateIncomplete)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
         return Err(ProductionCatalogError::ExistingStateIncomplete);
     }
     let entries =
@@ -259,7 +260,7 @@ fn validate_recovery_root(
 ) -> Result<PathBuf, ProductionCatalogError> {
     let recovery_metadata = fs::symlink_metadata(recovery_root)
         .map_err(|_| ProductionCatalogError::ExistingStateIncomplete)?;
-    if !recovery_metadata.is_dir() || is_reparse_point(&recovery_metadata) {
+    if !recovery_metadata.is_dir() || crate::link_guard::metadata_is_reparse_link(&recovery_metadata) {
         return Err(ProductionCatalogError::ExistingStateIncomplete);
     }
     let canonical_recovery = recovery_root
@@ -284,7 +285,8 @@ fn directory_has_entries(path: &Path) -> Result<bool, ProductionCatalogError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => return Err(ProductionCatalogError::ExistingStateIncomplete),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    // P16-T6：防逃逸判定统一走 link_guard。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
         return Err(ProductionCatalogError::ExistingStateIncomplete);
     }
     fs::read_dir(path)
@@ -299,20 +301,8 @@ fn random_hex(byte_count: usize) -> Result<String, ProductionCatalogError> {
     Ok(hex::encode(bytes))
 }
 
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
+// P16-T6：原本地 is_reparse_point（is_symlink + 0x400）已删除——
+// 判定统一收敛到 crate::link_guard::metadata_is_reparse_link（逻辑只改一处）。
 
 fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]

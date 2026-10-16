@@ -589,7 +589,7 @@ impl CheckinCredentialStore {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let metadata = fs::symlink_metadata(&marker_path)
                     .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
-                if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+                if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
                     return Err(CheckinCredentialError::RecoveryRequired);
                 }
                 let existing =
@@ -629,7 +629,7 @@ impl CheckinCredentialStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
             Err(_) => return Err(CheckinCredentialError::RecoveryRequired),
         };
-        if is_reparse_or_symlink(&metadata) || !metadata.is_dir() {
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
             return Err(CheckinCredentialError::RecoveryRequired);
         }
         let entries =
@@ -638,7 +638,7 @@ impl CheckinCredentialStore {
             let entry = entry.map_err(|_| CheckinCredentialError::RecoveryRequired)?;
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|_| CheckinCredentialError::RecoveryRequired)?;
-            if is_reparse_or_symlink(&metadata) || !metadata.is_dir() {
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
                 return Err(CheckinCredentialError::RecoveryRequired);
             }
             if let Some(manifest) = read_manifest_if_present(&entry.path().join("manifest.json"))? {
@@ -1328,7 +1328,7 @@ fn read_credential_payload(path: &Path) -> Result<Vec<u8>, CheckinCredentialErro
         }
         Err(_) => return Err(CheckinCredentialError::Invalid),
     };
-    if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(CheckinCredentialError::Invalid);
     }
     if metadata.len() > MAX_BUNDLE_BYTES {
@@ -1340,7 +1340,7 @@ fn read_credential_payload(path: &Path) -> Result<Vec<u8>, CheckinCredentialErro
 
 fn write_file_create_new(path: &Path, bytes: &[u8]) -> Result<(), CheckinCredentialError> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
-        if is_reparse_or_symlink(&metadata) || metadata.is_file() || metadata.is_dir() {
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || metadata.is_file() || metadata.is_dir() {
             return Err(CheckinCredentialError::RecoveryRequired);
         }
     }
@@ -1363,7 +1363,7 @@ fn write_file_atomically(destination: &Path, bytes: &[u8]) -> Result<(), Checkin
     fs::create_dir_all(parent).map_err(|_| CheckinCredentialError::Unavailable)?;
     reject_path_chain(parent, false)?;
     if let Ok(metadata) = fs::symlink_metadata(destination) {
-        if is_reparse_or_symlink(&metadata) || metadata.is_dir() {
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || metadata.is_dir() {
             return Err(CheckinCredentialError::Invalid);
         }
     }
@@ -1401,7 +1401,7 @@ fn read_manifest_if_present(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(CheckinCredentialError::RecoveryRequired),
     };
-    if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(CheckinCredentialError::RecoveryRequired);
     }
     let bytes = read_file_exact(path, metadata.len(), MAX_MANIFEST_BYTES)
@@ -1483,7 +1483,7 @@ fn reject_path_chain(path: &Path, allow_missing: bool) -> Result<(), CheckinCred
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if is_reparse_or_symlink(&metadata) || !metadata.is_dir() => {
+            Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
                 return Err(CheckinCredentialError::Invalid)
             }
             Ok(_) => {}
@@ -1504,20 +1504,8 @@ fn reject_path_chain(path: &Path, allow_missing: bool) -> Result<(), CheckinCred
     Ok(())
 }
 
-fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
+// P16-T6：原本地 is_reparse_or_symlink（is_symlink + 0x400）已删除——
+// 判定统一收敛到 crate::link_guard::metadata_is_reparse_link（逻辑只改一处）。
 
 fn map_key_wrapper_error(error: traesync_ports::KeyWrapperError) -> CheckinCredentialError {
     match error {

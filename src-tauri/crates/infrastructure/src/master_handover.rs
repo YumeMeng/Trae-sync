@@ -153,16 +153,8 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn copy_file_create_new(source: &Path, target: &Path) -> Result<(), MasterHandoverError> {
-    let mut input = std::fs::File::open(source).map_err(|_| MasterHandoverError::Io)?;
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .map_err(|_| MasterHandoverError::Io)?;
-    std::io::copy(&mut input, &mut output).map_err(|_| MasterHandoverError::Io)?;
-    Ok(())
-}
+// P16-T1：原 copy_file_create_new（未压缩复制）随备份压缩化删除——
+// 压缩写出统一走 compress_file_create_new。
 
 /// 当前秒级 UNIX 时间（备份链命名与凭据子目录同戳发号）。
 fn unix_seconds_now() -> u64 {
@@ -196,6 +188,17 @@ pub fn backup_master_trio_to(
 
 /// 显式时间戳版本（P11-4②）：凭据子目录（`credentials-{stamp}`）需要与
 /// 三件套同戳，由组合根统一发号传入，恢复时按戳配对。
+///
+/// **P16-T1 zstd 压缩形态**：三件套按成员分别压缩写出（db →
+/// `{db 名}.switch-bak-{stamp}.zst`、wal/shm → `…{suffix}.zst`）。
+/// 格式决策（选最简且恢复可靠）：**每成员独立标准 zstd 帧、无自定义
+/// 容器**——相比 tar-less 单档打包，省去成员长度表与切分逻辑，任意标准
+/// zstd 工具可直接解压单个成员人工恢复；wal/shm 缺席语义与旧格式一致
+/// （各自独立文件，有则备、无则跳）；单成员损坏不波及其他成员。
+/// 压缩级别 3（zstd 默认）：1.6GB 主库的体积/耗时平衡点（spec 目标
+/// 约 400MB；更高级别收益递减且拖慢切号路径）。恢复/回读/迁移路径对
+/// 旧未压缩与新压缩双格式兼容（见 `backup_member_file_names`、
+/// `list_master_backups_in`、`decompress_backup_member`）。
 pub fn backup_master_trio_stamped(
     db_path: &Path,
     target_dir: Option<&Path>,
@@ -215,20 +218,70 @@ pub fn backup_master_trio_stamped(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(MasterHandoverError::Io)?;
-    // 与同目录备份链同名（`{db 名}.switch-bak-{stamp}`）：恢复语义不变，
+    // 与同目录备份链同名（`{db 名}.switch-bak-{stamp}.zst`）：恢复语义不变，
     // 按文件名找同目录。create_new 永不覆盖既有备份。
-    let backup = dir.join(format!("{db_name}.switch-bak-{stamp}"));
-    copy_file_create_new(db_path, &backup)?;
+    let backup = dir.join(format!("{db_name}.switch-bak-{stamp}.zst"));
+    compress_file_create_new(db_path, &backup)?;
     for suffix in ["-wal", "-shm"] {
         let source = db_path.with_file_name(format!("{db_name}{suffix}"));
         if source.is_file() {
-            copy_file_create_new(
+            compress_file_create_new(
                 &source,
-                &dir.join(format!("{db_name}.switch-bak-{stamp}{suffix}")),
+                &dir.join(format!("{db_name}.switch-bak-{stamp}{suffix}.zst")),
             )?;
         }
     }
     Ok(backup)
+}
+
+/// P16-T1：备份链成员候选文件名（双格式）——旧未压缩与新压缩 `.zst`
+/// 各 3 个（db/wal/shm）。枚举、裁剪、迁移共用一份命名事实源。
+pub fn backup_member_file_names(db_name: &str, stamp: u64) -> Vec<String> {
+    let base = format!("{db_name}.switch-bak-{stamp}");
+    let mut names = Vec::with_capacity(6);
+    for suffix in ["", "-wal", "-shm"] {
+        names.push(format!("{base}{suffix}"));
+        names.push(format!("{base}{suffix}.zst"));
+    }
+    names
+}
+
+/// P16-T1：把源文件压缩为 `.zst` 写出（create_new 永不覆盖既有文件）。
+/// 压缩级别 3（见 `backup_master_trio_stamped` 格式决策注释）。
+/// 公开给组合根（tauri app）复用（旧→压缩迁移的暂存压缩同口径）。
+pub fn compress_file_create_new(
+    source: &Path,
+    target: &Path,
+) -> Result<(), MasterHandoverError> {
+    let input = std::fs::File::open(source).map_err(|_| MasterHandoverError::Io)?;
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|_| MasterHandoverError::Io)?;
+    let mut encoder =
+        zstd::stream::write::Encoder::new(output, 3).map_err(|_| MasterHandoverError::Io)?;
+    std::io::copy(&mut &input, &mut encoder).map_err(|_| MasterHandoverError::Io)?;
+    // finish 落帧（不 finish 则尾部校验帧缺失，解压端不完整）。
+    encoder.finish().map_err(|_| MasterHandoverError::Io)?;
+    Ok(())
+}
+
+/// P16-T1：把压缩备份成员解压为普通文件（恢复/回读路径用；SQLCipher
+/// 需要真实文件路径，不能流式打开）。公开给组合根复用。
+pub fn decompress_backup_member(
+    zst_path: &Path,
+    target: &Path,
+) -> Result<(), MasterHandoverError> {
+    let input = std::fs::File::open(zst_path).map_err(|_| MasterHandoverError::Io)?;
+    let mut decoder =
+        zstd::stream::read::Decoder::new(input).map_err(|_| MasterHandoverError::Io)?;
+    let output = std::fs::File::create(target).map_err(|_| MasterHandoverError::Io)?;
+    let mut writer = std::io::BufWriter::new(output);
+    std::io::copy(&mut decoder, &mut writer).map_err(|_| MasterHandoverError::Io)?;
+    // flush 需要 Write trait 在作用域内（BufWriter 落盘缓冲）。
+    std::io::Write::flush(&mut writer).map_err(|_| MasterHandoverError::Io)?;
+    Ok(())
 }
 
 // ===== 备份链枚举（P5-4 设置页备份分区数据源，只读）=====
@@ -262,6 +315,9 @@ pub fn list_master_backups(db_path: &Path) -> Vec<MasterBackupEntry> {
 ///
 /// 只读扫描 + 按时间戳倒序（最新在前）；命名异常的散件跳过不报错
 /// （备份链展示容错：不因一个异名文件让整页失败）。不读取文件内容。
+/// **P16-T1 双格式**：同时识别旧未压缩（`{stamp}`/`{stamp}-wal`/`-shm`）
+/// 与新压缩（同名 + `.zst` 后缀）形态；同 stamp 两形态并存时合并为一条
+/// （字节合计、有 wal 即记 true——迁移窗口内的过渡现场不丢链项）。
 pub fn list_master_backups_in(dir: &Path, db_name: &str) -> Vec<MasterBackupEntry> {
     let prefix = format!("{db_name}.switch-bak-");
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -276,12 +332,15 @@ pub fn list_master_backups_in(dir: &Path, db_name: &str) -> Vec<MasterBackupEntr
         let Some(rest) = name.strip_prefix(&prefix) else {
             continue;
         };
-        // rest 形如 `{stamp}` 或 `{stamp}-wal` / `{stamp}-shm`。
-        let (stamp_part, side) = match rest.strip_suffix("-wal") {
+        // P16-T1：先剥离压缩后缀再解析成员与时间戳——rest 形如
+        // `{stamp}`、`{stamp}-wal`、`{stamp}-shm`，或压缩形态
+        // `{stamp}.zst`、`{stamp}-wal.zst`、`{stamp}-shm.zst`。
+        let uncompressed_rest = rest.strip_suffix(".zst").unwrap_or(rest);
+        let (stamp_part, side) = match uncompressed_rest.strip_suffix("-wal") {
             Some(stamp) => (stamp, "-wal"),
-            None => match rest.strip_suffix("-shm") {
+            None => match uncompressed_rest.strip_suffix("-shm") {
                 Some(stamp) => (stamp, "-shm"),
-                None => (rest, ""),
+                None => (uncompressed_rest, ""),
             },
         };
         let Ok(stamp) = stamp_part.parse::<u64>() else {
@@ -2728,13 +2787,23 @@ mod tests {
         std::fs::write(sidecar(&db_path, "-wal"), b"wal-bytes").unwrap();
         let backup = backup_master_trio(&db_path).unwrap();
         assert!(backup.is_file());
-        assert_eq!(std::fs::read(&backup).unwrap(), b"db-bytes");
-        assert_eq!(
-            std::fs::read(sidecar(&backup, "-wal")).unwrap(),
-            b"wal-bytes"
-        );
+        // P16-T1：备份为压缩形态——解压回读与源字节一致。
+        let mut restored = backup.clone().into_os_string();
+        restored.push(".restored");
+        let restored = PathBuf::from(restored);
+        decompress_backup_member(&backup, &restored).unwrap();
+        assert_eq!(std::fs::read(&restored).unwrap(), b"db-bytes");
+        // P16-T1：wal 备份为 `{原名}.zst` 去 .zst 后缀 + `-wal.zst`。
+        let backup_name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        let wal_backup = backup.with_file_name(backup_name.replace(".zst", "-wal.zst"));
+        let mut restored_wal = wal_backup.clone().into_os_string();
+        restored_wal.push(".restored");
+        let restored_wal = PathBuf::from(restored_wal);
+        decompress_backup_member(&wal_backup, &restored_wal).unwrap();
+        assert_eq!(std::fs::read(&restored_wal).unwrap(), b"wal-bytes");
         // 不存在的 -shm 不产生备份文件。
-        assert!(!sidecar(&backup, "-shm").exists());
+        let shm_backup = backup.with_file_name(backup_name.replace(".zst", "-shm.zst"));
+        assert!(!shm_backup.exists());
         // 备份不覆盖：再次备份产生新文件（时间戳不同则路径不同；同秒内
         // create_new 拒绝覆盖，报 Io 而非静默覆盖）。
         std::fs::write(&db_path, b"db-bytes-2").unwrap();
@@ -2802,8 +2871,8 @@ mod tests {
 
     // ===== P11-4① 备份位置可选：跨目录备份 + 目录版枚举 + 凭据标记 =====
 
-    /// backup_master_trio_to(Some)：三件套写入目标目录；db 原目录不产生
-    /// 任何备份文件（防误写）。文件名与同目录备份链一致（恢复语义不变）。
+    /// backup_master_trio_to(Some)：三件套压缩写入目标目录（P16-T1 .zst）；
+    /// db 原目录不产生任何备份文件（防误写）。解压回读与源字节一致。
     #[test]
     fn backup_master_trio_to_writes_target_dir() {
         let root = temp_db_path("trio-to");
@@ -2814,23 +2883,30 @@ mod tests {
         let target = root.join("backups");
         let backup = backup_master_trio_to(&db_path, Some(&target)).unwrap();
         assert_eq!(backup.parent().unwrap(), target);
+        assert!(backup.to_string_lossy().ends_with(".zst"));
         let stamp = backup
             .file_name()
             .unwrap()
             .to_str()
             .unwrap()
             .trim_start_matches("database.db.switch-bak-")
+            .trim_end_matches(".zst")
             .to_string();
-        // 目标目录：db + 存在的 wal 一并到位（字节一致）。
-        assert_eq!(
-            std::fs::read(target.join("database.db.switch-bak-".to_string() + &stamp)).unwrap(),
-            [1u8; 100]
-        );
-        assert_eq!(
-            std::fs::read(target.join("database.db.switch-bak-".to_string() + &stamp + "-wal"))
-                .unwrap(),
-            [2u8; 20]
-        );
+        // 目标目录：db + 存在的 wal 以压缩形态到位（解压回读字节一致）。
+        let restored_db = root.join("restored-db");
+        decompress_backup_member(
+            &target.join("database.db.switch-bak-".to_string() + &stamp + ".zst"),
+            &restored_db,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&restored_db).unwrap(), [1u8; 100]);
+        let restored_wal = root.join("restored-wal");
+        decompress_backup_member(
+            &target.join("database.db.switch-bak-".to_string() + &stamp + "-wal.zst"),
+            &restored_wal,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&restored_wal).unwrap(), [2u8; 20]);
         // db 原目录无新备份文件。
         let left: Vec<_> = std::fs::read_dir(db_path.parent().unwrap())
             .unwrap()
@@ -2841,7 +2917,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// backup_master_trio_to(None)：等价原 backup_master_trio 同目录行为。
+    /// backup_master_trio_to(None)：等价原 backup_master_trio 同目录行为
+    /// （P16-T1 起写出压缩 .zst 形态）。
     #[test]
     fn backup_master_trio_none_keeps_same_dir() {
         let db_path = temp_db_path("trio-none");

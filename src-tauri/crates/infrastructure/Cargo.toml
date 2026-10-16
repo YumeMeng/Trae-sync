@@ -56,6 +56,9 @@ aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
 rusty-leveldb = "4.0.1"
 tempfile = "3"
+# P16-T1 备份治理：主库三件套备份 zstd 压缩写出（每成员独立 .zst 帧，
+# 无自定义容器格式——标准 zstd 工具可直接解压单个成员，恢复最可靠）。
+zstd = "0.13"
 
 [dev-dependencies]
 # filetime 用于在测试中设置会话目录 mtime——Windows 上需要 FILE_FLAG_BACKUP_SEMANTICS
@@ -117,3 +120,9 @@ required-features = ["sqlcipher"]
 [[example]]
 name = "remint_cooldown_probe"
 path = "examples/remint_cooldown_probe.rs"
+
+# P16-T1 真机迁移执行器：旧未压缩备份链 → 软件本体旁压缩档（Q12 授权）。
+# 不需要 SQLCipher（纯文件压缩迁移）。
+[[example]]
+name = "migrate_backups_p16"
+path = "examples/migrate_backups_p16.rs"

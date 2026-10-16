@@ -1210,7 +1210,8 @@ fn reconcile_catalog_operation(
         Ok(metadata) => metadata,
         Err(_) => return false,
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return false;
     }
     if reject_catalog_sidecars(&catalog_path).is_err() {
@@ -3358,7 +3359,8 @@ fn open_catalog_readwrite_connection(
 fn ensure_regular_catalog_file(db_path: &Path) -> Result<(), rusqlite::Error> {
     let metadata = std::fs::symlink_metadata(db_path)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())

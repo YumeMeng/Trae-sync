@@ -6,6 +6,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fs2::{lock_contended_error, FileExt};
 use serde::{Deserialize, Serialize};
@@ -246,7 +247,8 @@ impl OperationLease {
 fn canonical_storage_root(path: &Path) -> Result<PathBuf, OperationLeaseError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|_| OperationLeaseError::InvalidStorageRoot)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 等 reparse point 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
         return Err(OperationLeaseError::InvalidStorageRoot);
     }
     path.canonicalize()
@@ -258,7 +260,8 @@ fn ensure_lock_directory(recovery_root: &Path) -> Result<PathBuf, OperationLease
     let lock_dir = recovery_root.join("locks");
     match fs::symlink_metadata(&lock_dir) {
         Ok(metadata) => {
-            if is_reparse_point(&metadata) || !metadata.is_dir() {
+            // P16-T6：防逃逸判定统一走 link_guard（原本地 is_reparse_point 删除）。
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
                 return Err(OperationLeaseError::LockDirectoryUnavailable);
             }
         }
@@ -272,25 +275,10 @@ fn ensure_lock_directory(recovery_root: &Path) -> Result<PathBuf, OperationLease
 
     let metadata = fs::symlink_metadata(&lock_dir)
         .map_err(|_| OperationLeaseError::LockDirectoryUnavailable)?;
-    if is_reparse_point(&metadata) || !metadata.is_dir() {
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
         return Err(OperationLeaseError::LockDirectoryUnavailable);
     }
     Ok(lock_dir)
-}
-
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
 }
 
 impl Drop for OperationLease {
@@ -306,9 +294,43 @@ impl Drop for OperationLease {
     }
 }
 
+/// P16-T3：锁文件 open 阶段对瞬时拒绝（os error 5）的退避重试时长。
+///
+/// 取证定性（2026-10-16）：文件系统过滤驱动（杀软/Defender 实时扫描）对
+/// 新建文件 ~20ms 窗口内并发 open 返回 ERROR_ACCESS_DENIED(5)，窗口过后
+/// fs2 阻塞锁完全正常——并发 5 个环境失败测试的根因。仅对此错误码做一次
+/// ~50ms 退避重试，其余错误不重试（保持 fail-closed 语义）。
+const LOCK_OPEN_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// 打开锁标记文件：拒绝 reparse point，其余按普通读写文件打开。
+///
+/// P16-T3：open 返回 os error 5（ERROR_ACCESS_DENIED，过滤驱动扫描窗口）
+/// 时做一次 ~50ms 退避后重试；错误码语义见 `LOCK_OPEN_RETRY_DELAY`。
+/// `open` 为注入缝：生产路径传真实打开逻辑，单测注入 mock open 序列。
+fn open_lock_file_with_retry(
+    path: &Path,
+    open: &dyn Fn(&Path) -> io::Result<File>,
+    retry_delay: Duration,
+) -> io::Result<File> {
+    match open(path) {
+        Err(error) if error.raw_os_error() == Some(5) => {
+            // 仅 os error 5 重试一次；注意 `io::Error::new(PermissionDenied, ...)`
+            // 无 raw os error，不会落入此分支（reparse 拒绝路径保持不重试）。
+            std::thread::sleep(retry_delay);
+            open(path)
+        }
+        other => other,
+    }
+}
+
 fn open_lock_file(path: &Path) -> io::Result<File> {
+    open_lock_file_with_retry(path, &open_lock_file_once, LOCK_OPEN_RETRY_DELAY)
+}
+
+/// 单次打开逻辑（不含重试）；由 `open_lock_file` 包装注入重试。
+fn open_lock_file_once(path: &Path) -> io::Result<File> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if is_reparse_point(&metadata) => {
+        Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "锁标记不能是符号链接",
@@ -394,8 +416,9 @@ fn resource_location_id(resource_path: &Path) -> Result<String, OperationLeaseEr
         .file_name()
         .ok_or(OperationLeaseError::InvalidResourcePath)?
         .to_string_lossy();
+    // P16-T6：防逃逸判定统一走 link_guard（原本地 is_reparse_point 删除）。
     match fs::symlink_metadata(resource_path) {
-        Ok(metadata) if is_reparse_point(&metadata) => {
+        Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) => {
             return Err(OperationLeaseError::InvalidResourcePath);
         }
         Ok(_) => {}
@@ -449,7 +472,8 @@ fn is_lock_held(path: &Path) -> bool {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
         Err(_) => return true,
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 锁标记一并 fail-closed）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return true;
     }
     let file = match OpenOptions::new().read(true).write(true).open(path) {
@@ -486,7 +510,8 @@ pub fn inspect_lock_status(
             });
         }
         Err(_) => return Err(OperationLeaseError::LockDirectoryUnavailable),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
             return Err(OperationLeaseError::LockDirectoryUnavailable);
         }
         Ok(_) => {}
@@ -775,6 +800,80 @@ mod tests {
                 .unwrap()
                 .write_allowed
         );
+    }
+
+    // ===== P16-T3：open 阶段 os error 5 短退避重试（注入式单测）=====
+
+    /// mock open 序列：首次返回 os error 5（过滤驱动扫描窗口），重试成功。
+    #[test]
+    fn open_lock_file_retries_once_on_access_denied() {
+        let target = tempfile::tempdir().unwrap();
+        let file_path = target.path().join("probe.lock");
+        let attempts = std::cell::Cell::new(0_u32);
+        // 注入 open：首次 os error 5，第二次真实打开成功。
+        let mock = |path: &Path| -> io::Result<File> {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 0 {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+        };
+        let file = open_lock_file_with_retry(&file_path, &mock, Duration::from_millis(1))
+            .expect("os error 5 后重试应成功");
+        drop(file);
+        assert_eq!(attempts.get(), 2, "os error 5 应恰好重试一次（共两次 open）");
+    }
+
+    /// 非 error 5（如 NotFound）不重试：一次 open 直接返回原错误。
+    #[test]
+    fn open_lock_file_does_not_retry_other_errors() {
+        let target = tempfile::tempdir().unwrap();
+        let file_path = target.path().join("missing-parent").join("probe.lock");
+        let attempts = std::cell::Cell::new(0_u32);
+        let mock = |_path: &Path| -> io::Result<File> {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::from_raw_os_error(3)) // ERROR_PATH_NOT_FOUND
+        };
+        let result = open_lock_file_with_retry(&file_path, &mock, Duration::from_millis(1));
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(3));
+        assert_eq!(attempts.get(), 1, "非 error 5 不得重试");
+    }
+
+    /// reparse 拒绝路径（无 raw os error 的 PermissionDenied）不触发重试。
+    #[test]
+    fn open_lock_file_does_not_retry_reparse_rejection() {
+        let target = tempfile::tempdir().unwrap();
+        let link_path = target.path().join("link.lock");
+        let real = target.path().join("real.lock");
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&real)
+            .unwrap();
+        // unix 直接建符号链接；windows 无特权时降级为普通文件，此时该用例
+        // 只验证「mock 返回非 5 错误不重试」语义，仍有效。
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link_path).unwrap();
+        #[cfg(not(unix))]
+        std::fs::rename(&real, &link_path).unwrap();
+
+        let attempts = std::cell::Cell::new(0_u32);
+        let mock = |_path: &Path| -> io::Result<File> {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "锁标记不能是符号链接",
+            ))
+        };
+        let result = open_lock_file_with_retry(&link_path, &mock, Duration::from_millis(1));
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1, "无 raw os error 的拒绝不得重试");
     }
 
     #[test]

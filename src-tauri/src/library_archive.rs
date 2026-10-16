@@ -44,9 +44,9 @@ use traesync_infrastructure::trae_instance::{self as trae_instance_module, close
 use traesync_infrastructure::{
     apply_master_archive_changes as apply_master_archive_changes_inner, backup_master_trio_stamped,
     backup_master_trio_to, delete_master_sessions as delete_master_sessions_inner,
-    handover_master_records, list_master_backups_in, master_backup_db_name, master_database_path,
-    master_db_activity_detected, merge_master_projects as merge_master_projects_inner,
-    merge_trae_cn_project_records_with_progress,
+    delete_master_sessions_with_backup_dir, handover_master_records, list_master_backups_in,
+    master_backup_db_name, master_database_path, master_db_activity_detected,
+    merge_master_projects_with_backup_dir, merge_trae_cn_project_records_with_progress,
     preview_trae_cn_project_merge as preview_trae_cn_project_merge_infra,
     read_trae_cn_foreign_projects, AccountRegistry, MasterArchiveError, MasterDeleteOutcome,
     MasterHandover, MasterHandoverError, MasterMergeOutcome, OperationLease, RelayLedger,
@@ -1818,13 +1818,56 @@ pub(crate) async fn create_master_backup(
 }
 
 /// P11-4①：解析当前活动备份目录——配置 backup_dir 有值则写/读该目录，
-/// 否则主库 db 同目录（原行为）。fail-soft：配置损坏回退默认位置，
-/// 不阻断备份/切号主流程（与裁剪的静默容错同口径）。
+/// 否则 P16-T1 新默认：**软件本体旁 `backups/`**（exe 同级推导）。
+/// fail-soft：配置损坏回退新默认位置，不阻断备份/切号主流程（与裁剪的
+/// 静默容错同口径）。
 pub(crate) fn resolve_master_backup_dir(storage_root: &Path, db_path: &Path) -> PathBuf {
     if let Some(dir) = load_backup_dir_override(storage_root) {
         return dir;
     }
-    db_path.parent().map(Path::to_path_buf).unwrap_or_default()
+    default_master_backup_dir().unwrap_or_else(|| {
+        // current_exe 不可得（理论兜底）：回退 db 同目录旧行为。
+        db_path.parent().map(Path::to_path_buf).unwrap_or_default()
+    })
+}
+
+/// P16-T1：默认备份目录推导——`current_exe` 同级 `backups/`。
+///
+/// 安装版 = `E:\trae-sync\Trae Sync\backups\`（软件本体旁，E 盘大容量盘）；
+/// dev 版 = 编译产物目录下（`target\...\backups\`，仅本机开发可接受——
+/// 测试与开发环境不触碰生产数据根，注释登记）。此改动使客户端目录
+/// （`%APPDATA%\Trae CN\ModularData\ai-agent\`）不再产生新备份。
+/// 用户配置（backup_dir 覆盖）优先于本默认推导。
+pub(crate) fn default_master_backup_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.parent().map(|dir| dir.join("backups"))
+}
+
+/// P16-T1：解析基准备份主文件（双格式兼容）。
+///
+/// 旧未压缩（`{db 名}.switch-bak-{stamp}`）优先原样返回；新压缩
+/// （`…{stamp}.zst`）解压为备份目录内临时件（命名 `.read-tmp-{stamp}`，
+/// 用完由调用方删除）——SQLCipher 需要真实文件路径。两形态都不在时
+/// 返回 None（上游报 backup_missing）。
+fn materialize_backup_for_read(
+    active_dir: &Path,
+    db_name: &str,
+    stamp: u64,
+) -> Option<(PathBuf, Option<PathBuf>)> {
+    let plain = active_dir.join(format!("{db_name}.switch-bak-{stamp}"));
+    if plain.is_file() {
+        return Some((plain, None));
+    }
+    let compressed = active_dir.join(format!("{db_name}.switch-bak-{stamp}.zst"));
+    if !compressed.is_file() {
+        return None;
+    }
+    // 唯一临时名（读取路径已在操作租约内串行）；残留先清（上次中断现场）。
+    let temporary = active_dir.join(format!("{db_name}.switch-bak-{stamp}.read-tmp"));
+    let _ = std::fs::remove_file(&temporary);
+    traesync_infrastructure::master_handover::decompress_backup_member(&compressed, &temporary)
+        .ok()
+        .map(|_| (temporary.clone(), Some(temporary)))
 }
 
 /// P11-5⑤：库作用域活动备份目录——副环境备份链与主库链物理隔离。
@@ -2337,8 +2380,12 @@ pub(crate) async fn get_master_verification(
                 .filter(|stamp| backup_stamps.contains(stamp))
                 .unwrap_or(backup_stamps[0]);
             // P11-4①：基准备份按活动目录解析（不再假定与 db 同目录）。
-            let chosen_path = active_dir.join(format!("{db_name}.switch-bak-{chosen_stamp}"));
-            if !chosen_path.is_file() {
+            // P16-T1 双格式：旧未压缩优先；新压缩 .zst 解压为临时件供
+            // SQLCipher 打开（解压落在活动备份目录——已迁软件本体旁，
+            // 不落 C 盘 TEMP），用完即删。
+            let Some((chosen_path, temporary)) =
+                materialize_backup_for_read(&active_dir, &db_name, chosen_stamp)
+            else {
                 return Ok(MasterVerificationDto {
                     ledger: ledger_dto,
                     backup: BackupComparisonDto {
@@ -2351,8 +2398,13 @@ pub(crate) async fn get_master_verification(
                         missing: Vec::new(),
                     },
                 });
+            };
+            let read_result = read_session_facts(&chosen_path, &raw_key);
+            // 临时解压件用完即删（无论读取成败）。
+            if let Some(temporary) = temporary {
+                let _ = std::fs::remove_file(&temporary);
             }
-            match read_session_facts(&chosen_path, &raw_key) {
+            match read_result {
                 Some(backup_facts) => {
                     let report =
                         compare_with_backup(&current_facts, &backup_facts, chosen_stamp, &ledger_entries);
@@ -2679,11 +2731,16 @@ pub(crate) async fn delete_master_sessions(
             &ctx.dir,
             "master_delete_running",
         )?;
-        let result = delete_master_sessions_inner(
+        // P16-T1：删除内置备份写入库作用域活动备份目录（新默认 = exe 旁
+        // backups/，不再落客户端目录）；裁剪目标同源。
+        let db_path_for_backup = master_database_path(&ctx.dir);
+        let backup_dir = resolve_library_backup_dir(&storage_root, &db_path_for_backup, &ctx.env_id);
+        let result = delete_master_sessions_with_backup_dir(
             &ctx.dir,
             &raw_key,
             &session_ids,
             &current_account.account_id,
+            Some(&backup_dir),
         )
         .map(|outcome: MasterDeleteOutcome| MasterDeleteResultDto {
             deleted_sessions: outcome.deleted_sessions as u32,
@@ -2803,12 +2860,20 @@ fn run_master_project_merge_with_lease(
     ctx.ensure_writable()?;
     let current_account = require_library_account(material_root, storage_root, &ctx)?;
     ensure_stopped(&ctx)?;
-    let result = merge_master_projects_inner(
+    // P16-T1：合并内置备份写入库作用域活动备份目录（新默认 = exe 旁
+    // backups/，不再落客户端目录）。
+    let backup_dir = resolve_library_backup_dir(
+        storage_root,
+        &master_database_path(&ctx.dir),
+        &ctx.env_id,
+    );
+    let result = merge_master_projects_with_backup_dir(
         &ctx.dir,
         raw_key,
         source_project_ids,
         target_project_id,
         &current_account.account_id,
+        Some(&backup_dir),
     )
     .map(|outcome: MasterMergeOutcome| MasterMergeResultDto {
         moved_sessions: outcome.moved_sessions as u32,
@@ -3333,16 +3398,18 @@ mod backup_policy_tests {
         assert_eq!(backup_keep_policy(root.path()), 5);
     }
 
-    /// P11-4①：活动备份目录解析——未配置回退 db 同目录；配置了覆盖用之；
-    /// 配置损坏 fail-soft 回退 db 同目录（不阻断主流程）。
+    /// P11-4① + P16-T1：活动备份目录解析——未配置回退软件本体旁
+    /// backups/（exe 同级推导）；配置了覆盖用之；配置损坏 fail-soft 回退
+    /// 同上（不阻断主流程）。
     #[test]
     fn resolve_master_backup_dir_prefers_configured_override() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("master").join("database.db");
-        // 未配置：db 同目录。
+        // 未配置：exe 同级 backups/（P16-T1 新默认；客户端目录不再产生备份）。
+        let exe_adjacent = default_master_backup_dir().unwrap();
         assert_eq!(
             resolve_master_backup_dir(root.path(), &db_path),
-            root.path().join("master")
+            exe_adjacent
         );
         // 配置了覆盖：用它。
         let custom = root.path().join("custom-backups");
@@ -3354,11 +3421,11 @@ mod backup_policy_tests {
             })
             .unwrap();
         assert_eq!(resolve_master_backup_dir(root.path(), &db_path), custom);
-        // 配置损坏：fail-soft 回退 db 同目录。
+        // 配置损坏：fail-soft 回退 exe 同级 backups/。
         std::fs::write(root.path().join("backup-retention.json"), "not json").unwrap();
         assert_eq!(
             resolve_master_backup_dir(root.path(), &db_path),
-            root.path().join("master")
+            exe_adjacent
         );
     }
 
@@ -4856,6 +4923,17 @@ mod p14_4c_archive_caller_tests {
                 &storage_root.join("trae-instances").join("profile-2"),
                 &target,
             );
+
+            // P16-T1：主库默认备份目录已改为 exe 同级 backups/ 推导——测试
+            // 必须配置覆盖把备份隔离在夹具内（与生产「用户配置优先于默认
+            // 推导」同口径），否则多测试共享 exe 旁目录会互相污染计数。
+            traesync_infrastructure::backup_retention::BackupRetentionStore::new(&storage_root)
+                .save(&traesync_infrastructure::backup_retention::BackupRetentionSettings {
+                    enabled: true,
+                    keep: 5,
+                    backup_dir: Some(root.path().join("backups").display().to_string()),
+                })
+                .unwrap();
 
             Self {
                 _root: root,
@@ -7775,6 +7853,31 @@ pub mod acceptance_probe {
             "deleted_messages": outcome.deleted_messages,
             "removed_projects": outcome.removed_projects,
             "backup_path": outcome.backup_path,
+        }))
+    }
+
+    /// P16-T1：旧备份链压缩迁移（真机一次性执行；显式传入目标目录，
+    /// 避免探针 exe 路径干扰默认推导——生产默认推导见 default_master_backup_dir）。
+    pub fn migrate_backups(target_dir: &Path) -> Result<Value, String> {
+        let (storage_root, _recovery_root, _material_root) = production_roots()?;
+        let ctx = resolve_library_context(None, &storage_root)?;
+        let db_path = master_database_path(&ctx.dir);
+        let source_dir = db_path
+            .parent()
+            .ok_or_else(|| "master_db_no_parent".to_string())?;
+        let outcome = traesync_infrastructure::backup_retention::migrate_legacy_backups_to_compressed(
+            source_dir,
+            target_dir,
+            "database.db",
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        Ok(json!({
+            "migrated": outcome.migrated_backups,
+            "idempotent": outcome.idempotent_backups,
+            "freed_bytes": outcome.freed_bytes,
+            "failures": outcome.failures,
+            "source_dir": source_dir.display().to_string(),
+            "target_dir": target_dir.display().to_string(),
         }))
     }
 }

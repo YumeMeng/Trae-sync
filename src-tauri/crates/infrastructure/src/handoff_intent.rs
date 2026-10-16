@@ -37,7 +37,8 @@ impl JsonHandoffIntentStore {
             .ok_or_else(|| "handoff_intent_root_invalid".to_string())?;
         let metadata = fs::symlink_metadata(root)
             .map_err(|_| "handoff_intent_root_unavailable".to_string())?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        if !metadata.is_dir() || crate::link_guard::metadata_is_reparse_link(&metadata) {
             return Err("handoff_intent_root_invalid".to_string());
         }
         Ok(())
@@ -49,7 +50,8 @@ impl JsonHandoffIntentStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err("handoff_intent_unavailable".to_string()),
         };
-        if metadata.file_type().is_symlink()
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&metadata)
             || !metadata.is_file()
             || metadata.len() > MAX_INTENT_BYTES
         {

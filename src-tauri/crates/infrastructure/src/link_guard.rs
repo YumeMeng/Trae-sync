@@ -1,4 +1,5 @@
-//! 链接（reparse point）统一判定 helper——工具链 1.97 适配（P15-12 独立票）。
+//! 链接（reparse point）统一判定 helper——工具链 1.97 适配（P15-12 独立票）
+//! + P16-T6 判定点统一（全库防逃逸判定唯一入口）。
 //!
 //! 背景：rustc 1.97.1 的 std 在无符号链接特权时把
 //! `std::os::windows::fs::symlink_dir` 降级创建 **junction**、
@@ -7,10 +8,17 @@
 //! 原有防目录逃逸判定 `metadata.file_type().is_symlink()` 不识别 junction
 //! （junction 是 MOUNT_POINT reparse point，同样可做目录逃逸向量）。
 //!
-//! 判定策略：`std::fs::read_link(path).is_ok()`——std 原生同时识别
-//! 符号链接与 junction（返回链接目标），文件与目录通用，零新依赖。
+//! 判定策略（P16-T6 统一后）：
+//! - `read_link(path).is_ok()`——std 原生同时识别符号链接与 junction
+//!   （返回链接目标），文件与目录通用，零新依赖；
+//! - **0x400 属性兜底**（Windows）——`FILE_ATTRIBUTE_REPARSE_POINT` 覆盖
+//!   未被 read_link 识别的重解析 tag（原 operation_lease / checkin_credential /
+//!   credential_vault / production_catalog / work_cn_location 五处本地
+//!   `is_reparse_point`/`is_reparse_or_symlink` 助手的判定口径），read_link
+//!   对符号链接/junction 必返回 Ok，故 0x400 判定与 read_link 判定的并集
+//!   即完整 reparse 覆盖；两者任一命中即拒绝。
 //!
-//! **硬链接防护评估（本轮只评估不实现，登记结论）**：
+//! **硬链接防护评估（P15-12 只评估不实现，登记结论）**：
 //! Windows 硬链接检测需要 nlink>1。stable 1.97.1 上
 //! `std::os::windows::fs::MetadataExt::number_of_links()` 仍属 unstable
 //! `windows_by_handle`（本仓库探针实测 E0658），stable 渠道需经
@@ -22,17 +30,47 @@
 
 use std::path::Path;
 
-/// 判定 `path` 是否为链接（符号链接或 Windows junction）。
+/// 判定 `path` 是否为链接（符号链接、junction 或任何 reparse point）。
 ///
-/// 用 `read_link` 的成功与否统一识别两类 reparse link：
-/// - 符号链接：`read_link` 返回目标；
-/// - junction（MOUNT_POINT reparse point）：`read_link` 同样返回目标；
-/// - 普通文件/目录与硬链接：`read_link` 返回 Err → false。
-///
-/// 与 `symlink_metadata(...).file_type().is_symlink()` 配合使用：
-/// 后者识别符号链接，本 helper 补上 junction，两者并集即完整 reparse 覆盖。
+/// 路径形态统一入口（P16-T6：全库防逃逸判定只经此函数）：
+/// - 符号链接 / junction：`read_link` 返回目标 → true；
+/// - 其他 reparse tag（0x400 属性命中）：true（Windows 兜底）；
+/// - 普通文件/目录与硬链接：false；
+/// - 不存在的路径：false（调用方先用 metadata 判存在性）。
 pub(crate) fn is_reparse_link(path: &Path) -> bool {
-    std::fs::read_link(path).is_ok()
+    if std::fs::read_link(path).is_ok() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            return metadata_is_reparse_link(&metadata);
+        }
+    }
+    false
+}
+
+/// 已持有 `symlink_metadata` 结果时的等价判定重载（避免为 0x400 兜底
+/// 二次 stat；语义与 `is_reparse_link` 完全一致）。
+///
+/// 替代原 operation_lease/checkin_credential/credential_vault/
+/// production_catalog/work_cn_location 各文件本地 `is_reparse_point` /
+/// `is_reparse_or_symlink` 助手（P16-T6 统一：判定逻辑只改一处）。
+pub(crate) fn metadata_is_reparse_link(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT；涵盖 junction 等所有 Windows 重解析点。
+        return metadata.file_attributes() & 0x400 != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 #[cfg(test)]

@@ -271,9 +271,8 @@ fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), Witness
                 WitnessError::HashFailed
             }
         })?;
-        // 工具链 1.97 适配：junction 识别（read_link），目录 junction 同样
-        // 能把组件解析到受保护根之外——与符号链接同为拒绝对象。
-        if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&current) {
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        if crate::link_guard::metadata_is_reparse_link(&metadata) {
             return Err(WitnessError::SymlinkRejected);
         }
     }
@@ -282,9 +281,9 @@ fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), Witness
 
 fn reject_optional_symlink(path: &Path) -> Result<(), WitnessError> {
     match fs::symlink_metadata(path) {
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         Ok(metadata)
-            if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(path) =>
+            if crate::link_guard::metadata_is_reparse_link(&metadata) =>
         {
             Err(WitnessError::SymlinkRejected)
         }
@@ -310,11 +309,8 @@ fn capture_file_observation(
         }
         Err(_) => return Err(WitnessError::HashFailed),
     };
-    // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || crate::link_guard::is_reparse_link(path)
-    {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(WitnessError::SymlinkRejected);
     }
     let identity_before = provider

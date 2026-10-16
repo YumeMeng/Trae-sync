@@ -898,7 +898,8 @@ fn leveldb_file_manifest(directory: &Path) -> io::Result<BTreeMap<String, LevelD
         let entry = entry?;
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "LevelDB 目录包含非普通文件",

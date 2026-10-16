@@ -187,7 +187,7 @@ impl CredentialVault {
         let mut found = None;
         for candidate in candidates {
             if let Ok(metadata) = fs::symlink_metadata(&candidate) {
-                if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+                if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
                     return Err(CredentialVaultError::StorageInvalid);
                 }
                 if found.is_some() {
@@ -221,7 +221,7 @@ impl CredentialVault {
             return base;
         }
         if fs::symlink_metadata(&self.root)
-            .map(|metadata| is_reparse_or_symlink(&metadata) || !metadata.is_dir())
+            .map(|metadata| crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir())
             .unwrap_or(true)
         {
             return CredentialStatus {
@@ -463,7 +463,7 @@ impl CredentialVault {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
             Err(_) => return Err(CredentialVaultError::RecoveryRequired),
         };
-        if is_reparse_or_symlink(&metadata) || !metadata.is_dir() {
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
             return Err(CredentialVaultError::RecoveryRequired);
         }
         let entries =
@@ -472,7 +472,7 @@ impl CredentialVault {
             let entry = entry.map_err(|_| CredentialVaultError::RecoveryRequired)?;
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|_| CredentialVaultError::RecoveryRequired)?;
-            if is_reparse_or_symlink(&metadata) || !metadata.is_dir() {
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() {
                 return Err(CredentialVaultError::RecoveryRequired);
             }
             collect_pending_manifest(&entry.path().join("manifest.json"), &mut records)?;
@@ -578,7 +578,7 @@ fn read_storage_json(path: &Path) -> Result<StorageJson, CredentialVaultError> {
     let parent = path.parent().ok_or(CredentialVaultError::StorageInvalid)?;
     reject_path_chain(parent, false)?;
     let metadata = fs::symlink_metadata(path).map_err(|_| CredentialVaultError::StorageInvalid)?;
-    if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(CredentialVaultError::StorageInvalid);
     }
     if metadata.len() > MAX_STORAGE_JSON_BYTES {
@@ -714,7 +714,7 @@ fn read_vault_payload(path: &Path) -> Result<Vec<u8>, CredentialVaultError> {
         }
         Err(_) => return Err(CredentialVaultError::Invalid),
     };
-    if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(CredentialVaultError::Invalid);
     }
     if metadata.len() > MAX_VAULT_BYTES {
@@ -814,7 +814,7 @@ fn write_atomically(
     fs::create_dir_all(parent).map_err(|_| CredentialVaultError::Unavailable)?;
     reject_path_chain(parent, false)?;
     if let Ok(metadata) = fs::symlink_metadata(destination) {
-        if is_reparse_or_symlink(&metadata) || (!replace_existing && metadata.is_file()) {
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || (!replace_existing && metadata.is_file()) {
             return Err(CredentialVaultError::RecoveryRequired);
         }
         if metadata.is_dir() {
@@ -874,7 +874,7 @@ fn read_manifest_if_present(path: &Path) -> Result<Option<RecoveryManifest>, Cre
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(CredentialVaultError::RecoveryRequired),
     };
-    if is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(CredentialVaultError::RecoveryRequired);
     }
     let bytes = read_file_exact(path, metadata.len(), 64 * 1024)
@@ -1016,7 +1016,7 @@ fn reject_path_chain(path: &Path, allow_missing: bool) -> Result<(), CredentialV
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if is_reparse_or_symlink(&metadata) || !metadata.is_dir() => {
+            Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
                 return Err(CredentialVaultError::Invalid)
             }
             Ok(_) => {}
@@ -1037,20 +1037,8 @@ fn reject_path_chain(path: &Path, allow_missing: bool) -> Result<(), CredentialV
     Ok(())
 }
 
-fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
+// P16-T6：原本地 is_reparse_or_symlink（is_symlink + 0x400）已删除——
+// 判定统一收敛到 crate::link_guard::metadata_is_reparse_link（逻辑只改一处）。
 
 fn map_key_wrapper_error(error: traesync_ports::KeyWrapperError) -> CredentialVaultError {
     match error {
@@ -1129,7 +1117,7 @@ mod tests {
 
     fn link_file(target: &Path, link: &Path) -> bool {
         // 工具链 1.97 适配：std symlink_file 无特权时降级创建普通空文件占位物
-        // （非链接也非硬链接），is_reparse_or_symlink 判定识别不出——改用
+        // （非链接也非硬链接），link_guard 判定识别不出——改用
         // test_support helper 验证真伪，无法构造真文件链接时跳过
         // （硬链接防护按评估结论不实现，不能用硬链接占位物冒充符号链接）。
         #[cfg(windows)]

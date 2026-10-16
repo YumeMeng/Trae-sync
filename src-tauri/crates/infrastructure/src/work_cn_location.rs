@@ -174,7 +174,7 @@ impl WorkCnReadLocation {
                 raw: appdata.to_string_lossy().into_owned(),
             }
         })?;
-        if !appdata_metadata.is_dir() || is_reparse_point(&appdata_metadata) {
+        if !appdata_metadata.is_dir() || crate::link_guard::metadata_is_reparse_link(&appdata_metadata) {
             return Err(WorkCnReadLocationError::AppdataUnavailable {
                 raw: appdata.to_string_lossy().into_owned(),
             });
@@ -192,7 +192,7 @@ impl WorkCnReadLocation {
                 path: expected_root.to_string_lossy().into_owned(),
             }
         })?;
-        if is_reparse_point(&root_metadata) {
+        if crate::link_guard::metadata_is_reparse_link(&root_metadata) {
             return Err(WorkCnReadLocationError::RootReparsePoint {
                 path: expected_root.to_string_lossy().into_owned(),
             });
@@ -236,7 +236,7 @@ impl WorkCnReadLocation {
                 path: db_path.to_string_lossy().into_owned(),
             }
         })?;
-        if is_reparse_point(&db_metadata) {
+        if crate::link_guard::metadata_is_reparse_link(&db_metadata) {
             return Err(WorkCnReadLocationError::DatabaseReparsePoint {
                 path: db_path.to_string_lossy().into_owned(),
             });
@@ -297,7 +297,7 @@ fn reject_reparse_chain(path: &Path) -> Result<(), PathBuf> {
     let mut current = path.to_path_buf();
     loop {
         if let Ok(metadata) = fs::symlink_metadata(&current) {
-            if is_reparse_point(&metadata) {
+            if crate::link_guard::metadata_is_reparse_link(&metadata) {
                 return Err(current);
             }
         }
@@ -308,21 +308,8 @@ fn reject_reparse_chain(path: &Path) -> Result<(), PathBuf> {
     Ok(())
 }
 
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_REPARSE_POINT；涵盖 junction 等 Windows 重解析点。
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
+// P16-T6：原本地 is_reparse_point（is_symlink + 0x400）已删除——
+// 判定统一收敛到 crate::link_guard::metadata_is_reparse_link（逻辑只改一处）。
 
 fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]

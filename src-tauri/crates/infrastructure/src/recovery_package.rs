@@ -320,11 +320,8 @@ fn read_authenticated_package(
         return Err(RecoveryPackageError::EmptyPassphrase);
     }
     let metadata = fs::symlink_metadata(package).map_err(|_| RecoveryPackageError::Io)?;
-    // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || crate::link_guard::is_reparse_link(package)
-    {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(RecoveryPackageError::Io);
     }
     if metadata.len() > MAX_RECOVERY_PACKAGE_BYTES {
@@ -468,7 +465,7 @@ pub fn upgrade_catalog_sidecar_with_lease(
     source_schema_version: u32,
     target_schema_version: u32,
 ) -> Result<CatalogUpgradeResult, RecoveryPackageError> {
-    if is_symlink(source_catalog)
+    if crate::link_guard::is_reparse_link(source_catalog)
         || !source_catalog.is_file()
         || target_schema_version != source_schema_version.saturating_add(1)
     {
@@ -640,8 +637,8 @@ fn verify_generation(
     raw_key: &str,
     expected: &CatalogGenerationMetadata,
 ) -> Result<(), RecoveryPackageError> {
-    if is_symlink(&generation_dir.join("generation.json"))
-        || is_symlink(&generation_dir.join("catalog.db"))
+    if crate::link_guard::is_reparse_link(&generation_dir.join("generation.json"))
+        || crate::link_guard::is_reparse_link(&generation_dir.join("catalog.db"))
     {
         return Err(RecoveryPackageError::VerificationFailed);
     }
@@ -760,7 +757,7 @@ fn validate_raw_key(raw_key: &str) -> Result<(), RecoveryPackageError> {
 
 fn open_catalog_readonly(path: &Path, raw_key: &str) -> Result<Connection, RecoveryPackageError> {
     validate_raw_key(raw_key)?;
-    if !path.is_file() || is_symlink(path) {
+    if !path.is_file() || crate::link_guard::is_reparse_link(path) {
         return Err(RecoveryPackageError::VerificationFailed);
     }
     reject_catalog_sidecars(path).map_err(|_| RecoveryPackageError::VerificationFailed)?;
@@ -809,7 +806,11 @@ fn cleanup_readonly_created_sidecars(catalog_path: &Path, existed_before: &[bool
         let Ok(metadata) = fs::symlink_metadata(&sidecar) else {
             continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 32 * 1024 {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&metadata)
+            || !metadata.is_file()
+            || metadata.len() > 32 * 1024
+        {
             continue;
         }
         let _ = fs::remove_file(sidecar);
@@ -818,7 +819,7 @@ fn cleanup_readonly_created_sidecars(catalog_path: &Path, existed_before: &[bool
 
 fn open_catalog_readwrite(path: &Path, raw_key: &str) -> Result<Connection, RecoveryPackageError> {
     validate_raw_key(raw_key)?;
-    if !path.is_file() || is_symlink(path) {
+    if !path.is_file() || crate::link_guard::is_reparse_link(path) {
         return Err(RecoveryPackageError::VerificationFailed);
     }
     reject_catalog_sidecars(path).map_err(|_| RecoveryPackageError::VerificationFailed)?;
@@ -914,7 +915,7 @@ fn migrate_catalog_one_step(
 }
 
 fn read_pointer(pointer: &Path) -> Result<String, RecoveryPackageError> {
-    if is_symlink(pointer) {
+    if crate::link_guard::is_reparse_link(pointer) {
         return Err(RecoveryPackageError::VerificationFailed);
     }
     let value: serde_json::Value = serde_json::from_reader(
@@ -936,10 +937,9 @@ fn validate_current_pointer(
     match fs::symlink_metadata(&pointer) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(RecoveryPackageError::VerificationFailed),
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || crate::link_guard::is_reparse_link(&pointer) =>
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() =>
         {
             Err(RecoveryPackageError::VerificationFailed)
         }
@@ -955,7 +955,7 @@ fn validate_current_pointer(
                 return Err(RecoveryPackageError::VerificationFailed);
             }
             let generation_dir = destination_root.join("generations").join(&generation_id);
-            if !generation_dir.is_dir() || is_symlink(&generation_dir) {
+            if !generation_dir.is_dir() || crate::link_guard::is_reparse_link(&generation_dir) {
                 return Err(RecoveryPackageError::VerificationFailed);
             }
             let metadata: CatalogGenerationMetadata = serde_json::from_reader(
@@ -1032,20 +1032,14 @@ fn sync_directory(path: &Path) -> Result<(), RecoveryPackageError> {
     Ok(())
 }
 
-fn is_symlink(path: &Path) -> bool {
-    // 工具链 1.97 适配：junction 也是 reparse point（is_symlink 不识别），
-    // 用 read_link 统一识别符号链接与 junction（硬链接评估结论：不拒绝）。
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-        || crate::link_guard::is_reparse_link(path)
-}
+// P16-T6：原本地 is_symlink 助手已删除——判定统一收敛到
+// crate::link_guard::is_reparse_link（read_link + 0x400 双口径，逻辑只改一处）。
 
 fn reject_symlink_directory(path: &Path) -> Result<(), RecoveryPackageError> {
     let mut current = Path::new("").to_path_buf();
     for component in path.components() {
         current.push(component.as_os_str());
-        if is_symlink(&current) {
+        if crate::link_guard::is_reparse_link(&current) {
             return Err(RecoveryPackageError::Io);
         }
     }

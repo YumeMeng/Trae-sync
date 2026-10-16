@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::master_handover::{backup_master_trio, master_database_path};
+use crate::master_handover::{backup_master_trio_to, master_database_path};
 
 /// 借用的原生隐藏枚举（会话列表排除式白名单成员）。
 pub const ARCHIVE_HIDDEN_STATUS: &str = "voice_discussion";
@@ -368,6 +368,24 @@ pub fn delete_master_sessions(
     session_ids: &[String],
     current_user_id: &str,
 ) -> Result<MasterDeleteOutcome, MasterArchiveError> {
+    delete_master_sessions_with_backup_dir(
+        master_data_dir,
+        raw_key,
+        session_ids,
+        current_user_id,
+        None,
+    )
+}
+
+/// 带活动备份目录的删除（P16-T1）：备份写入调用方解析的活动备份目录
+/// （Some = 指定目录；None = db 同目录旧行为，保留给既有测试调用方）。
+pub fn delete_master_sessions_with_backup_dir(
+    master_data_dir: &Path,
+    raw_key: &str,
+    session_ids: &[String],
+    current_user_id: &str,
+    backup_dir: Option<&Path>,
+) -> Result<MasterDeleteOutcome, MasterArchiveError> {
     if session_ids.is_empty() {
         return Ok(MasterDeleteOutcome {
             deleted_sessions: 0,
@@ -396,7 +414,9 @@ pub fn delete_master_sessions(
     drop(conn);
 
     // ADR-0018 铁律：破坏性批量操作前必须先备份（失败则删除不执行）。
-    let backup = backup_master_trio(&db_path).map_err(|_| MasterArchiveError::BackupFailed)?;
+    // P16-T1：备份目录由调用方按库作用域解析（Some = 活动目录）。
+    let backup =
+        backup_master_trio_to(&db_path, backup_dir).map_err(|_| MasterArchiveError::BackupFailed)?;
 
     let conn = open_with_key_readwrite(&db_path, raw_key)?;
     verify_key_readable(&conn)?;
@@ -520,6 +540,26 @@ pub fn merge_master_projects(
     target_project_id: &str,
     current_user_id: &str,
 ) -> Result<MasterMergeOutcome, MasterArchiveError> {
+    merge_master_projects_with_backup_dir(
+        master_data_dir,
+        raw_key,
+        source_project_ids,
+        target_project_id,
+        current_user_id,
+        None,
+    )
+}
+
+/// 带活动备份目录的合并（P16-T1）：备份写入调用方解析的活动备份目录
+/// （Some = 指定目录；None = db 同目录旧行为，保留给既有测试调用方）。
+pub fn merge_master_projects_with_backup_dir(
+    master_data_dir: &Path,
+    raw_key: &str,
+    source_project_ids: &[String],
+    target_project_id: &str,
+    current_user_id: &str,
+    backup_dir: Option<&Path>,
+) -> Result<MasterMergeOutcome, MasterArchiveError> {
     // 参数防御：目标不能在来源集合中（改挂目标必须是被保留的分组）。
     if source_project_ids.is_empty() || source_project_ids.iter().any(|id| id == target_project_id)
     {
@@ -566,7 +606,9 @@ pub fn merge_master_projects(
     drop(conn);
 
     // ADR-0018 铁律：批量迁移前必须先备份（失败则合并不执行）。
-    let backup = backup_master_trio(&db_path).map_err(|_| MasterArchiveError::BackupFailed)?;
+    // P16-T1：备份目录由调用方按库作用域解析（Some = 活动目录）。
+    let backup =
+        backup_master_trio_to(&db_path, backup_dir).map_err(|_| MasterArchiveError::BackupFailed)?;
 
     let conn = open_with_key_readwrite(&db_path, raw_key)?;
     verify_key_readable(&conn)?;

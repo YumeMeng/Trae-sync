@@ -420,11 +420,9 @@ pub fn read_progress_snapshot(
     let directory = path.parent().ok_or(())?;
     reject_directory_chain(directory)?;
     match fs::symlink_metadata(&path) {
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || crate::link_guard::is_reparse_link(&path) =>
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() =>
         {
             Err(())
         }
@@ -463,11 +461,10 @@ fn reject_directory_chain(path: &Path) -> Result<(), ()> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            // 工具链 1.97 适配：junction 也是目录逃逸向量，read_link 统一识别。
+            // P16-T6：防逃逸判定统一走 link_guard（junction 也是目录逃逸向量）。
             Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_dir()
-                    || crate::link_guard::is_reparse_link(candidate) =>
+                if crate::link_guard::metadata_is_reparse_link(&metadata)
+                    || !metadata.is_dir() =>
             {
                 return Err(())
             }
@@ -488,11 +485,8 @@ fn reject_directory_chain(path: &Path) -> Result<(), ()> {
 
 fn publish_progress_file(temporary: &Path, destination: &Path) -> Result<(), ()> {
     if let Ok(metadata) = fs::symlink_metadata(destination) {
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || crate::link_guard::is_reparse_link(destination)
-        {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
             return Err(());
         }
     }

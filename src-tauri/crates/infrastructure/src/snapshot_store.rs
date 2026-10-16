@@ -453,7 +453,12 @@ fn preserve_staging_failure(storage_root: &Path, staging: &Path) {
     }
     let failure_root = storage_root.join("failure-staging");
     match std::fs::symlink_metadata(&failure_root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return,
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        Ok(metadata)
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() =>
+        {
+            return
+        }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if std::fs::create_dir(&failure_root).is_err() {

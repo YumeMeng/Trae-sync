@@ -233,7 +233,11 @@ pub(crate) fn unprotect_secret(encrypted: &[u8]) -> Result<Vec<u8>, KeyWrapperEr
 fn read_blob(path: &Path) -> Result<Vec<u8>, KeyWrapperError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| KeyWrapperError::Unavailable)?;
     let max_file_bytes = (MAGIC.len() + 8 + MAX_BLOB_BYTES) as u64;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_file_bytes {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > max_file_bytes
+    {
         return Err(KeyWrapperError::Failed);
     }
     let file = File::open(path).map_err(|_| KeyWrapperError::Unavailable)?;
@@ -271,7 +275,8 @@ fn read_blob(path: &Path) -> Result<Vec<u8>, KeyWrapperError> {
 }
 
 fn write_blob(path: &Path, encrypted: &[u8]) -> Result<(), KeyWrapperError> {
-    if encrypted.is_empty() || encrypted.len() > MAX_BLOB_BYTES || is_symlink(path) {
+    // P16-T6：防逃逸判定统一走 link_guard（原本地 is_symlink 助手删除）。
+    if encrypted.is_empty() || encrypted.len() > MAX_BLOB_BYTES || crate::link_guard::is_reparse_link(path) {
         return Err(KeyWrapperError::Failed);
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -348,7 +353,8 @@ fn reject_symlink_chain(path: &Path) -> Result<(), KeyWrapperError> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+            Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
                 return Err(KeyWrapperError::Failed)
             }
             Ok(_) => {}
@@ -366,11 +372,8 @@ fn reject_symlink_chain(path: &Path) -> Result<(), KeyWrapperError> {
     Ok(())
 }
 
-fn is_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-}
+// P16-T6：原本地 is_symlink 助手已删除——判定统一收敛到
+// crate::link_guard::{is_reparse_link, metadata_is_reparse_link}（逻辑只改一处）。
 
 fn now_nanos() -> u128 {
     SystemTime::now()

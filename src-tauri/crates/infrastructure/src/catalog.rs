@@ -228,7 +228,8 @@ pub fn ensure_catalog_initialized(
 
     let catalog_root = storage_root.join("catalog");
     match fs::symlink_metadata(&catalog_root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
             return Err(CatalogPathError::Invalid)
         }
         Ok(_) => {
@@ -595,7 +596,11 @@ fn cleanup_readonly_created_sidecars(catalog_path: &Path, existed_before: &[bool
         let Ok(metadata) = fs::symlink_metadata(&sidecar) else {
             continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 32 * 1024 {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&metadata)
+            || !metadata.is_file()
+            || metadata.len() > 32 * 1024
+        {
             continue;
         }
         let _ = fs::remove_file(sidecar);
@@ -815,7 +820,8 @@ impl SqlCipherCatalogRepository {
     fn open_existing_catalog(&self) -> Option<Connection> {
         reject_catalog_sidecars(&self.db_path).ok()?;
         let metadata = fs::symlink_metadata(&self.db_path).ok()?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
             return None;
         }
         self.open_catalog_with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -831,7 +837,8 @@ impl SqlCipherCatalogRepository {
         reject_catalog_sidecars(&self.db_path)?;
         let metadata =
             fs::symlink_metadata(&self.db_path).map_err(|_| CatalogPathError::Invalid)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
             return Err(CatalogPathError::Invalid);
         }
         let sidecars_before = catalog_sidecars_snapshot(&self.db_path);
@@ -893,12 +900,15 @@ impl SqlCipherCatalogRepository {
 
         let generation_metadata =
             fs::symlink_metadata(&generation_dir).map_err(|_| CatalogPathError::Invalid)?;
-        if generation_metadata.file_type().is_symlink() || !generation_metadata.is_dir() {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&generation_metadata)
+            || !generation_metadata.is_dir()
+        {
             return Err(CatalogPathError::Invalid);
         }
         let metadata_file =
             fs::symlink_metadata(&metadata_path).map_err(|_| CatalogPathError::Invalid)?;
-        if metadata_file.file_type().is_symlink() || !metadata_file.is_file() {
+        if crate::link_guard::metadata_is_reparse_link(&metadata_file) || !metadata_file.is_file() {
             return Err(CatalogPathError::Invalid);
         }
         let metadata_on_disk: CatalogGenerationMetadataOnDisk = serde_json::from_reader(
@@ -925,7 +935,8 @@ impl SqlCipherCatalogRepository {
 
         let catalog_file =
             fs::symlink_metadata(&self.db_path).map_err(|_| CatalogPathError::Invalid)?;
-        if catalog_file.file_type().is_symlink() || !catalog_file.is_file() {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&catalog_file) || !catalog_file.is_file() {
             return Err(CatalogPathError::Invalid);
         }
         // 先拒绝 WAL/SHM/journal，再以 READ_ONLY 打开；协调路径不得创建连接或改写 DB header。
@@ -1168,7 +1179,8 @@ impl CatalogRepository for SqlCipherCatalogRepository {
         }
         let existing_file = match fs::symlink_metadata(&self.db_path) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                // P16-T6：防逃逸判定统一走 link_guard。
+                if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
                     return false;
                 }
                 true

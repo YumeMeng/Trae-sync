@@ -3,13 +3,14 @@ use std::path::Path;
 
 /// 以同卷原子替换发布临时文件；失败时清理本次调用创建的临时文件。
 pub(crate) fn publish_replacing(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 目标一并拒绝替换）。
     if fs::symlink_metadata(destination)
-        .map(|metadata| metadata.file_type().is_symlink())
+        .map(|metadata| crate::link_guard::metadata_is_reparse_link(&metadata))
         .unwrap_or(false)
     {
         let result = Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "拒绝替换符号链接目标",
+            "拒绝替换链接（符号链接/junction）目标",
         ));
         let _ = fs::remove_file(temporary);
         return result;

@@ -105,13 +105,11 @@ impl StorageRootBinding {
             .canonicalize()
             .map_err(|_| StorageRootError::DestinationUnavailable)?;
         // 已有绑定只能幂等打开，不能被新的目录库身份静默覆盖。
-        // 工具链 1.97 适配：junction 也是 reparse point（is_symlink 不识别），
-        // 用 read_link 统一识别符号链接与 junction（硬链接评估结论：不拒绝）。
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         let binding_path = canonical.join("storage-root.json");
         if fs::symlink_metadata(&binding_path)
-            .map(|metadata| metadata.file_type().is_symlink())
+            .map(|metadata| crate::link_guard::metadata_is_reparse_link(&metadata))
             .unwrap_or(false)
-            || crate::link_guard::is_reparse_link(&binding_path)
         {
             return Err(StorageRootError::BindingInvalid);
         }
@@ -160,9 +158,9 @@ impl StorageRootBinding {
         let binding_path = canonical.join("storage-root.json");
         let binding_metadata =
             fs::symlink_metadata(&binding_path).map_err(|_| StorageRootError::BindingMissing)?;
-        if binding_metadata.file_type().is_symlink()
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&binding_metadata)
             || !binding_metadata.is_file()
-            || crate::link_guard::is_reparse_link(&binding_path)
         {
             return Err(StorageRootError::BindingMissing);
         }
@@ -290,11 +288,8 @@ fn migrate_storage_root(
 pub fn read_storage_root_pointer(pointer: &Path) -> Result<StorageRootBinding, StorageRootError> {
     let metadata =
         fs::symlink_metadata(pointer).map_err(|_| StorageRootError::PointerUnavailable)?;
-    // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || crate::link_guard::is_reparse_link(pointer)
-    {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+    if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
         return Err(StorageRootError::PointerUnavailable);
     }
     let pointer: StorageRootPointer = serde_json::from_reader(
@@ -317,11 +312,9 @@ pub fn publish_initial_storage_root_pointer(
     binding: &StorageRootBinding,
 ) -> Result<(), StorageRootError> {
     match fs::symlink_metadata(pointer) {
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || crate::link_guard::is_reparse_link(pointer) =>
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() =>
         {
             Err(StorageRootError::PointerUnavailable)
         }
@@ -506,11 +499,9 @@ fn prepare_storage_root_pointer(
     source_binding: &StorageRootBinding,
 ) -> Result<(), StorageRootError> {
     match fs::symlink_metadata(pointer) {
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || crate::link_guard::is_reparse_link(pointer) =>
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() =>
         {
             Err(StorageRootError::PointerUnavailable)
         }
@@ -542,10 +533,10 @@ fn write_storage_root_pointer(
     reject_symlink_directory_chain(parent)?;
     fs::create_dir_all(parent).map_err(|_| StorageRootError::PointerUnavailable)?;
     reject_symlink_directory_chain(parent)?;
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
     if fs::symlink_metadata(pointer)
-        .map(|metadata| metadata.file_type().is_symlink())
+        .map(|metadata| crate::link_guard::metadata_is_reparse_link(&metadata))
         .unwrap_or(false)
-        || crate::link_guard::is_reparse_link(pointer)
     {
         return Err(StorageRootError::PointerUnavailable);
     }
@@ -587,11 +578,9 @@ fn reject_symlink_directory_chain(path: &Path) -> Result<(), StorageRootError> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            // 工具链 1.97 适配：junction 也是目录逃逸向量，read_link 统一识别。
+            // P16-T6：防逃逸判定统一走 link_guard（junction 也是目录逃逸向量）。
             Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_dir()
-                    || crate::link_guard::is_reparse_link(candidate) =>
+                if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() =>
             {
                 return Err(StorageRootError::DestinationUnavailable)
             }
@@ -775,7 +764,8 @@ fn copy_tree_inner(
         let destination_path = destination.join(relative);
         let metadata =
             fs::symlink_metadata(&source_path).map_err(|_| StorageRootError::CopyFailed)?;
-        if metadata.file_type().is_symlink() {
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        if crate::link_guard::metadata_is_reparse_link(&metadata) {
             return Err(StorageRootError::VerificationFailed);
         }
         if metadata.is_dir() {
@@ -820,7 +810,7 @@ fn collect_tree_manifest_inner(
             fs::symlink_metadata(&path).map_err(|_| StorageRootError::VerificationFailed)?;
         // 工具链 1.97 适配：junction 识别（read_link），目录 junction 会把
         // 复制边界外的内容带进清单/体积统计——与符号链接同为拒绝对象。
-        if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&path) {
+        if crate::link_guard::metadata_is_reparse_link(&metadata) {
             return Err(StorageRootError::VerificationFailed);
         }
         let relative = path
@@ -852,7 +842,7 @@ fn tree_size_inner(root: &Path, current: &Path, total: &mut u64) -> Result<(), S
             fs::symlink_metadata(&path).map_err(|_| StorageRootError::VerificationFailed)?;
         // 工具链 1.97 适配：junction 识别（read_link），目录 junction 会把
         // 复制边界外的内容带进清单/体积统计——与符号链接同为拒绝对象。
-        if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&path) {
+        if crate::link_guard::metadata_is_reparse_link(&metadata) {
             return Err(StorageRootError::VerificationFailed);
         }
         let relative = path
@@ -1459,10 +1449,8 @@ mod tests {
         write_binding(root.path(), &binding).unwrap();
 
         assert_eq!(fs::read(outside_file).unwrap(), b"outside");
-        assert!(fs::symlink_metadata(marker)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        // P16-T6：断言走 link_guard（不再直接调用 std is_symlink）。
+        assert!(crate::link_guard::is_reparse_link(&marker));
     }
 
     #[test]

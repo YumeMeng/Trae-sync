@@ -567,7 +567,8 @@ fn validate_directory_chain(path: &Path, invalid: &str) -> Result<(), String> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+            Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() => {
                 return Err(invalid.to_string())
             }
             Ok(_) => {}
@@ -613,7 +614,8 @@ fn open_existing_regular_file(
     #[cfg(not(windows))]
     {
         let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => metadata,
+            // P16-T6：junction 不是普通文件，与符号链接同为拒绝对象。
+            Ok(metadata) if !crate::link_guard::metadata_is_reparse_link(&metadata) && metadata.is_file() => metadata,
             Ok(_) => return Err(invalid.to_string()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(unavailable.to_string()),
@@ -649,7 +651,8 @@ fn open_or_create_regular_file(path: &Path) -> Result<File, SecurePathOpenError>
         use std::fs::OpenOptions;
 
         match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            // P16-T6：防逃逸判定统一走 link_guard。
+            Ok(metadata) if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() => {
                 return Err(SecurePathOpenError::Invalid)
             }
             Ok(_) => {}

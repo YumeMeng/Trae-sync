@@ -328,7 +328,10 @@ pub fn capture_fixture_failure_scene(
     }
     if failure_raw_dir.exists()
         || fs::symlink_metadata(target_db_path)
-            .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+            .map(|metadata| {
+                // P16-T6：防逃逸判定统一走 link_guard。
+                crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file()
+            })
             .unwrap_or(true)
     {
         return false;
@@ -360,7 +363,8 @@ pub fn capture_fixture_failure_scene(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => continue,
             Err(_) => return false,
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        // P16-T6：防逃逸判定统一走 link_guard。
+        if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_file() {
             return false;
         }
         let destination = failure_raw_dir.join(name);

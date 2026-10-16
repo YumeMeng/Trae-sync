@@ -64,7 +64,8 @@ pub fn resolve_current_catalog_path(storage_root: &Path) -> Result<PathBuf, Cata
             CatalogPathError::Io
         }
     })?;
-    if catalog_metadata.file_type().is_symlink() || !catalog_metadata.is_dir() {
+    // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝，下同）。
+    if crate::link_guard::metadata_is_reparse_link(&catalog_metadata) || !catalog_metadata.is_dir() {
         return Err(CatalogPathError::Invalid);
     }
 
@@ -76,7 +77,7 @@ pub fn resolve_current_catalog_path(storage_root: &Path) -> Result<PathBuf, Cata
             CatalogPathError::Io
         }
     })?;
-    if pointer_metadata.file_type().is_symlink() || !pointer_metadata.is_file() {
+    if crate::link_guard::metadata_is_reparse_link(&pointer_metadata) || !pointer_metadata.is_file() {
         return Err(CatalogPathError::Invalid);
     }
     let pointer: CatalogCurrentPointer =
@@ -87,19 +88,24 @@ pub fn resolve_current_catalog_path(storage_root: &Path) -> Result<PathBuf, Cata
     let generations_root = catalog_root.join("generations");
     let generations_metadata =
         fs::symlink_metadata(&generations_root).map_err(|_| CatalogPathError::Invalid)?;
-    if generations_metadata.file_type().is_symlink() || !generations_metadata.is_dir() {
+    if crate::link_guard::metadata_is_reparse_link(&generations_metadata)
+        || !generations_metadata.is_dir()
+    {
         return Err(CatalogPathError::Invalid);
     }
     let generation_dir = generations_root.join(&pointer.generation_id);
     let generation_metadata =
         fs::symlink_metadata(&generation_dir).map_err(|_| CatalogPathError::Invalid)?;
-    if generation_metadata.file_type().is_symlink() || !generation_metadata.is_dir() {
+    if crate::link_guard::metadata_is_reparse_link(&generation_metadata)
+        || !generation_metadata.is_dir()
+    {
         return Err(CatalogPathError::Invalid);
     }
     let catalog_path = generation_dir.join("catalog.db");
     let catalog_metadata =
         fs::symlink_metadata(&catalog_path).map_err(|_| CatalogPathError::Invalid)?;
-    if catalog_metadata.file_type().is_symlink() || !catalog_metadata.is_file() {
+    if crate::link_guard::metadata_is_reparse_link(&catalog_metadata) || !catalog_metadata.is_file()
+    {
         return Err(CatalogPathError::Invalid);
     }
     Ok(catalog_path)

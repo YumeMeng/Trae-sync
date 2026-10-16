@@ -1463,3 +1463,91 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 推荐批次：P15-0 → P15-1（阶段一，10-18 前）→ P15-2（用户确认）→ P15-3 与 P15-4 并行（文件不重叠）→ P15-5、P15-6 → P15-7 → P15-8 → P15-9 → P15-10（10-23 停服前）→ P15-11（真实切号验收后）。Blocked by 才是真正依赖；真实破坏性操作（数据删除、主库绑定切换、首次真实切号）执行点单次确认保持。执行纪律沿用 Phase 14 末段（子 agent 调度限制、文件责任串行、证据分账）。
 
 本期不做：海外版适配、融合版 Agent/IDE 功能开发、副环境扩展、Work 客户端卸载与目录清理（用户验收后另行执行）、融合版客户端原生多账号逆向（官方无此 UI）。发现阻断性事实立即更正任务与决策并同步 ADR/CONTEXT。
+
+### P16 账号捕获闭环 + 备份治理 + 移植性纪律
+
+**交付：** 新账号「从客户端捕获」入池（.fused+.checkin 双铸造，入池即全功能）；备份治理三合一（E 盘软件旁+zstd 压缩+迁移释放 C 盘 3.13GB）；移植性纪律（存储根收口/37 判定点统一/并发锁重试/fixture 收敛/OAuth 链 deprecated）。
+
+**来源 Spec：** [docs/specs/p16-account-capture.md](docs/specs/p16-account-capture.md)（grilling 共识 Q1-Q12）。
+
+**Blocked by:** Phase 15（已完成）。实施顺序 = 工作 frontier：T1→T3→T6→T2→T4→T5→T7→T8→T9。
+
+#### T1 备份治理（目录迁移 + zstd 压缩 + 链迁移）
+
+**What to build:** 写操作的三件套备份自动落到软件本体旁 `backups/` 目录（exe 同级推导，E 盘）并写 zstd 压缩包（1.6GB→约 400MB）；恢复/迁移链对旧未压缩与新压缩双格式兼容；现有 4 份（3.13GB，客户端目录内）迁移转换到新位置后删除原副本。
+
+**Blocked by:** None — can start immediately。
+
+- [x] backup_master_trio_to 支持 zstd 压缩写出（.zst），恢复/迁移路径双格式读取兼容（**2026-10-16 真机实测修正：SQLCipher 为 AES-256 加密库，密文熵接近满值、压缩比 ≈1:1——"体积减 75%" 预期不成立（按普通 SQLite 误估）；zstd 管线保留（无害且已测试）。空间收益来源 = 位置迁移 + 保留策略，非压缩**）
+- [x] 默认备份目录推导改为软件本体旁 backups/（exe 同级推导 + 配置覆盖保留），客户端目录不再产生备份（2026-10-16 已实现并真机验证）
+- [x] 现有备份链迁移转换到新位置，原 C 盘副本删除（释放 3.13GB），迁移幂等可重跑（2026-10-16 真机执行：migrated=2 freed=3.13GB failures=0——其中 2 份系 prune keep=2 正常清理，2 份由迁移转换）
+- [x] prune 保留策略兼容压缩命名；单测覆盖压缩写/双格式读/迁移幂等（infrastructure 921/0/7 全绿）
+
+#### T2 存储根派生收口
+
+**What to build:** checkin / products-trae_cn / product-state / fused-login 四处独立派生纯函数收口为单一来源模块，全部调用点替换。移植性关键前置。
+
+**Blocked by:** None — can start immediately。
+
+- [ ] 单一来源模块落地（4 个根函数唯一实现），原散落点全部改为转发或删除
+- [ ] 相关模块测试全绿（调点替换不改语义）
+
+#### T3 并发锁 error 5 短退避重试
+
+**What to build:** FileOperationLock::acquire_sibling_resource 对 open 阶段 ERROR_ACCESS_DENIED(5)（文件系统过滤驱动扫描窗口）做一次短退避重试。
+
+**Blocked by:** None — can start immediately。
+
+- [x] 重试实现（LOCK_OPEN_RETRY_DELAY 50ms）+ error 5 注入单测；并发环境失败测试重试下全部转绿（infrastructure 921/0——原 909/3 的 3 个并发项消除）
+
+#### T4 捕获编排核心（capture_trae_cn_account）
+
+**What to build:** 新账号「从客户端捕获」入池的完整后端编排：读 Trae 登录 blob → 在线 GetUserInfo 复核 → GetPCAuthCode → ExchangeToken（设备身份对齐，P15-0 同链路）→ FusedLoginStore.save（.fused）+ CheckinCredentialStore 写入（.checkin，入池即全功能）→ AccountRegistry 档案登记（去重：user_id 已存在拒绝）。与 UI 命令共享编排查，供前端接线。
+
+**Blocked by:** T2（credential_handover 文件交叠）。
+
+- [ ] capture 编排函数 + tauri 命令 + lib.rs 注册
+- [ ] 去重拒绝（account_already_registered）路径
+- [ ] 隔离单测（临时目录 + mock HTTP）覆盖正常/去重/复核失败三路径；无真号，真机验收待新号补（单次确认）
+
+#### T5 捕获前端接线
+
+**What to build:** 环境页「从客户端捕获账号」按钮 + 回执展示（昵称/账号 ID/入池确认）+ AccountCenter 账号列表出现新号；mock-bridge/e2e 场景同步。
+
+**Blocked by:** T4。
+
+- [ ] 按钮 + 回执 + 列表可见性（Vitest 场景）
+- [ ] mock-bridge 捕获场景 + e2e 用例
+
+#### T6 判定点统一替换（37 处 contract）
+
+**What to build:** 全库 is_symlink 防逃逸判定点批量替换为 link_guard 调用（expand 已落，本轮 contract）。
+
+**Blocked by:** None — can start immediately。
+
+- [x] 替换完成，grep 零残留（is_symlink 直接调用清零）；infrastructure 921/0 全绿
+
+#### T7 fixture 泄漏收敛
+
+**What to build:** 测试 fixture 临时目录的 tag + 收尾清理机制（每次 trae-sync 全量 ~27 目录泄漏归零）。
+
+**Blocked by:** None — can start immediately。
+
+- [ ] 清理机制落地 + 全量测试连跑两次 TEMP 零增长验证
+
+#### T8 OAuth 链 deprecated 标注
+
+**What to build:** begin/complete_trae_cn_login 标记 deprecated（捕获路线稳定后的清理预备），前端登录入口状态评估记录。
+
+**Blocked by:** T5。
+
+- [ ] deprecated 标注 + 编译证据 + 前端入口处置结论落档
+
+#### T9 收尾回归与发布
+
+**What to build:** 全量回归（Rust 两段 + Vitest + E2E + typecheck）+ push + 0.2.5 安装版更新评估结论。
+
+**Blocked by:** T1-T8。
+
+- [ ] 四套件全绿（并发环境项按既有定性豁免）
+- [ ] push 落远端 + 0.2.5 更新评估结论写回票据

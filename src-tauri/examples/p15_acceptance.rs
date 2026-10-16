@@ -48,6 +48,15 @@ fn main() {
         "--delete" => trae_sync_lib::library_archive::acceptance_probe::delete_sessions(
             split_ids(flag_value("--delete").as_ref()),
         ),
+        "--migrate-backups" => {
+            let Some(target) = flag_value("--migrate-backups") else {
+                eprintln!("缺少 --migrate-backups <目标目录>");
+                std::process::exit(2);
+            };
+            trae_sync_lib::library_archive::acceptance_probe::migrate_backups(
+                std::path::Path::new(&target),
+            )
+        }
         other => {
             eprintln!("未知模式 {other:?}；见文件头用法注释");
             std::process::exit(2);

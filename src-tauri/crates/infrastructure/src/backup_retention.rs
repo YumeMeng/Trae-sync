@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
-use crate::master_handover::list_master_backups_in;
+use crate::master_handover::{backup_member_file_names, list_master_backups_in};
 use crate::operation_lease::FileOperationLock;
 
 const STORE_FILE: &str = "backup-retention.json";
@@ -199,13 +199,15 @@ pub fn prune_master_backups(backup_dir: &Path, db_name: &str, keep: u32) -> usiz
     let mut removed = 0;
     for entry in chain.iter().skip(keep as usize) {
         let stamp = entry.stamp_unix_seconds;
-        let base = format!("{db_name}.switch-bak-{stamp}");
         let mut removed_this = true;
-        for name in [&base, &format!("{base}-wal"), &format!("{base}-shm")] {
+        // P16-T1 双格式：旧未压缩与新压缩 .zst 成员名都在候选清单里
+        // （不存在的名字 remove 失败但文件也不存在 → 视为已删，静默）。
+        for name in backup_member_file_names(db_name, stamp) {
+            let member = backup_dir.join(&name);
             // 删除失败不中断整体裁剪；该份下次备份生成时再试。
-            if fs::remove_file(backup_dir.join(name)).is_err() {
+            if fs::remove_file(&member).is_err() {
                 // 仅当文件不存在视为已删；其他失败标记该份未完全清理。
-                if backup_dir.join(name).exists() {
+                if member.exists() {
                     removed_this = false;
                 }
             }
@@ -257,11 +259,12 @@ pub fn migrate_master_backups(
     // 收集待迁清单：(源绝对路径, 备份目录内相对显示名)。
     let mut plan: Vec<(PathBuf, String)> = Vec::new();
     for entry in list_master_backups_in(source_dir, db_name) {
-        let base = format!("{db_name}.switch-bak-{}", entry.stamp_unix_seconds);
-        for name in [&base, &format!("{base}-wal"), &format!("{base}-shm")] {
-            let path = source_dir.join(name);
+        // P16-T1 双格式：旧未压缩与新压缩 .zst 成员都在候选清单里，
+        // 存在哪个迁哪个（迁移窗口内两形态并存的现场也完整搬迁）。
+        for name in backup_member_file_names(db_name, entry.stamp_unix_seconds) {
+            let path = source_dir.join(&name);
             if path.is_file() {
-                plan.push((path, name.to_string()));
+                plan.push((path, name));
             }
         }
         // 凭据子目录（存在时）整体按相对结构迁入。
@@ -349,6 +352,192 @@ fn collect_dir_files(
         }
     }
     Ok(())
+}
+
+// ===== P16-T1：旧未压缩备份链 → 压缩形态迁移（读入 → 压缩 → 校验 → 删原）=====
+
+/// 旧备份压缩迁移回执（Q12 决策：用户授权真机迁移）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCompressionMigrationOutcome {
+    /// 本次压缩校验通过并删除原副本的备份数。
+    pub migrated_backups: usize,
+    /// 目标 .zst 已存在且解压比对一致（幂等重跑计入）的备份数。
+    pub idempotent_backups: usize,
+    /// 实际删除的原副本字节总量（释放空间口径）。
+    pub freed_bytes: u64,
+    /// 失败清单（`{stamp}: {原因}`；失败份的原副本完整保留）。
+    pub failures: Vec<String>,
+}
+
+/// 把 source_dir 内**旧未压缩**备份链迁移为压缩形态写入 target_dir，
+/// 全部成员解压比对通过后删除原副本（Q12 用户授权的例外：普通场景
+/// 铁律「不自动删快照」不受影响——本函数只在迁移校验全过时删源）。
+///
+/// 安全边界与幂等设计：
+/// - 每份备份先在 target_dir 的暂存子目录压缩，逐成员**流式**解压与
+///   源文件字节比对（不整载内存，备份可达 GB 级），全部通过才改名发布
+///   到最终名，最后删除源副本——任一步失败都保留源，清理暂存；
+/// - 幂等可重跑：目标 .zst 已存在且全部比对一致 → 只删源（计入幂等）；
+///   部分存在（上次中断现场）→ 记失败保留现场，不猜测覆盖；
+/// - 只处理旧未压缩成员（新压缩 .zst 本就是目标形态，不属迁移对象）；
+/// - 凭据子目录不参与本迁移（P11-4② 结构保持原样，另行处理）。
+pub fn migrate_legacy_backups_to_compressed(
+    source_dir: &Path,
+    target_dir: &Path,
+    db_name: &str,
+) -> Result<LegacyCompressionMigrationOutcome, BackupRetentionError> {
+    std::fs::create_dir_all(target_dir).map_err(|_| BackupRetentionError::Io)?;
+    let mut outcome = LegacyCompressionMigrationOutcome {
+        migrated_backups: 0,
+        idempotent_backups: 0,
+        freed_bytes: 0,
+        failures: Vec::new(),
+    };
+    for entry in list_master_backups_in(source_dir, db_name) {
+        let stamp = entry.stamp_unix_seconds;
+        // 只取旧未压缩成员（db/wal/shm；.zst 已是目标形态）。
+        let members: Vec<(PathBuf, String)> = ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| (suffix, source_dir.join(format!("{db_name}.switch-bak-{stamp}{suffix}"))))
+            .filter(|(_, path)| path.is_file())
+            .map(|(suffix, path)| (path, suffix.to_string()))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let targets: Vec<(PathBuf, PathBuf)> = members
+            .iter()
+            .map(|(source, suffix)| {
+                (
+                    source.clone(),
+                    target_dir.join(format!("{db_name}.switch-bak-{stamp}{suffix}.zst")),
+                )
+            })
+            .collect();
+
+        // 幂等分支：目标 .zst 全部已存在 → 全量比对，一致则删源。
+        if targets.iter().all(|(_, target)| target.is_file()) {
+            if targets
+                .iter()
+                .all(|(source, target)| compressed_file_matches(target, source))
+            {
+                outcome.freed_bytes += remove_source_members(&members);
+                outcome.idempotent_backups += 1;
+            } else {
+                outcome
+                    .failures
+                    .push(format!("{stamp}: 目标压缩件与源内容不一致，原副本保留"));
+            }
+            continue;
+        }
+        // 中断现场：部分目标已存在——记失败保留现场（永不覆盖既有文件）。
+        if targets.iter().any(|(_, target)| target.is_file()) {
+            outcome
+                .failures
+                .push(format!("{stamp}: 目标已存在部分压缩件（上次迁移中断），原副本保留"));
+            continue;
+        }
+
+        // 暂存压缩 + 逐成员流式校验；任一失败清理暂存、保留源、记失败。
+        let staging = target_dir.join(format!(".migrating-{db_name}-{stamp}"));
+        let mut ok = true;
+        for (source, target) in &targets {
+            let staged = staging.join(
+                target
+                    .file_name()
+                    .ok_or(BackupRetentionError::Io)?
+                    .to_os_string(),
+            );
+            if std::fs::create_dir_all(&staging).is_err()
+                || crate::master_handover::compress_file_create_new(source, &staged).is_err()
+                || !compressed_file_matches(&staged, source)
+            {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            let _ = std::fs::remove_dir_all(&staging);
+            outcome
+                .failures
+                .push(format!("{stamp}: 压缩或解压比对失败，原副本保留"));
+            continue;
+        }
+        // 发布：暂存 → 最终名（同卷改名），随后删源。改名失败同样保留源。
+        let mut published: Vec<PathBuf> = Vec::new();
+        let mut publish_ok = true;
+        for (_, target) in &targets {
+            let staged = staging.join(target.file_name().ok_or(BackupRetentionError::Io)?);
+            if std::fs::rename(&staged, target).is_err() {
+                publish_ok = false;
+                break;
+            }
+            published.push(target.clone());
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        if !publish_ok {
+            // 已发布的部分留给下次幂等重跑核验（不删源、不回滚已发布件）。
+            outcome
+                .failures
+                .push(format!("{stamp}: 压缩件发布中断，原副本保留"));
+            continue;
+        }
+        outcome.freed_bytes += remove_source_members(&members);
+        outcome.migrated_backups += 1;
+    }
+    Ok(outcome)
+}
+
+/// 删除一份备份的全部源成员，返回实际释放字节（删除失败静默跳过——
+/// 与裁剪同口径，下次重跑幂等分支再收尾）。
+fn remove_source_members(members: &[(PathBuf, String)]) -> u64 {
+    let mut freed = 0;
+    for (source, _) in members {
+        let size = std::fs::metadata(source).map(|meta| meta.len()).unwrap_or(0);
+        if std::fs::remove_file(source).is_ok() {
+            freed += size;
+        }
+    }
+    freed
+}
+
+/// 流式比对：zst 解压结果与源文件逐块字节一致（不整载内存）。
+fn compressed_file_matches(zst_path: &Path, source: &Path) -> bool {
+    (|| -> std::io::Result<bool> {
+        let input = std::fs::File::open(zst_path)?;
+        let mut decoder = zstd::stream::read::Decoder::new(input)?;
+        let mut original = std::fs::File::open(source)?;
+        let mut a = [0_u8; 64 * 1024];
+        let mut b = [0_u8; 64 * 1024];
+        loop {
+            let na = read_full(&mut decoder, &mut a)?;
+            let nb = read_full(&mut original, &mut b)?;
+            if na != nb {
+                return Ok(false);
+            }
+            if na == 0 {
+                return Ok(true);
+            }
+            if a[..na] != b[..nb] {
+                return Ok(false);
+            }
+        }
+    })()
+    .unwrap_or(false)
+}
+
+/// 把 reader 精确读满 buf（EOF 返回实际读到的字节数）。
+fn read_full(reader: &mut dyn std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -815,5 +1004,167 @@ mod tests {
         let second = migrate_master_backups(&source, &target, "database.db").unwrap();
         assert_eq!(second.migrated_files, 1);
         assert!(second.failures.is_empty());
+    }
+
+    // ===== P16-T1：压缩写 / 双格式读 / 迁移幂等 / prune 兼容 =====
+
+    use crate::master_handover::{
+        backup_master_trio_to, decompress_backup_member, list_master_backups_in,
+    };
+
+    /// 压缩写出：backup_master_trio_to 产出 .zst 成员，解压后与源字节一致。
+    #[test]
+    fn compressed_backup_roundtrip() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let db = data.join("database.db");
+        // 足够大的可压缩样本，覆盖流式编解码路径。
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 7) as u8).collect();
+        std::fs::write(&db, &payload).unwrap();
+        std::fs::write(data.join("database.db-wal"), b"wal-bytes").unwrap();
+        let target = root.path().join("backups");
+        let main = backup_master_trio_to(&db, Some(&target)).unwrap();
+        assert!(main.to_string_lossy().ends_with(".zst"));
+        let stamp = main
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches("database.db.switch-bak-")
+            .trim_end_matches(".zst")
+            .to_string();
+        // 成员为压缩形态，解压回读字节一致（双格式读路径）。
+        let restored = root.path().join("restored.db");
+        decompress_backup_member(&main, &restored).unwrap();
+        assert_eq!(std::fs::read(&restored).unwrap(), payload);
+        let restored_wal = root.path().join("restored.wal");
+        decompress_backup_member(
+            &target.join(format!("database.db.switch-bak-{stamp}-wal.zst")),
+            &restored_wal,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&restored_wal).unwrap(), b"wal-bytes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 双格式链枚举：未压缩与压缩成员同目录并存时聚合为同一 stamp 一条，
+    /// has_wal 任一形态命中即 true。
+    #[test]
+    fn chain_listing_recognizes_both_formats() {
+        let dir = tempdir().unwrap();
+        // 旧未压缩 1000（带 wal），新压缩 900（带 wal.zst）。
+        std::fs::write(dir.path().join("database.db.switch-bak-1000"), [1u8; 10]).unwrap();
+        std::fs::write(dir.path().join("database.db.switch-bak-1000-wal"), [1u8; 4]).unwrap();
+        std::fs::write(dir.path().join("database.db.switch-bak-900.zst"), [1u8; 6]).unwrap();
+        std::fs::write(dir.path().join("database.db.switch-bak-900-wal.zst"), [1u8; 3]).unwrap();
+        let chain = list_master_backups_in(dir.path(), "database.db");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].stamp_unix_seconds, 1000);
+        assert!(chain[0].has_wal);
+        assert_eq!(chain[0].total_bytes, 14);
+        assert_eq!(chain[1].stamp_unix_seconds, 900);
+        assert!(chain[1].has_wal);
+        // 同 stamp 双形态并存：聚合一条（迁移窗口过渡现场不丢链项）。
+        std::fs::write(dir.path().join("database.db.switch-bak-800"), [1u8; 5]).unwrap();
+        std::fs::write(dir.path().join("database.db.switch-bak-800.zst"), [1u8; 2]).unwrap();
+        let chain = list_master_backups_in(dir.path(), "database.db");
+        assert_eq!(chain.len(), 3);
+        let merged = chain.iter().find(|entry| entry.stamp_unix_seconds == 800).unwrap();
+        assert_eq!(merged.total_bytes, 7);
+    }
+
+    /// prune 兼容压缩命名：keep=1 时最旧一份（纯压缩形态）连带 .zst 删除。
+    #[test]
+    fn prune_removes_compressed_members() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("database.db.switch-bak-1000.zst"), [1u8; 10]).unwrap();
+        std::fs::write(dir.path().join("database.db.switch-bak-1000-wal.zst"), [1u8; 4]).unwrap();
+        std::fs::write(dir.path().join("database.db.switch-bak-900.zst"), [1u8; 6]).unwrap();
+        assert_eq!(prune_master_backups(dir.path(), "database.db", 1), 1);
+        assert!(dir.path().join("database.db.switch-bak-1000.zst").is_file());
+        assert!(!dir.path().join("database.db.switch-bak-900.zst").is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 旧→压缩迁移：压缩写出 + 解压比对 + 原副本删除 + 释放字节统计。
+    #[test]
+    fn legacy_migration_compresses_verifies_and_frees() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&source).unwrap();
+        let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 13) as u8).collect();
+        std::fs::write(source.join("database.db.switch-bak-1000"), &payload).unwrap();
+        std::fs::write(source.join("database.db.switch-bak-1000-wal"), b"w").unwrap();
+        // 命名异常散件与已有 .zst（非迁移对象）不受影响。
+        std::fs::write(source.join("database.db.switch-bak-abc"), b"x").unwrap();
+        std::fs::write(source.join("database.db.switch-bak-800.zst"), b"z").unwrap();
+
+        let outcome = migrate_legacy_backups_to_compressed(&source, &target, "database.db").unwrap();
+        assert_eq!(outcome.migrated_backups, 1);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.freed_bytes, payload.len() as u64 + 1);
+        // 源副本已删；暂存目录不残留。
+        assert!(!source.join("database.db.switch-bak-1000").exists());
+        assert!(!source.join("database.db.switch-bak-1000-wal").exists());
+        assert!(!target.join(format!(".migrating-database.db-1000")).exists());
+        // 新位置为压缩形态，解压后与源字节一致。
+        let restored = root.path().join("restored");
+        decompress_backup_member(&target.join("database.db.switch-bak-1000.zst"), &restored).unwrap();
+        assert_eq!(std::fs::read(&restored).unwrap(), payload);
+        let restored_wal = root.path().join("restored-wal");
+        decompress_backup_member(&target.join("database.db.switch-bak-1000-wal.zst"), &restored_wal)
+            .unwrap();
+        assert_eq!(std::fs::read(&restored_wal).unwrap(), b"w");
+        // 散件与既有 .zst 原样保留。
+        assert!(source.join("database.db.switch-bak-abc").is_file());
+        assert!(source.join("database.db.switch-bak-800.zst").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 迁移幂等：首次迁移后重跑——目标已存在且一致 → 只删残留源（无残留
+    /// 时 freed=0），计入幂等而非重复迁移。
+    #[test]
+    fn legacy_migration_rerun_is_idempotent() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("database.db.switch-bak-1000"), b"db-bytes").unwrap();
+        let first = migrate_legacy_backups_to_compressed(&source, &target, "database.db").unwrap();
+        assert_eq!(first.migrated_backups, 1);
+        // 源已删干净：重跑无对象可迁，零失败零迁移。
+        let second = migrate_legacy_backups_to_compressed(&source, &target, "database.db").unwrap();
+        assert_eq!(second.migrated_backups, 0);
+        assert_eq!(second.idempotent_backups, 0);
+        assert!(second.failures.is_empty());
+        // 模拟残留源（同内容）：重跑幂等分支核验一致后只删源。
+        std::fs::write(source.join("database.db.switch-bak-1000"), b"db-bytes").unwrap();
+        let third = migrate_legacy_backups_to_compressed(&source, &target, "database.db").unwrap();
+        assert_eq!(third.migrated_backups, 0);
+        assert_eq!(third.idempotent_backups, 1);
+        assert_eq!(third.freed_bytes, b"db-bytes".len() as u64);
+        assert!(!source.join("database.db.switch-bak-1000").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 部分中断现场：目标已有部分压缩件时记失败保留源（不猜测覆盖）。
+    #[test]
+    fn legacy_migration_partial_target_reports_failure_and_keeps_source() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("database.db.switch-bak-1000"), b"db-bytes").unwrap();
+        std::fs::write(target.join("database.db.switch-bak-1000.zst"), b"stale").unwrap();
+
+        let outcome = migrate_legacy_backups_to_compressed(&source, &target, "database.db").unwrap();
+        assert_eq!(outcome.migrated_backups, 0);
+        assert_eq!(outcome.failures.len(), 1);
+        // 源原样保留。
+        assert_eq!(std::fs::read(source.join("database.db.switch-bak-1000")).unwrap(), b"db-bytes");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

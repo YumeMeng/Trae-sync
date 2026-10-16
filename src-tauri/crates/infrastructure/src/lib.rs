@@ -183,7 +183,9 @@ pub use logging::{
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_archive::{
-    apply_master_archive_changes, delete_master_sessions, merge_master_projects,
+    apply_master_archive_changes,
+    delete_master_sessions, delete_master_sessions_with_backup_dir, merge_master_projects,
+    merge_master_projects_with_backup_dir,
     MasterArchiveApplyOutcome, MasterArchiveError, MasterDeleteOutcome, MasterMergeOutcome,
     ARCHIVE_HIDDEN_STATUS,
 };

@@ -494,11 +494,9 @@ fn scan_manifest_family(
     match fs::symlink_metadata(&family_root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(DeletionError::LiveReferenceUnavailable),
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || crate::link_guard::is_reparse_link(&family_root) =>
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() =>
         {
             return Err(DeletionError::LiveReferenceUnavailable)
         }
@@ -510,11 +508,9 @@ fn scan_manifest_family(
         let metadata = entry
             .file_type()
             .map_err(|_| DeletionError::LiveReferenceUnavailable)?;
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
-        if metadata.is_symlink()
-            || !metadata.is_dir()
-            || crate::link_guard::is_reparse_link(&entry.path())
-        {
+        // P16-T6：防逃逸判定统一走 link_guard（is_reparse_link 已覆盖符号链接
+        // 与 junction，无需再单查 metadata.is_symlink）。
+        if !metadata.is_dir() || crate::link_guard::is_reparse_link(&entry.path()) {
             return Err(DeletionError::LiveReferenceUnavailable);
         }
         let latest = latest_manifest(&entry.path())?;
@@ -542,11 +538,9 @@ fn reject_symlink_directory_chain(path: &Path) -> Result<(), DeletionError> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            // 工具链 1.97 适配：junction 也是目录逃逸向量，read_link 统一识别。
+            // P16-T6：防逃逸判定统一走 link_guard（junction 也是目录逃逸向量）。
             Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_dir()
-                    || crate::link_guard::is_reparse_link(candidate) =>
+                if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() =>
             {
                 return Err(DeletionError::LiveReferenceUnavailable)
             }
@@ -572,7 +566,8 @@ fn latest_manifest(directory: &Path) -> Result<Option<Value>, DeletionError> {
         let metadata = entry
             .file_type()
             .map_err(|_| DeletionError::LiveReferenceUnavailable)?;
-        if metadata.is_symlink() || !metadata.is_file() {
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+        if !metadata.is_file() || crate::link_guard::is_reparse_link(&entry.path()) {
             return Err(DeletionError::LiveReferenceUnavailable);
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -743,8 +738,8 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf, DeletionError> {
         if let Component::Normal(name) = component {
             path.push(name);
             let metadata = fs::symlink_metadata(&path).map_err(|_| DeletionError::OutsideRoot)?;
-            // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
-            if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&path) {
+            // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
+            if crate::link_guard::metadata_is_reparse_link(&metadata) {
                 return Err(DeletionError::OutsideRoot);
             }
         }
@@ -851,11 +846,9 @@ fn append_journal_event(file: &mut File, event: &JournalEvent) -> Result<(), Del
 fn audit_directory(root: &Path, name: &str) -> Result<PathBuf, DeletionError> {
     let dir = root.join(name);
     match fs::symlink_metadata(&dir) {
-        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        // P16-T6：防逃逸判定统一走 link_guard（junction 一并拒绝）。
         Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || crate::link_guard::is_reparse_link(&dir) =>
+            if crate::link_guard::metadata_is_reparse_link(&metadata) || !metadata.is_dir() =>
         {
             Err(DeletionError::TombstoneFailed)
         }

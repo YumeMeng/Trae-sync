@@ -6683,6 +6683,8 @@ mod real_checkin_tests {
 
     /// P11-4③：purge 备份先行——主库 db 存在时先留三件套备份（create_new
     /// 永不覆盖既有链），备份成功后再执行删除。
+    /// P16-T1：备份为压缩 .zst 形态，测试显式配置 backup_dir 覆盖指向
+    /// 夹具 master 目录（新默认 = exe 同级 backups/，测试必须隔离）。
     #[test]
     fn purge_backs_up_master_trio_before_deletion() {
         let root = tempfile::tempdir().unwrap();
@@ -6697,6 +6699,14 @@ mod real_checkin_tests {
         std::fs::write(&master_db, b"master-db-bytes").unwrap();
         std::fs::write(master_dir.join("database.db-wal"), b"wal-bytes").unwrap();
         let appdata = tempfile::tempdir().unwrap();
+        // P16-T1：覆盖备份目录到夹具内，隔离 exe 同级默认目录。
+        traesync_infrastructure::backup_retention::BackupRetentionStore::new(root.path())
+            .save(&traesync_infrastructure::backup_retention::BackupRetentionSettings {
+                enabled: true,
+                keep: 5,
+                backup_dir: Some(master_dir.display().to_string()),
+            })
+            .unwrap();
 
         purge_account_records_inner(
             &root.path().join("checkin"),
@@ -6708,29 +6718,40 @@ mod real_checkin_tests {
         )
         .unwrap();
 
-        // 备份生成：主文件内容与 db 一致，且带 wal 附属件。
+        // 备份生成：压缩形态解压后与 db 一致，且带 wal 压缩附属件。
         let backup_main = std::fs::read_dir(&master_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .find(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 name.starts_with("database.db.switch-bak-")
-                    && !name.ends_with("-wal")
-                    && !name.ends_with("-shm")
+                    && name.ends_with(".zst")
+                    && !name.ends_with("-wal.zst")
+                    && !name.ends_with("-shm.zst")
             })
             .expect("备份主文件应存在");
-        assert_eq!(
-            std::fs::read(backup_main.path()).unwrap(),
-            b"master-db-bytes"
-        );
+        let restored = root.path().join("restored-db");
+        traesync_infrastructure::master_handover::decompress_backup_member(
+            &backup_main.path(),
+            &restored,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&restored).unwrap(), b"master-db-bytes");
         let backup_name = backup_main.file_name().to_string_lossy().into_owned();
-        assert!(master_dir.join(format!("{backup_name}-wal")).is_file());
+        let restored_wal = root.path().join("restored-wal");
+        traesync_infrastructure::master_handover::decompress_backup_member(
+            &master_dir.join(format!("{backup_name}").replace(".zst", "-wal.zst")),
+            &restored_wal,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&restored_wal).unwrap(), b"wal-bytes");
         // 备份先行不阻断删除主流程：三处现场照常清理。
         assert!(!instance_dir.exists());
     }
 
     /// P11-4③：备份失败一律拒绝执行（无备份不动数据），删除零发生。
-    /// 预占未来数秒的同名备份位使 create_new 撞车，确定性触发备份失败。
+    /// 预占未来数秒的同名压缩备份位使 create_new 撞车，确定性触发备份失败。
+    /// P16-T1：压缩写出 → 预占位也用 .zst 名；备份目录经覆盖指向夹具。
     #[test]
     fn purge_rejects_when_master_backup_fails() {
         let root = tempfile::tempdir().unwrap();
@@ -6742,13 +6763,21 @@ mod real_checkin_tests {
         std::fs::create_dir_all(&master_dir).unwrap();
         let master_db = master_dir.join("database.db");
         std::fs::write(&master_db, b"master-db-bytes").unwrap();
+        // P16-T1：覆盖备份目录到夹具内，隔离 exe 同级默认目录。
+        traesync_infrastructure::backup_retention::BackupRetentionStore::new(root.path())
+            .save(&traesync_infrastructure::backup_retention::BackupRetentionSettings {
+                enabled: true,
+                keep: 5,
+                backup_dir: Some(master_dir.display().to_string()),
+            })
+            .unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         for stamp in now - 2..=now + 5 {
             std::fs::write(
-                master_dir.join(format!("database.db.switch-bak-{stamp}")),
+                master_dir.join(format!("database.db.switch-bak-{stamp}.zst")),
                 b"occupied",
             )
             .unwrap();
