@@ -11,12 +11,15 @@
 //! 收编安全口径：孤儿行（`user_id IS NULL`）只报告不收编——无归属行
 //! 可能是 TRAE 自身维护的数据，改写归属缺乏依据（保守不动）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::account_session_index::InstanceFingerprint;
 use crate::master_archive::{open_with_key_readwrite, verify_key_readable, MasterArchiveError};
 use crate::master_handover::master_database_path;
+use crate::master_history::stat_master_fingerprint;
 use crate::sqlcipher::open_with_key_readonly;
 
 /// 注册表账号映射条目（调用方从 AccountRegistry 投影；user_id 即 account_id）。
@@ -92,6 +95,105 @@ pub fn read_master_checkup(master_data_dir: &Path, raw_key: &str) -> MasterCheck
         return MasterCheckupStatus::ReadFailed;
     };
     read_checkup_inner(&conn).map_or(MasterCheckupStatus::ReadFailed, MasterCheckupStatus::Ready)
+}
+
+// ===== P15-11 体检预聚合（指纹 + 显式失效，2026-10-15）=====
+
+/// 体检缓存条目：目录 + 密钥 + 库指纹 + 报告（单条目；主库是唯一高频调用方，
+/// 副环境/只读库偶发且体量小，换目录即换值）。
+struct CheckupCacheEntry {
+    master_dir: PathBuf,
+    raw_key: String,
+    fingerprint: InstanceFingerprint,
+    report: MasterCheckup,
+}
+
+/// 体检缓存状态机（与真实读取解耦，单测注入指纹与报告）。
+#[derive(Default)]
+struct CheckupCacheState {
+    entry: Option<CheckupCacheEntry>,
+}
+
+impl CheckupCacheState {
+    /// 指纹与密钥均一致才命中；`master_dir` 不同视为另一库。
+    fn get(
+        &self,
+        master_dir: &Path,
+        raw_key: &str,
+        fingerprint: &InstanceFingerprint,
+    ) -> Option<MasterCheckup> {
+        let entry = self.entry.as_ref()?;
+        (entry.master_dir == master_dir
+            && entry.raw_key == raw_key
+            && &entry.fingerprint == fingerprint)
+            .then(|| entry.report.clone())
+    }
+
+    fn store(
+        &mut self,
+        master_dir: PathBuf,
+        raw_key: String,
+        fingerprint: InstanceFingerprint,
+        report: MasterCheckup,
+    ) {
+        self.entry = Some(CheckupCacheEntry {
+            master_dir,
+            raw_key,
+            fingerprint,
+            report,
+        });
+    }
+
+    fn invalidate(&mut self) {
+        self.entry = None;
+    }
+}
+
+static CHECKUP_CACHE: OnceLock<Mutex<CheckupCacheState>> = OnceLock::new();
+
+fn checkup_cache() -> &'static Mutex<CheckupCacheState> {
+    CHECKUP_CACHE.get_or_init(|| Mutex::new(CheckupCacheState::default()))
+}
+
+/// 改写主库内容的编排成功后调用（切号完成 / 归档恢复提交 / 归并 / 收编 /
+/// 删除会话 / 清理空项目）：WAL 模式下改写先进 -wal，db 主文件指纹要等
+/// checkpoint 才变化——只靠指纹会在这些动作后出现分钟级陈旧分布，显式
+/// 失效补上零陈旧窗口。
+pub fn invalidate_master_checkup_cache() {
+    if let Ok(mut state) = checkup_cache().lock() {
+        state.invalidate();
+    }
+}
+
+/// 带预聚合缓存的体检读取（[`read_master_checkup`] 的缓存壳）。
+///
+/// P15-11：1.6GB 库 SQLCipher 打开 ~1s + 账号聚合 ~3s，环境页进页与每次
+/// 动作后 load 触发——指纹（db 主文件，见 [`stat_master_fingerprint`]）与
+/// 密钥均未变化时复用上次报告（4.0s → <1ms）；改库编排成功后由调用方
+/// [`invalidate_master_checkup_cache`] 显式作废，无陈旧窗口。只缓存 Ready
+/// 形态（NoMasterData 的 is_file 预检与 ReadFailed 的重开成本本身很低）。
+pub fn read_master_checkup_cached(
+    master_data_dir: &Path,
+    raw_key: &str,
+) -> MasterCheckupStatus {
+    let fingerprint = stat_master_fingerprint(master_data_dir);
+    if let Ok(state) = checkup_cache().lock() {
+        if let Some(report) = state.get(master_data_dir, raw_key, &fingerprint) {
+            return MasterCheckupStatus::Ready(report);
+        }
+    }
+    let status = read_master_checkup(master_data_dir, raw_key);
+    if let MasterCheckupStatus::Ready(report) = &status {
+        if let Ok(mut state) = checkup_cache().lock() {
+            state.store(
+                master_data_dir.to_path_buf(),
+                raw_key.to_string(),
+                fingerprint,
+                report.clone(),
+            );
+        }
+    }
+    status
 }
 
 /// 读取可选列是否存在，兼容归档功能上线前的旧主库结构。
@@ -496,5 +598,77 @@ mod tests {
             Err(MasterArchiveError::DbOpenFailed)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// P15-11：体检缓存状态机（命中 / 换目录 / 换密钥 / 换指纹 / 显式失效；
+/// 注入指纹与报告离线验证，不触碰真实库）。
+#[cfg(test)]
+mod checkup_cache_tests {
+    use super::*;
+
+    fn fingerprint(label: u64) -> InstanceFingerprint {
+        InstanceFingerprint {
+            db: Some(crate::account_session_index::FileStatFingerprint {
+                mtime_secs: label,
+                mtime_nanos: 0,
+                size: label,
+            }),
+            wal: None,
+            shm: None,
+        }
+    }
+
+    fn report(sessions: u64) -> MasterCheckup {
+        MasterCheckup {
+            accounts: vec![CheckupAccountRow {
+                user_id: "111".to_string(),
+                project_count: 1,
+                session_count: sessions,
+                empty_project_count: 0,
+            }],
+            orphan_project_count: 0,
+            orphan_session_count: 0,
+        }
+    }
+
+    fn dir(label: &str) -> PathBuf {
+        PathBuf::from(format!("C:\\fake\\{label}"))
+    }
+
+    fn key() -> String {
+        "ab".repeat(32)
+    }
+
+    #[test]
+    fn cache_hits_on_same_dir_key_fingerprint() {
+        let mut state = CheckupCacheState::default();
+        let dir = dir("master");
+        state.store(dir.clone(), key(), fingerprint(1), report(5));
+        let hit = state.get(&dir, &key(), &fingerprint(1)).expect("应命中");
+        assert_eq!(hit.accounts[0].session_count, 5);
+    }
+
+    #[test]
+    fn cache_misses_on_different_dir_or_key_or_fingerprint() {
+        let mut state = CheckupCacheState::default();
+        state.store(dir("master"), key(), fingerprint(1), report(5));
+        assert!(state.get(&dir("other"), &key(), &fingerprint(1)).is_none());
+        assert!(state.get(&dir("master"), &"cd".repeat(32), &fingerprint(1)).is_none());
+        assert!(state.get(&dir("master"), &key(), &fingerprint(2)).is_none());
+    }
+
+    #[test]
+    fn invalidate_clears_entry_immediately() {
+        let mut state = CheckupCacheState::default();
+        state.store(dir("master"), key(), fingerprint(1), report(5));
+        state.invalidate();
+        assert!(state.get(&dir("master"), &key(), &fingerprint(1)).is_none());
+    }
+
+    #[test]
+    fn empty_state_misses() {
+        let state = CheckupCacheState::default();
+        assert!(state.get(&dir("master"), &key(), &fingerprint(1)).is_none());
     }
 }

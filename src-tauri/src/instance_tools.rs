@@ -229,9 +229,44 @@ where
     if let Some(handle) = stderr_handle {
         command.stderr(handle);
     }
-    command
-        .spawn()
-        .map_err(|_| "trae_launch_failed".to_string())?;
+    // P15-8 增补（2026-10-15 两次真实事故，用户报告）：工具进程消亡时，由
+    // 本函数启动的 TRAE 客户端被连带终止——两条独立链条均已实证：
+    // ① Job 继承链：子进程默认继承父进程所在 Job，kill-on-close 的 Job 随
+    //    工具退出终止全部成员；
+    // ② 控制台链（dev/debug 构建）：debug 版 trae-sync 附着启动它的控制台
+    //    （一键启动 bat 的 cmd 窗口），spawn 的客户端继承同一控制台；用户
+    //    关闭/重启 bat 窗口时 CTRL_CLOSE 发给整个控制台进程组，工具与
+    //    客户端一起被终止（16:44 与 19:2x 两次事故的主链条）。
+    // 处置：CREATE_BREAKAWAY_FROM_JOB（脱离 Job，需 Job 声明 BREAKAWAY_OK）
+    // + DETACHED_PROCESS（不继承/不附着控制台）+ CREATE_NEW_PROCESS_GROUP
+    // （脱离 Ctrl 信号组）。三重脱离后，客户端的存活与工具进程/控制台
+    // 完全解耦；Job 拒绝脱离或极端失败时回退无标志启动（与历史行为一致）。
+    // spawn 返回的 Child 句柄随即丢弃（std 不 kill），工具侧不持任何子
+    // 进程生命周期。
+    #[cfg(windows)]
+    let spawned = {
+        use std::os::windows::process::CommandExt;
+        /// 脱离继承的 Job（需 Job 允许 BREAKAWAY_OK）。
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        /// 不继承/不附着控制台（GUI 程序无感知，免疫控制台关闭信号）。
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        /// 新进程组：脱离调用方的 Ctrl+C / Ctrl+Break 信号组。
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACH_FLAGS: u32 =
+            CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        match command.creation_flags(DETACH_FLAGS).spawn() {
+            Ok(child) => Ok(child),
+            Err(_) => {
+                command.creation_flags(0);
+                command.spawn()
+            }
+        }
+    };
+    #[cfg(not(windows))]
+    let spawned = command.spawn();
+    spawned.map_err(|_| "trae_launch_failed".to_string())?;
+    // 启动成功即清进程查询缓存：后续状态查询读到含新实例的真实快照。
+    trae_instance_module::invalidate_process_cache();
     Ok(TraeInstanceLaunchDto {
         outcome: match seed {
             Some(trae_instance_module::SeedOutcome::Seeded) => "seeded",

@@ -10,6 +10,8 @@
 //! 本模块只做无副作用判定与系统交互；启动编排（账号校验、种子决策）在应用层。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::product_adapter::TraeProduct;
 
@@ -160,10 +162,75 @@ const PROCESS_QUERY_SCRIPT: &str = concat!(
     "ConvertTo-Json -InputObject $rows -Compress"
 );
 
+// ===== P15-11 进程查询 TTL 缓存（2026-10-15）=====
+
+/// 进程查询缓存条目：采样时刻 + 快照。
+struct ProcessCacheEntry {
+    at: Instant,
+    processes: Vec<TraeProcessInfo>,
+}
+
+/// 进程查询缓存状态机（与真实查询解耦，单测注入 `Instant`）。
+#[derive(Default)]
+struct ProcessCacheState {
+    entry: Option<ProcessCacheEntry>,
+}
+
+impl ProcessCacheState {
+    /// 环境页轮询间隔 5s，3s TTL 下轮询几乎全命中；对用户手动开/关客户端
+    /// 的最坏感知延迟 3s（工具自身干预后由显式失效覆盖，不走 TTL）。
+    const TTL: Duration = Duration::from_secs(3);
+
+    fn get_fresh(&self, now: Instant) -> Option<Vec<TraeProcessInfo>> {
+        let entry = self.entry.as_ref()?;
+        (now.duration_since(entry.at) <= Self::TTL).then(|| entry.processes.clone())
+    }
+
+    fn store(&mut self, now: Instant, processes: Vec<TraeProcessInfo>) {
+        self.entry = Some(ProcessCacheEntry { at: now, processes });
+    }
+
+    fn invalidate(&mut self) {
+        self.entry = None;
+    }
+}
+
+static PROCESS_CACHE: OnceLock<Mutex<ProcessCacheState>> = OnceLock::new();
+
+fn process_cache() -> &'static Mutex<ProcessCacheState> {
+    PROCESS_CACHE.get_or_init(|| Mutex::new(ProcessCacheState::default()))
+}
+
+/// 工具自身对进程的干预（taskkill / 启动实例）之后调用：清空缓存，保证
+/// 关闭复查与启动后的状态查询读到真实最新快照（不受 TTL 影响）。
+pub fn invalidate_process_cache() {
+    if let Ok(mut state) = process_cache().lock() {
+        state.invalidate();
+    }
+}
+
 /// 查询当前全部 TRAE IDE 进程（不含本应用自身）。
 /// 首次调用冷启动 PowerShell 约 0.5~1 秒；调用方应放在阻塞线程。
+/// P15-11：TTL 3s 内复用同一快照（环境页每 5s 双命令轮询 1.4s/次 → 0）；
+/// 工具自身干预（taskkill/launch）后经 [`invalidate_process_cache`] 立即失效。
 #[cfg(windows)]
 pub fn list_trae_processes() -> Result<Vec<TraeProcessInfo>, TraeInstanceError> {
+    let now = Instant::now();
+    if let Ok(state) = process_cache().lock() {
+        if let Some(cached) = state.get_fresh(now) {
+            return Ok(cached);
+        }
+    }
+    let processes = query_trae_processes()?;
+    if let Ok(mut state) = process_cache().lock() {
+        state.store(Instant::now(), processes.clone());
+    }
+    Ok(processes)
+}
+
+/// 真实查询（PowerShell Win32_Process；无缓存路径，供缓存壳与复查链使用）。
+#[cfg(windows)]
+fn query_trae_processes() -> Result<Vec<TraeProcessInfo>, TraeInstanceError> {
     use std::os::windows::process::CommandExt;
     // CREATE_NO_WINDOW：避免每次查询闪出 PowerShell 控制台窗口。
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1051,11 +1118,15 @@ fn run_taskkill(pid: u32, force: bool) -> bool {
     if force {
         command.arg("/F");
     }
-    command
+    let success = command
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map(|output| output.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // P15-11：对进程的干预立即失效查询缓存——关闭编排的复查链（3s 内的
+    // 多次 query_processes）必须读到真实状态，不能吃干预前的旧快照。
+    invalidate_process_cache();
+    success
 }
 
 /// 关闭运行于指定产品与 data_dir 的 TRAE 实例。
@@ -2222,5 +2293,62 @@ mod tests {
             seed_login_state_with_appdata(&instance_dir, "9876543210987654", appdata.path())
                 .unwrap();
         assert_eq!(outcome, SeedOutcome::NativeMissing);
+    }
+}
+
+/// P15-11：进程查询缓存状态机（TTL 命中 / 过期 / 显式失效；注入 Instant 离线验证）。
+#[cfg(test)]
+mod process_cache_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn sample(pid: u32) -> TraeProcessInfo {
+        TraeProcessInfo {
+            pid,
+            exe_path: Some(format!("C:\\fake\\Trae {pid}.exe")),
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn cache_returns_fresh_entry_within_ttl() {
+        let mut state = ProcessCacheState::default();
+        let t0 = Instant::now();
+        state.store(t0, vec![sample(11)]);
+        let fresh = state
+            .get_fresh(t0 + Duration::from_secs(2))
+            .expect("TTL 内应命中");
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].pid, 11);
+    }
+
+    #[test]
+    fn cache_expires_after_ttl() {
+        let mut state = ProcessCacheState::default();
+        let t0 = Instant::now();
+        state.store(t0, vec![sample(11)]);
+        assert!(state.get_fresh(t0 + ProcessCacheState::TTL).is_some());
+        assert!(state
+            .get_fresh(t0 + ProcessCacheState::TTL + Duration::from_millis(1))
+            .is_none());
+    }
+
+    #[test]
+    fn invalidate_clears_entry_immediately() {
+        let mut state = ProcessCacheState::default();
+        let t0 = Instant::now();
+        state.store(t0, vec![sample(11)]);
+        state.invalidate();
+        assert!(state.get_fresh(t0).is_none());
+        // 失效后重新 store 恢复命中。
+        state.store(t0 + Duration::from_secs(1), vec![sample(12)]);
+        let fresh = state.get_fresh(t0 + Duration::from_secs(2)).expect("重新缓存");
+        assert_eq!(fresh[0].pid, 12);
+    }
+
+    #[test]
+    fn empty_state_misses() {
+        let state = ProcessCacheState::default();
+        assert!(state.get_fresh(Instant::now()).is_none());
     }
 }
