@@ -420,7 +420,14 @@ pub fn read_progress_snapshot(
     let directory = path.parent().ok_or(())?;
     reject_directory_chain(directory)?;
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(()),
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || crate::link_guard::is_reparse_link(&path) =>
+        {
+            Err(())
+        }
         Ok(_) => {
             let snapshot: ProgressSnapshot =
                 serde_json::from_reader(File::open(path).map_err(|_| ())?).map_err(|_| ())?;
@@ -456,7 +463,12 @@ fn reject_directory_chain(path: &Path) -> Result<(), ()> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            // 工具链 1.97 适配：junction 也是目录逃逸向量，read_link 统一识别。
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || crate::link_guard::is_reparse_link(candidate) =>
+            {
                 return Err(())
             }
             Ok(_) => {}
@@ -476,7 +488,11 @@ fn reject_directory_chain(path: &Path) -> Result<(), ()> {
 
 fn publish_progress_file(temporary: &Path, destination: &Path) -> Result<(), ()> {
     if let Ok(metadata) = fs::symlink_metadata(destination) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || crate::link_guard::is_reparse_link(destination)
+        {
             return Err(());
         }
     }
@@ -719,13 +735,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let recovery_link = root.path().join("recovery-link");
+        // 工具链 1.97 适配：std symlink_dir 无特权时降级创建普通空目录占位物
+        // （非链接），改用 test_support helper（验证失败回退 mklink /J）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_dir(outside.path(), &recovery_link);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(outside.path(), &recovery_link);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(outside.path(), &recovery_link);
+        let link_created = std::os::unix::fs::symlink(outside.path(), &recovery_link).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 

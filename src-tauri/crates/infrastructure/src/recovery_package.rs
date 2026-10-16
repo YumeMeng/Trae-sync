@@ -320,7 +320,11 @@ fn read_authenticated_package(
         return Err(RecoveryPackageError::EmptyPassphrase);
     }
     let metadata = fs::symlink_metadata(package).map_err(|_| RecoveryPackageError::Io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || crate::link_guard::is_reparse_link(package)
+    {
         return Err(RecoveryPackageError::Io);
     }
     if metadata.len() > MAX_RECOVERY_PACKAGE_BYTES {
@@ -932,7 +936,11 @@ fn validate_current_pointer(
     match fs::symlink_metadata(&pointer) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(RecoveryPackageError::VerificationFailed),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || crate::link_guard::is_reparse_link(&pointer) =>
+        {
             Err(RecoveryPackageError::VerificationFailed)
         }
         Ok(_) => {
@@ -1025,9 +1033,12 @@ fn sync_directory(path: &Path) -> Result<(), RecoveryPackageError> {
 }
 
 fn is_symlink(path: &Path) -> bool {
+    // 工具链 1.97 适配：junction 也是 reparse point（is_symlink 不识别），
+    // 用 read_link 统一识别符号链接与 junction（硬链接评估结论：不拒绝）。
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
+        || crate::link_guard::is_reparse_link(path)
 }
 
 fn reject_symlink_directory(path: &Path) -> Result<(), RecoveryPackageError> {
@@ -1551,13 +1562,17 @@ mod tests {
         let source_target = outside.path().join("catalog.db");
         let source = dir.path().join("source.db");
         fs::write(&source_target, b"catalog").unwrap();
+        // 工具链 1.97 适配：std symlink_file 无特权时降级创建普通空文件占位物
+        // （非链接也非硬链接），改用 test_support helper 验证真伪；
+        // 无法构造真文件链接时跳过（硬链接防护按评估结论不实现）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_file(&source_target, &source);
+        let link_created =
+            crate::link_guard::test_support::create_file_link(&source_target, &source);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(&source_target, &source);
+        let link_created = std::os::unix::fs::symlink(&source_target, &source).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 
@@ -1584,13 +1599,16 @@ mod tests {
         let target = outside.path().join("catalog.db");
         create_catalog(&target, 1);
         let linked_root = dir.path().join("linked");
+        // 工具链 1.97 适配：std symlink_dir 无特权时降级创建普通空目录占位物
+        // （非链接），改用 test_support helper（验证失败回退 mklink /J）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_dir(outside.path(), &linked_root);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(outside.path(), &linked_root);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(outside.path(), &linked_root);
+        let link_created = std::os::unix::fs::symlink(outside.path(), &linked_root).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 
@@ -1607,13 +1625,16 @@ mod tests {
         let source = dir.path().join("old.db");
         let destination = dir.path().join("catalog");
         fs::write(&source, b"catalog").unwrap();
+        // 工具链 1.97 适配：std symlink_dir 无特权时降级创建普通空目录占位物
+        // （非链接），改用 test_support helper（验证失败回退 mklink /J）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_dir(outside.path(), &destination);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(outside.path(), &destination);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(outside.path(), &destination);
+        let link_created = std::os::unix::fs::symlink(outside.path(), &destination).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 

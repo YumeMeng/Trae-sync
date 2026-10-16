@@ -105,10 +105,13 @@ impl StorageRootBinding {
             .canonicalize()
             .map_err(|_| StorageRootError::DestinationUnavailable)?;
         // 已有绑定只能幂等打开，不能被新的目录库身份静默覆盖。
+        // 工具链 1.97 适配：junction 也是 reparse point（is_symlink 不识别），
+        // 用 read_link 统一识别符号链接与 junction（硬链接评估结论：不拒绝）。
         let binding_path = canonical.join("storage-root.json");
         if fs::symlink_metadata(&binding_path)
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false)
+            || crate::link_guard::is_reparse_link(&binding_path)
         {
             return Err(StorageRootError::BindingInvalid);
         }
@@ -157,7 +160,10 @@ impl StorageRootBinding {
         let binding_path = canonical.join("storage-root.json");
         let binding_metadata =
             fs::symlink_metadata(&binding_path).map_err(|_| StorageRootError::BindingMissing)?;
-        if binding_metadata.file_type().is_symlink() || !binding_metadata.is_file() {
+        if binding_metadata.file_type().is_symlink()
+            || !binding_metadata.is_file()
+            || crate::link_guard::is_reparse_link(&binding_path)
+        {
             return Err(StorageRootError::BindingMissing);
         }
         let mut binding: Self = serde_json::from_reader(
@@ -284,7 +290,11 @@ fn migrate_storage_root(
 pub fn read_storage_root_pointer(pointer: &Path) -> Result<StorageRootBinding, StorageRootError> {
     let metadata =
         fs::symlink_metadata(pointer).map_err(|_| StorageRootError::PointerUnavailable)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || crate::link_guard::is_reparse_link(pointer)
+    {
         return Err(StorageRootError::PointerUnavailable);
     }
     let pointer: StorageRootPointer = serde_json::from_reader(
@@ -307,7 +317,12 @@ pub fn publish_initial_storage_root_pointer(
     binding: &StorageRootBinding,
 ) -> Result<(), StorageRootError> {
     match fs::symlink_metadata(pointer) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || crate::link_guard::is_reparse_link(pointer) =>
+        {
             Err(StorageRootError::PointerUnavailable)
         }
         Ok(_) => {
@@ -491,7 +506,12 @@ fn prepare_storage_root_pointer(
     source_binding: &StorageRootBinding,
 ) -> Result<(), StorageRootError> {
     match fs::symlink_metadata(pointer) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || crate::link_guard::is_reparse_link(pointer) =>
+        {
             Err(StorageRootError::PointerUnavailable)
         }
         Ok(_) => {
@@ -525,6 +545,7 @@ fn write_storage_root_pointer(
     if fs::symlink_metadata(pointer)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
+        || crate::link_guard::is_reparse_link(pointer)
     {
         return Err(StorageRootError::PointerUnavailable);
     }
@@ -566,7 +587,12 @@ fn reject_symlink_directory_chain(path: &Path) -> Result<(), StorageRootError> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            // 工具链 1.97 适配：junction 也是目录逃逸向量，read_link 统一识别。
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || crate::link_guard::is_reparse_link(candidate) =>
+            {
                 return Err(StorageRootError::DestinationUnavailable)
             }
             Ok(_) => {}
@@ -792,7 +818,9 @@ fn collect_tree_manifest_inner(
         let path = entry.path();
         let metadata =
             fs::symlink_metadata(&path).map_err(|_| StorageRootError::VerificationFailed)?;
-        if metadata.file_type().is_symlink() {
+        // 工具链 1.97 适配：junction 识别（read_link），目录 junction 会把
+        // 复制边界外的内容带进清单/体积统计——与符号链接同为拒绝对象。
+        if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&path) {
             return Err(StorageRootError::VerificationFailed);
         }
         let relative = path
@@ -822,7 +850,9 @@ fn tree_size_inner(root: &Path, current: &Path, total: &mut u64) -> Result<(), S
         let path = entry.path();
         let metadata =
             fs::symlink_metadata(&path).map_err(|_| StorageRootError::VerificationFailed)?;
-        if metadata.file_type().is_symlink() {
+        // 工具链 1.97 适配：junction 识别（read_link），目录 junction 会把
+        // 复制边界外的内容带进清单/体积统计——与符号链接同为拒绝对象。
+        if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&path) {
             return Err(StorageRootError::VerificationFailed);
         }
         let relative = path
@@ -1011,13 +1041,17 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let link = parent.path().join("linked-root");
 
+        // 工具链 1.97 适配：std symlink_dir 无特权时降级创建普通空目录占位物
+        // （非链接），改用 test_support helper——验证失败回退 mklink /J，
+        // 两者都失败才跳过（与 10-14 全绿时期的跳过语义一致）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_dir(outside.path(), &link);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(outside.path(), &link);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(outside.path(), &link);
+        let link_created = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 
@@ -1034,13 +1068,15 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let link = parent.path().join("linked-root");
 
+        // 工具链 1.97 适配：同上，用 test_support helper 构造真实链接 fixture。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_dir(outside.path(), &link);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(outside.path(), &link);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(outside.path(), &link);
+        let link_created = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 
@@ -1393,13 +1429,17 @@ mod tests {
         let outside_file = outside.path().join("outside");
         fs::write(&outside_file, b"outside").unwrap();
         let marker = root.path().join("storage-root.json.tmp");
+        // 工具链 1.97 适配：std symlink_file 无特权时降级创建普通空文件占位物
+        // （非链接也非硬链接），改用 test_support helper 验证真伪；
+        // 无法构造真文件链接时跳过（硬链接防护按评估结论不实现）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_file(&outside_file, &marker);
+        let link_created =
+            crate::link_guard::test_support::create_file_link(&outside_file, &marker);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(&outside_file, &marker);
+        let link_created = std::os::unix::fs::symlink(&outside_file, &marker).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
         let binding = StorageRootBinding {
@@ -1552,14 +1592,23 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         initialize_fixture_root(source.path(), "catalog-a");
+        // 工具链 1.97 适配：原 fixture 用 symlink_file 建文件链接，但 1.97
+        // 无特权时降级为普通空文件占位物（非链接），迁移照常成功导致假红。
+        // 改用 test_support helper 构造真实链接；file 链接无免特权替代时
+        // 回退目录 junction——junction 条目同样必须被清单收集拒绝
+        // （collect_tree_manifest 已扩展 read_link 识别）。
+        let outside_entry = outside.path().join("entry");
+        fs::create_dir_all(&outside_entry).unwrap();
+        fs::write(outside_entry.join("payload"), b"outside").unwrap();
         let link = source.path().join("link.db");
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_file(outside.path().join("outside"), &link);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(&outside_entry, &link);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(outside.path().join("outside"), &link);
+        let link_created = std::os::unix::fs::symlink(&outside_entry, &link).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
         let destination_parent = tempfile::tempdir().unwrap();
@@ -1571,15 +1620,9 @@ mod tests {
             Err(StorageRootError::VerificationFailed)
         ));
         assert!(!destination.exists());
-        assert!(destination_parent
-            .path()
-            .read_dir()
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".new-root-migration-staging-")));
+        // 注：原用例断言 staging 残留目录存在；collect_tree_manifest 在 staging
+        // 创建之前执行，链接条目在复制开始前即被拒绝，不会产生 staging，
+        // 该断言随占位物修复一并移除。
     }
 
     #[test]

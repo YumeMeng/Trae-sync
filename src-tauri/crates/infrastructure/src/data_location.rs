@@ -271,7 +271,9 @@ fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), Witness
                 WitnessError::HashFailed
             }
         })?;
-        if metadata.file_type().is_symlink() {
+        // 工具链 1.97 适配：junction 识别（read_link），目录 junction 同样
+        // 能把组件解析到受保护根之外——与符号链接同为拒绝对象。
+        if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&current) {
             return Err(WitnessError::SymlinkRejected);
         }
     }
@@ -280,7 +282,12 @@ fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), Witness
 
 fn reject_optional_symlink(path: &Path) -> Result<(), WitnessError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(WitnessError::SymlinkRejected),
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        Ok(metadata)
+            if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(path) =>
+        {
+            Err(WitnessError::SymlinkRejected)
+        }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(WitnessError::HashFailed),
@@ -303,7 +310,11 @@ fn capture_file_observation(
         }
         Err(_) => return Err(WitnessError::HashFailed),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || crate::link_guard::is_reparse_link(path)
+    {
         return Err(WitnessError::SymlinkRejected);
     }
     let identity_before = provider
@@ -532,18 +543,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let db = dir.path().join("database.db");
-        let outside_wal = outside.path().join("outside-wal");
         let wal = dir.path().join("database.db-wal");
         std::fs::write(&db, b"db").unwrap();
-        std::fs::write(&outside_wal, b"wal").unwrap();
+        fs::create_dir_all(&outside).unwrap();
 
+        // 工具链 1.97 适配：std symlink_file 无特权时降级创建普通空文件占位物
+        // （非链接也非硬链接），sidecar 被当普通空文件哈希导致假红。改用
+        // test_support helper 构造真实目录 junction（-wal 逃逸载体语义不变：
+        // 侧车经 reparse link 解析到根外必须被拒绝而非哈希）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_file(&outside_wal, &wal);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(outside.path(), &wal);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(&outside_wal, &wal);
+        let link_created = std::os::unix::fs::symlink(&outside, &wal).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 

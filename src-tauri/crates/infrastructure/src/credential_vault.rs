@@ -1128,9 +1128,13 @@ mod tests {
     }
 
     fn link_file(target: &Path, link: &Path) -> bool {
+        // 工具链 1.97 适配：std symlink_file 无特权时降级创建普通空文件占位物
+        // （非链接也非硬链接），is_reparse_or_symlink 判定识别不出——改用
+        // test_support helper 验证真伪，无法构造真文件链接时跳过
+        // （硬链接防护按评估结论不实现，不能用硬链接占位物冒充符号链接）。
         #[cfg(windows)]
         {
-            std::os::windows::fs::symlink_file(target, link).is_ok()
+            crate::link_guard::test_support::create_file_link(target, link)
         }
         #[cfg(unix)]
         {
@@ -1144,9 +1148,12 @@ mod tests {
     }
 
     fn link_directory(target: &Path, link: &Path) -> bool {
+        // 工具链 1.97 适配：std symlink_dir 无特权时降级创建普通空目录占位物
+        // （非链接），vault 根判定放行导致 fail-closed 断言假红——改用
+        // test_support helper（验证失败回退 mklink /J，均失败才跳过）。
         #[cfg(windows)]
         {
-            std::os::windows::fs::symlink_dir(target, link).is_ok()
+            crate::link_guard::test_support::create_directory_link(target, link)
         }
         #[cfg(unix)]
         {

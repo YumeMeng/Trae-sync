@@ -325,6 +325,13 @@ impl PathPolicy {
             });
         }
 
+        // 1.5 工具链 1.97 适配：候选路径自身是 reparse link（符号链接/junction）
+        // 时直接拒绝——canonicalize 会跟随链接把根外对象伪装成根内写目标，
+        // 显式 fail closed 不依赖 canonicalize 的跟随行为（硬链接评估结论：不拒绝）。
+        if candidate.exists() && crate::link_guard::is_reparse_link(candidate) {
+            return Err(FixturePathError::OutsideFixtureRoot { raw });
+        }
+
         // 2. 规范化候选路径（跟随符号链接、解析 `..`、统一大小写与分隔符）
         let canonical_candidate = canonicalize_or_parent(candidate)?;
 
@@ -625,6 +632,13 @@ pub(crate) fn validate_db_relative_path_inside(
 
     // 4. DB 必须存在——canonicalize 会跟随符号链接，暴露 symlink/junction 逃逸
     let db_candidate = canonical_root.join(db_relative_path);
+    // 工具链 1.97 适配：候选自身是 reparse link（符号链接/junction）时直接
+    // 拒绝，不依赖 canonicalize 的跟随行为（硬链接评估结论：不拒绝）。
+    if crate::link_guard::is_reparse_link(&db_candidate) {
+        return Err(FixturePathError::OutsideFixtureRoot {
+            raw: db_relative_path.to_string(),
+        });
+    }
     let canonical_db =
         db_candidate
             .canonicalize()
@@ -644,6 +658,12 @@ pub(crate) fn validate_db_relative_path_inside(
     // 6. WAL/SHM 可能不存在；若存在则规范化并验证封闭性
     for rel in [&wal_relative_path, &shm_relative_path] {
         let candidate = canonical_root.join(rel);
+        // 工具链 1.97 适配：sidecar 自身是 reparse link 时直接拒绝（同 DB）。
+        if crate::link_guard::is_reparse_link(&candidate) {
+            return Err(FixturePathError::OutsideFixtureRoot {
+                raw: rel.to_string(),
+            });
+        }
         if candidate.exists() {
             let canonical =
                 candidate
@@ -1197,48 +1217,23 @@ mod tests {
     }
 }
 
-/// 测试辅助：尽力创建文件 symlink。
-///
-/// Windows 上优先尝试 `symlink_file`；权限不足或开发者模式未开启时
-/// 退回到创建 junction（用于目录）。两者均失败时返回 false。
+/// 测试辅助：尽力创建**真实**链接（符号链接或 junction）。
 ///
 /// R2-1：不再静默 return；调用方需根据返回值决定是 panic 还是 continue。
 /// junction 通过 `cmd /c mklink /J` 创建，无需开发者模式或提升权限。
+///
+/// 工具链 1.97 适配：std 无特权时 `symlink_file` 降级创建普通空文件占位物、
+/// `symlink_dir` 降级创建普通空目录占位物（read_link 报 4390，非 reparse
+/// point）——占位物不是链接，会让逃逸 fixture 变成无害对象导致假红。
+/// 因此每次降级创建后必须用 read_link 验证真伪，非链接即删除占位物并回退。
 #[cfg(test)]
 #[allow(dead_code)]
 fn symlink_file_best_effort(target: &Path, link: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        // 文件 symlink：Windows 上需要开发者模式或管理员权限
-        if std::os::windows::fs::symlink_file(target, link).is_ok() {
-            return true;
-        }
-        // 退回到 junction（目录 junction，不需要开发者模式）
-        // 仅当 target 是目录时才尝试
-        if target.is_dir() {
-            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
-                return true;
-            }
-            // 通过 cmd mklink /J 创建 junction（参数分立传递，避免组合字符串的引号问题）
-            let out = std::process::Command::new("cmd")
-                .args([
-                    "/C",
-                    "mklink",
-                    "/J",
-                    &link.to_string_lossy(),
-                    &target.to_string_lossy(),
-                ])
-                .output();
-            if let Ok(o) = out {
-                if o.status.success() {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-    #[cfg(not(windows))]
-    {
-        std::os::unix::fs::symlink(target, link).is_ok()
+    // 目录 target 走 junction 路径；文件 target 需要真文件符号链接
+    //（无免特权替代，硬链接按评估结论不用于 fixture）。
+    if target.is_dir() {
+        crate::link_guard::test_support::create_directory_link(target, link)
+    } else {
+        crate::link_guard::test_support::create_file_link(target, link)
     }
 }

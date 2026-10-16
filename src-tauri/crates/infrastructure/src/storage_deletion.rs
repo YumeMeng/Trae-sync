@@ -494,7 +494,12 @@ fn scan_manifest_family(
     match fs::symlink_metadata(&family_root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(DeletionError::LiveReferenceUnavailable),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || crate::link_guard::is_reparse_link(&family_root) =>
+        {
             return Err(DeletionError::LiveReferenceUnavailable)
         }
         Ok(_) => {}
@@ -505,7 +510,11 @@ fn scan_manifest_family(
         let metadata = entry
             .file_type()
             .map_err(|_| DeletionError::LiveReferenceUnavailable)?;
-        if metadata.is_symlink() || !metadata.is_dir() {
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        if metadata.is_symlink()
+            || !metadata.is_dir()
+            || crate::link_guard::is_reparse_link(&entry.path())
+        {
             return Err(DeletionError::LiveReferenceUnavailable);
         }
         let latest = latest_manifest(&entry.path())?;
@@ -533,7 +542,12 @@ fn reject_symlink_directory_chain(path: &Path) -> Result<(), DeletionError> {
     let mut current = Some(path);
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            // 工具链 1.97 适配：junction 也是目录逃逸向量，read_link 统一识别。
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || crate::link_guard::is_reparse_link(candidate) =>
+            {
                 return Err(DeletionError::LiveReferenceUnavailable)
             }
             Ok(_) => {}
@@ -729,7 +743,8 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf, DeletionError> {
         if let Component::Normal(name) = component {
             path.push(name);
             let metadata = fs::symlink_metadata(&path).map_err(|_| DeletionError::OutsideRoot)?;
-            if metadata.file_type().is_symlink() {
+            // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+            if metadata.file_type().is_symlink() || crate::link_guard::is_reparse_link(&path) {
                 return Err(DeletionError::OutsideRoot);
             }
         }
@@ -836,7 +851,12 @@ fn append_journal_event(file: &mut File, event: &JournalEvent) -> Result<(), Del
 fn audit_directory(root: &Path, name: &str) -> Result<PathBuf, DeletionError> {
     let dir = root.join(name);
     match fs::symlink_metadata(&dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        // 工具链 1.97 适配：junction 识别（read_link），见 link_guard 模块注释。
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || crate::link_guard::is_reparse_link(&dir) =>
+        {
             Err(DeletionError::TombstoneFailed)
         }
         Ok(_) => Ok(dir),
@@ -1196,13 +1216,18 @@ mod tests {
         fs::write(&target, b"outside").unwrap();
         let link = root.path().join("link.db");
 
+        // 工具链 1.97 适配：std symlink_file 无特权时降级创建普通空文件占位物
+        // （非链接），候选被当根内普通对象放行导致假红。改用 test_support
+        // helper 构造真实目录 junction（逃逸载体语义不变：候选经 reparse
+        // link 解析到根外必须以 OutsideRoot 拒绝）。
         #[cfg(windows)]
-        let link_result = std::os::windows::fs::symlink_file(&target, &link);
+        let link_created =
+            crate::link_guard::test_support::create_directory_link(outside.path(), &link);
         #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(&target, &link);
+        let link_created = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
         #[cfg(not(any(windows, unix)))]
         return;
-        if link_result.is_err() {
+        if !link_created {
             return;
         }
 
