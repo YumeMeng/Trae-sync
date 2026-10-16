@@ -13,7 +13,6 @@ import type {
   TraeInstanceStateDto,
 } from "../types/account_switch";
 import type { BatchProgressEvent, BatchProgressKind } from "../types/batchProgress";
-import type { ProductId } from "../platform/productRegistry";
 import { useTauriEvents } from "../hooks/useTauriEvents";
 import type { EnvironmentStateDto } from "../types/environment";
 import { safeUiErrorMessage } from "../utils/safeUiError";
@@ -43,9 +42,15 @@ import type {
 interface AccountCenterProps {
   /** 页面可见时才发起账号状态读取，避免后台 IPC。 */
   active: boolean;
-  /** Trae CN 等产品通过适配器接入同一账号工作台；Work 保持默认事务实现。 */
+  /** 适配器注入仅用于测试场景；生产固定走完整账号事务（P15-10 单产品塌缩）。 */
   adapter?: AccountAdapter | null;
 }
+
+/**
+ * Work 签到档案链的协议产品标识（P15-10）：后端批量命令与进度事件载荷沿用
+ * "work_cn"（协议值稳定，ADR-0035）；它是账号域内部链路标识，不是产品切换概念。
+ */
+const WORK_ARCHIVE_PRODUCT_ID = "work_cn";
 
 /** 批量操作进度文案的最小展示状态：第 i/N 个账号名。 */
 interface BatchProgress {
@@ -62,7 +67,7 @@ interface BatchProgress {
 function resolveBatchProgress(
   payload: BatchProgressEvent,
   expected: BatchProgressKind,
-  productId: ProductId,
+  productId: string,
 ): BatchProgress | null {
   if (payload.product_id !== productId) return null;
   if (payload.kind !== undefined && payload.kind !== expected) return null;
@@ -118,7 +123,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const snapshotReadGeneration = useRef(0);
   const environmentReadGeneration = useRef(0);
   const currentProductId = adapter?.productId ?? null;
-  const progressProductId: ProductId = adapter?.productId ?? "work_cn";
+  const progressProductId: string = adapter?.productId ?? WORK_ARCHIVE_PRODUCT_ID;
   const currentProductIdRef = useRef(currentProductId);
   const activeRef = useRef(active);
   useLayoutEffect(() => {
@@ -138,15 +143,15 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const loginAdapterRef = useRef<AccountAdapter | null>(null);
   // 登录浏览器方式（默认隔离实例）：添加账号时可切换“隔离浏览器 / 本机浏览器”。
   const [loginBrowserMode, setLoginBrowserMode] = useState<LoginBrowserMode>("isolated");
-  // 批量操作仍全局互斥；保存来源产品，切页时区分“本产品正在执行”和“等待上一产品完成”。
-  const [creditsBusyProductId, setCreditsBusyProductId] = useState<ProductId | null>(null);
+  // 批量操作仍全局互斥；记录来源链路，区分「本链路正在执行」和「等待上一批完成」。
+  const [creditsBusyProductId, setCreditsBusyProductId] = useState<string | null>(null);
   const creditsBusy = creditsBusyProductId !== null;
   const creditsBusyForCurrentProduct = creditsBusyProductId === progressProductId;
-  const [credentialRefreshBusyProductId, setCredentialRefreshBusyProductId] = useState<ProductId | null>(null);
+  const [credentialRefreshBusyProductId, setCredentialRefreshBusyProductId] = useState<string | null>(null);
   const credentialRefreshBusy = credentialRefreshBusyProductId !== null;
   const credentialRefreshBusyForCurrentProduct = credentialRefreshBusyProductId === progressProductId;
-  // 健康检测保持全局串行；记录来源产品，用于切页后准确显示等待状态。
-  const [healthBusyProductId, setHealthBusyProductId] = useState<ProductId | null>(null);
+  // 健康检测保持全局串行；记录来源链路，用于切页后准确显示等待状态。
+  const [healthBusyProductId, setHealthBusyProductId] = useState<string | null>(null);
   const healthBusy = healthBusyProductId !== null;
   const healthBusyForCurrentProduct = healthBusyProductId === progressProductId;
   // 批量操作逐账号进度（P11-3，P12-R2c 收敛为单 state 按 kind 判别）：
@@ -187,7 +192,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   // 登录凭据健康度（profile_id → 条目，P7-5 凭据包实调判定）：
   // login_state 为实调结果（驱动卡片徽章），archive_available 为存档次要信息。
   const [loginStates, setLoginStates] = useState<Record<string, TraeInstanceStateDto>>({});
-  // 账号页只把本次实测到的 Work CN 身份标为「使用中」，环境缓存不作为登录证据。
+  // 账号页只把本次实测到的官方登录身份标为「使用中」，环境缓存不作为登录证据。
   const [envObservedProfileId, setEnvObservedProfileId] = useState<string | null>(null);
   const [switchTarget, setSwitchTarget] = useState<MasterSwitchTarget | null>(null);
   // G11 登录后手机号补录弹层：profileId + 展示名 + 服务端脱敏号（肉眼比对基准）。
@@ -332,20 +337,20 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   // 预期 kind 校验（暂无 kind 的旧载荷降级接受），未知 kind 静默丢弃。
   useTauriEvents({
     "credential-refresh-progress": (payload: BatchProgressEvent) => {
-      const progress = resolveBatchProgress(payload, "credential_refresh", currentProductIdRef.current ?? "work_cn");
+      const progress = resolveBatchProgress(payload, "credential_refresh", currentProductIdRef.current ?? WORK_ARCHIVE_PRODUCT_ID);
       if (progress) setKindProgress("credential_refresh", progress);
     },
     "health-check-progress": (payload: BatchProgressEvent) => {
-      const progress = resolveBatchProgress(payload, "health_check", currentProductIdRef.current ?? "work_cn");
+      const progress = resolveBatchProgress(payload, "health_check", currentProductIdRef.current ?? WORK_ARCHIVE_PRODUCT_ID);
       if (progress) setKindProgress("health_check", progress);
     },
     "credits-refresh-progress": (payload: BatchProgressEvent) => {
-      const progress = resolveBatchProgress(payload, "credits_refresh", currentProductIdRef.current ?? "work_cn");
+      const progress = resolveBatchProgress(payload, "credits_refresh", currentProductIdRef.current ?? WORK_ARCHIVE_PRODUCT_ID);
       if (progress) setKindProgress("credits_refresh", progress);
     },
   }, []);
 
-  // 账号卡片的「使用中」只依据本次从 Work CN 登录材料实测到的身份。
+  // 账号卡片的「使用中」只依据本次从 TRAE 登录材料实测到的身份。
   const loadEnvironment = useCallback(async () => {
     const generation = ++environmentReadGeneration.current;
     if (!active || !activeRef.current || adapter || currentProductIdRef.current !== null) {
@@ -666,7 +671,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const handleRefreshAllCredits = useCallback(() => {
     if (creditsBusy || overview.length === 0) return;
     setKindProgress("credits_refresh", null);
-    setCreditsBusyProductId("work_cn");
+    setCreditsBusyProductId(WORK_ARCHIVE_PRODUCT_ID);
     void (async () => {
       try {
         const profileIds = overview.map((entry) => entry.profile_id);
@@ -703,7 +708,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     setCredentialConfirmOpen(false);
     if (credentialRefreshBusy || overview.length === 0) return;
     setKindProgress("credential_refresh", null);
-    setCredentialRefreshBusyProductId("work_cn");
+    setCredentialRefreshBusyProductId(WORK_ARCHIVE_PRODUCT_ID);
     void (async () => {
       try {
         const profileIds = overview.map((entry) => entry.profile_id);
@@ -759,7 +764,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     if (healthBusy || targets.length === 0) return;
     setKindProgress("health_check", null);
     setKindProgress("credits_refresh", null);
-    setHealthBusyProductId("work_cn");
+    setHealthBusyProductId(WORK_ARCHIVE_PRODUCT_ID);
     void (async () => {
       try {
         const profileIds = targets.map((entry) => entry.profile_id);
@@ -1318,7 +1323,7 @@ interface SharedAccountEntryProps {
 }
 
 /**
- * Work 与 Trae CN 共用的账号条目骨架。
+ * 完整账号事务与适配器注入路径共用的账号条目骨架。
  * 产品差异只能通过状态槽、指标槽和动作能力进入，不能再复制整张卡片。
  */
 function SharedAccountEntry({
@@ -1444,7 +1449,7 @@ function AdapterAccountCard({
   const statusClass = account.status === "active" ? "slot-badge--ok" : account.status === "expired" ? "slot-badge--danger" : "slot-badge--idle";
   const statusLabel = account.status === "active" ? "登录有效" : account.status === "expired" ? "登录已过期" : "状态待验证";
   const statusContent = (
-    <span className={`slot-badge ${statusClass}`} title="Trae CN 当前保存凭据的状态">
+    <span className={`slot-badge ${statusClass}`} title="TRAE 当前保存凭据的状态">
       {statusLabel}
     </span>
   );
@@ -1494,7 +1499,7 @@ function AccountCard({
   loginState?: TraeInstanceLoginState;
   /** 登录存档存在（切换账号的备用方式可用）：徽章悬浮提示次要信息。 */
   archiveAvailable?: boolean;
-  /** 本次从 Work CN 登录材料实测确认的主库账号：展示「使用中」并隐藏切换入口。 */
+  /** 本次从 TRAE 登录材料实测确认的主库账号：展示「使用中」并隐藏切换入口。 */
   isCurrentAccount: boolean;
   /** 切号弹层进行中：全部卡片的切换按钮禁用（同时只有一个切换事务）。 */
   switchBusy: boolean;
@@ -1599,7 +1604,7 @@ function AccountCard({
       onOpen={onOpen}
       onAction={onSwitch}
       actionTitle={`切换主库到 ${displayName}（全部对话记录保持不变）`}
-      selectedTitle="Work 登录材料中识别到的账号；不代表客户端进程正在运行。"
+      selectedTitle="TRAE 登录材料中识别到的账号；不代表客户端进程正在运行。"
     />
   );
 

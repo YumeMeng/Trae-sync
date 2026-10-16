@@ -81,6 +81,15 @@ function deriveWriteCapability(libraryId: string): LibraryWriteCapability {
   return "none";
 }
 
+/**
+ * 库实例所属产品的协议值（P15-10）：后端操作注册表按 product_id + library_id
+ * 校验（work_cn → master/env-*，trae_cn → trae_cn 只读根）。这是库实例到
+ * 操作注册表的协议映射，不是产品切换概念，塌缩后保持字符串不动。
+ */
+function operationProductIdForLibrary(libraryId: string): string {
+  return libraryId === "trae_cn" ? "trae_cn" : "work_cn";
+}
+
 interface LibrarySessionsPanelProps {
   /** 页面可见时才读取库记录，避免后台 IPC；隐藏时停止轮询。 */
   active: boolean;
@@ -159,7 +168,7 @@ export function LibrarySessionsPanel({
   // trae_cn 虽传 readOnly，仍按能力开放归档/恢复。
   const derivedCapability = deriveWriteCapability(library.id);
   const [operationSnapshot, setOperationSnapshot] = useState<ProductOperationSnapshotDto | null>(null);
-  const snapshotMatchesLibrary = operationSnapshot?.product_id === (library.id === "trae_cn" ? "trae_cn" : "work_cn")
+  const snapshotMatchesLibrary = operationSnapshot?.product_id === operationProductIdForLibrary(library.id)
     && operationSnapshot.library_id === library.id;
   const currentOperations = snapshotMatchesLibrary ? operationSnapshot?.operations ?? [] : [];
   const archiveOperation = currentOperations.find((operation) => operation.operation_id === "library.archive");
@@ -290,7 +299,7 @@ export function LibrarySessionsPanel({
     }
     let cancelled = false;
     setOperationSnapshot(null);
-    const productId = library.id === "trae_cn" ? "trae_cn" : "work_cn";
+    const productId = operationProductIdForLibrary(library.id);
     void invoke<ProductOperationSnapshotDto>("get_product_operation_states", {
       productId,
       libraryId: library.id,

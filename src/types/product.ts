@@ -1,14 +1,19 @@
-import type { ProductId } from "../platform/productRegistry";
+/**
+ * 当前产品协议标识（P15-10 单产品塌缩，ADR-0035）：融合版 TRAE 是唯一产品目标，
+ * 需要产品标识处使用此常量，不再散落字面量。后端命令参数与 product-state
+ * 指针值沿用同一字符串（协议值稳定）。
+ */
+export const CURRENT_PRODUCT_ID = "trae_cn";
 
 export type OperationReadiness = "ready" | "pending" | "absent";
 
+/** checkin.claim 已随 P15-10 惰性注册表条目清理移除（无命令消费）。 */
 export type ProductOperationId =
   | "account.health_check"
   | "account.tool_selection"
   | "account.switch"
   | "account.native_activation"
   | "checkin.status"
-  | "checkin.claim"
   | "checkin.schedule"
   | "library.read"
   | "library.archive"
@@ -24,14 +29,15 @@ export interface ProductOperationStateDto {
 }
 
 export interface ProductOperationSnapshotDto {
-  readonly product_id: ProductId;
+  /** 产品协议值（后端操作注册表按 product_id + library_id 校验；协议值稳定）。 */
+  readonly product_id: string;
   readonly library_id: string | null;
   readonly operations: readonly ProductOperationStateDto[];
 }
 
 /** 后端只读身份发现结果；不包含 userId、token 或 native storage。 */
 export interface ProductIdentityStateDto {
-  readonly product_id: ProductId;
+  readonly product_id: string;
   readonly display_name: string;
   readonly identity_status: "recognized" | "unknown" | "conflict";
   readonly credential_status: "managed_by_work" | "need_authorization";

@@ -10,18 +10,16 @@ import type {
 import { safeUiErrorMessage } from "../utils/safeUiError";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
-import type { ProductId } from "../platform/productRegistry";
 import { EmptyState } from "./EmptyState";
 
 interface SettingsPanelProps {
   /** 页面可见时才读取设置，避免后台 IPC。 */
   active: boolean;
-  /** 当前产品；缺省 Work 以保留既有调用行为。 */
-  product?: ProductId;
 }
 
-// 设置页：自动签到偏好 + 主库备份。
-export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProps) {
+// 设置页：自动签到偏好 + 主库备份。P15-10 单产品塌缩：设置服务唯一产品，
+// 不再按产品条件读取，跨产品通知前缀机制随之移除。
+export function SettingsPanel({ active }: SettingsPanelProps) {
   // 自动签到设置（ADR-0019 决策 5 / 2026-08-23 grill）：总开关 + 每日时间点 + 今日台账。
   const [autoStatus, setAutoStatus] = useState<AutoCheckinStatusDto | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
@@ -40,37 +38,16 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
   const [retention, setRetention] = useState<BackupRetentionDto | null>(null);
   const [retentionBusy, setRetentionBusy] = useState(false);
 
-  // 产品切换后作废旧操作的界面回写，并重置当前产品的忙状态与弹层。
-  const previousProduct = useRef(product);
-  const currentProduct = useRef(product);
+  // 页面失活期间的界面回写守卫：只以活动状态区分「本页操作」与「后台收尾」。
   const currentActive = useRef(active);
-  const productGeneration = useRef(0);
   // 每类设置单独递增读取序号，避免旧快照晚到后覆盖更新值。
   const backupChainReadVersion = useRef(0);
   const retentionReadVersion = useRef(0);
   const autoStatusReadVersion = useRef(0);
 
   useLayoutEffect(() => {
-    currentProduct.current = product;
     currentActive.current = active;
-    if (previousProduct.current === product) return;
-    previousProduct.current = product;
-    productGeneration.current += 1;
-    backupChainReadVersion.current += 1;
-    retentionReadVersion.current += 1;
-    autoStatusReadVersion.current += 1;
-    setBackupBusy(false);
-    setLocationBusy(false);
-    setRetentionBusy(false);
-    setAutoBusy(false);
-    setLocationDialogOpen(false);
-    setLocationInput("");
-  }, [active, product]);
-
-  const isCurrentProductGeneration = useCallback(
-    (generation: number) => productGeneration.current === generation,
-    [],
-  );
+  }, [active]);
 
   const readSnapshot = useCallback(<T,>(
     version: { current: number },
@@ -82,7 +59,6 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
     return read().then((snapshot) => {
       if (
         version.current === requestVersion
-        && currentProduct.current === "work_cn"
         && currentActive.current
         && isEffectCurrent()
       ) {
@@ -92,25 +68,8 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
     });
   }, []);
 
-  const refreshStaleWorkSnapshot = useCallback(<T,>(
-    operationGeneration: number,
-    read: () => Promise<T>,
-  ) => {
-    if (
-      isCurrentProductGeneration(operationGeneration)
-      || currentProduct.current !== "work_cn"
-      || !currentActive.current
-    ) return;
-    void read()
-      .catch(() => undefined);
-  }, [isCurrentProductGeneration]);
-
-  const formatWorkNotification = useCallback((origin: ProductId, message: string) => (
-    origin === "work_cn" && currentProduct.current !== origin ? `TRAE Work CN：${message}` : message
-  ), []);
-
   const loadBackupChain = useCallback((isEffectCurrent: () => boolean = () => true) => {
-    if (!currentActive.current || currentProduct.current !== "work_cn") return Promise.resolve(null);
+    if (!currentActive.current) return Promise.resolve(null);
     return readSnapshot(
       backupChainReadVersion,
       () => invoke<MasterBackupChainDto>("get_master_backup_chain").catch(() => null),
@@ -120,7 +79,7 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
   }, [readSnapshot]);
 
   const loadRetention = useCallback((isEffectCurrent: () => boolean = () => true) => {
-    if (!currentActive.current || currentProduct.current !== "work_cn") return Promise.resolve(null);
+    if (!currentActive.current) return Promise.resolve(null);
     return readSnapshot(
       retentionReadVersion,
       () => invoke<BackupRetentionDto>("get_backup_retention"),
@@ -130,7 +89,7 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
   }, [readSnapshot]);
 
   const loadAutoStatus = useCallback((isEffectCurrent: () => boolean = () => true) => {
-    if (!currentActive.current || currentProduct.current !== "work_cn") return Promise.resolve(null);
+    if (!currentActive.current) return Promise.resolve(null);
     return readSnapshot(
       autoStatusReadVersion,
       () => invoke<AutoCheckinStatusDto>("get_auto_checkin_settings"),
@@ -140,64 +99,47 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
   }, [readSnapshot]);
 
   useEffect(() => {
-    if (product === "work_cn") return;
-    setAutoStatus(null);
-    setBackupChain(null);
-    setRetention(null);
-  }, [product]);
-
-  useEffect(() => {
-    if (!active || product !== "work_cn") return;
+    if (!active) return;
     let cancelled = false;
     void loadRetention(() => !cancelled)
       .catch(() => undefined); // 读取失败不阻塞页面；保存时会再次报错
     return () => { cancelled = true; };
-  }, [active, loadRetention, product]);
+  }, [active, loadRetention]);
 
   useEffect(() => {
-    if (!active || product !== "work_cn") return;
+    if (!active) return;
     let cancelled = false;
     void loadAutoStatus(() => !cancelled)
       .catch(() => undefined); // 读取失败不阻塞页面；保存时会再次报错
     void loadBackupChain(() => !cancelled);
     return () => { cancelled = true; };
-  }, [active, product, loadAutoStatus, loadBackupChain]);
+  }, [active, loadAutoStatus, loadBackupChain]);
 
   // 手动备份：主库三件套复制为 .switch-bak-{时间戳}（create_new 永不覆盖）。
   // 勾选凭据时后端把签到凭据白名单整拷到 credentials-{同时间戳}/ 子目录。
   // 成功后重读备份链；失败提示稳定原因（如主库运行中），原数据不受影响。
   const handleCreateBackup = useCallback(() => {
-    if (product !== "work_cn" || backupBusy) return;
-    const origin = product;
-    const generation = productGeneration.current;
+    if (backupBusy) return;
     setBackupBusy(true);
     void invoke<string>("create_master_backup", { includeCredentials })
       .then(async () => {
-        if (!isCurrentProductGeneration(generation)) return;
         await loadBackupChain();
       })
       .then(() =>
-        notify.success(
-          formatWorkNotification(origin, includeCredentials
-            ? "主库数据备份已创建（含账号凭据子目录），原数据未受影响。"
-            : "主库数据备份已创建，原数据未受影响。"),
-        ),
+        notify.success(includeCredentials
+          ? "主库数据备份已创建（含账号凭据子目录），原数据未受影响。"
+          : "主库数据备份已创建，原数据未受影响。"),
       )
       .catch((reason: unknown) => notify.error(
-        formatWorkNotification(origin, safeUiErrorMessage(reason, "主库数据备份未完成。")),
+        safeUiErrorMessage(reason, "主库数据备份未完成。"),
       ))
-      .finally(() => {
-        if (isCurrentProductGeneration(generation)) setBackupBusy(false);
-        else refreshStaleWorkSnapshot(generation, loadBackupChain);
-      });
-  }, [backupBusy, formatWorkNotification, includeCredentials, isCurrentProductGeneration, loadBackupChain, product, refreshStaleWorkSnapshot]);
+      .finally(() => setBackupBusy(false));
+  }, [backupBusy, includeCredentials, loadBackupChain]);
 
   // P11-4① 提交备份位置变更：先迁移（此刻活动目录仍是旧位置）再切换；
   // 迁移出现失败清单时中止切换（已复制的保留，可排查后重试，迁移幂等）。
   const handleSaveBackupLocation = useCallback(() => {
-    if (product !== "work_cn" || locationBusy) return;
-    const origin = product;
-    const generation = productGeneration.current;
+    if (locationBusy) return;
     const targetDir = locationInput.trim();
     if (targetDir === "") return;
     setLocationBusy(true);
@@ -209,7 +151,7 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
         if (migration && migration.failures.length > 0) {
           // 部分失败：不切换位置，返回清单（notify.summary 带异常逐行）。
           notify.summary(
-            formatWorkNotification(origin, "部分备份未能复制到新位置，备份位置未变更"),
+            "部分备份未能复制到新位置，备份位置未变更",
             migration.failures.map((failure) => ({
               displayName: failure.file_name,
               reason: failure.reason,
@@ -219,96 +161,58 @@ export function SettingsPanel({ active, product = "work_cn" }: SettingsPanelProp
           return;
         }
         return invoke("set_backup_dir", { backupDir: targetDir }).then(() => {
-          notify.success(
-            formatWorkNotification(origin, migration
-              ? `备份位置已更新，${migration.migrated_files} 个文件已复制到新位置（原位置备份保留，可自行清理）。`
-              : "备份位置已更新，之后的备份将写入新目录。"),
-          );
+          notify.success(migration
+            ? `备份位置已更新，${migration.migrated_files} 个文件已复制到新位置（原位置备份保留，可自行清理）。`
+            : "备份位置已更新，之后的备份将写入新目录。");
         });
       })
       .then(() => {
-        if (!isCurrentProductGeneration(generation)) return;
         setLocationDialogOpen(false);
         setLocationInput("");
         return loadBackupChain();
       })
       .catch((reason: unknown) => notify.error(
-        formatWorkNotification(origin, safeUiErrorMessage(reason, "备份位置变更未完成，当前设置保持不变。")),
+        safeUiErrorMessage(reason, "备份位置变更未完成，当前设置保持不变。"),
       ))
-      .finally(() => {
-        if (isCurrentProductGeneration(generation)) setLocationBusy(false);
-        else refreshStaleWorkSnapshot(generation, loadBackupChain);
-      });
-  }, [formatWorkNotification, isCurrentProductGeneration, locationBusy, locationInput, migrateExisting, loadBackupChain, product, refreshStaleWorkSnapshot]);
+      .finally(() => setLocationBusy(false));
+  }, [locationBusy, locationInput, migrateExisting, loadBackupChain]);
 
   // P5-9 保存备份保留设置：开关与保留份数一起提交（后端范围校验 1-50）。
   const handleSaveRetention = useCallback((enabled: boolean, keep: number) => {
-    if (product !== "work_cn" || retentionBusy) return;
-    const origin = product;
-    const generation = productGeneration.current;
+    if (retentionBusy) return;
     setRetentionBusy(true);
     void invoke("set_backup_retention", { enabled, keep })
       .then(() => {
-        if (!isCurrentProductGeneration(generation)) return null;
         setRetention({ enabled, keep });
         return loadRetention().catch(() => undefined);
       })
       .then(() => {
-        notify.success(formatWorkNotification(origin, enabled
+        notify.success(enabled
           ? `备份自动清理已开启，超出 ${keep} 份的旧备份会在新备份生成后自动删除。`
-          : "备份自动清理已关闭，旧备份不会再被自动删除。"));
+          : "备份自动清理已关闭，旧备份不会再被自动删除。");
       })
       .catch((reason: unknown) => notify.error(
-        formatWorkNotification(origin, safeUiErrorMessage(reason, "备份清理设置保存失败。")),
+        safeUiErrorMessage(reason, "备份清理设置保存失败。"),
       ))
-      .finally(() => {
-        if (isCurrentProductGeneration(generation)) setRetentionBusy(false);
-        else refreshStaleWorkSnapshot(generation, loadRetention);
-      });
-  }, [formatWorkNotification, isCurrentProductGeneration, loadRetention, product, refreshStaleWorkSnapshot, retentionBusy]);
+      .finally(() => setRetentionBusy(false));
+  }, [loadRetention, retentionBusy]);
 
   // 保存自动签到设置：开关与时间一起提交（后端原子写保留台账 + 格式校验）。
   const handleSaveAutoCheckin = useCallback((enabled: boolean, dailyTime: string) => {
-    if (product !== "work_cn" || autoBusy) return;
-    const origin = product;
-    const generation = productGeneration.current;
+    if (autoBusy) return;
     setAutoBusy(true);
     void invoke("set_auto_checkin_settings", { enabled, dailyTimeHhmm: dailyTime })
-      .then(() => isCurrentProductGeneration(generation)
-        ? loadAutoStatus()
-        : null)
+      .then(() => loadAutoStatus())
       .then(() => {
-        notify.success(formatWorkNotification(
-          origin,
-          enabled ? `自动签到已开启，每日 ${dailyTime} 后自动执行。` : "自动签到已关闭。",
-        ));
+        notify.success(enabled
+          ? `自动签到已开启，每日 ${dailyTime} 后自动执行。`
+          : "自动签到已关闭。");
       })
       .catch((reason: unknown) => notify.error(
-        formatWorkNotification(origin, safeUiErrorMessage(reason, "自动签到设置保存失败。")),
+        safeUiErrorMessage(reason, "自动签到设置保存失败。"),
       ))
-      .finally(() => {
-        if (isCurrentProductGeneration(generation)) setAutoBusy(false);
-        else refreshStaleWorkSnapshot(generation, loadAutoStatus);
-      });
-  }, [autoBusy, formatWorkNotification, isCurrentProductGeneration, loadAutoStatus, product, refreshStaleWorkSnapshot]);
-
-  if (product !== "work_cn") {
-    return (
-      <section className="settings-panel" role="region" aria-label="设置">
-        <header className="page-header">
-          <div className="page-header__copy">
-            <span className="page-header__eyebrow">偏好与安全</span>
-            <h1 data-page-title="settings" tabIndex={-1}>设置</h1>
-          </div>
-        </header>
-        <EmptyState
-          role="status"
-          description="当前产品暂时没有可管理的设置。"
-          testId="product-settings-empty"
-        />
-      </section>
-    );
-  }
+      .finally(() => setAutoBusy(false));
+  }, [autoBusy, loadAutoStatus]);
 
   return (
     <section className="settings-panel" role="region" aria-label="设置">

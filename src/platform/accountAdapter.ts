@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ProductId } from "./productRegistry";
+import { CURRENT_PRODUCT_ID } from "../types/product";
 import type {
   ProductIdentityStateDto,
   TraeCnAccountDto,
@@ -28,8 +28,8 @@ export interface AccountView {
 
 /** 适配器返回给共享账号工作台的快照；不携带令牌或本地凭据。 */
 export interface AccountSnapshot {
-  /** 快照来源产品；用于丢弃切产品后迟到的读取结果。 */
-  readonly productId: ProductId;
+  /** 快照来源产品（账号域内部标识值；用于丢弃切产品后迟到的读取结果）。 */
+  readonly productId: string;
   readonly statusLabel: string;
   readonly accounts: readonly AccountView[];
   readonly officialIdentityLabel: string;
@@ -52,12 +52,13 @@ export interface AccountActionResult {
 /**
  * 产品差异的最小切口。
  *
- * Work CN 目前仍由 AccountCenter 内部保留成熟的签到/详情事务；Trae CN
- * 先通过此接口接入共享账号工作台。这样不会为了“抽象完整”而复制后端存储或
- * 把 Work 专有 DTO 泄漏到 CN 页面。
+ * P15-10 单产品塌缩后，AccountCenter 主路径保留完整的账号事务（官方切号/
+ * 凭据/额度/健康），本适配器保留融合版账号链的轻量接入面（工具内选择、
+ * 健康检测、登录设备），由测试场景注入。
  */
 export interface AccountAdapter {
-  readonly productId: ProductId;
+  /** 账号域内部产品标识值（协议值稳定；不是产品切换概念）。 */
+  readonly productId: string;
   readonly productName: string;
   readonly capabilities: readonly AccountCapability[];
   loadSnapshot(): Promise<AccountSnapshot>;
@@ -85,14 +86,13 @@ function identityCopy(
     : identity?.identity_status === "conflict"
       ? "官方客户端身份：信息冲突"
       : "官方客户端身份：未确认";
-  const relation = identity?.identity_status === "recognized" ? identity.relation_to_work : "unknown";
-  const officialIdentityMessage = relation === "same_identity"
-    ? "从 Trae CN 客户端数据读取到的身份与 Work CN 相同。"
-    : relation === "different_identity"
-      ? "从 Trae CN 客户端数据读取到的身份与 Work CN 不同。"
-      : relation === "current_product"
-        ? "这是 Work CN 客户端记录的身份。"
-        : "目前无法确认 Trae CN 客户端身份与 Work CN 的关系。";
+  // P15-10 单产品塌缩：身份观察只描述本机客户端证据状态，
+  // 不再表述与另一产品（Work CN）的关系（后端 relation_to_work 字段保留不用）。
+  const officialIdentityMessage = identity?.identity_status === "recognized"
+    ? "已从本机客户端登录数据读取到官方身份。"
+    : identity?.identity_status === "conflict"
+      ? "本机客户端登录数据存在冲突，请重新登录确认。"
+      : "暂时无法从本机客户端登录数据确认身份。";
   return { officialIdentityLabel, officialIdentityMessage };
 }
 
@@ -121,27 +121,27 @@ export function createTraeCnAccountAdapter(
       invoke<TraeCnAccountDto[]>("list_trae_cn_accounts"),
     ]);
     return {
-      identity: identityItems.find((item) => item.product_id === "trae_cn"),
+      identity: identityItems.find((item) => item.product_id === CURRENT_PRODUCT_ID),
       accounts,
     };
   };
 
   return {
-    productId: "trae_cn",
+    productId: CURRENT_PRODUCT_ID,
     productName,
     capabilities: ["login", "relogin", "toolSelection", "health", "remoteDevices"],
     async loadSnapshot() {
       const { identity, accounts } = await loadRawAccounts();
       const copy = identityCopy(identity);
       return {
-        productId: "trae_cn",
+        productId: CURRENT_PRODUCT_ID,
         statusLabel: accounts.length > 0 ? `已保存 ${accounts.length} 个账号` : defaultStatusLabel,
         accounts: accounts.map(toAccountView),
         ...copy,
       };
     },
     async login(onAttemptStarted) {
-      // 复用的是浏览器网页登录会话，不是 Work CN 的本地凭据或 native storage。
+      // 复用的是浏览器网页登录会话，不读取本地凭据或 native storage。
       const begin = await invoke<{ attempt_id: number }>("begin_trae_cn_login", { useSystemBrowser: true });
       onAttemptStarted(begin.attempt_id);
       const receipt = await invoke<TraeCnLoginReceiptDto>("complete_trae_cn_login", { attemptId: begin.attempt_id });
@@ -188,7 +188,10 @@ function actionResultFromHealth(results: readonly TraeCnHealthEntryDto[]): Accou
   };
 }
 
-/** 当前已实现产品的账号适配器；Work 继续走其成熟的原生账号事务。 */
-export function accountAdapterFor(productId: ProductId): AccountAdapter | null {
-  return productId === "trae_cn" ? createTraeCnAccountAdapter() : null;
+/**
+ * 当前已实现产品的账号适配器（P15-10 单产品塌缩）：路由参数只剩协议值比较，
+ * 完整账号事务路径（AccountCenter 主路径）不经此工厂，适配器由测试注入。
+ */
+export function accountAdapterFor(productId: string): AccountAdapter | null {
+  return productId === CURRENT_PRODUCT_ID ? createTraeCnAccountAdapter() : null;
 }

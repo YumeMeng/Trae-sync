@@ -1,5 +1,3 @@
-import type { ProductId } from "../platform/productRegistry";
-
 /**
  * 批量操作逐账号进度事件统一契约（P12-R2 Q2 定案）。
  *
@@ -17,8 +15,11 @@ export type BatchProgressKind = "credential_refresh" | "health_check" | "credits
 
 /** 批量操作逐账号进度事件载荷（三链统一，非敏感白名单）。 */
 export interface BatchProgressEvent {
-  /** 进度所属产品；账号页只接受当前产品的事件。 */
-  product_id: ProductId;
+  /**
+   * 进度所属产品（协议值）：Work 签到档案链为 "work_cn"，融合版账号链为
+   * CURRENT_PRODUCT_ID；账号页按事件来源链匹配，不作为产品切换概念。
+   */
+  product_id: string;
   /** 事件链类型；R2b 落地前的过渡期载荷可能缺省（前端按事件名降级推断）。 */
   kind?: BatchProgressKind;
   profile_id: string;

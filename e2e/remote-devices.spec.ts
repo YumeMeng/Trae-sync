@@ -2,14 +2,14 @@ import { test, expect } from "@playwright/test";
 import { installMockBridge } from "./mock-bridge";
 
 // ============================================================================
-// 登录设备面板 e2e（ADR-0031，P10-5 切片 3 / 结构调整）
+// 登录设备面板 e2e（ADR-0031，P10-5 切片 3 / 结构调整；P15-10 单产品塌缩后
+// 入口改为唯一产品的完整账号事务路径）
 // ============================================================================
 //
-// 全程走 mock-bridge（不触网、不启动 Tauri）。P10-5 起登录设备绑定在
-// 账号详情页：入口路径为 Trae CN 账号列表 → 点击账号卡片进入详情 →
-// 展开登录设备。fixture：
-// - traeCnAccounts 场景让 Trae CN 账号页有一个可进入详情的账号
-//   （与 list_remote_devices 的归属标注同源）；
+// 全程走 mock-bridge（不触网、不启动 Tauri）。登录设备绑定在账号详情页：
+// 入口路径为账号列表 → 点击账号卡片进入详情 → 展开登录设备。fixture：
+// - realHttp 场景让账号页走真实签到档案总览（合成数据），有一个可进入
+//   详情的账号卡片；
 // - list_remote_devices 返回两行设备（一本机一非本机）；
 // - clear_remote_device 对本机目标抛 remote_device_local_device_targeted
 //   （后端拒绝防线模拟），对其他设备从 fixture 删除（下次列表少一行）。
@@ -19,20 +19,20 @@ import { installMockBridge } from "./mock-bridge";
 
 test.describe("登录设备面板（ADR-0031）", () => {
   test("账号详情页内登录设备：本机区块置顶无退出按钮；其他设备默认折叠，展开后退出需确认且成功后列表刷新", async ({ page }) => {
-    await installMockBridge(page, { traeCnAccounts: true });
+    await installMockBridge(page, { realHttp: true });
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
 
-    // 切到 Trae CN 产品进入账号页；列表页不应出现独立设备区块。
-    await page.getByRole("combobox", { name: "当前产品" }).selectOption("trae_cn");
-    const card = page.getByTestId("account-adapter-card-trae-cn-profile");
+    // 进入账号页（单产品，无产品切换器）；列表页不应出现独立设备区块。
+    await page.getByTestId("navigation-accounts").click();
+    const card = page.getByTestId("account-card-profile-current");
     await expect(card).toBeVisible();
     await expect(page.getByTestId("remote-devices-panel")).toHaveCount(0);
 
     // 点击账号卡片进入详情：设备模块出现但默认折叠，未发设备命令。
     await card.click();
     const panel = page.getByTestId("remote-devices-panel");
-    await expect(page.getByTestId("adapter-account-detail")).toBeVisible();
+    await expect(page.getByTestId("account-detail-back")).toBeVisible();
     await expect(panel).toBeVisible();
     await page.getByTestId("remote-devices-toggle").click();
 

@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
-import { AccountWorkbench } from "../src/components/AccountWorkbench";
+import { AccountCenter } from "../src/components/AccountCenter";
 import { accountAdapterFor, createTraeCnAccountAdapter } from "../src/platform/accountAdapter";
+import { CURRENT_PRODUCT_ID } from "../src/types/product";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
@@ -57,9 +58,10 @@ describe("账号适配器与共享工作台", () => {
     ]);
   });
 
-  it("通过产品 ID 路由到 CN 适配器，并保留 Work 的渐进迁移入口", () => {
-    expect(accountAdapterFor("trae_cn")?.productId).toBe("trae_cn");
-    // Work 仍由 AccountCenter 保留成熟事务；迁移完成前不伪造一个空适配器。
+  it("按协议值路由到 CN 适配器（单产品塌缩后 Work 仍由 AccountCenter 主路径承载）", () => {
+    expect(accountAdapterFor(CURRENT_PRODUCT_ID)?.productId).toBe(CURRENT_PRODUCT_ID);
+    // 完整账号事务（官方切号/凭据/额度）由 AccountCenter 主路径保留；非当前
+    // 协议值不伪造适配器。
     expect(accountAdapterFor("work_cn")).toBeNull();
   });
 
@@ -67,7 +69,7 @@ describe("账号适配器与共享工作台", () => {
     const adapter = createTraeCnAccountAdapter();
     const snapshot = await adapter.loadSnapshot();
 
-    expect(snapshot.productId).toBe("trae_cn");
+    expect(snapshot.productId).toBe(CURRENT_PRODUCT_ID);
     expect(snapshot.accounts).toEqual([
       expect.objectContaining({ id: "cn-main", displayName: "CN 主账号", isToolSelected: true }),
       expect.objectContaining({ id: "cn-backup", displayName: "CN 备用账号", isToolSelected: false }),
@@ -80,7 +82,8 @@ describe("账号适配器与共享工作台", () => {
       "remoteDevices",
     ]);
     expect(snapshot.officialIdentityLabel).toBe("官方客户端身份：已识别");
-    expect(snapshot.officialIdentityMessage).toBe("从 Trae CN 客户端数据读取到的身份与 Work CN 相同。");
+    // P15-10 单产品塌缩：身份观察只描述本机客户端证据状态，不再表述 Work CN 关系。
+    expect(snapshot.officialIdentityMessage).toBe("已从本机客户端登录数据读取到官方身份。");
   });
 
   it("账号选择只更新 Trae Sync 工具自有指针", async () => {
@@ -107,8 +110,8 @@ describe("账号适配器与共享工作台", () => {
     expect(mockInvoke).toHaveBeenCalledWith("cancel_trae_cn_login", { attemptId: 23 });
   });
 
-  it("Trae CN 使用同一账号工作台，并隐藏 Work 专有操作（凭据刷新随融合版续期语义移除）", async () => {
-    render(<AccountWorkbench active adapter={createTraeCnAccountAdapter()} />);
+  it("适配器路径使用同一账号工作台，并隐藏 Work 专有操作（凭据刷新随融合版续期语义移除）", async () => {
+    render(<AccountCenter active adapter={createTraeCnAccountAdapter()} />);
 
     expect(await screen.findByRole("region", { name: "TRAE 账号" })).toBeInTheDocument();
     expect(screen.getByText("CN 主账号")).toBeInTheDocument();

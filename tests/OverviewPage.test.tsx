@@ -1,15 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { invoke } from "@tauri-apps/api/core";
 import { OverviewPage } from "../src/pages/OverviewPage";
 import type { WorkspaceStateDto } from "../src/types/workspace";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
 // ============================================================================
-// OverviewPage（P11-6）：
-// 任务 1 —— 问候语取产品注册表 displayName 动态生成，随产品切换变化；
-// 任务 2 —— Trae CN 总览为 pending 形态：问候 + 诚实说明卡 + 浏览入口，
-// 不发起 Work CN 数据读取（跨产品数据隔离）。
+// OverviewPage（P15-10 单产品塌缩后）：
+// 问候语取单产品展示名「TRAE」（注册表 PRODUCT_DISPLAY_NAME）；
+// 总览恒 ready：证据带 + 签到摘要 + 主库统计正常渲染。
 // ============================================================================
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
@@ -18,13 +16,11 @@ vi.mock("@tauri-apps/api/core", async () => {
   return { invoke: fake.mockCoreInvoke };
 });
 
-const mockInvoke = vi.mocked(invoke);
-
 function workspaceState(overrides: Partial<WorkspaceStateDto> = {}): WorkspaceStateDto {
   return {
     platform: {
       platform_id: "work_cn",
-      display_name: "TRAE Work CN",
+      display_name: "TRAE",
       adapter_implemented: true,
     },
     data_location: {
@@ -79,7 +75,7 @@ function setupReadyMocks() {
   }));
 }
 
-describe("OverviewPage 问候语动态化（任务 1）", () => {
+describe("OverviewPage 单产品塌缩", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // 等价于原 vi.fn() 空实现：清历史 + 重装按路由表分发的实现。
@@ -87,51 +83,21 @@ describe("OverviewPage 问候语动态化（任务 1）", () => {
     installFakeInvoke();
   });
 
-  it("Work CN：问候语带注册表 displayName「TRAE Work CN 工作台」", () => {
+  it("问候语固定为单产品展示名「TRAE 工作台」，零 Work CN 表述", () => {
     setupReadyMocks();
-    render(<OverviewPage state={workspaceState()} active product="work_cn" onNavigate={() => undefined} />);
+    render(<OverviewPage state={workspaceState()} active onNavigate={() => undefined} />);
     const heading = screen.getByRole("heading", { level: 1 });
     // 时段词（早上好/下午好等）随真实时间变化，断言产品名后缀稳定存在。
-    expect(heading).toHaveTextContent(/，这里是你的 TRAE Work CN 工作台$/);
-  });
-
-  it("TRAE：问候语随产品切换变为「TRAE 工作台」", () => {
-    render(<OverviewPage state={workspaceState()} active product="trae_cn" onNavigate={() => undefined} />);
-    const heading = screen.getByRole("heading", { level: 1 });
     expect(heading).toHaveTextContent(/，这里是你的 TRAE 工作台$/);
-    expect(heading).not.toHaveTextContent("TRAE Work CN");
-  });
-});
-
-describe("OverviewPage Trae CN pending 形态（任务 2）", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    resetRoutes();
-    installFakeInvoke();
+    expect(heading).not.toHaveTextContent("Work CN");
   });
 
-  it("渲染诚实说明卡与浏览入口，不发起 Work CN 数据读取", () => {
-    render(<OverviewPage state={workspaceState()} active product="trae_cn" onNavigate={() => undefined} />);
-
-    expect(screen.getByTestId("capability-pending")).toBeInTheDocument();
-    // 浏览入口进入主库详情页（Trae CN 只读数据根）。
-    expect(screen.getByTestId("overview-library-cta")).toBeInTheDocument();
-    expect(screen.getByTestId("overview-accounts-cta")).toBeInTheDocument();
-    // 跨产品数据隔离：pending 形态不读取 Work CN 环境与统计。
-    expect(mockInvoke).not.toHaveBeenCalled();
-  });
-
-  it("不出 Work CN 证据带、统计卡与目录缺失文案", () => {
-    render(<OverviewPage state={workspaceState()} active product="trae_cn" onNavigate={() => undefined} />);
-    expect(screen.queryByTestId("current-account-context")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("overview-stats-master")).not.toBeInTheDocument();
-    expect(screen.queryByText(/未找到 TRAE 数据目录/)).not.toBeInTheDocument();
-  });
-
-  it("Work CN ready 形态不受影响：无 pending 卡，统计卡正常", async () => {
+  it("ready 形态：无 pending/absent 说明卡，证据带与统计卡正常", async () => {
     setupReadyMocks();
-    render(<OverviewPage state={workspaceState()} active product="work_cn" onNavigate={() => undefined} />);
+    render(<OverviewPage state={workspaceState()} active onNavigate={() => undefined} />);
     expect(screen.queryByTestId("capability-pending")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("capability-absent")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("current-account-context")).toBeInTheDocument();
     expect(await screen.findByTestId("overview-stats-master")).toBeInTheDocument();
   });
 });

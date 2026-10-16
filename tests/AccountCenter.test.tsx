@@ -2238,7 +2238,7 @@ describe("AccountCenter", () => {
           device_id: "dev-local",
           device_type: "IDE_PC",
           device_name: "本机电脑",
-          bound_products: ["TRAE Work CN"],
+          bound_products: ["TRAE"],
           last_active_at: null,
           is_local: true,
         },

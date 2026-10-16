@@ -104,7 +104,7 @@ export function AdapterAccountDetail({
               disabled={toolSelectionBusy}
               onClick={onSelectToolAccount}
               data-testid="adapter-account-detail-tool-select"
-              title="只设置 Trae Sync 工具当前账号，不会改变官方 Trae CN 客户端登录状态"
+              title="只设置 Trae Sync 工具当前账号，不会改变官方 TRAE 客户端登录状态"
             >
               <ArrowLeftRight size={15} aria-hidden="true" />
               {toolSelectionBusy ? "设置中…" : "设置工具当前账号"}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { WorkspaceStateDto } from "./types/workspace";
@@ -11,15 +11,7 @@ import { OverviewPage } from "./pages/OverviewPage";
 import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
 import type { LibraryRef } from "./components/LibrarySessionsPanel";
-import {
-  PRODUCT_DEFINITIONS,
-  detailLibraryRefFor,
-  productDefinitionOf,
-  workspaceStateForProduct,
-  type ProductCapability,
-  type ProductId,
-} from "./platform/productRegistry";
-import { accountAdapterFor } from "./platform/accountAdapter";
+import { detailLibraryRefFor } from "./platform/productRegistry";
 import { notify, Toaster } from "./platform/notify";
 import { safeUiErrorMessage } from "./utils/safeUiError";
 
@@ -37,18 +29,12 @@ interface AutoCheckinFinishedEvent {
   skipped: number;
 }
 
-// 应用根组件：导航工作区五页对所有产品开放（ADR-0032）；
-// 各页内容按产品注册表能力三态呈现，Work CN 与 Trae CN 页面本体一致。
+// 应用根组件：单产品塌缩（P15-10，ADR-0035）——融合版 TRAE 是唯一产品，
+// 导航工作区五页全部 ready，无产品切换状态；账号工作台固定走完整账号事务。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<AppPage>("overview");
-  const [selectedProductId, setSelectedProductId] = useState<ProductId>("work_cn");
-  // 每个产品保留自己的安全页面；切换产品不把详情对象和数据库状态带过去。
-  const [productPages, setProductPages] = useState<Record<ProductId, AppPage>>({
-    work_cn: "overview",
-    trae_cn: "accounts",
-  });
   const [workspaceRefreshPending, setWorkspaceRefreshPending] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const navigationMountedRef = useRef(false);
@@ -60,24 +46,14 @@ export default function App() {
   // 同一页面槽位承载主库/副库两种详情（导航模式与主库详情一致）。
   const [libraryDetail, setLibraryDetail] = useState<LibraryRef | null>(null);
 
-  const selectedProduct = productDefinitionOf(selectedProductId);
-  const accountAdapter = useMemo(
-    () => accountAdapterFor(selectedProductId),
-    [selectedProductId],
-  );
-  // 主库详情页的库实例（ADR-0032 决策 5）：Trae CN 固定只读数据根；
-  // Work CN 沿用环境页入口注入（缺省主库）。
-  const detailLibrary = detailLibraryRefFor(selectedProductId, libraryDetail);
-  const selectedState = state
-    ? workspaceStateForProduct(state, selectedProduct)
-    : null;
+  // 主库详情页的库实例（ADR-0032 决策 5）：环境页入口注入优先，缺省主库。
+  const detailLibrary = detailLibraryRefFor(libraryDetail);
 
   const handlePageChange = useCallback((page: AppPage) => {
     // 离开库详情页即重置库实例引用，避免下次进入主库详情残留副库上下文。
     if (page !== "master-library") setLibraryDetail(null);
     setActivePage(page);
-    setProductPages((current) => ({ ...current, [selectedProductId]: page }));
-  }, [selectedProductId]);
+  }, []);
 
   /** 主库详情入口（主库卡「详情」）：清空副库引用后进入。 */
   const handleOpenMasterDetail = useCallback(() => {
@@ -90,16 +66,6 @@ export default function App() {
     setLibraryDetail(library);
     handlePageChange("master-library");
   }, [handlePageChange]);
-
-  const handleProductChange = useCallback((productId: ProductId) => {
-    const product = productDefinitionOf(productId);
-    const rememberedPage = productPages[productId];
-    const page = rememberedPage && product.capabilities.includes(rememberedPage as ProductCapability)
-      ? rememberedPage
-      : product.id === "trae_cn" ? "accounts" : "overview";
-    setSelectedProductId(productId);
-    setActivePage(page);
-  }, [productPages]);
 
   const refreshWorkspaceState = useCallback(async () => {
     const generation = (workspaceRefreshGenerationRef.current += 1);
@@ -237,30 +203,21 @@ export default function App() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>
-      <TitleBar
-        platform={selectedState?.platform ?? state.platform}
-        products={PRODUCT_DEFINITIONS}
-        selectedProductId={selectedProductId}
-        onProductChange={handleProductChange}
-      />
+      <TitleBar platform={state.platform} />
       <div className="app-body">
         <NavigationRail activePage={activePage} onPageChange={handlePageChange} />
         <main id="main-content" className="app-main" ref={mainRef}>
-          {selectedState && (
+          {state && (
             <div className="app-page" hidden={activePage !== "overview"}>
               <OverviewPage
-                state={selectedState}
+                state={state}
                 active={activePage === "overview"}
                 onNavigate={handlePageChange}
-                product={selectedProductId}
               />
             </div>
           )}
           <div className="app-page" hidden={activePage !== "accounts"}>
-            <AccountWorkbench
-              active={activePage === "accounts"}
-              adapter={accountAdapter}
-            />
+            <AccountWorkbench active={activePage === "accounts"} />
           </div>
           <div className="app-page" hidden={activePage !== "checkin"}>
             <CheckinPage
@@ -273,7 +230,6 @@ export default function App() {
               active={activePage === "environment"}
               onOpenMasterDetail={handleOpenMasterDetail}
               onOpenLibraryDetail={handleOpenLibraryDetail}
-              product={selectedProductId}
             />
           </div>
           <div className="app-page" hidden={activePage !== "master-library"}>
@@ -284,7 +240,7 @@ export default function App() {
             />
           </div>
           <div className="app-page" hidden={activePage !== "settings"}>
-            <SettingsPanel active={activePage === "settings"} product={selectedProductId} />
+            <SettingsPanel active={activePage === "settings"} />
           </div>
         </main>
       </div>

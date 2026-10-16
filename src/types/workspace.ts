@@ -1,9 +1,9 @@
 // 工作台状态 DTO：与 Rust 后端 `get_workspace_state` 命令返回的结构保持一致。
 // 0.2.1 生产能力限于 RealReadPreview；真实写入、恢复和迁移开关保持关闭。
 
-/** 平台上下文：由当前产品工作区提供；Work CN 为完整支持面，其他产品按能力清单逐步开放。 */
+/** 平台上下文：由当前产品工作区提供；展示名与能力按单产品（融合版 TRAE）塌缩呈现。 */
 export interface PlatformContextDto {
-  /** 当前产品标识，例如 "work_cn" 或 "trae_cn"。 */
+  /** 当前产品协议标识（单产品塌缩后值稳定，展示层不再按它分支）。 */
   readonly platform_id: string;
   /** 平台显示名 */
   readonly display_name: string;

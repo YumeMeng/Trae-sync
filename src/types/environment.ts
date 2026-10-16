@@ -13,7 +13,7 @@ export interface EnvironmentStateDto {
   readonly current_profile_id: string | null;
   /** 环境档案账号的显示名（备注名优先）；不单独证明实时登录。 */
   readonly current_account_name: string | null;
-  /** 本次从 Work CN 登录材料实测并映射到档案的账号；null = 未能确认当前身份。 */
+  /** 本次从 TRAE（融合版）登录材料实测并映射到档案的账号；null = 未能确认当前身份。 */
   readonly observed_profile_id: string | null;
   /** 主库 data_dir 绝对路径（展示与排障用）。 */
   readonly data_dir: string;

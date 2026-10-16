@@ -3,8 +3,8 @@ import type { LucideIcon } from "lucide-react";
 import { Home } from "lucide-react";
 import type { SectionKey } from "../platform/productRegistry";
 
-// master-library 为主库详情页（P5-8a-2）：不在导航栏（Work CN 从环境页主库卡
-// 进入，Trae CN 从总览浏览入口进入），故 navigationItems 不含它。
+// master-library 为主库详情页（P5-8a-2）：不在导航栏（从环境页主库卡/副环境
+// 「查看详情」入口进入），故 navigationItems 不含它。
 export type AppPage = SectionKey;
 
 interface NavigationRailProps {
@@ -13,8 +13,7 @@ interface NavigationRailProps {
 }
 
 // 导航只负责切换页面；状态徽章统一收敛到标题栏，不再重复展示能力状态。
-// ADR-0032 决策 1：五页对所有产品开放（页面本体一致，区块按能力三态呈现），
-// 不再按产品过滤导航项；未适配区块以诚实说明卡承载。
+// P15-10 单产品塌缩：五页固定全开放（区块三态全部 ready）。
 const navigationItems: Array<{
   page: AppPage;
   label: string;

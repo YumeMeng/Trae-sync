@@ -55,8 +55,8 @@ async function mockInvoke(command, args) {
   ];
   switch (command) {
     case "get_workspace_state": return {
-      platform: { platform_id: "work_cn", display_name: "TRAE Work CN", adapter_implemented: false },
-      data_location: { selected: true, display_name: "TRAE Work CN", unavailable_reason: null },
+      platform: { platform_id: "work_cn", display_name: "TRAE", adapter_implemented: false },
+      data_location: { selected: true, display_name: "TRAE", unavailable_reason: null },
       current_account: { detected: false, user_fingerprint: null, unavailable_reason: "not_detected" },
       history: { account_count: 2, project_count: 6, session_count: 74 },
       capabilities: { scan_enabled: true, sync_enabled: false, backup_enabled: false, restore_enabled: false },

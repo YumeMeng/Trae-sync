@@ -1,6 +1,6 @@
 import { CircleSlash, Hourglass } from "lucide-react";
 import type { ReactNode } from "react";
-import type { CapabilityState, ProductId } from "../platform/productRegistry";
+import type { CapabilityState } from "../platform/productRegistry";
 import { EmptyState } from "./EmptyState";
 
 // ============================================================================
@@ -8,6 +8,7 @@ import { EmptyState } from "./EmptyState";
 // ready 渲染真实内容；pending/absent 渲染诚实说明卡（毛玻璃 + 靛蓝点缀），
 // 卡上带 data-state / data-product / data-testid 供三态断言。
 // 分支判定依据产品注册表能力清单，由调用方传入 state，本组件不做产品判断。
+// P15-10 单产品塌缩：product 退化为展示用协议值字符串（data-product 锚点）。
 // ============================================================================
 
 /** pending/absent 的缺省卡文案与图标（标题可由调用方覆盖）。 */
@@ -20,10 +21,10 @@ const STATE_COPY: Record<
 };
 
 export interface CapabilitySectionProps {
-  /** 当前产品在该区块的能力三态（来自 sectionStateOf）。 */
+  /** 当前区块的能力三态（来自 sectionStateOf）。 */
   state: CapabilityState;
-  /** 当前产品（承载在卡的数据属性上，供每产品每区块断言）。 */
-  product: ProductId;
+  /** 产品协议值（承载在卡的数据属性上，供断言；不再是切换概念）。 */
+  product: string;
   /** pending/absent 卡标题覆盖（如签到区块的「签到能力适配中」）。 */
   title?: string;
   /** pending/absent 的补充说明行（可选）。 */

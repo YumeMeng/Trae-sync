@@ -39,7 +39,7 @@ const notifyMock = vi.mocked(notify);
 const workspace: WorkspaceStateDto = {
   platform: {
     platform_id: "work_cn",
-    display_name: "TRAE Work CN",
+    display_name: "TRAE",
     adapter_implemented: true,
   },
   data_location: {
@@ -123,10 +123,6 @@ describe("应用工作区入口", () => {
     await waitFor(() => {
       expect(handlers.get("auto-checkin-finished")).toBeDefined();
     });
-    fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {
-      target: { value: "trae_cn" },
-    });
-    expect(screen.getByRole("combobox", { name: "当前产品" })).toHaveValue("trae_cn");
     handlers.get("auto-checkin-finished")?.({
       payload: { total: 4, completed: 2, failed: 1, skipped: 1 },
     });
@@ -330,9 +326,8 @@ describe("应用工作区入口", () => {
     });
   });
 
-  it("P11-6（ADR-0032）：导航五页全产品开放，Trae CN 各页按区块三态呈现", async () => {
-    // 全量 mock：ready 页激活所需命令；pending/absent 页不发起读取。
-    // 原 catch-all 实现按 libraryId 分支的命令改为在各自 handler 内分支。
+  it("P15-10 单产品塌缩：无产品切换器，五页全开放且零 Work CN 表述", async () => {
+    // 全量 mock：唯一产品的五页全部 ready，各自激活所需命令。
     mockRoute("get_workspace_state", () => workspace);
     mockRoute("get_environment_state", () => ({
       env_id: "master",
@@ -350,140 +345,57 @@ describe("应用工作区入口", () => {
       real_http_enabled: false,
       message: "",
     }));
-    mockRoute("get_product_identity_state", () => [
-      {
-        product_id: "work_cn",
-        display_name: "TRAE Work CN",
-        identity_status: "recognized",
-        credential_status: "managed_by_work",
-        relation_to_work: "current_product",
-      },
-      {
-        product_id: "trae_cn",
-        display_name: "TRAE",
-        identity_status: "recognized",
-        credential_status: "need_authorization",
-        relation_to_work: "different_identity",
-      },
-    ]);
-    mockRoute("list_trae_cn_accounts", () => []);
-    mockRoute("get_master_library_stats", (args) => {
-      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
-      if (libraryId === "trae_cn") {
-        return {
-          status: "ready",
-          current_user_id: "u-t1",
-          project_count: 1,
-          session_count: 2,
-          message_count: 5,
-          participating_account_count: 1,
-          last_active_unix_seconds: null,
-          size_bytes: 0,
-        };
-      }
-      throw new Error("未模拟的命令: get_master_library_stats");
-    });
-    mockRoute("get_master_backup_chain", (args) => {
-      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
-      if (libraryId === "trae_cn") {
-        return { backups: [], backup_dir: "C:\\trae-cn", keep_policy: 5 };
-      }
-      return { backups: [], backup_dir: "C:\\bak", keep_policy: 5 };
-    });
-    mockRoute("get_master_history", (args) => {
-      const libraryId = (args as { libraryId?: string } | undefined)?.libraryId;
-      if (libraryId === "trae_cn") {
-        return {
-          status: "ready",
-          current_user_id: "u-t1",
-          projects: [{ project_id: "p-t1", name: "Trae 项目", absolute_path: null }],
-          sessions: [
-            {
-              session_id: "s-t1",
-              project_id: "p-t1",
-              title: "Trae 会话",
-              message_count: 5,
-              updated_at_unix_seconds: 1750000000,
-              deleted: false,
-              hidden_status: null,
-              work_mode: null,
-            },
-          ],
-          fingerprint: { db: { mtime_secs: 1, mtime_nanos: 0, size: 1 }, wal: null, shm: null },
-        };
-      }
-      throw new Error("未模拟的命令: get_master_history");
-    });
-    mockRoute("get_relay_ledger", () => []);
-    mockRoute("get_master_session_messages", () => ({ session_id: "s-t1", status: "ready", messages: [] }));
+    mockRoute("get_master_library_stats", () => ({
+      status: "ready",
+      current_user_id: "u-1",
+      project_count: 4,
+      session_count: 16,
+      message_count: 128,
+      participating_account_count: 3,
+      last_active_unix_seconds: null,
+      size_bytes: 0,
+    }));
     mockRoute("get_backup_retention", () => ({ enabled: true, keep: 5 }));
     mockRoute("get_auto_checkin_settings", () => ({ enabled: false, daily_time_hhmm: "09:00", ledger: null }));
 
     render(<App />);
     await screen.findByTestId("current-account-context");
 
-    fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {
-      target: { value: "trae_cn" },
-    });
+    // 产品切换器已随单产品塌缩移除。
+    expect(screen.queryByRole("combobox", { name: "当前产品" })).not.toBeInTheDocument();
 
-    // 导航五页全产品渲染（master-library 仍不生成导航项，从浏览入口进入）。
+    // 导航五页全部渲染（master-library 仍不生成导航项，从详情入口进入）。
     for (const page of ["overview", "accounts", "checkin", "environment", "settings"]) {
       expect(screen.getByTestId(`navigation-${page}`)).toBeInTheDocument();
     }
 
-    // accounts = ready：TRAE 账号工作台，不复用 Work CN 账号页。
-    expect(await screen.findByRole("region", { name: "TRAE 账号" })).toBeVisible();
-    expect(screen.getByTestId("product-credential-status")).toHaveTextContent("需要授权");
-    expect(screen.getByTestId("account-adapter-identity")).toHaveTextContent("官方客户端身份：已识别");
-    expect(screen.queryByRole("region", { name: "账号" })).not.toBeInTheDocument();
-
-    // overview = pending：问候语随产品变化，诚实说明卡 + 数据根浏览入口。
-    fireEvent.click(screen.getByTestId("navigation-overview"));
-    const overviewRegion = await screen.findByRole("region", { name: "总览" });
-    // 签到页也有 pending 卡（页面槽位常驻 DOM），在总览 region 内定位。
-    expect(within(overviewRegion).getByTestId("capability-pending")).toBeVisible();
+    // overview = ready：问候语固定单产品展示名，证据带与统计卡正常。
+    const overviewRegion = screen.getByRole("region", { name: "总览" });
     expect(
       within(overviewRegion).getByRole("heading", { level: 1, name: /TRAE 工作台$/ }),
     ).toBeInTheDocument();
-    // pending 形态同一槽位重渲染：Work CN 证据带与统计卡不再出现在总览内。
-    expect(within(overviewRegion).queryByTestId("current-account-context")).not.toBeInTheDocument();
-    expect(within(overviewRegion).queryByTestId("overview-stats-master")).not.toBeInTheDocument();
+    expect(within(overviewRegion).queryByTestId("capability-pending")).not.toBeInTheDocument();
+    expect(within(overviewRegion).getByTestId("current-account-context")).toBeVisible();
 
-    // P15-7：签到页统一 SOLO 单通道（旧 CN 独立账号池签到区块已随产品
-    // 合并移除），CN 产品下渲染同一签到工作台，无 pending 说明卡。
+    // accounts = ready：完整账号事务工作台（适配器路径不再由产品切换触达）。
+    fireEvent.click(screen.getByTestId("navigation-accounts"));
+    expect(await screen.findByRole("region", { name: "账号" })).toBeVisible();
+
+    // checkin = ready：签到页渲染同一签到工作台，无 pending 说明卡。
     fireEvent.click(screen.getByTestId("navigation-checkin"));
     const checkinRegion = await screen.findByRole("region", { name: "签到" });
     expect(within(checkinRegion).queryByTestId("capability-pending")).not.toBeInTheDocument();
 
-    // environment = absent：环境体系是 Work CN 产品能力，整页说明卡。
+    // environment = ready：环境体系完整渲染（主库卡 + 辅助环境区）。
     fireEvent.click(screen.getByTestId("navigation-environment"));
     const envRegion = await screen.findByRole("region", { name: "环境" });
-    expect(within(envRegion).getByTestId("capability-absent")).toBeVisible();
+    expect(within(envRegion).queryByTestId("capability-absent")).not.toBeInTheDocument();
+    expect(within(envRegion).getByTestId("env-master-card")).toBeInTheDocument();
 
-    // settings = ready：工具级设置两产品通用。
+    // settings = ready：设置页直接渲染完整管理面（无产品空态）。
     fireEvent.click(screen.getByTestId("navigation-settings"));
-    expect(await screen.findByRole("region", { name: "设置" })).toBeVisible();
-
-    // master-library = ready：TRAE 数据根详情（总览浏览入口进入）。
-    fireEvent.click(screen.getByTestId("navigation-overview"));
-    fireEvent.click(await screen.findByTestId("overview-library-cta"));
-    const detailRegion = await screen.findByRole("region", { name: "TRAE 数据根详情" });
-    expect(within(detailRegion).getByRole("heading", { level: 1 })).toHaveTextContent(
-      "TRAE 数据根",
-    );
-    // 真实验收前 CN 写入状态为 pending：写入口隐藏，历史列表仍可浏览。
-    expect(within(detailRegion).getByTestId("library-cn-write-pending")).toBeInTheDocument();
-    expect(within(detailRegion).queryByTestId("library-select-mode")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("library-project-p-t1"));
-    expect(await screen.findByTestId("library-session-s-t1")).toBeVisible();
-    expect(screen.queryByTestId("library-quick-archive-s-t1")).not.toBeInTheDocument();
-
-    // 切回 Work CN：签到页恢复 ready 形态（pending 卡消失）。
-    fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {
-      target: { value: "work_cn" },
-    });
-    fireEvent.click(screen.getByTestId("navigation-checkin"));
-    const workCheckin = await screen.findByRole("region", { name: "签到" });
-    expect(within(workCheckin).queryByTestId("capability-pending")).not.toBeInTheDocument();
+    const settingsRegion = await screen.findByRole("region", { name: "设置" });
+    expect(await within(settingsRegion).findByTestId("auto-checkin-settings")).toBeInTheDocument();
+    expect(within(settingsRegion).queryByTestId("product-settings-empty")).not.toBeInTheDocument();
   });
 });

@@ -16,7 +16,6 @@ import type { Page } from "@playwright/test";
 import type { ProductOperationSnapshotDto, OperationReadiness } from "../src/types/product";
 
 type MockProductOperationId =
-  | "checkin.claim"
   | "library.archive"
   | "library.delete"
   | "library.work_project_merge"
@@ -39,10 +38,6 @@ export interface MockScenario {
   masterHistory?: MasterHistoryMode;
   // 会话消息窗口：bulk = 首页 2000 条，滚到顶部可继续取一页更早消息。
   sessionMessages?: "normal" | "bulk";
-  // P10-5：Trae CN 已保存账号（默认无账号；登录设备 e2e 需要账号详情入口）。
-  traeCnAccounts?: boolean;
-  // P13-2：Trae CN 归并入口 fixture（默认无其他账号项目；归并 e2e 开启）。
-  traeCnMergeEntry?: boolean;
   // 指定测试场景下模拟已验收的操作；未配置的 Trae CN 写操作保持 pending。
   operationReadiness?: Partial<Record<MockProductOperationId, OperationReadiness>>;
 }
@@ -70,7 +65,7 @@ export async function installMockBridge(
     const PRODUCTION_WS = {
       platform: {
         platform_id: "work_cn",
-        display_name: "TRAE Work CN",
+        display_name: "TRAE",
         adapter_implemented: true,
       },
       data_location: {
@@ -96,7 +91,7 @@ export async function installMockBridge(
     const WS = {
       platform: {
         platform_id: "work_cn",
-        display_name: "TRAE Work CN",
+        display_name: "TRAE",
         adapter_implemented: false,
       },
       data_location: {
@@ -550,18 +545,16 @@ export async function installMockBridge(
     ];
 
     // P13-2：Trae CN 归并可变状态（必须在 mockInvoke 外声明）——
-    // 归并成功后入口行从清单移除，详情页刷新后「其他账号的项目」消失。
-    let traeCnForeignProjects = initialScenario.traeCnMergeEntry
-      ? [
-          {
-            project_id: "p-cn-foreign",
-            name: "共享项目（来源账号）",
-            absolute_path: "C:\\work\\shared-demo",
-            session_count: 2,
-            message_count: 9,
-          },
-        ]
-      : [];
+    // 归并成功后入口行从清单移除。P15-10：归并 e2e 随只读根 UI 入口删除，
+    // 场景开关（原 traeCnMergeEntry）一并移除；fixture 清单保持空，
+    // 归并命令 mock 保留以镜像后端命令契约。
+    let traeCnForeignProjects: Array<{
+      project_id: string;
+      name: string;
+      absolute_path: string;
+      session_count: number;
+      message_count: number;
+    }> = [];
 
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
@@ -581,14 +574,14 @@ export async function installMockBridge(
         return [
           {
             product_id: "work_cn",
-            display_name: "TRAE Work CN",
+            display_name: "TRAE",
             identity_status: "recognized",
             credential_status: "managed_by_work",
             relation_to_work: "current_product",
           },
           {
             product_id: "trae_cn",
-            display_name: "Trae CN",
+            display_name: "TRAE",
             identity_status: "unknown",
             credential_status: "need_authorization",
             relation_to_work: "unknown",
@@ -601,7 +594,6 @@ export async function installMockBridge(
         const defaults: Partial<Record<MockProductOperationId, OperationReadiness>> =
           productId === "trae_cn"
             ? {
-                "checkin.claim": "pending",
                 "library.archive": "pending",
                 "library.delete": "absent",
                 "library.work_project_merge": "absent",
@@ -615,7 +607,6 @@ export async function installMockBridge(
               };
         const operations = (
           [
-            "checkin.claim",
             "library.archive",
             "library.delete",
             "library.work_project_merge",
@@ -638,20 +629,9 @@ export async function installMockBridge(
           operations,
         } satisfies ProductOperationSnapshotDto;
       }
-      // P10-5：场景开启时返回一个与登录设备 fixture 同源的账号
-      // （profile_id / 显示名对齐 list_remote_devices 的归属标注），
-      // 让登录设备 e2e 能从账号列表进入 Trae CN 详情页。
-      if (cmd === "list_trae_cn_accounts") {
-        if (!scn.traeCnAccounts) return [];
-        return [{
-          profile_id: "trae-cn-profile",
-          display_name: "Trae CN 测试账号",
-          avatar_url: "",
-          last_verified_at: new Date().toISOString(),
-          status: "active",
-          is_current: true,
-        }];
-      }
+      // P15-10 单产品塌缩：适配器账号路径不再由生产 UI 触达（remote-devices
+      // e2e 已改走完整账号事务路径），此处仅保留空契约避免未知命令报错。
+      if (cmd === "list_trae_cn_accounts") return [];
       if (cmd === "check_trae_cn_account_health") return [];
       if (cmd === "begin_trae_cn_login") {
         return { login_url: "https://www.trae.cn/authorization?auth_from=trae", attempt_id: 1 };

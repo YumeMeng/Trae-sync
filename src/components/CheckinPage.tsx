@@ -12,9 +12,8 @@ import type {
   ManagedAccountsViewDto,
 } from "../types/account_switch";
 import type { AppPage } from "./NavigationRail";
-import { CapabilitySection } from "./CapabilitySection";
 import { EmptyState } from "./EmptyState";
-import { productDefinitionOf, sectionStateOf, type ProductId } from "../platform/productRegistry";
+import { PRODUCT_DISPLAY_NAME, sectionStateOf } from "../platform/productRegistry";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
@@ -54,9 +53,9 @@ interface CheckinPageProps {
   onNavigate: (page: AppPage) => void;
 }
 
-// 通知来源取产品注册表名称，异步回执按发起操作的产品标注。
-function checkinNotification(product: ProductId, message: string): string {
-  return `${productDefinitionOf(product).displayName}：${message}`;
+// 通知前缀取单产品展示名（P15-10 塌缩：不再按发起操作的产品路由）。
+function checkinNotification(message: string): string {
+  return `${PRODUCT_DISPLAY_NAME}：${message}`;
 }
 
 /**
@@ -74,7 +73,7 @@ export function CheckinPage({ active, onNavigate }: CheckinPageProps) {
 }
 
 function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active" | "onNavigate">) {
-  const sectionState = sectionStateOf("work_cn", "checkin");
+  const sectionState = sectionStateOf("checkin");
   const [capability, setCapability] = useState<CheckinCapabilityDto | null>(null);
   const [overview, setOverview] = useState<readonly CheckinOverviewEntryDto[]>([]);
   // fixture 模式（CI 演示）没有登录账号，沿用本地已保存账号作为签到池。
@@ -125,7 +124,7 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
           // 读取失败必须可见：静默置空会把真实故障伪装成“还没有账号”。
           if (!cancelled) {
             setOverview([]);
-            notify.error(checkinNotification("trae_cn", safeUiErrorMessage(reason, "账号总览读取失败。")));
+            notify.error(checkinNotification(safeUiErrorMessage(reason, "账号总览读取失败。")));
           }
         });
     } else if (capability.transport === "fixture") {
@@ -267,15 +266,15 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
       const next = await invoke<CheckinBatchSummaryDto>("run_checkin", { profileIds: [...ids] });
       setSummary(next);
       // 批次结果走全局通知：全成功按成功档，部分失败按警告档（异常原因仍在逐行结果里）。
-      if (next.failed === 0) notify.success(checkinNotification("trae_cn", "签到流程已完成。"));
-      else notify.warning(checkinNotification("trae_cn", "部分签到未完成，请查看逐账号结果。"));
+      if (next.failed === 0) notify.success(checkinNotification("签到流程已完成。"));
+      else notify.warning(checkinNotification("部分签到未完成，请查看逐账号结果。"));
       // 签到会更新积分缓存（后端写回）；刷新总览让“今日已签/积分”同步。
       if (realMode) {
         const entries = await invoke<CheckinOverviewEntryDto[]>("get_checkin_overview").catch(() => null);
         if (entries) setOverview(entries);
       }
     } catch (reason: unknown) {
-      notify.error(checkinNotification("trae_cn", safeUiErrorMessage(reason, "签到未完成，请稍后重试。")));
+      notify.error(checkinNotification(safeUiErrorMessage(reason, "签到未完成，请稍后重试。")));
     } finally {
       setBusy(false);
       setRunIds([]);
@@ -323,26 +322,8 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
   const progressCompleted = liveProgress?.completed ?? 0;
   const cursorId = busy && runIds.length > 0 ? runIds[Math.min(progressCompleted, runIds.length - 1)] : null;
 
-  // 区块能力三态（P11-6，ADR-0032 决策 2/4）：非 ready 产品渲染诚实说明卡。
-  // Trae CN 签到：只读探针已验证 status 端点存在，claim 实装未做真实验收 → pending。
-  if (sectionState !== "ready") {
-    return (
-      <section className="checkin-page" role="region" aria-label="签到">
-        <header className="page-header">
-          <div className="page-header__copy">
-            <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
-          </div>
-        </header>
-        <CapabilitySection
-          state={sectionState}
-          product="work_cn"
-          title="签到能力适配中"
-          note="协议端点已验证，实装待验收。"
-        />
-      </section>
-    );
-  }
-
+  // 区块能力三态（P11-6，ADR-0032 决策 2/4）：单产品塌缩后签到区块恒 ready，
+  // 非 ready 说明卡随 PRODUCT_SECTION_STATES 塌缩移除（P15-10）。
   if (!active) {
     return (
       <section className="checkin-page" role="region" aria-label="签到">

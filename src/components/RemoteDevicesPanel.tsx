@@ -8,7 +8,11 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 import type { RemoteDeviceEntry, RemoteDeviceSnapshot } from "../types/product";
 
 interface RemoteDevicesPanelProps {
-  /** 面板归属的产品（work_cn / trae_cn）；后端据此选择凭据材料根与 OAuth client。 */
+  /**
+   * 面板归属产品的协议值（work_cn = Work 签到档案链 / trae_cn = 融合版账号链，
+   * P15-10 塌缩后仍是后端路由的协议值，不是产品切换概念）；
+   * 后端据此选择凭据材料根与 OAuth client。
+   */
   productId: string;
   /** 产品名：归属标注用，明确这是账号级列表而非产品切换入口。 */
   productName: string;

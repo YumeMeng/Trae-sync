@@ -204,38 +204,36 @@ test.describe("桌面尺寸与滚动验收", () => {
     }
   });
 
-  test("P10/P11-6 产品切换器切换工作区：五页全开放、区块按能力三态呈现", async ({ page }) => {
-    await installMockBridge(page);
+  test("P15-10 单产品塌缩：无产品切换器，五页全开放且零 Work CN 表述", async ({ page }) => {
+    await installMockBridge(page, { production: true });
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
 
-    const productSwitcher = page.getByRole("combobox", { name: "当前产品" });
-    await expect(productSwitcher).toHaveValue("work_cn");
-    await productSwitcher.selectOption("trae_cn");
+    // 产品切换器已随单产品塌缩移除；问候语固定单产品展示名。
+    await expect(page.getByRole("combobox", { name: "当前产品" })).toHaveCount(0);
+    await expect(page.getByRole("heading", { level: 1, name: /TRAE 工作台$/ })).toBeVisible();
 
-    await expect(page.getByRole("region", { name: "TRAE 账号" })).toBeVisible();
-    await expect(page.getByTestId("product-credential-status")).toHaveText("需要授权");
-    // P11-6（ADR-0032）：导航五页全产品开放；账号 region 不复用 Work CN 工作台。
-    await expect(page.getByTestId("navigation-checkin")).toBeVisible();
-    await expect(page.getByRole("region", { name: "账号", exact: true })).toHaveCount(0);
-    // 产品凭据边界由共享账号工作台展示；不能把浏览器会话复用误报成凭据迁移。
-    await expect(page.getByText("目前无法确认 Trae CN 客户端身份与 Work CN 的关系。")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "我的账号", level: 3 })).toBeVisible();
-
-    // P15-7：签到页统一 SOLO 单通道（旧 CN 独立账号池签到区块已随产品
-    // 合并移除），任一产品下签到页渲染同一签到工作台，无 pending 说明卡。
+    // P15-10（ADR-0035）：单产品五页全开放；账号 region 是完整账号事务工作台。
+    await page.getByTestId("navigation-accounts").click();
+    await expect(page.getByRole("region", { name: "账号", exact: true })).toBeVisible();
+    // 签到页统一 SOLO 单通道，任一页无 pending 说明卡。
     await page.getByTestId("navigation-checkin").click();
     const checkinRegion = page.getByRole("region", { name: "签到" });
     await expect(checkinRegion.getByTestId("capability-pending")).toHaveCount(0);
 
-    // 环境页为 absent 说明卡（环境体系是 Work CN 产品能力）。
+    // 环境页完整渲染：主库卡承载体检与实例操作（不再有 absent 说明卡）。
     await page.getByTestId("navigation-environment").click();
-    await expect(
-      page.getByRole("region", { name: "环境" }).getByTestId("capability-absent"),
-    ).toBeVisible();
+    const envRegion = page.getByRole("region", { name: "环境" });
+    await expect(envRegion.getByTestId("capability-absent")).toHaveCount(0);
+    await expect(envRegion.getByTestId("env-master-card")).toBeVisible();
 
-    await productSwitcher.selectOption("work_cn");
-    await expect(page.getByTestId("navigation-checkin")).toBeVisible();
+    // 设置页直接渲染完整管理面（无产品空态）。
+    await page.getByTestId("navigation-settings").click();
+    await expect(page.getByRole("region", { name: "设置" })).toBeVisible();
+    await expect(page.getByTestId("auto-checkin-settings")).toBeVisible();
+
+    // 回到总览：证据带与统计卡正常（五页往返一致）。
+    await page.getByTestId("navigation-overview").click();
     await expect(page.getByTestId("current-account-context")).toBeVisible();
     await expect(page.getByTestId("capability-pending")).toHaveCount(0);
   });

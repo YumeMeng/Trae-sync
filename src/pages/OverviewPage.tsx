@@ -2,8 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { BookOpen, CalendarCheck, Database, UserRound } from "lucide-react";
 import type { AppPage } from "../components/NavigationRail";
-import { CapabilitySection } from "../components/CapabilitySection";
-import { productDefinitionOf, sectionStateOf, type ProductId } from "../platform/productRegistry";
+import { PRODUCT_DISPLAY_NAME } from "../platform/productRegistry";
 import type { EnvironmentStateDto } from "../types/environment";
 import type { WorkspaceStateDto } from "../types/workspace";
 import type {
@@ -16,26 +15,20 @@ interface OverviewPageProps {
   state: WorkspaceStateDto;
   active: boolean;
   onNavigate: (page: AppPage) => void;
-  /** 当前产品（缺省 work_cn）：问候语与区块三态都取自产品注册表。 */
-  product?: ProductId;
 }
 
 /**
  * 总览页 = 综合门面（U-3 契约）：一眼知道工具的作用与当前状态，不繁杂，可扩展。
- * 结构：问候（产品名取注册表 displayName，ADR-0032 决策 6）+ 证据带（当前账号，
- * 原标题栏下沉）+ 签到摘要行（四统计卡）+ 快捷操作 + 工作台状态。
- * 区块能力三态（P11-6）：非 ready 产品渲染诚实说明卡与已开放能力的入口，
- * 不发起该产品未适配的数据读取（跨产品数据隔离）。
+ * 结构：问候（单产品展示名，P15-10 塌缩）+ 证据带（当前账号，原标题栏下沉）
+ * + 签到摘要行（四统计卡）+ 快捷操作 + 工作台状态。
  */
 export function OverviewPage({
   state,
   active,
   onNavigate,
-  product = "work_cn",
 }: OverviewPageProps) {
-  // 产品事实源：显示名与区块三态都来自注册表，组件内不做 productId 判断。
-  const productName = productDefinitionOf(product).displayName;
-  const sectionState = sectionStateOf(product, "overview");
+  // 产品事实源：单产品塌缩后展示名与区块三态都来自注册表常量。
+  const productName = PRODUCT_DISPLAY_NAME;
   const [checkinOverview, setCheckinOverview] = useState<readonly CheckinOverviewEntryDto[] | null>(null);
   const [checkinRealMode, setCheckinRealMode] = useState(false);
   // P5-4 主库聚合统计：ready 时主库统计卡替换旧工作台统计（fixture 模式
@@ -72,10 +65,10 @@ export function OverviewPage({
   }, []);
 
   useEffect(() => {
-    if (!active || sectionState !== "ready") return;
+    if (!active) return;
     void loadCheckinSummary();
     void loadMasterEvidence();
-  }, [active, sectionState, loadCheckinSummary, loadMasterEvidence]);
+  }, [active, loadCheckinSummary, loadMasterEvidence]);
 
   const hasHistory =
     state.history.account_count + state.history.project_count + state.history.session_count > 0;
@@ -104,51 +97,19 @@ export function OverviewPage({
   return (
     <section className="overview-page" role="region" aria-label="总览">
       <header className="overview-page__hero">
-        {/* 任务 1（ADR-0032 决策 6）：产品名取注册表 displayName，随产品切换变化。 */}
+        {/* 单产品塌缩（P15-10）：产品名取注册表展示名，不再随产品切换变化。 */}
         <h1 data-page-title="overview" tabIndex={-1}>
           {greeting()}，这里是你的 {productName} 工作台
         </h1>
-        {sectionState === "ready" && (
-          <p className="overview-page__hero-sub">
-            {state.data_location.selected
-              ? "历史数据位置已就绪。"
-              : "未找到 TRAE 数据目录，请确认 TRAE 已安装。"}
-          </p>
-        )}
+        <p className="overview-page__hero-sub">
+          {state.data_location.selected
+            ? "历史数据位置已就绪。"
+            : "未找到 TRAE 数据目录，请确认 TRAE 已安装。"}
+        </p>
       </header>
 
-      {sectionState !== "ready" ? (
-        <>
-          {/* 非 ready 形态：诚实说明卡 + 已开放能力的入口（不发起未适配的数据读取）。 */}
-          <CapabilitySection
-            state={sectionState}
-            product={product}
-            note="账号管理与数据只读浏览已开放，更多数据视图将随适配逐步开放。"
-          />
-          <div className="overview-page__actions">
-            <button
-              type="button"
-              className="btn btn--primary btn--large"
-              onClick={() => onNavigate("master-library")}
-              data-testid="overview-library-cta"
-            >
-              <Database size={17} strokeWidth={2} aria-hidden="true" />
-              浏览 {productName} 数据
-            </button>
-            <button
-              type="button"
-              className="btn"
-              onClick={() => onNavigate("accounts")}
-              data-testid="overview-accounts-cta"
-            >
-              <UserRound size={16} strokeWidth={2} aria-hidden="true" />
-              管理账号
-            </button>
-          </div>
-        </>
-      ) : (
-        <>
-          {/* G7 证据带：当前登录账号与主库最近活跃时间，读不到主库时显示未登录。 */}
+      <>
+        {/* G7 证据带：当前登录账号与主库最近活跃时间，读不到主库时显示未登录。 */}
           <div className="overview-evidence" data-testid="current-account-context">
             <UserRound size={15} strokeWidth={1.9} aria-hidden="true" />
             <span className="overview-evidence__label">当前登录：</span>
@@ -295,8 +256,7 @@ export function OverviewPage({
             </button>
           )}
         </div>
-        </>
-      )}
+      </>
     </section>
   );
 }

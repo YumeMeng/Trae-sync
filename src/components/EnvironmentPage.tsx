@@ -34,8 +34,7 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
 import { InstanceSlotBadge } from "./StatusBadges";
-import { CapabilitySection } from "./CapabilitySection";
-import { sectionStateOf, type ProductId } from "../platform/productRegistry";
+import { sectionStateOf } from "../platform/productRegistry";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 interface EnvironmentPageProps {
@@ -45,8 +44,6 @@ interface EnvironmentPageProps {
   onOpenMasterDetail?: () => void;
   /** 打开副库详情页（P11-5 收官：副环境卡「查看详情」入口，携带环境引用）。 */
   onOpenLibraryDetail?: (library: { id: string; displayName: string }) => void;
-  /** 当前产品（缺省 work_cn）：区块三态取自产品注册表。 */
-  product?: ProductId;
 }
 
 function environmentProcessState(
@@ -65,9 +62,9 @@ function environmentProcessState(
  * 注册表账号与待登录态）+「归入当前账号」+「查看详情」入口；收编弹层
  * 复用同一结构，进度事件按 env_id 过滤。
  */
-export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetail, product = "work_cn" }: EnvironmentPageProps) {
-  // 产品事实源：区块三态来自注册表，组件内不做 productId 判断。
-  const sectionState = sectionStateOf(product, "environment");
+export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetail }: EnvironmentPageProps) {
+  // 产品事实源：区块三态来自注册表直查（P15-10 单产品塌缩，环境区块恒 ready）。
+  const sectionState = sectionStateOf("environment");
   const [state, setState] = useState<EnvironmentStateDto | null>(null);
   const masterProcessState = environmentProcessState(state);
   // P5-5 主库体检：同读同刷；失败静默降级为 null（库内容分组显示降级提示）。
@@ -373,22 +370,8 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
     }
   }, [cleaningUp, load]);
 
-  // 区块能力三态（P11-6，ADR-0032 决策 2）：非 ready 产品整页说明卡。
-  // 环境体系是 Work CN 产品能力（多环境与实例管理依赖其数据根布局）；
-  // Trae CN 的数据浏览入口不放在这里，由主库详情页承载只读数据根。
-  if (sectionState !== "ready") {
-    return (
-      <section className="environment-page" role="region" aria-label="环境">
-        <header className="page-header">
-          <div className="page-header__copy">
-            <h1 data-page-title="environment" tabIndex={-1}>环境</h1>
-          </div>
-        </header>
-        <CapabilitySection state={sectionState} product={product} />
-      </section>
-    );
-  }
-
+  // 区块能力三态（P11-6，ADR-0032 决策 2）：单产品塌缩后环境区块恒 ready，
+  // 非 ready 说明卡随 PRODUCT_SECTION_STATES 塌缩移除（P15-10）。
   return (
     <section className="environment-page" role="region" aria-label="环境">
       <header className="page-header">

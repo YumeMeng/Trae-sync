@@ -110,7 +110,7 @@ describe("AdapterAccountDetail", () => {
     const { onSelectToolAccount } = renderDetail();
     const button = screen.getByTestId("adapter-account-detail-tool-select");
     expect(button).toHaveTextContent("设置工具当前账号");
-    expect(button).toHaveAttribute("title", expect.stringContaining("不会改变官方 Trae CN 客户端登录状态"));
+    expect(button).toHaveAttribute("title", expect.stringContaining("不会改变官方 TRAE 客户端登录状态"));
 
     fireEvent.click(button);
     expect(onSelectToolAccount).toHaveBeenCalledTimes(1);
