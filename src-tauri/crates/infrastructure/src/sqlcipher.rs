@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use traesync_domain::{
     CompatibilityState, IncompatibleReason, OperationCancellation, OperationState, PlanAction,
@@ -42,6 +43,82 @@ use crate::storage_root::{
     required_storage_reserve_bytes, reserve_space_on_volumes, SpaceReservationRequest,
 };
 use crate::work_cn_schema::{check_schema, compute_schema_fingerprint, read_table_counts};
+
+/// 只读副本专用父目录名（相对 TEMP 根）。
+///
+/// P15-12 空间卫生修复：副本目录从「散落 TEMP 根的
+/// `trae-sync-readonly-{pid}-{时间戳}`」收敛为
+/// `%TEMP%\trae-sync-readonly\{pid}-{时间戳}-{序号}`，
+/// 使启动孤儿清理只需扫描本目录，不再翻找整个 TEMP。
+const READONLY_COPY_ROOT_NAME: &str = "trae-sync-readonly";
+
+fn readonly_copy_root_in(base: &Path) -> PathBuf {
+    base.join(READONLY_COPY_ROOT_NAME)
+}
+
+/// 只读副本专用父目录（生产路径：系统 TEMP）。
+pub fn readonly_copy_root() -> PathBuf {
+    readonly_copy_root_in(&std::env::temp_dir())
+}
+
+/// 同进程内副本目录唯一序号：纳秒时间戳可能同刻碰撞，追加原子序号兜底，
+/// 保证同一进程内 `create_dir` 不会因重名失败。
+static READONLY_COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// P15-12：进程启动时清理历史实例泄漏的只读副本孤儿。
+///
+/// 返回删除的目录数。清理范围两处：
+/// 1. TEMP 根下旧版散落格式 `trae-sync-readonly-{pid}-{时间戳}`——新代码
+///    不再产生，凡存在即旧实例泄漏物，一律删除（旧格式解析无意义）；
+/// 2. 专用父目录 `%TEMP%\trae-sync-readonly\` 下名称首段 pid 非本进程的
+///    条目（含无法解析的非本工具条目）——本 pid 的条目可能正被在途请求
+///    使用，不触碰。
+///
+/// 并发边界：另一实例若正持有一份活跃副本，其数据库文件被 SQLite 打开
+/// 且未共享删除权限，`remove_dir_all` 会因占用失败并被忽略，不影响该
+/// 请求；残件留待该实例自身 Drop 或下次启动清理兜底。
+pub fn cleanup_stale_readonly_copies() -> usize {
+    cleanup_stale_readonly_copies_in(&std::env::temp_dir())
+}
+
+/// `cleanup_stale_readonly_copies` 的可注入版本，测试用临时 base 隔离，
+/// 不触碰真实 TEMP。
+pub(crate) fn cleanup_stale_readonly_copies_in(base: &Path) -> usize {
+    let current_pid = std::process::id();
+    let mut removed = 0_usize;
+    // 1) 旧版散落 TEMP 根的历史格式：新代码不产生，一律按泄漏物删除。
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("trae-sync-readonly-") {
+                if std::fs::remove_dir_all(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    // 2) 专用父目录下首段 pid 非本进程的孤儿；解析失败按孤儿处理
+    //    （目录为本工具专用，非本 pid 条目没有保留价值）。
+    let root = readonly_copy_root_in(base);
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_text = name.to_string_lossy();
+            let pid_text = name_text.split('-').next().unwrap_or("");
+            let belongs_to_current = pid_text
+                .parse::<u32>()
+                .map(|pid| pid == current_pid)
+                .unwrap_or(false);
+            if belongs_to_current {
+                continue;
+            }
+            if std::fs::remove_dir_all(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
 
 /// 嵌入式 SQLCipher 探测器：实现 `DatabaseProbePort`。
 #[derive(Clone, Copy)]
@@ -3141,6 +3218,16 @@ fn create_readonly_trio_copy_with_validation(
     db_path: &Path,
     is_authorized: &dyn Fn() -> bool,
 ) -> std::io::Result<Option<ReadonlyTrioCopy>> {
+    create_readonly_trio_copy_with_validation_in(db_path, is_authorized, &std::env::temp_dir())
+}
+
+/// 上函数的可注入版本：副本目录落在指定 base 之下（生产 = 系统 TEMP，
+/// 测试 = 临时根），便于隔离验证而不触碰真实 TEMP。
+fn create_readonly_trio_copy_with_validation_in(
+    db_path: &Path,
+    is_authorized: &dyn Fn() -> bool,
+    base: &Path,
+) -> std::io::Result<Option<ReadonlyTrioCopy>> {
     if !is_authorized() {
         return Ok(None);
     }
@@ -3151,10 +3238,16 @@ fn create_readonly_trio_copy_with_validation(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
-        "trae-sync-readonly-{}-{}",
+    // P15-12：副本收敛到专用父目录 `%TEMP%\trae-sync-readonly\{pid}-{ts}-{seq}`，
+    // 启动孤儿清理只需扫描父目录；序号兜底避免同刻重名。
+    let sequence = READONLY_COPY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let root = readonly_copy_root_in(base);
+    std::fs::create_dir_all(&root)?;
+    let directory = root.join(format!(
+        "{}-{}-{}",
         std::process::id(),
-        unique
+        unique,
+        sequence
     ));
     std::fs::create_dir(&directory)?;
 
@@ -4795,6 +4888,98 @@ mod tests {
 
         assert!(copy.is_none(), "授权撤销后不得返回可用隔离副本");
         assert!(checks.load(Ordering::SeqCst) >= 4);
+    }
+
+    /// P15-12：副本目录必须收敛到专用父目录下，且 guard Drop 后连同
+    /// 三件套副本目录一并删除（正常返回路径的清理验证）。
+    #[test]
+    fn readonly_trio_copy_lives_in_dedicated_root_and_is_removed_on_drop() {
+        let base = tempdir().unwrap();
+        let source = base.path().join("database.db");
+        std::fs::write(&source, vec![0x5a_u8; 4096]).unwrap();
+
+        let copy = create_readonly_trio_copy_with_validation_in(&source, &|| true, base.path())
+            .unwrap()
+            .expect("复制应成功");
+        let copy_dir = copy.directory.clone();
+
+        // 副本必须位于专用父目录内，目录名以本进程 pid 开头。
+        let root = readonly_copy_root_in(base.path());
+        assert_eq!(copy_dir.parent(), Some(root.as_path()));
+        assert!(copy_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with(&std::process::id().to_string()))
+            .unwrap_or(false));
+        assert!(copy.db_path.is_file(), "主库副本文件必须存在");
+
+        // Drop（RAII guard）：正常返回路径结束即删副本目录。
+        drop(copy);
+        assert!(!copy_dir.exists(), "guard Drop 后副本目录必须被删除");
+        // 测试收尾：清掉测试 base 下的专用父目录，不在 TEMP 留垃圾。
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P15-12：错误返回路径（复制中途授权撤销）同样不得残留副本目录。
+    #[test]
+    fn readonly_trio_copy_cancelled_leaves_no_directory_behind() {
+        let base = tempdir().unwrap();
+        let source = base.path().join("database.db");
+        std::fs::write(&source, vec![0x5a_u8; 4096]).unwrap();
+        let root = readonly_copy_root_in(base.path());
+
+        let copy =
+            create_readonly_trio_copy_with_validation_in(&source, &|| false, base.path()).unwrap();
+
+        assert!(copy.is_none());
+        let leftover = std::fs::read_dir(&root)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(leftover, 0, "撤销路径不得残留任何副本目录");
+        // 测试收尾：清掉测试 base 下的专用父目录。
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P15-12：启动孤儿清理只删非本 pid 的残留副本与旧版散落目录，
+    /// 本 pid 的在用条目必须保留。
+    #[test]
+    fn cleanup_stale_readonly_copies_removes_only_foreign_entries() {
+        let base = tempdir().unwrap();
+        let root = readonly_copy_root_in(base.path());
+        std::fs::create_dir_all(&root).unwrap();
+        let current_pid = std::process::id();
+        // 本 pid 在用条目：必须保留。
+        let owned = root.join(format!("{current_pid}-1000-0"));
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::write(owned.join("database.db"), b"x").unwrap();
+        // 异 pid 孤儿：必须删除。
+        let foreign_pid = if current_pid == 424242 { 424243 } else { 424242 };
+        let foreign = root.join(format!("{foreign_pid}-2000-0"));
+        std::fs::create_dir_all(&foreign).unwrap();
+        // 首段无法解析为 pid 的杂项：按孤儿删除。
+        let junk = root.join("junk-entry");
+        std::fs::create_dir_all(&junk).unwrap();
+        // 旧版散落 TEMP 根的历史格式：一律删除。
+        let legacy = base.path().join("trae-sync-readonly-7777-999");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let removed = cleanup_stale_readonly_copies_in(base.path());
+
+        assert_eq!(removed, 3, "应删除 异pid孤儿 + 杂项 + 旧版散落目录 共 3 个");
+        assert!(owned.is_dir(), "本 pid 在用条目必须保留");
+        assert!(!foreign.exists());
+        assert!(!junk.exists());
+        assert!(!legacy.exists());
+        // 测试收尾：清理测试 base，不在 TEMP 留垃圾。
+        let _ = std::fs::remove_dir_all(base.path());
+    }
+
+    /// P15-12：父目录不存在时孤儿清理必须是干净的无操作。
+    #[test]
+    fn cleanup_stale_readonly_copies_noop_without_root() {
+        let base = tempdir().unwrap();
+        assert_eq!(cleanup_stale_readonly_copies_in(base.path()), 0);
+        let _ = std::fs::remove_dir_all(base.path());
     }
 
     #[test]
