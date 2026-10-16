@@ -4180,6 +4180,11 @@ pub(crate) async fn switch_master_account(
         Err(code) => code.as_str(),
     };
     journal_switch_attempt(&journal_storage_root, &journal_profile_id, outcome_code);
+    // P15-11：切号改写主库归属成功后作废体检预聚合缓存（WAL checkpoint
+    // 前指纹不变，显式失效保证零陈旧窗口）。
+    if inner.is_ok() {
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    }
     inner
 }
 

@@ -77,7 +77,8 @@ impl WorkspaceStateProvider for FixtureWorkspaceStateProvider {
         WorkspaceState {
             platform: PlatformContext {
                 platform_id: PlatformId::work_cn(),
-                display_name: "TRAE Work CN（隔离副本）".to_string(),
+                // P15-10 单产品塌缩：展示名统一「TRAE」（platform_id 协议值不变）。
+                display_name: "TRAE（隔离副本）".to_string(),
                 adapter_implemented: false,
             },
             data_location: DataLocationState {
@@ -185,7 +186,8 @@ impl WorkspaceStateProvider for RealReadWorkspaceStateProvider {
         WorkspaceState {
             platform: PlatformContext {
                 platform_id: PlatformId::work_cn(),
-                display_name: "TRAE Work CN".to_string(),
+                // P15-10 单产品塌缩：展示名统一「TRAE」（platform_id 协议值不变）。
+                display_name: "TRAE".to_string(),
                 adapter_implemented: true,
             },
             data_location: DataLocationState {

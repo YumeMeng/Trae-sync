@@ -44,6 +44,9 @@ pub mod environment_registry;
 pub mod file_identity;
 pub mod fixture_paths;
 pub mod handoff_intent;
+// 工具链 1.97 适配：junction/符号链接统一判定 helper（防目录逃逸判定扩展）。
+// 模块私有：is_reparse_link 仅供 crate 内安全判定点使用；test_support 仅测试用。
+mod link_guard;
 pub mod key_wrapper;
 // P12-R1b：产品×库 → 当前账号解析（组合根 resolve_library_account 系下沉）。
 pub mod library_account;
