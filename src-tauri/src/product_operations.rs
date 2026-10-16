@@ -57,12 +57,8 @@ const WORK_OPERATIONS: &[ProductOperationStateDto] = &[
         "Work 签到状态读取已完成现有验收。",
         Some("tickets.new.md#P1-3"),
     ),
-    operation(
-        "checkin.claim",
-        OperationReadiness::Ready,
-        "Work 签到保持现有已验证行为。",
-        Some("tickets.new.md#P1-1"),
-    ),
+    // P15-10：checkin.claim 惰性注册表条目已清理——签到 claim 由 run_checkin
+    // 命令直接承载（SOLO 通道），无门禁消费方，条目只剩惰性元数据。
     operation(
         "library.read",
         OperationReadiness::Ready,
@@ -71,21 +67,21 @@ const WORK_OPERATIONS: &[ProductOperationStateDto] = &[
     ),
     operation(
         "library.archive",
-        OperationReadiness::Pending,
-        "Work 归档与恢复的客户端结果仍需验收。",
-        None,
+        OperationReadiness::Ready,
+        "Work 归档与恢复已于 2026-10-16 完成真机验收（归档+恢复往返，主库终态核对通过）。",
+        Some("tickets.new.md#P15-8"),
     ),
     operation(
         "library.delete",
-        OperationReadiness::Pending,
-        "Work 会话删除的备份与删除结果仍需验收。",
-        None,
+        OperationReadiness::Ready,
+        "Work 会话删除已于 2026-10-16 完成真机验收（删除+空壳清理，备份链留存）。",
+        Some("tickets.new.md#P15-8"),
     ),
     operation(
         "library.work_project_merge",
-        OperationReadiness::Pending,
-        "Work 项目归并结果与重启后状态仍需验收。",
-        None,
+        OperationReadiness::Ready,
+        "Work 项目归并已于 2026-10-16 完成真机验收（同名项目合并生效，客户端已确认）。",
+        Some("tickets.new.md#P15-8"),
     ),
 ];
 
@@ -114,12 +110,8 @@ const TRAE_CN_OPERATIONS: &[ProductOperationStateDto] = &[
         "签到状态查询已通过只读探针验证。",
         Some(".scratch/checkin-http/reports/trae-cn-checkin-probe-20260928.json#trae-cn-checkin-status-probe"),
     ),
-    operation(
-        "checkin.claim",
-        OperationReadiness::Pending,
-        "真实领取尚待验收。",
-        Some("tickets.new.md#P14-7"),
-    ),
+    // P15-10：checkin.claim 惰性条目清理（原 Pending「真实领取尚待验收」；
+    // 融合版身份下的真实 claim 验收由签到域真机关口承载，注册表不再登记）。
     operation(
         "checkin.schedule",
         OperationReadiness::Absent,
@@ -418,9 +410,10 @@ mod tests {
             snapshot("unknown", None, root.path(), true).unwrap_err(),
             "product_not_found"
         );
+        // P15-10：checkin.claim 惰性条目清理后，未登记的操作一律 fail-closed。
         assert_eq!(
             ensure_ready("trae_cn", "checkin.claim", None, root.path(), true).unwrap_err(),
-            "product_operation_pending"
+            "product_operation_unknown"
         );
         assert_eq!(
             ensure_ready("trae_cn", "checkin.schedule", None, root.path(), true).unwrap_err(),
@@ -430,32 +423,6 @@ mod tests {
             ensure_ready("trae_cn", "unknown", None, root.path(), true).unwrap_err(),
             "product_operation_unknown"
         );
-    }
-
-    #[test]
-    fn snapshot_keeps_status_query_ready_while_claim_is_pending() {
-        let root = tempfile::tempdir().unwrap();
-        let observe = |_: &str, _: &str, _: &Path| Ok(ProductProcessState::NotRunning);
-        let snapshot = snapshot_with_process_observer(
-            "trae_cn",
-            Some("trae_cn".to_string()),
-            root.path(),
-            true,
-            &observe,
-        )
-        .unwrap();
-        let status = snapshot
-            .operations
-            .iter()
-            .find(|state| state.operation_id == "checkin.status")
-            .unwrap();
-        let claim = snapshot
-            .operations
-            .iter()
-            .find(|state| state.operation_id == "checkin.claim")
-            .unwrap();
-        assert_eq!(status.state, OperationReadiness::Ready);
-        assert_eq!(claim.state, OperationReadiness::Pending);
     }
 
     #[test]
@@ -523,49 +490,45 @@ mod tests {
             .unwrap_err(),
             "product_operation_pending"
         );
-        assert_eq!(
-            ensure_library_ready_with_process_observer(
-                "library.archive",
-                Some("master".to_string()),
-                root.path(),
-                true,
-                &observe,
-            )
-            .unwrap_err(),
-            "product_operation_pending"
-        );
-        assert_eq!(
-            ensure_library_ready_with_process_observer(
-                "library.work_project_merge",
-                Some("master".to_string()),
-                root.path(),
-                true,
-                &observe,
-            )
-            .unwrap_err(),
-            "product_operation_pending"
-        );
-        assert_eq!(
-            ensure_library_ready_with_process_observer(
-                "library.work_project_merge",
-                None,
-                root.path(),
-                true,
-                &observe,
-            )
-            .unwrap_err(),
-            "product_operation_pending"
-        );
+        // P15-8：Work 三项完成真机验收转 Ready——NotRunning 下闸门放行
+        //（进程规则仍由 snapshot 运行时降级承载，见后续两个进程规则测试）；
+        // Pending 拒绝语义由上方 trae_cn 侧条目继续覆盖。
+        assert!(ensure_library_ready_with_process_observer(
+            "library.archive",
+            Some("master".to_string()),
+            root.path(),
+            true,
+            &observe,
+        )
+        .is_ok());
+        assert!(ensure_library_ready_with_process_observer(
+            "library.work_project_merge",
+            Some("master".to_string()),
+            root.path(),
+            true,
+            &observe,
+        )
+        .is_ok());
+        assert!(ensure_library_ready_with_process_observer(
+            "library.work_project_merge",
+            None,
+            root.path(),
+            true,
+            &observe,
+        )
+        .is_ok());
     }
 
     #[test]
     fn work_merge_readiness_and_command_gate_share_target_process_state() {
         let root = tempfile::tempdir().unwrap();
+        // P15-8：验收后静态 Ready——NotRunning 放行；Running/Unknown 仍由
+        // snapshot 运行时降级为 Pending（进程闸门规则不变）。
         let cases = [
             (
                 ProductProcessState::NotRunning,
-                OperationReadiness::Pending,
-                Some("product_operation_pending"),
+                OperationReadiness::Ready,
+                None,
             ),
             (
                 ProductProcessState::Running,
@@ -650,11 +613,39 @@ mod tests {
             };
 
             let archive = operation("library.archive");
-            assert_eq!(archive.state, OperationReadiness::Pending);
-            assert_eq!(archive.gate_error, expected_archive_error);
             let delete = operation("library.delete");
-            assert_eq!(delete.state, OperationReadiness::Pending);
-            assert_eq!(delete.gate_error, expected_delete_error);
+            // P15-8：静态 Ready 后，snapshot 仅在进程闸门阻断（error=Some）
+            // 时降级 Pending；未阻断透传静态值。archive 的运行中守卫在提交
+            // 编排内（ensure_cn_client_stopped），注册表层 Running 不阻断。
+            match process_state {
+                ProductProcessState::NotRunning => {
+                    assert_eq!(archive.state, OperationReadiness::Ready);
+                    assert_eq!(archive.gate_error, None);
+                    assert_eq!(delete.state, OperationReadiness::Ready);
+                    assert_eq!(delete.gate_error, None);
+                }
+                ProductProcessState::Running => {
+                    assert_eq!(archive.state, OperationReadiness::Ready);
+                    assert_eq!(archive.gate_error, None);
+                    assert_eq!(delete.state, OperationReadiness::Pending);
+                    assert_eq!(
+                        delete.gate_error.as_deref(),
+                        Some("master_delete_running")
+                    );
+                }
+                ProductProcessState::Unknown => {
+                    assert_eq!(archive.state, OperationReadiness::Pending);
+                    assert_eq!(
+                        archive.gate_error.as_deref(),
+                        Some("process_state_unknown")
+                    );
+                    assert_eq!(delete.state, OperationReadiness::Pending);
+                    assert_eq!(
+                        delete.gate_error.as_deref(),
+                        Some("process_state_unknown")
+                    );
+                }
+            }
         }
 
         assert!(!TRAE_CN_OPERATIONS
@@ -762,8 +753,10 @@ mod tests {
             .build(tauri::generate_context!())
             .unwrap();
 
-        // P15-7：CN 手动签到命令已随旧产品池移除，pending 闸门用例由
-        // 归档/删除两个真实模式写入口继续承载。
+        // P15-8：主库 archive/delete 静态 Ready 后，fixture 模式下写入口仍被
+        // 挡在真实模式工作之外——fixture state 的 storage_root 无生产目录库，
+        // snapshot 运行时降级为 Pending（product_operation_pending）承载拦截；
+        // trae_cn 侧 archive 维持注册表 Pending 闸门。
         let apply_error =
             tauri::async_runtime::block_on(crate::library_archive::apply_master_archive_changes(
                 vec!["session-1".to_string()],
@@ -795,8 +788,14 @@ mod tests {
             ("work_cn", "account.tool_selection", "tickets.new.md#P5-2"),
             ("work_cn", "account.switch", "tickets.new.md#P5-1"),
             ("work_cn", "checkin.status", "tickets.new.md#P1-3"),
-            ("work_cn", "checkin.claim", "tickets.new.md#P1-1"),
             ("work_cn", "library.read", "tickets.new.md#P5-3"),
+            ("work_cn", "library.archive", "tickets.new.md#P15-8"),
+            ("work_cn", "library.delete", "tickets.new.md#P15-8"),
+            (
+                "work_cn",
+                "library.work_project_merge",
+                "tickets.new.md#P15-8",
+            ),
             (
                 "trae_cn",
                 "account.health_check",
@@ -868,7 +867,9 @@ mod tests {
             } else if file.ends_with(".json") {
                 verify_probe_evidence(operation.operation_id, fragment, &evidence);
             } else if operation.operation_id == "account.tool_selection" {
-                assert!(evidence.contains("Trae CN 使用同一账号工作台"));
+                // P15-10：测试标题随单产品塌缩更名，证据锚点同步（文件与
+                // switch_trae_cn_account 用例保持同一证据链）。
+                assert!(evidence.contains("适配器路径使用同一账号工作台"));
                 assert!(evidence.contains("switch_trae_cn_account"));
             } else {
                 panic!(
@@ -880,13 +881,22 @@ mod tests {
     }
 
     #[test]
-    fn work_library_mutations_stay_pending_without_operation_acceptance_evidence() {
+    fn work_library_mutations_ready_after_real_machine_acceptance() {
+        // P15-8（2026-10-16）：三项真机验收通过（探针 p15_acceptance 在真实
+        // 主库执行归并/删除/归档+恢复，终态核对通过，客户端结果用户确认），
+        // 注册表由 Pending 转 Ready，证据锚点指向验收票据小节。
         let expected = [
-            ("library.archive", "Work 归档与恢复的客户端结果仍需验收。"),
-            ("library.delete", "Work 会话删除的备份与删除结果仍需验收。"),
+            (
+                "library.archive",
+                "Work 归档与恢复已于 2026-10-16 完成真机验收（归档+恢复往返，主库终态核对通过）。",
+            ),
+            (
+                "library.delete",
+                "Work 会话删除已于 2026-10-16 完成真机验收（删除+空壳清理，备份链留存）。",
+            ),
             (
                 "library.work_project_merge",
-                "Work 项目归并结果与重启后状态仍需验收。",
+                "Work 项目归并已于 2026-10-16 完成真机验收（同名项目合并生效，客户端已确认）。",
             ),
         ];
 
@@ -895,9 +905,12 @@ mod tests {
                 .iter()
                 .find(|operation| operation.operation_id == operation_id)
                 .unwrap();
-            assert_eq!(operation.state, OperationReadiness::Pending);
+            assert_eq!(operation.state, OperationReadiness::Ready);
             assert_eq!(operation.reason, expected_reason);
-            assert_eq!(operation.evidence_ref, None);
+            assert_eq!(
+                operation.evidence_ref,
+                Some("tickets.new.md#P15-8")
+            );
         }
     }
 
@@ -926,8 +939,12 @@ mod tests {
             "account.tool_selection" => &["AccountCenter.tsx", "当前账号"],
             "account.switch" => &["五步事务", "真机端到端验收"],
             "checkin.status" => &["status API", "积分"],
-            "checkin.claim" => &["自动签到", "逐账号"],
             "library.read" => &["get_master_history", "真机验收"],
+            // P15-8：三项写操作的验收证据标记（tickets.new.md#P15-8 小节须
+            // 包含对应关键词，验收回执数字与备份路径随小节落档）。
+            "library.archive" => &["归档", "恢复", "真机验收", "archived_sessions"],
+            "library.delete" => &["删除", "空壳", "真机验收", "deleted_sessions"],
+            "library.work_project_merge" => &["归并", "moved_sessions", "真机验收"],
             _ => panic!("ticket evidence is not mapped for {operation_id}"),
         }
     }
