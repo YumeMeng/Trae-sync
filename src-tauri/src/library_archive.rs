@@ -705,7 +705,9 @@ pub(crate) async fn get_master_checkup(
     let storage_root = PathBuf::from(&state.storage_root);
     let raw_key = state.source_raw_key.clone();
     run_blocking("master_checkup_join_failed", move || {
-        use traesync_infrastructure::master_checkup::{read_master_checkup, MasterCheckupStatus};
+        use traesync_infrastructure::master_checkup::{
+            read_master_checkup_cached, MasterCheckupStatus,
+        };
         let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
         // P11-6（ADR-0032 决策 5）：体检/收编是 Work CN 的账号归属治理
         // 概念，Trae CN 只读库不适用——返回「不适用」形态（前端按 absent
@@ -722,7 +724,9 @@ pub(crate) async fn get_master_checkup(
             library_account::resolve_library_account(&material_root, &storage_root, &ctx)?
                 .and_then(LibraryAccountResolution::into_account);
 
-        match read_master_checkup(&ctx.dir, &raw_key) {
+        // P15-11：预聚合缓存壳——指纹/密钥未变时复用上次报告（4.0s→<1ms）；
+        // 改库编排成功后经 invalidate_master_checkup_cache 显式作废。
+        match read_master_checkup_cached(&ctx.dir, &raw_key) {
             MasterCheckupStatus::Ready(report) => {
                 let Some(current) = current.as_ref() else {
                     return Ok(MasterCheckupDto {
@@ -844,6 +848,11 @@ pub(crate) async fn incorporate_master_records(
         incorporate_master_records_inner(&app, &material_root, &storage_root, &raw_key, &ctx)
     })
     .await
+    .inspect(|_| {
+        // P15-11：收编改写主库成功后作废体检预聚合缓存（WAL checkpoint 前
+        // 指纹不变，显式失效保证零陈旧窗口）。
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    })
 }
 
 /// 收编编排主体（阻塞上下文）：体检预检 → 四步事务 → 台账 → 回执。
@@ -1384,6 +1393,10 @@ where
         on_progress,
     )
     .await
+    .inspect(|_| {
+        // P15-11：CN 项目归并改写主库成功后作废体检预聚合缓存。
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    })
 }
 
 /// Trae CN 归并只接受明确的 Trae CN 库引用，不沿用缺省主库路由。
@@ -1580,6 +1593,10 @@ pub(crate) async fn cleanup_master_empty_projects(
         cleanup_master_empty_projects_inner(&material_root, &storage_root, &raw_key, &ctx)
     })
     .await
+    .inspect(|_| {
+        // P15-11：清理空项目改写主库成功后作废体检预聚合缓存。
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    })
 }
 
 /// 清理空项目编排主体（阻塞上下文）：预检 → 关实例 → 备份 → 删除 → 重启。
@@ -2447,6 +2464,10 @@ pub(crate) async fn apply_master_archive_changes(
         )
     })
     .await
+    .inspect(|_| {
+        // P15-11：归档/恢复提交改写主库成功后作废体检预聚合缓存。
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    })
 }
 
 /// 单库归档写入主体：先拿真实数据目录租约，再解析账号并执行全部副作用。
@@ -2685,6 +2706,10 @@ pub(crate) async fn delete_master_sessions(
         result
     })
     .await
+    .inspect(|_| {
+        // P15-11：删除会话改写主库成功后作废体检预聚合缓存。
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    })
 }
 
 /// P5-8c 分组合并回执（规模供 UI 结果展示）。
@@ -2753,6 +2778,10 @@ pub(crate) async fn merge_master_projects(
         )
     })
     .await
+    .inspect(|_| {
+        // P15-11：主库归并改写成功后作废体检预聚合缓存。
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    })
 }
 
 /// Work 项目归并生产/合成库共用：目录租约覆盖账号解析、进程检查、备份与数据库写入。
@@ -7550,5 +7579,202 @@ mod p14_4c_archive_caller_tests {
             )
             .unwrap();
         assert_eq!(source_owner, "account-1");
+    }
+}
+
+/// P15-8 主库真实写操作验收驱动（归档/恢复、项目归并、删除会话）。
+///
+/// 仅 `--features probe` 编译；与 UI 命令共享同一编排核心（本文件私有
+/// 函数），仅绕过 Tauri State 与就绪注册表闸门——注册表三项的解锁依据
+/// 正是本探针产出的真实验收证据。每个写入口执行前自动三件套备份
+/// （ADR-0018 铁律），删除/归并核心另有内建备份。
+#[cfg(feature = "probe")]
+pub mod acceptance_probe {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// 生产同源根目录推导（与 real_switch_probe 同规则）。
+    fn production_roots() -> Result<(PathBuf, PathBuf, PathBuf), String> {
+        let app_root = std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("Trae Sync"))
+            .ok_or_else(|| "localappdata_unavailable".to_string())?;
+        let storage_root = app_root.join("data");
+        let recovery_root = app_root.join("recovery");
+        let material_root = storage_root.join("checkin");
+        if !material_root.is_dir() {
+            return Err("checkin_registry_missing".to_string());
+        }
+        Ok((storage_root, recovery_root, material_root))
+    }
+
+    fn source_key() -> Result<String, String> {
+        let key = crate::WORK_CN_SOURCE_RAW_KEY;
+        if key.is_empty() {
+            return Err("source_key_unavailable".to_string());
+        }
+        Ok(key.to_string())
+    }
+
+    /// 验收安全网：三件套手动备份（独立于各写入口的内建备份）。
+    fn guard_backup(storage_root: &Path) -> Result<String, String> {
+        let ctx = resolve_library_context(None, storage_root)?;
+        let db_path = master_database_path(&ctx.dir);
+        let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
+        let path = backup_master_trio_to(&db_path, Some(&backup_dir))
+            .map_err(|error| format!("pre_acceptance_backup_failed:{error:?}"))?;
+        Ok(path.display().to_string())
+    }
+
+    /// 主库项目/会话清单（验收对象选择；只读）。
+    pub fn list_snapshot() -> Result<Value, String> {
+        let (storage_root, _recovery_root, material_root) = production_roots()?;
+        let raw_key = source_key()?;
+        let ctx = resolve_library_context(None, &storage_root)?;
+        let account = library_account::resolve_library_account(
+            &material_root,
+            &storage_root,
+            &ctx,
+        )?
+        .and_then(LibraryAccountResolution::into_account)
+        .ok_or_else(|| "no_current_account".to_string())?;
+        match read_master_history(&ctx.dir, &raw_key, &account.account_id) {
+            MasterHistoryStatus::Ready { projects, sessions } => Ok(json!({
+                "status": "ready",
+                "account_id": account.account_id,
+                "master_dir": ctx.dir.display().to_string(),
+                "projects": projects,
+                "sessions": sessions,
+            })),
+            MasterHistoryStatus::NoMasterData => {
+                Ok(json!({ "status": "no_master_data" }))
+            }
+            MasterHistoryStatus::ReadFailed => {
+                Err("master_history_read_failed".to_string())
+            }
+        }
+    }
+
+    /// 手动三件套备份（验收安全网入口）。
+    pub fn backup_now() -> Result<Value, String> {
+        let (storage_root, _recovery_root, _material_root) = production_roots()?;
+        let path = guard_backup(&storage_root)?;
+        Ok(json!({ "backup_path": path }))
+    }
+
+    /// 归档/恢复提交（真实编排：租约 → 关实例 → 备份 → 单事务 → 重启）。
+    pub fn archive_apply(
+        archive_session_ids: Vec<String>,
+        restore_session_ids: Vec<String>,
+    ) -> Result<Value, String> {
+        let (storage_root, recovery_root, material_root) = production_roots()?;
+        let raw_key = source_key()?;
+        let guard = guard_backup(&storage_root)?;
+        let (ctx, lifecycle_lease) =
+            prepare_library_write_context(&recovery_root, &storage_root, None)?;
+        let close_instance =
+            |ctx: &LibraryContext| ctx.close_instance().map(|_| ());
+        let relaunch_instance = |ctx: &LibraryContext, title: &str| {
+            ctx.relaunch(title).map(|relaunch| relaunch.outcome.to_string())
+        };
+        let ensure_stopped = |ctx: &LibraryContext| {
+            crate::process_guard::ensure_product_stopped(
+                TraeProduct::TraeCn,
+                &ctx.dir,
+                "trae_cn_archive_client_running",
+            )
+        };
+        let result = apply_library_archive_for_context(
+            &recovery_root,
+            &storage_root,
+            &material_root,
+            &raw_key,
+            ctx,
+            lifecycle_lease,
+            &archive_session_ids,
+            &restore_session_ids,
+            &close_instance,
+            &relaunch_instance,
+            &ensure_stopped,
+            &|| {},
+        );
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+        let result = result?;
+        Ok(json!({
+            "archived_sessions": result.archived_sessions,
+            "restored_sessions": result.restored_sessions,
+            "relaunch_outcome": result.relaunch_outcome,
+            "guard_backup": guard,
+        }))
+    }
+
+    /// 项目归并（源分组会话并入目标分组，内建自动备份）。
+    pub fn merge_projects(
+        source_project_ids: Vec<String>,
+        target_project_id: String,
+    ) -> Result<Value, String> {
+        let (storage_root, recovery_root, material_root) = production_roots()?;
+        let raw_key = source_key()?;
+        let (ctx, lifecycle_lease) =
+            prepare_library_write_context(&recovery_root, &storage_root, None)?;
+        let ensure_stopped = |ctx: &LibraryContext| {
+            crate::process_guard::ensure_product_stopped(
+                TraeProduct::TraeCn,
+                &ctx.dir,
+                "master_merge_running",
+            )
+        };
+        let result = run_master_project_merge_with_lease(
+            &recovery_root,
+            &storage_root,
+            &storage_root,
+            &material_root,
+            &raw_key,
+            ctx,
+            lifecycle_lease,
+            &source_project_ids,
+            &target_project_id,
+            &ensure_stopped,
+            &|| {},
+        );
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+        let result = result?;
+        Ok(json!({
+            "moved_sessions": result.moved_sessions,
+            "removed_projects": result.removed_projects,
+            "backup_path": result.backup_path,
+        }))
+    }
+
+    /// 删除会话（含备份与保留策略清理）。
+    pub fn delete_sessions(session_ids: Vec<String>) -> Result<Value, String> {
+        let (storage_root, recovery_root, material_root) = production_roots()?;
+        let raw_key = source_key()?;
+        let (ctx, _lease) =
+            acquire_library_write_lease(&recovery_root, &storage_root, None)?;
+        ctx.ensure_writable()?;
+        let current_account =
+            require_library_account(&material_root, &storage_root, &ctx)?;
+        crate::process_guard::ensure_product_stopped(
+            TraeProduct::TraeCn,
+            &ctx.dir,
+            "master_delete_running",
+        )?;
+        let outcome = delete_master_sessions_inner(
+            &ctx.dir,
+            &raw_key,
+            &session_ids,
+            &current_account.account_id,
+        )
+        .map_err(map_master_archive_error)?;
+        let db_path = master_database_path(&ctx.dir);
+        let backup_dir = resolve_library_backup_dir(&storage_root, &db_path, &ctx.env_id);
+        prune_backups_if_enabled_in(&db_path, &storage_root, &backup_dir);
+        traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+        Ok(json!({
+            "deleted_sessions": outcome.deleted_sessions,
+            "deleted_messages": outcome.deleted_messages,
+            "removed_projects": outcome.removed_projects,
+            "backup_path": outcome.backup_path,
+        }))
     }
 }

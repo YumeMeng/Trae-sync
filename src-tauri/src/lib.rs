@@ -62,7 +62,9 @@ use traesync_infrastructure::OAuthClient;
 // P12-R3：environment_registry_error_code / master_data_dir_for /
 // secondary_data_dir 随环境/库域迁出组合根，经对应域模块引用；
 // EnvironmentRegistry 随凭据域（自检/切号写回）迁 credential_handover。
-use traesync_infrastructure::environment_registry::{master_data_dir, MASTER_ENV_ID};
+// P15-6 后 master_data_dir 的全部 caller 收敛在 infrastructure 内部，
+// 组合根不再引用（2026-10-15 清理未使用导入）。
+use traesync_infrastructure::environment_registry::MASTER_ENV_ID;
 // P12-R1b：产品×库 → 当前账号解析（原组合根 resolve_library_account 系下沉）。
 // P12-R3：observed_profile_id / trae_cn_material_root_from 随凭据域迁
 // credential_handover，经该模块引用。
@@ -96,6 +98,11 @@ mod environment;
 // P12-R3：库历史/归档/备份域（ADR-0025 库抽象 + P5-3/5-4/5-5/5-7/5-8/5-9/
 // P11-4/11-5）自 lib.rs 纯移动；切号与彻底删除引用的备份工具经
 // crate::library_archive 转发导入。
+// P15-8：主库写操作验收探针（feature=probe 门控）需经 examples 访问；
+// 生产构建模块本身不编译，pub 无暴露面变化（与 credential_handover 同模式）。
+#[cfg(feature = "probe")]
+pub mod library_archive;
+#[cfg(not(feature = "probe"))]
 mod library_archive;
 // P12-R3：账号/凭据/切号域（账号中心 + 账号增删改查 + 凭据刷新三链 + Trae CN
 // 健康检测 + 主库切号五步 + G18 自检 + 设备重铸 + 占用统计/彻底删除）自 lib.rs
@@ -728,10 +735,12 @@ fn spawn_oauth_profile_cleanup_scheduler() {
 // 产品账号路由按定案留在组合根。
 
 /// 产品账号路由（list_remote_devices / clear_remote_device 共用，ADR-0031）：
-/// work_cn → 主库登录态解析（指定 profile 或主库当前账号）+ OAuthClient::Solo；
+/// work_cn → 指定 profile 的签到档案解析 + OAuthClient::Solo（签到档案链协议值保留）；
 /// trae_cn → 融合版账号档案（Work 签到注册表；指定 profile 或 product-state
 /// 工具选择指针）+ OAuthClient::TraeCn（P15-7 迁出旧 CN 产品池，ADR-0035）；
 /// 其他产品 → unknown_product。
+/// P15-10：work_cn 无 profile 时的主库实测分支已随前端产品塌缩删除
+/// （前端塌缩后不再发送 work_cn + 空 profile 的组合）。
 fn resolve_remote_device_account(
     material_root: &Path,
     storage_root: &str,
@@ -750,16 +759,6 @@ fn resolve_remote_device_account(
                     .into_iter()
                     .find(|record| record.profile_id == profile)
                     .ok_or_else(|| "account_not_found".to_string())?
-            }
-            None if product_id == "work_cn" => {
-                let master_dir = master_data_dir()
-                    .map_err(|_| "environment_registry_invalid".to_string())?;
-                resolve_actual_master_account(
-                    material_root,
-                    Path::new(storage_root),
-                    &master_dir,
-                )?
-                .ok_or_else(|| "current_account_unresolved".to_string())?
             }
             // 融合版默认账号：product-state 工具选择指针（switch 命令写入的
             // 同一状态；未选择/悬空分别映射为各自稳定错误码）。
@@ -800,7 +799,7 @@ fn resolve_remote_device_account(
 /// 解析需要数据归属或账号凭据的主库当前账号（P5-5 语义，P11-5⑤ 起为
 /// 实测分支的主库特化入口）。P12-R1b：实测分支下沉
 /// `library_account::resolve_measured_env_account`，此处保留薄转发——
-/// 调用点（插件预检/凭据/自检/远程设备）只持有主库目录，不持有
+/// 调用点（插件预检/凭据/自检）只持有主库目录，不持有
 /// LibraryContext，语义与错误码口径保持不变。
 fn resolve_actual_master_account(
     material_root: &Path,
@@ -1248,6 +1247,10 @@ pub fn run() {
             // 仅真实模式启动自动签到调度器；fixture 演示模式无自动行为语义。
             let scheduler_mode = runtime_mode;
             move |app| {
+                // P15-12 空间卫生：启动时清理历史实例泄漏的只读副本孤儿
+                // （TEMP 散落旧格式 + 专用父目录内非本 pid 条目）。
+                // 失败只影响本次清理，不阻断启动；返回值仅为统计，无需展示。
+                let _removed = traesync_infrastructure::sqlcipher::cleanup_stale_readonly_copies();
                 if scheduler_mode == RuntimeMode::RealReadPreview {
                     let lock = app.state::<AppState>().checkin_execution_lock.clone();
                     spawn_auto_checkin_scheduler(app.handle().clone(), scheduler_root, lock);
