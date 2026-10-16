@@ -48,3 +48,13 @@
 - 进程匹配规则：`WorkBuddy.exe` 映像名 + `--user-data-dir` 参数解析（close_instance/launch 的 WorkBuddy 版）。
 - 数据根常量：`~/.workbuddy/app`（storage_roots 模式新增 WorkBuddy 根组）。
 - 备份治理复用：IndexedDB/LocalStorage 目录的压缩备份（zstd 对未加密数据有效——与 SQLCipher 不同，**这里压缩真有效**）。
+
+
+## 6. 探针深挖补充（2026-10-17 asar 分析，P17-T1/T2 前置事实）
+
+- **账号体系定论**：WorkBuddy 账号 = **CodeBuddy 账号**（account.js 内嵌 `www.codebuddy.cn/profile/plan` 套餐页链接 + `smh26tqjmz2qlj4i.api.tencentsmh.cn` 后端 API + `lightmake.site` 副域）。**"登录方式与 Trae 一样"的实质 = 同为网页 OAuth 授权码流（形态同构），账号源不同（CodeBuddy vs TRAE）**。
+- **OAuth 客户端流完整**：`oauthClientId`（配置注入 e.oauth_client_id）、`oauthAppName`、`authorizedFlow/authorizedRecovery/authorizedCallbacks`——与 Trae Sync 的 OAuth 编排**模式同构，仅协议参数不同**。
+- **凭据运行时**：`daemon.auth` 域（CLI 守护进程 401 观察链）——**凭据活动在 CodeBuddy daemon（CLI 后台进程）**；token 存储无 keytar/safeStorage 痕迹，渲染侧 localStorage + daemon 侧待 T1 正式解析。
+- **本地服务**：`127.0.0.1:18488`（JSON API，`{"ok":false,"error":"Not Found"}` 形态）——路由表待 T2 从主代码解析。
+- **内核**：`@genie` 命名空间（browser-runtime/extension-im-channels/workbuddy-browser-use）+ **内嵌 CodeBuddy CLI**（cli/bin/codebuddy + codebuddy-lite-wb.mjs）——WorkBuddy 的 agent 能力由 CodeBuddy CLI 驱动（与本项目同生态）。
+- **对适配的直接影响**：Trae Sync 的捕获/铸造编排模式**可整体复用**，协议参数层（client_id/端点/设备绑定）按 CodeBuddy 协议重配——与"复用并扩展"的用户意图完全吻合。
