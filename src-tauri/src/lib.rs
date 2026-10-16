@@ -113,6 +113,8 @@ mod library_archive;
 pub mod credential_handover;
 #[cfg(not(feature = "probe"))]
 mod credential_handover;
+// P16-T4：新账号「从客户端捕获」入池编排（spec docs/specs/p16-account-capture.md）。
+mod account_capture;
 // P12-R3：插件域（P5-8b 插件 tab：ADR-0023 环境插件清单 + ADR-0026 实时同步）
 // 自 lib.rs 纯移动；命令注册改路径形式。
 mod plugins;
@@ -1370,6 +1372,7 @@ pub fn run() {
             library_archive::get_master_checkup,
             library_archive::incorporate_master_records,
             // P5-5 清理空项目（体检诊断口径的空壳行，破坏性 + 自动备份）。
+            account_capture::capture_trae_cn_account,
             library_archive::cleanup_master_empty_projects,
             // P5-8b 插件 tab（ADR-0023 清单 + ADR-0026 实时同步）：
             // 状态/市场/装（零确认）/卸（全账号传播）；P12-R3 命令迁 plugins。

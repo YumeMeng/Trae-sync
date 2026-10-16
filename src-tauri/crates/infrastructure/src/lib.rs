@@ -83,6 +83,8 @@ pub mod snapshot_store;
 #[cfg(feature = "sqlcipher")]
 pub mod sqlcipher;
 pub mod storage_deletion;
+// P16-T2：存储根派生路径唯一来源（checkin/products-trae_cn/product-state/fused-login）。
+pub mod storage_roots;
 pub mod storage_root;
 pub mod trae_instance;
 pub mod work_cn_location;

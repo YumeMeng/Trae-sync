@@ -20,7 +20,8 @@ const MAX_PROFILE_ID_BYTES: usize = 256;
 /// 迁到独立目录，避免指针写入复活已删除目录；纯函数供组合根与库作用域
 /// 账号解析共用，不落盘、无副作用。
 pub fn product_state_root_from(storage_root: &Path) -> PathBuf {
-    storage_root.join("product-state")
+    // P16-T2：路径拼接收口到 storage_roots 唯一来源（本函数保留 API 供既有调用方）。
+    crate::storage_roots::product_state_root_from(storage_root)
 }
 
 /// 当前产品账号选择状态的读写错误；不携带路径中的敏感内容。

@@ -1102,3 +1102,41 @@ describe("EnvironmentPage（P5-2 环境页）", () => {
     });
   });
 });
+
+// P16-T4：账号捕获按钮冒烟（点击 → invoke capture_trae_cn_account → 入池通知）。
+describe("P16-T4 账号捕获", () => {
+  it("点击捕获按钮调用 capture_trae_cn_account 并展示入池通知", async () => {
+    mockRoute("capture_trae_cn_account", async () => ({
+      profile_id: "checkin-mock-capture-1",
+      account_id: "mock-captured-account",
+      screen_name: "MockCaptured",
+    }));
+    render(<EnvironmentPage active />);
+    const button = await screen.findByTestId("env-capture-account-entry");
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("env-capture-account-notice")).toHaveTextContent(
+        "已捕获账号「MockCaptured」入池",
+      );
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("capture_trae_cn_account");
+  });
+
+  it("重复捕获（account_already_registered）展示去重提示", async () => {
+    mockRoute("capture_trae_cn_account", async () => {
+      throw "capture_account_already_registered:checkin-existing-1";
+    });
+    render(<EnvironmentPage active />);
+    const button = await screen.findByTestId("env-capture-account-entry");
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("env-capture-account-notice")).toHaveTextContent(
+        "该账号已在账号池中",
+      );
+    });
+  });
+});

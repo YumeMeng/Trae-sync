@@ -277,7 +277,10 @@ pub(crate) fn checkin_material_root(state: &AppState) -> Result<PathBuf, String>
     if state.storage_root.is_empty() {
         return Err("checkin_storage_unavailable".to_string());
     }
-    Ok(Path::new(&state.storage_root).join("checkin"))
+    // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+    Ok(traesync_infrastructure::storage_roots::checkin_material_root_from(
+        Path::new(&state.storage_root),
+    ))
 }
 
 /// 自动签到调度器循环间隔（秒）：兼顾触发及时性与存储读取频率。
@@ -403,7 +406,10 @@ pub(crate) fn spawn_auto_checkin_scheduler(
         if storage_root.is_empty() {
             return;
         }
-        let material_root = PathBuf::from(&storage_root).join("checkin");
+        // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+        let material_root = traesync_infrastructure::storage_roots::checkin_material_root_from(
+            Path::new(&storage_root),
+        );
         let mut last_credential_maintenance: Option<std::time::Instant> = None;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(AUTO_CHECKIN_TICK_SECONDS));

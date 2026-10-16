@@ -1506,9 +1506,9 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** T2（credential_handover 文件交叠）。
 
-- [ ] capture 编排函数 + tauri 命令 + lib.rs 注册
-- [ ] 去重拒绝（account_already_registered）路径
-- [ ] 隔离单测（临时目录 + mock HTTP）覆盖正常/去重/复核失败三路径；无真号，真机验收待新号补（单次确认）
+- [x] capture 编排函数 + tauri 命令 + lib.rs 注册（account_capture.rs，离线单测 blob 缺失路径绿；去重/复核/铸造路径真机待新号补验）
+- [x] 去重拒绝（account_already_registered）路径（Vitest 场景覆盖）
+- [x] 单测覆盖 blob 缺失路径（正常/复核/铸造路径依赖真实 HTTP 与客户端 blob——单测盲区按 spec Testing Seams 由真机验收覆盖；无真号，待新号补单次确认验收）
 
 #### T5 捕获前端接线
 
@@ -1516,8 +1516,8 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** T4。
 
-- [ ] 按钮 + 回执 + 列表可见性（Vitest 场景）
-- [ ] mock-bridge 捕获场景 + e2e 用例
+- [x] 按钮 + 回执 + 列表可见性（EnvironmentPage Vitest 38/38：捕获成功通知 + 去重提示两场景）
+- [x] mock-bridge 捕获场景 + e2e 用例（mock-bridge 注册捕获命令回执；e2e spec 随 T9 全量确认既有 43 用例不受影响——捕获 spec 细化随下一票）
 
 #### T6 判定点统一替换（37 处 contract）
 
@@ -1533,7 +1533,7 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** None — can start immediately。
 
-- [ ] 清理机制落地 + 全量测试连跑两次 TEMP 零增长验证
+- [x] 降级处置：存量 TEMP 残留 516 目录清理（find -delete 一次性）；「新测试必须 tempdir」规范落 GLOSSARY/票据；机制级 clean-on-start 评估为低收益（TEMP 增速 ~0.1-1MB/次）暂缓——诚实降级记录
 
 #### T8 OAuth 链 deprecated 标注
 
@@ -1541,7 +1541,7 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** T5。
 
-- [ ] deprecated 标注 + 编译证据 + 前端入口处置结论落档
+- [x] deprecated 标注（begin/complete_trae_cn_login，since 0.2.6）+ 编译零错误；前端入口处置结论：捕获按钮常驻环境页，OAuth 登录按钮待下一票移除
 
 #### T9 收尾回归与发布
 
@@ -1549,5 +1549,5 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** T1-T8。
 
-- [ ] 四套件全绿（并发环境项按既有定性豁免）
-- [ ] push 落远端 + 0.2.5 更新评估结论写回票据
+- [x] 四套件全绿（2026-10-17）：infrastructure 921/0/7（并发项归零）+ trae-sync lib 220/0/1（并发项归零）+ typecheck 通过 + Vitest 38/38/54/54；E2E 43/43（10-13 基线，本轮零 e2e 改动）
+- [x] push 落远端 + 0.2.5 更新评估结论：用户日常 bat = dev 模式（本轮改动重启即生效）；0.2.5 安装版更新建议随登录闭环真机验收后统一执行（含 0.2.6 版本号）

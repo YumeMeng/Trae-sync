@@ -2216,7 +2216,10 @@ pub(crate) fn fused_login_root(state: &AppState) -> Result<PathBuf, String> {
     if state.storage_root.is_empty() {
         return Err("trae_cn_storage_unavailable".to_string());
     }
-    Ok(Path::new(&state.storage_root).join("fused-login"))
+    // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+    Ok(traesync_infrastructure::storage_roots::fused_login_root_from(Path::new(
+        &state.storage_root,
+    )))
 }
 
 /// 融合版产品工具选择指针根（P15-7，ADR-0035）：`{storage_root}/product-state`。
@@ -2435,7 +2438,10 @@ fn check_trae_cn_account_health_inner(
     // 容器根由调用方注入（与 list 命令同源），此处以参数传入避免再依赖 AppState。
     let fused_root = material_root
         .parent()
-        .map(|storage_root| storage_root.join("fused-login"))
+        // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+        .map(|storage_root| {
+            traesync_infrastructure::storage_roots::fused_login_root_from(storage_root)
+        })
         .ok_or_else(|| "trae_cn_storage_unavailable".to_string())?;
     let fused_store = FusedLoginStore::new(&fused_root);
 
@@ -3830,7 +3836,9 @@ fn get_master_self_check_inner(
     // P15-6：融合版切号的真实依赖是 `.fused` 登录容器（P15-1 铸造，16/16
     // 齐全）；Work 时代的 trae-instances 存档目录只覆盖少量旧实例，按它
     // 判定会让多数账号误报「没有可用的登录存档」（用户实测 2026-10-14）。
-    let fused_root = storage_root.join("fused-login");
+    // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+        let fused_root =
+            traesync_infrastructure::storage_roots::fused_login_root_from(Path::new(storage_root));
     let donor_available = donor_profile_id
         .map(|profile_id| FusedLoginStore::new(&fused_root).exists(profile_id))
         .unwrap_or(true);
@@ -4476,7 +4484,9 @@ pub(crate) fn switch_master_account_at<R: tauri::Runtime>(
 ) -> Result<MasterAccountSwitchDto, String> {
     // 融合版身份切换（P15-5，ADR-0035）：`.fused` 登录代次容器构造。
     // donor_dir 参数保留（离线测试注入签名不变），融合版路径不消费存档。
-    let fused_root = storage_root.join("fused-login");
+    // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+        let fused_root =
+            traesync_infrastructure::storage_roots::fused_login_root_from(Path::new(storage_root));
     let identity_switch = |record: &AccountRecord, _donor_dir: &Path, target_dir: &Path| {
         switch_login_identity_fused(&fused_root, record, target_dir)
     };
@@ -4590,7 +4600,9 @@ pub(crate) fn switch_master_account_at_with_identity_switch<R: tauri::Runtime>(
     // 第 0.5 步（P15-5，ADR-0035）：切出回存——实例已关、blob 稳定，
     // 把上一个账号的最新续期态写回其 `.fused` 容器（fail-soft：身份
     // 校验失败或写失败都不阻断切号，只影响旧账号下次切入的凭据新旧）。
-    let fused_root = storage_root.join("fused-login");
+    // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+        let fused_root =
+            traesync_infrastructure::storage_roots::fused_login_root_from(Path::new(storage_root));
     if let Some(saved_profile) =
         save_back_master_container(master_dir, &fused_root, material_root)
     {
@@ -7651,7 +7663,9 @@ pub mod real_switch_probe {
                 .map_err(|error| error.to_string())
         };
         // 融合版身份路径（与生产 switch_master_account_at 同源）。
-        let fused_root = storage_root.join("fused-login");
+        // P16-T2：路径拼接收口到 storage_roots 唯一来源。
+        let fused_root =
+            traesync_infrastructure::storage_roots::fused_login_root_from(Path::new(storage_root));
         let identity_switch = |record: &AccountRecord, _donor_dir: &Path, target_dir: &Path| {
             switch_login_identity_fused(&fused_root, record, target_dir)
         };

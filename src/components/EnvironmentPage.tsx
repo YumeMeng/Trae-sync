@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import {
+import { UserPlus,
   CheckCircle2,
   Combine,
   Database,
@@ -87,6 +87,9 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
   // 清理空项目：弹层开关 + 执行中（后端编排：关实例 → 备份 → 删除 → 重启）。
   const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
   const [cleaningUp, setCleaningUp] = useState(false);
+  // P16-T4 账号捕获：从 Trae 客户端登录态捕获新账号入池（捕获中/结果提示）。
+  const [capturingAccount, setCapturingAccount] = useState(false);
+  const [captureNotice, setCaptureNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   // P6-4 辅助环境生命周期弹层（同一时刻至多一个）。
   const [createDialog, setCreateDialog] = useState<NameDialogState | null>(null);
   const [renameDialog, setRenameDialog] = useState<NameDialogState | null>(null);
@@ -333,6 +336,41 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
   const closeIncorporate = useCallback(() => {
     setIncorporating((current) => (current?.phase.kind === "running" ? current : null));
   }, []);
+
+  /** P16-T4：从客户端捕获账号（读登录态 → 在线复核 → 铸造入池）。 */
+  const handleCaptureAccount = useCallback(async () => {
+    if (capturingAccount) return;
+    setCapturingAccount(true);
+    setCaptureNotice(null);
+    try {
+      const receipt = await invoke<{ profile_id: string; account_id: string; screen_name: string }>(
+        "capture_trae_cn_account",
+      );
+      setCaptureNotice({
+        kind: "ok",
+        text: `已捕获账号「${receipt.screen_name}」入池（${receipt.profile_id}），切号/签到/历史能力即刻可用。`,
+      });
+      try {
+        await load();
+      } catch {
+        // 捕获已成功，刷新失败不影响结果。
+      }
+    } catch (reason: unknown) {
+      const raw = typeof reason === "string" ? reason : String(reason);
+      setCaptureNotice({
+        kind: "error",
+        text: raw.startsWith("capture_account_already_registered")
+          ? "该账号已在账号池中，无需重复捕获。"
+          : raw.startsWith("capture_blob_missing")
+            ? "未在 Trae 客户端检测到新的登录态：请先在客户端登录要捕获的账号，再点击捕获。"
+            : raw.startsWith("capture_identity_review_failed")
+              ? "在线复核身份未通过，未做任何改动；请稍后重试。"
+              : `捕获未完成：${raw}（数据保持操作前状态）。`,
+      });
+    } finally {
+      setCapturingAccount(false);
+    }
+  }, [capturingAccount, load]);
 
   /** 确认清理空项目 → 后端编排（关实例 → 备份 → 删除 → 重启）。 */
   const handleCleanupEmptyProjects = useCallback(async () => {
@@ -582,6 +620,30 @@ export function EnvironmentPage({ active, onOpenMasterDetail, onOpenLibraryDetai
               </div>
             </div>
           )}
+          {/* P16-T4 账号捕获：从客户端登录态捕获新账号入池（非破坏性，失败零副作用）。
+              独立于体检区块常驻展示；捕获不依赖任何体检/诊断状态。 */}
+          <div className="env-checkup__group" data-testid="env-capture-account-group">
+            <div className="env-checkup__group-title">账号捕获</div>
+            <button
+              className="btn env-checkup__action"
+              type="button"
+              onClick={handleCaptureAccount}
+              disabled={capturingAccount}
+              data-testid="env-capture-account-entry"
+            >
+              <UserPlus size={15} aria-hidden="true" />
+              {capturingAccount ? "正在捕获…" : "从客户端捕获账号"}
+            </button>
+            {captureNotice && (
+              <p
+                className="env-checkup__note"
+                data-testid="env-capture-account-notice"
+                style={{ color: captureNotice.kind === "ok" ? undefined : "#c0392b" }}
+              >
+                {captureNotice.text}
+              </p>
+            )}
+          </div>
 
           <div className="env-card__foot">
             {/* 数据目录完整路径收进悬浮提示，不占主视野（界面表达纪律）。 */}

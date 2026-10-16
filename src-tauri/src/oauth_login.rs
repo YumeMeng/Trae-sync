@@ -76,7 +76,8 @@ static NEXT_LOGIN_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 生成新登录会话的 profile_id（时间 + 进程指纹哈希；同一账号重复登录
 /// 在入库时复用已有档案的 profile_id，这里只需保证新账号间不冲突）。
-fn generate_login_profile_id() -> String {
+// P16-T4：捕获编排与 OAuth 登录共用同一 profile_id 生成器（格式兼容账号池）。
+pub(crate) fn generate_login_profile_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -466,6 +467,10 @@ pub(crate) async fn complete_checkin_login(
 
 /// 完成 Trae CN OAuth 回调并写入 Trae CN 独立账号池。
 #[tauri::command]
+#[deprecated(
+    since = "0.2.6",
+    note = "P16-T4 捕获路线（account_capture::capture_trae_cn_account）已覆盖新账号入池场景；\n本 OAuth 浏览器链为旧入口，入库目标仍指向已废弃语义的旧池根，待下一票清理。"
+)]
 pub(crate) async fn complete_trae_cn_login(
     attempt_id: u64,
     state: tauri::State<'_, AppState>,

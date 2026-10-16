@@ -190,7 +190,8 @@ pub fn observed_profile_id(accounts: &[AccountRecord], instance_dir: &Path) -> O
 /// Trae CN 产品账号根 = `{storage_root}/products/trae_cn`（与
 /// trae_cn_material_root 同源派生规则；原组合根纯函数形态随迁）。
 pub fn trae_cn_material_root_from(storage_root: &Path) -> PathBuf {
-    storage_root.join("products").join("trae_cn")
+    // P16-T2：路径拼接收口到 storage_roots 唯一来源（本函数保留 API 供既有调用方）。
+    crate::storage_roots::trae_cn_material_root_from(storage_root)
 }
 
 #[cfg(test)]

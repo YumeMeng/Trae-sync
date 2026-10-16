@@ -17,6 +17,7 @@ export type CommandName =
   | "cleanup_master_empty_projects"
   | "clear_remote_device"
   | "close_environment_instance"
+  | "capture_trae_cn_account"
   | "complete_checkin_login"
   | "complete_trae_cn_login"
   | "create_environment"

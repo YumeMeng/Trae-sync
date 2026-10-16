@@ -693,7 +693,7 @@ fn generate_login_trace_id() -> Result<String, LoginError> {
 }
 
 /// 机器指纹（非敏感）：用随机 hex 代替真实 MachineGuid，作为虚拟设备上下文。
-fn generate_machine_fingerprint() -> Result<String, LoginError> {
+pub fn generate_machine_fingerprint() -> Result<String, LoginError> {
     let mut bytes = [0u8; 16];
     rand_bytes(&mut bytes).map_err(|_| LoginError::ExchangeFailed)?;
     Ok(hex::encode(bytes))
