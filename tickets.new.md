@@ -1551,3 +1551,17 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 - [x] 四套件全绿（2026-10-17）：infrastructure 921/0/7（并发项归零）+ trae-sync lib 220/0/1（并发项归零）+ typecheck 通过 + Vitest 38/38/54/54；E2E 43/43（10-13 基线，本轮零 e2e 改动）
 - [x] push 落远端 + 0.2.5 更新评估结论：用户日常 bat = dev 模式（本轮改动重启即生效）；0.2.5 安装版更新建议随登录闭环真机验收后统一执行（含 0.2.6 版本号）
+
+
+### P17 WorkBuddy 适配（调研定案，探针先行）
+
+**交付：** WorkBuddy（Electron，数据根 `~/.workbuddy/app`，IndexedDB/LocalStorage 栈）的账号/对话/签到/切换四大核心适配。**路径 C→A**：探针按 Trae Sync 扩展位开发，结论直接演进为双产品扩展（系统性 product descriptor 落地）。
+
+**来源 Spec：** [docs/specs/p17-workbuddy-adaptation-research.md](docs/specs/p17-workbuddy-adaptation-research.md)。
+
+**Blocked by:** 遗留优先——新号真机验收（待新号）与 OAuth 清理完成后启动。
+
+- [ ] P17-T1 探针：登录态定位（登录页面观察 + 凭据存储解析——用户不确定账号体系，探针第一步）
+- [ ] P17-T2 探针：IndexedDB/LocalStorage 结构解析 + 签到/多账号体系确认 + 进程/路径适配点（WorkBuddy.exe 映像名 + --user-data-dir）
+- [ ] P17-T3 系统性 product descriptor 抽象（TraeProduct/LoginProduct/OAuthClient/存储根五层散落收口，fact-finder 盘点为基线）
+- [ ] P17-T4 双产品扩展实施（数据层/凭据层按探针结论，架构骨架复用闸门/备份/纪律/流程）
