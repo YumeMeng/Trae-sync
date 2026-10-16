@@ -73,3 +73,6 @@ QODER.md
 /target
 # Added by code-review-graph
 .code-review-graph/
+
+# WorkBuddy 会话记忆（本地，不入库）
+.workbuddy/

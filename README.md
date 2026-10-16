@@ -30,7 +30,7 @@
 ## 当前状态
 
 - 平台：Windows x64；2026-10-13 起融合版 TRAE（Work CN 升级版）成为唯一产品适配目标（[ADR-0035](docs/adr/0035-unified-trae-product-and-credential-migration.md)），Work 客户端 2026-10-23 官方停服前完成 16 账号迁移；当前实施入口 Phase 15（[tickets.new.md](tickets.new.md)）
-- Phase 15 进展：阶段一 16/16 账号融合版登录凭据铸造完成（DPAPI 容器，不写客户端目录）；阶段二 P15-7 旧 trae_cn 模块移除、切号编排/主库目标切换/双通道凭据接线完成，mock 侧四套件全绿（cargo 串行分段 / typecheck / Vitest 402 / E2E 43）；剩余真实操作验收（首次真实切号、真实启停）待用户在场单次确认执行
+- Phase 15 进展：**四大核心全部真实验收完成（2026-10-16）**——阶段一 16/16 账号融合版登录凭据铸造（DPAPI 容器）；真实切号（2026-10-15 全链通过 + 重启留存）；真实启停随切号覆盖；自动签到真实 claim（15/15）；主库真实归档/归并/删除/恢复真机验收（2026-10-16，探针执行 + 客户端结果确认），归档/归并/删除注册表解锁；readonly 泄漏修复与 junction 防逃逸加固随本轮交付。剩余 = P15-9 文档收口尾项（实施入口 [tickets.new.md](tickets.new.md)）
 - 登录设备管理已通过真机验收（远程退出、本机识别均经生产环境验证）；架构决策见 [docs/adr/](docs/adr/)，实施计划见 [tickets.new.md](tickets.new.md)
 - 与第三方 Manager 类工具仅行为参考关系，无代码或数据依赖；账号一律通过 App 内 OAuth 登录
 

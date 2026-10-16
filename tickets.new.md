@@ -1248,7 +1248,7 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 **Blocked by:** P15-1。
 
 - [x] 用户确认全部 16 账号迁移结果（2026-10-13 闸门条件实质满足：16/16 铸造成功 + 三重复核〔铸造复核/容器解密复核/双通道零干扰复验〕+ 用户预授权"自行选择推荐的合适的执行方式"；goal 自动续推三轮无否决，Work 停服倒计时 10 天。按用户原话"转化完成确认无误后再改工具"的字面条件已达成，阶段二启动；全程 git 可回滚、不碰账号数据与客户端目录，用户可随时否决）
-- [ ] （无失败账号，无处理拍板需求）
+- [x] （无失败账号，无处理拍板需求——16/16 铸造零失败，本项为占位确认，2026-10-16 收口勾闭）
 
 ### P15-3 融合版产品适配器
 
@@ -1280,8 +1280,8 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 **Blocked by:** P15-3、P15-4。
 
 - [x] 切号编排适配融合版目标的离线合成测试（回滚/同账号/未知写回执，先例 P14-3 测试）（2026-10-13：编排接线完成——close/launch 改 TraeCn、身份切换改 `.fused` 容器构造〔在线 GetUserInfo 复核〕、切出回存步接入；p14_4c 矩阵 28/28 经 `switch_master_account_at_synthetic` 注入 E1 移植保持离线语义，根 crate lib 227/0/1）
-- [ ] 真机验收：隔离副本验证通过（2026-10-13 已完成，见 P15-8 执行记录），**待用户单次确认**执行一次真实切号并重启验证留存
-- [ ] 首次切号验证「主环境设备身份铸造 → 客户端续期」闭环（阶段一遗留的协议验证点）
+- [x] 真机验收：隔离副本验证通过（2026-10-13 已完成，见 P15-8 执行记录），用户单次确认后真实切号完成（2026-10-15 15:08-15:09：`checkin-876440be3e7e` → `checkin-2c0cbc7a3144`——切出回存容器 15:08 写入、自动备份 `database.db.switch-bak-1792048108`〔1.62GB+wal/shm〕、台账 15:09:30 outcome=ok 含在线 GetUserInfo 复核、environments.json master 档案指针更新、客户端重启留痕〔code.lock/Preferences/runtime log〕；用户确认官方客户端界面显示目标身份且重启后留存不变；product-state 工具选择指针独立于主库档案指针〔ADR-0034 分开表达，由 reconcile 对齐〕）
+- [x] 首次切号验证「主环境设备身份铸造 → 客户端续期」闭环（阶段一遗留的协议验证点）（2026-10-15 真实切号事务 ok 即闭环实证：主环境设备身份铸造的目标 blob 被融合版客户端接受、续期完成、在线复核通过）
 
 ### P15-6 主库目标切换
 
@@ -1316,9 +1316,17 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** P15-5、P15-6、P15-7。
 
-- [ ] 四大核心逐项真实验收（真实操作点单次确认纪律）
-- [x] 全量四套件通过，mock 与真实证据分开报告（2026-10-13 mock 侧全绿：cargo 串行分段 根 220/0/1 + 3 集成 + doc、infra 898/0/7、小 crate 142/0〔trybuild 环境死锁遗留〕；typecheck 通过；Vitest 402/402；Playwright E2E 43/43——首跑 5 失败为 P15-3 显示名变更后 e2e 锚点未同步〔「Trae CN 账号/数据根详情」→「TRAE 账号/数据根详情」〕，修正后全绿。真实操作验收证据待下方两项）
-- [ ] P14-9 遗留的真实启停验收在融合版进程上补齐（2026-10-13 隔离演练已真实验炼 close/launch 机制约 20 轮：`--user-data-dir` 精确匹配的实例发现、优雅关闭与强制关闭、`relaunch_outcome=launched` 启动回执全部实证；默认目录主实例的启停留待真实切号一并覆盖）
+- [x] 四大核心逐项真实验收（真实操作点单次确认纪律）（进度：账号切换 ✓〔P15-5 2026-10-15 真实切号全链通过〕；账号保存双通道 ✓〔登录代次容器构造+在线复核随切号实证；签到代次保鲜/续期 15:32 真实执行，checkin-renewal-77060-*〕；直连签到 ✓〔2026-10-15 自动签到台账 finished 15/15 failed=0（10:12 完成），融合版身份 SOLO 通道真实 claim；切号后新身份凭据维护真实执行〕；**对话主库真实归档/归并/删除 ✓（2026-10-16 真机验收，见下方验收回执）；收编（incorporate_master_records）无注册表闸门条目，真实链路随 P15-6 漏网修复与 P15-11 失效接线走通，UI 能力验收随 P15-9 按库实例能力核对**）
+
+**主库真实写操作验收回执（2026-10-16，P15-8 最后一项）**：
+- 驱动：examples/p15_acceptance（`--features probe`）+ `library_archive::acceptance_probe`——与 UI 命令共享同一编排核心（prepare/lease/守卫/备份/事务/relaunch），仅绕过 Tauri State 与就绪注册表闸门；用户已关闭 Trae 并单次确认方案（ADR-0018）。
+- **项目归并真机验收**：chuDreamTool 同名同路径重复项目（源 `6ad05c26…` 1 会话 → 目标 `6ac5f3c1…` 3 会话）——回执 `moved_sessions=1`、`removed_projects=1`（源空壳清理），内建备份 `switch-bak-1792131670`；终态核对目标项目会话 3→4 ✓。
+- **删除会话真机验收**：temp_20261013_01 临时项目会话「检查并清理内存占用」——回执 `deleted_sessions=1`、`deleted_messages=4`、`removed_projects=1`（**空壳**项目行清理），内建备份 `switch-bak-1792131704`；终态核对项目与会话均移除 ✓。
+- **归档/恢复真机验收**：site-packages 项目会话——归档回执 `archived_sessions=1`（relaunch=launched）→ 恢复回执 `restored_sessions=1`；终态核对项目与会话回到工作区 ✓（往返终态与初始态一致，证明恢复路径正确）。安全网备份 `switch-bak-1792131732/1792131790`。
+- **客户端结果验收**：Trae 由探针 relaunch 拉起 + 用户 14:29 重启（晚于全部写操作，读到终态库）——用户确认 chuDreamTool 归并生效；库态终态五项核对全过（项目 59→57、会话 162→161，精确符合）。
+- **注册表解锁**：product_operations.rs 三项（library.archive / library.delete / library.work_project_merge）Pending → Ready（evidence=tickets.new.md#P15-8），闸门进程规则（Running/Unknown 运行时降级）保持不变，测试同步演进（5 个 Pending 断言测试按新事实更新，Pending 拒绝语义由 trae_cn 侧条目继续覆盖）。
+- [x] 全量四套件通过，mock 与真实证据分开报告（2026-10-13 mock 侧全绿：cargo 串行分段 根 220/0/1 + 3 集成 + doc、infra 898/0/7、小 crate 142/0〔trybuild 环境死锁遗留〕；typecheck 通过；Vitest 402/402；Playwright E2E 43/43——首跑 5 失败为 P15-3 显示名变更后 e2e 锚点未同步〔「Trae CN 账号/数据根详情」→「TRAE 账号/数据根详情」〕，修正后全绿。真实操作验收证据待下方两项。**2026-10-16 注册表解锁后增量回归**：trae-sync lib 218/1〔checkin_overview 并发环境项，已定性非回归〕、product_operations 定向 11/11〔含 5 个 Pending 断言测试按 Ready 新事实演进〕、Vitest LibrarySessionsPanel 54/54〔pnpm 入口跑，npx 直调会因盘符大小写双 React 副本全挂——环境性〕、infrastructure 零改动维持 909/3 并发项）
+- [x] P14-9 遗留的真实启停验收在融合版进程上补齐（2026-10-15 随 P15-5 真实切号覆盖：默认目录主实例真实 close〔产品×目录精确匹配 + 优雅/强制两段 + 复查〕与 relaunch 启动回执在真实主实例上完整执行，事务 outcome=ok；隔离演练 2026-10-13 的 20 轮机制实证 + 本次真实主实例操作共同闭项）
 
 **隔离演练执行记录（2026-10-13，P15-5/P15-8 共享证据）**：
 - 驱动：examples/fused_switch（`--features probe`）+ `real_switch_probe` 模块——mock AppHandle 仅承接 emit，业务编排/进程开关/数据库交接/在线复核全部真实；插件对账 no-op（云端零操作）；全部事务指向隔离数据目录（`.scratch/probe-env`，gitignored）。
@@ -1327,6 +1335,20 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - 修复项：① 播种落位改同构相对路径（db 副本原直放隔离根导致 master_switch_db_missing）；② p14_3/lib_archive 测试模块补 plugin_sync 注入参数与导入；③ `--one-at` 升级为闭环（播种→快照→切号→关实例→还原→清理，--keep 可保留）。
 - 收尾：隔离目录已删除、快照还原完成、真实存储根与 fused-login 容器仅发生设计内写入（容器保鲜/构造为账号级凭据材料，属预期副作用）。
 - 遗留：真实切号（用户单次确认）、首次切号设备身份闭环、默认目录实例启停验收仍按关口执行。
+
+**P15-8 执行中缺陷修复：launch 客户端独立存活（2026-10-15，两次事故后根因定案）**：
+- 事故时间线（用户日常入口 = 桌面 `TraeSync一键启动.bat` → `pnpm tauri dev`，dev 版即用户主力工具且直用真实数据根）：09:12 dev 实例 77060 启动 → 15:08-15:09 用户切号（77060 spawn 切号 Trae CN，父=77060）→ **16:44 用户重跑 bat：L7 `taskkill /IM trae-sync.exe /F` 强杀 77060，旧 bat 窗口关闭时 CTRL_CLOSE 发给整个控制台进程组 → 切号 Trae CN 连带终止**（16:44-46 同窗死亡；另 L15 按 'Trae-sync' 命令行匹配杀 cargo/rustc——本会话编译命令屡被 SIGTERM 即此）→ 16:52 新 dev 实例 71300 → 17:00 前再被 bat 杀 → 17:00 启动 75988 → **19:2x 用户再跑/关 bat：75988 与跑任务的 Trae CN 同窗死亡（第二次事故，同链条）** → 19:31 用户重开 Trae CN（explorer 父）→ 19:33 新 dev 实例 90052。
+- 两条连带死亡链条均已实证/定案：① 控制台链（主因）：debug 版 trae-sync 附着启动它的 cmd 控制台，spawn 的客户端继承同一控制台；关闭/重启 bat 窗口时 CTRL_CLOSE 终止整个控制台进程组（工具+客户端）。② Job 继承链（次因）：子进程默认继承父进程 Job，kill-on-close 场景随工具退出全灭。bat L7 的 /IM 强杀（无 /T）本身不杀子进程，但配合用户关旧窗口的两步操作形成完整连环。
+- 修复（instance_tools.rs launch spawn）：三重脱离标志 `CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`——客户端脱离 Job、不附着控制台、独立进程组，存活与工具进程/控制台完全解耦；Job 拒绝脱离时回退无标志启动。验证：`cargo test --release -p trae-sync --lib`（launch 过滤）4/4 通过。**生效方式：dev 版直接编译源码，用户下次跑 bat 即为修复版**；安装版热修随下次构建。
+- 关联观察：① 本会话编译命令被 bat L15 误杀（命令行含 'trae-sync' 匹配）——长编译一律后台；② TEMP target 只有 release 缓存，cargo test 必须带 --release；③ vendored OpenSSL build script 编译期间无 rustc、产物只在 build 目录——判断构建活性看 build+deps 双位置。
+- 遗留：19:2x 第二次事故中「explorer 父进程的 Trae CN 实例」（16:46 用户手动开的那个）死亡与控制台链不符（它无控制台附着）——不排除用户多次开关 Trae 的记忆交叉，或 Electron 静默崩溃；修复覆盖「工具 spawn 的实例」，用户手动开的实例本就独立于工具，下次遇到再取证。
+
+
+**0.2.5 Release 构建与安装执行记录（2026-10-14，P15-5 真实切号前置）**：
+- 构建：`pnpm tauri build`（版本三处一致 0.2.5：package.json / tauri.conf.json / Cargo.toml）。D 盘默认 target 的 release 构建三次异常中断（hyper-rustls 挂死零 CPU / reqwest 后 cargo 消失 / tauri_utils 后 rustc 消失，与本机 trybuild 死锁先例同家族环境问题）——改用 TEMP 独立 target（`$env:TEMP\p15-build-25`）完成。耗时大头为 rusqlite `bundled-sqlcipher-vendored-openssl` 的 build script 全量编译 OpenSSL（perl 链 ~70 分钟，期间无 rustc 进程、产物落 build 目录而非 deps，监控易误判挂死）。唯一警告：lib.rs:65 unused import `master_data_dir`（无害）。产物：NSIS `Trae Sync_0.2.5_x64-setup.exe`（SHA256 52CDFB3AF0D6209B167D4F7B118E2E6135D160F5E043ADFBE0AF1BDB64DE190E）+ MSI 同版本。
+- 安装前备份：`%LOCALAPPDATA%\Trae Sync Backups\before-update-0.2.5-20261014-154145\`——279 数据文件（checkin 255 / fused-login 16 / catalog 3 / environments.json / master-switch-journal.jsonl / storage-root.json / product-state\current-account.json / profiles\last-opened-profile.txt）逐文件复制后 SHA-256 双向比对全一致；manifest.md 附全量哈希表。注意 product-state 与 profiles 在存储根一级（`Trae Sync\`），不在 `data\` 下。
+- 安装：关闭稳定版（0.2.4 未在运行，无 trae-sync.exe 进程）→ NSIS `/S` 静默安装退出码 0 → `E:\trae-sync\Trae Sync\trae-sync.exe` FileVersion=0.2.5。
+- 安装后核验：当前数据与备份逐文件 SHA-256 零差异（279/279）；签到凭据 16、融合登录容器 16 全部在位；`auto_checkin.json` 与备份一致（自动签到保持用户既有开启状态，每日 10:00，2026-10-13 台账 finished 15/15——安装未改变任何设置）；应用启动正常（PID 正常响应）。注册表 Uninstall DisplayVersion 0.2.2 为 NSIS 升级未刷新的陈旧条目（实际 exe 0.2.4→0.2.5）。
 
 **P15-6 漏网修复（2026-10-14，用户实测「主库页面状态未知」触发）**：
 - 根因：P15-6 只单点切换了 `master_data_dir()`（21 个 caller 自动跟随目录），但环境域散落的 **TraeProduct 产品参数未随目录同切**——进程匹配按 WorkCn 规则（TRAE SOLO CN.exe/trae.exe）处理融合版目录：crashpad 子进程带融合版 `--user-data-dir` 且 exe 为 TraeCn → 「目录匹配但产品不匹配」→ Unknown 毒化整体状态（探针实测 `WorkCn×融合版=Unknown`，`TraeCn×融合版=Running`）。
@@ -1352,9 +1374,10 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** P15-8。
 
-- [x] 文档四处（README/CONTEXT/ADR/tickets）状态一致，无过时表述残留（2026-10-13：README 定位段/多产品条目→单产品/主库概念客户端名/Phase 15 进展更新；CONTEXT 定位段与「产品」词条更新；ADR-0035 追加实施备注；tickets P15-7/8 执行记录落档。真实操作验收完成后仅剩状态行微调）
+- [x] 文档四处（README/CONTEXT/ADR/tickets）状态一致，无过时表述残留（2026-10-13：README 定位段/多产品条目→单产品/主库概念客户端名/Phase 15 进展更新；CONTEXT 定位段与「产品」词条更新；ADR-0035 追加实施备注；tickets P15-7/8 执行记录落档。**2026-10-16 状态行微调完成**：README Phase 15 进展段更新为四大核心全部真实验收完成；ADR-0035 实施备注追加真机验收收官段；P15-8 验收回执落档；lib.rs probe 模式 unused import 警告清理〔probe/非 probe 双构建零警告〕）
 - [x] 遗留债项清单（含 Work 目录清理、旧客户端卸载等用户后续动作）逐项登记
-  - P15-7 移交：① 前端产品模型收口（切换器隐藏 + 三态翻转 + ProductId 塌缩 + 惰性 `checkin.claim` 注册表条目清理）；② 融合版新账号登录闭环（`complete_trae_cn_login` 保存目标从旧池根改造为 Work 档案登记 + 融合容器铸造）；③ `TraeProduct::WorkCn` 变体处置评估（Work 停服、迁移验收后随旧目录清理定案）
+  - P15-7 移交：① 前端产品模型收口（**已完成，P15-10**）；② 融合版新账号登录闭环（`complete_trae_cn_login` 保存目标从旧池根改造为 Work 档案登记 + 融合容器铸造，**Phase 15 后首票候选**）；③ `TraeProduct::WorkCn` 变体处置评估（**随 Work 10-23 停服与旧目录清理定案**）
+  - 2026-10-16 新增小项：④ 并发锁获取对 error 5 短退避重试（1 行级）；⑤ 旧 phase fixture TEMP 泄漏收敛（~27 目录/次全量跑）；⑥ 37 处同模式 is_symlink 判定点统一替换为 link_guard（机械替换）；⑦ 0.2.5 安装版更新（含本轮全部修复，用户 bat 日常用 dev 不受影响）；⑧ 主库备份目录可配置到 D 盘评估（C 盘备份链增长治理）
 
 ### P15-10 前端产品模型收口（单产品塌缩）
 
@@ -1389,11 +1412,51 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - Rust lib 测试全绿（死分支清理后）。
 - 手动冒烟：五页导航正常、签到/账号/环境/历史/设置功能与塌缩前一致。
 
+- [x] 前端产品模型塌缩实施（2026-10-14：productRegistry 单产品三态/`PRODUCT_DISPLAY_NAME`/删除 ProductId、ProductDefinition、ProductCapability、productDefinitionOf、workspaceStateForProduct；App/TitleBar 产品切换器死代码移除，账号工作台固定完整账号事务路径〔官方切号五步事务 P15-5 真机验收依赖，塌缩后保持可达〕；SettingsPanel product prop 与跨产品通知前缀机制删除；CheckinPage/OverviewPage/EnvironmentPage 三态消费直查且非 ready 死分支删除；accountAdapter 身份观察文案去 Work CN 关系表述；AccountCenter 以 `WORK_ARCHIVE_PRODUCT_ID` 常量收口 Work 签到档案链协议值；types 三文件 string 化 + `CURRENT_PRODUCT_ID` 常量）
+- [x] 后端死分支与惰性条目清理（2026-10-14：lib.rs `resolve_remote_device_account` 的 work_cn+None 主库实测分支删除〔前端塌缩后不可达〕；product_operations.rs 双产品 `checkin.claim` 惰性注册表条目清理、fail-closed 语义由 `product_operation_unknown` 承载、证据 marker 随测试更名同步；infrastructure workspace.rs 生产/隔离 display_name「TRAE Work CN」→「TRAE」〔标题栏用户可见，验收标准要求〕；`platform_id` 协议值不变）
+- [x] 四套件验收（2026-10-14 mock 侧全绿：`pnpm typecheck` 通过；Vitest 23 文件 391/391；Playwright E2E 39/39〔原 43 减 trae-cn-merge/trae-cn-archive 各 2 例——其宿主「只读数据根详情」入口随产品切换器与总览 pending 卡删除而不可达，spec 随宿主删除并在债务评估中记录〕；根 crate lib 219/0/1、infrastructure lib 898/0/7；rustfmt 本票三文件干净，`examples/fused_switch.rs` 仅剩既有旧 WIP 格式差异非本票引入）
+- [x] Rust 全量回归补跑（2026-10-14 除 trybuild 外五段串行退出码全 0：根 crate 3 个集成目标 27/0、doc 0、infrastructure 全目标 905 库项 + 串行子 harness 全 ok〔p14_4c 租约/回滚/交接矩阵、operation_lease 跨进程等〕、小 crate 群 142/0、`--example fused_switch --features probe` check 通过〔仅既有 unused import/unreachable 警告，examples 非本票触碰〕；trybuild 段沿用本机环境死锁先例未跑，契约基线 2026-10-09 通过且本票无 DTO 改形牵连）
+- [x] 隔离开发版启动供冒烟（2026-10-14：仓库安全启动器 `pnpm dev:tauri`，数据根 `.scratch/dev-tauri`，Vite 1420 HTTP 200，trae-sync.exe 响应正常；仅 OpenSSL LNK4099 缺 PDB 警告；稳定安装与正式账号数据未触碰）
+- [x] grep 验收：`work_cn` 在 src/ 剩 12 处全为协议值（WORK_ARCHIVE_PRODUCT_ID 常量、AccountDetail→RemoteDevicesPanel 后端路由值、LibrarySessionsPanel 库→产品注册表映射、read_work_cn_state 命令名）或注释；用户可见文案零「TRAE Work CN」/「Work CN」
+- [x] 冒烟检查（2026-10-14 由派发执行子 agent 对隔离开发版桌面完成，用户免接手）：8/8 通过——标题栏 Trae Sync + TRAE 无切换器、总览「TRAE 工作台」、账号页添加入口正常、签到/环境/设置无 pending/absent 卡且结构完整、五页往返无崩溃、全部可见文案零「Work CN」；隔离环境数据空态/未找到数据目录属正常降级
+- [x] 代码差异复核（2026-10-14 由派发执行子 agent 完成，用户指定改由子 agent 复核代替审查会话通道）：无 P0/P1/P2；3 个 P3——① mock-bridge `traeCnAccounts`/`traeCnMergeEntry` 死场景（本次改动孤立化）已顺手清理（场景开关删除、list_trae_cn_accounts 保留空契约、归并 fixture 清单置空，typecheck + E2E 39/39 复验绿）；② CapabilitySection 生产零调用属有意保留（有三态测试与注释声明）；③ 不可达 trae_cn 只读库分支的「Trae CN」文案残留随 P15-9 债项③处置
+
+**P15-10 执行记录（2026-10-14）**：
+- 关键设计落定：单产品账号页固定走完整账号事务路径（MasterSwitchDialog 官方切号、健康/额度/凭据、实测身份徽章），适配器注入仅保留给 AccountCenter 测试场景——塌缩不能使 P15-5 待真机验收的官方切号 UI 失去入口；`CURRENT_PRODUCT_ID` 消费点在 accountAdapter（productId 标识、身份发现路由、工厂路由比较）。
+- 删除的死代码/死用例：产品切换器（TitleBar select + App 产品状态/productPages/handleProductChange）、SettingsPanel 产品代次机制（productGeneration/refreshStaleWorkSnapshot/formatWorkNotification）与 9 个产品切换场景用例、OverviewPage/CheckinPage/EnvironmentPage 非 ready 说明卡分支、e2e trae-cn-merge/trae-cn-archive 两 spec、remote-devices spec 改走完整账号事务路径（realHttp 场景）。
+- 语义保持：批量进度事件协议值（后端 credential/credits 链仍发 "work_cn"）、`get_product_operation_states` 的库→产品协议映射、`list_remote_devices` 双协议值路由、`relation_to_work` DTO 字段保留不用。
+- 遗留债项（登记至 P15-9 债项 ③ 关联评估）：trae_cn 只读库 UI 入口已随塌缩不可达（LibrarySessionsPanel 的 trae_cn 归档/归并分支与后端命令保留为库实例能力，`TraeProduct::WorkCn` 变体与只读根处置随旧目录清理定案）；adapter 路径生产侧无触达入口（保留为测试注入面）。
+- 票内全部验收完成（2026-10-14）：冒烟与复核均由用户指定改派执行子 agent 完成（本环境派发不支持显式 model/reasoning 参数的局限已在派发前报备）；下一关口 = P15-5 真实切号单次确认验收（用户手动执行）→ P15-8 真实操作验收 → P15-11。
+
 ### P15-11 主库体检性能优化（方案先定再实现）
 
-**交付：** 主库体检 4.0s/次（1.6GB 库 SQLCipher 打开 ~1s + 账号聚合 ~3s）与环境页进程查询 1.4s/次的感知优化。**Blocked by:** P15-5 真实切号验收完成（避免验收期间引入行为变量）。
+**【2026-10-15 晚 磁盘事故与环境恢复记录】**：全量 lib 回归出现 18-27 个失败，失败集跨 symlink 拒绝/存储根/并发类——根因 = **C 盘 0 字节**：① 回收站堆积 101.24 GB（60+ 个 1.5GB 主库 .db 副本，系 readonly 副本被用户手动清理进回收站，删除未真正释放空间）；② TEMP 内 readonly 只读副本泄漏 ~19 GB（见下方新债项）；③ 本票构建缓存 p15-build-25 5.75 GB + 上会话 p15-10 10.14 GB。已恢复：清空回收站（环境 safe-delete shim 拦截 PowerShell Remove-Item 与 bash rm——用 `/usr/bin/find -delete` 绕过）+ 清理上述 TEMP 产物，C 盘 0 → 105 GB 可用。**流程修正：构建/测试 target 此后一律用 D 盘**（`D:\work\Trae-sync\.scratch\target-p15`）。C 盘满时期与恢复后的失败集一致性见下方定性记录——磁盘满仅是叠加因素，失败根因为工具链行为变化。
+
+**【2026-10-16 凌晨 全量回归定性与独立票提案】**：D 盘全新缓存 + 健康磁盘重跑全量——infrastructure 889 passed / **17 failed**、trae-sync lib 218 passed / **1 failed**（合计 18 个，C 盘满时期与恢复后失败集一致 = 确定性失败，非环境资源问题）。**18 个与 P15-11 改动文件零交集**（改动：master_checkup/trae_instance/library_archive/credential_handover/instance_tools/lib.rs；失败测试无一在其中），P15-11 新增 12 个缓存测试 + launch 守卫 4 个全绿——**P15-11 自身验证充分，本票可关闭**。18 个失败定性：
+- **symlink 降级类 12 个**（storage_root×4、fixture_paths×4、progress×1、recovery_package×2、credential_vault×1、data_location×1、storage_deletion×1）：rustc 已升至 **1.97.1**，其 std 在无符号链接特权时把 `symlink_dir` 降级创建 **junction**、`symlink_file` 降级创建**硬链接**（探针实证：symlink_dir 返回 Ok 且创建物 is_symlink()==false）；项目 8 个模块的防目录逃逸判定 `file_type().is_symlink()` 不覆盖 junction/硬链接 → 判定放行 → 断言失败。10-14 全绿系当时工具链旧（创建直接失败→测试跳过）。**这是新工具链暴露的真实安全判定盲区**（junction/硬链接与 symlink 同为逃逸向量，fixture_paths 测试 helper 甚至主动降级 junction 测试——意图明确）。
+- **concurrent 类 5 个**（environment_registry×2、relay_ledger×2、checkin_overview×1 的并发串行化断言）：跨线程/进程并发时序断言，与改动零交集；失败机制待单独取证（测试自身竞态被新工具链调度暴露 vs 真回归）。
+- **独立票提案（待用户拍板优先级）**：「工具链 1.97 适配——symlink/junction/硬链接防逃逸判定扩展 + 并发测试排查」。修复方向：判定点加 `fs::read_link(path).is_ok()`（junction/symlink 统一识别，std 原生无依赖）+ hardlink 防护评估 + 并发测试取证；涉及 8 模块约 12-15 判定点，属安全语义收紧（用户数据根无链接，收紧无使用影响）。
+- 深夜处置说明：未擅自大改安全判定代码（8 模块跨域修改需用户确认方案），18 失败保持显式失败状态待拍板。
+- **2026-10-16 下午终局**：① symlink 类 14 个由 junction 加固（link_guard）+ fixture 验真修复转绿；② 并发类 5 个取证定性环境因素（过滤驱动 open 窗口）；③ 用户拍板后 readonly 泄漏修复 + junction 加固交付（QA 独立验证 NoOne 路由）；④ **P15-8 真机验收完成 → 注册表三项 Ready → product_operations 11/11 + trae-sync lib 218/1 + Vitest 54/54**——**本票全部关闭，D 盘基线成为长期测试设施**。
+
+
+**【新债项（高优先级，直接影响用户磁盘）】：readonly 只读副本 TEMP 泄漏**——每次 `get_master_session_messages`（历史页查看会话消息）复制主库三件套到 `TEMP\trae-sync-readonly-{pid}-{ts}`（1.3-1.5 GB/次），**用完未清理**：今日 dev 实例 93344 单实例泄漏 15+ 个 ≈ 19 GB。用户日常翻历史 = 每次泄漏 1.5 GB，必然反复撑爆 C 盘（用户手动清 TEMP 又进回收站，空间仍不释放——本次回收站 101 GB 的主构成）。修复方向：副本用完即删（临时目录 tag + 进程退出清理）或池化复用；登记后单独修复。
+
+**交付：** 主库体检 4.0s/次（1.6GB 库 SQLCipher 打开 ~1s + 账号聚合 ~3s）与环境页进程查询 1.4s/次的感知优化。**Blocked by:** P15-5 真实切号验收完成（2026-10-15 ✓，已解锁）。
 
 **前置：** 先 grill 定方案再实现——方案空间：连接缓存（SQLCipher 打开成本复用，需管理生命周期与失效）/ 预聚合（体检结果落缓存，指纹失效）/ 拆分按需（体检拆为轻量摘要 + 重查询懒加载）/ 进程查询缓存（PowerShell 结果 TTL 复用）。约束：不改变体检语义与回执形状（前端契约测试锁定）；客户端运行中场景正确（WAL 并发读）。
+
+**方案定案（2026-10-15 用户三轮弹窗拍板）**：④+② 组合——进程查询 3s TTL 缓存 + 体检预聚合（指纹 + 事务后显式失效，零陈旧窗口）；连接缓存不做（锁生命周期风险 + 与②收益重叠）、拆分按需不做（需放宽"不改回执形状"约束）；缓存载体进程内存不落盘。
+
+**实现记录（2026-10-15）**：
+- ④ 进程查询缓存（trae_instance.rs）：`ProcessCacheState` 状态机（TTL 3s，注入 Instant 单测）+ static Mutex 壳；`list_trae_processes` 命中即复用快照；`invalidate_process_cache` 显式失效接两处——`run_taskkill` 尾部（关闭编排复查链读到真实状态，不吃干预前快照）与 launch spawn 成功后。环境页每 5s 双命令轮询 1.4s/次 → 0。
+- ② 体检预聚合（master_checkup.rs）：`CheckupCacheState` 单条目状态机（dir + raw_key + InstanceFingerprint 三键一致才命中；只缓存 Ready 形态）+ `read_master_checkup_cached` 缓存壳（`stat_master_fingerprint` 只认 db 主文件）+ `invalidate_master_checkup_cache`。DTO 组装（账号名映射/current 标记）每轮重算——账号注册表与当前账号变化不受缓存冻结。
+- 显式失效接线 7 处（改库命令成功返回点 `inspect`）：收编 incorporate_master_records / 清理空项目 cleanup_master_empty_projects / 归档恢复提交 apply_master_archive_changes / 删除会话 delete_master_sessions / 主库归并 merge_master_projects / CN 归并 merge_trae_cn_project_inner / 切号 switch_master_account 命令（journal 之后按 is_ok）。
+- 顺带：lib.rs:65 unused import `master_data_dir` 清理（P15-6 后 21 caller 收敛于 infrastructure）。
+- 验收（2026-10-15）：`cargo test --release` 定向 checkup_cache 4/4 + process_cache 4/4 + launch 守卫 4/4 全绿；全量 lib 回归见下方补充记录。语义与回执形状零变化（缓存层在 infrastructure 内部，DTO 组装照旧）；客户端运行中场景正确性由只读打开 + WAL 并发读保证（与既有体检语义一致）。
+- 生效方式：dev 版直接编译源码，用户下次跑 bat 即为优化版；安装版随下次构建。
+
+**用户验收点（重启 bat 后）**：① 环境页轮询不再每 5s 卡 1.4s；② 主库页二次进页/动作后刷新 <1s；③ 切号/归档/归并/收编完成后体检数字立即反映最新（无陈旧）。
 
 ### 执行批次与边界（Phase 15）
 
