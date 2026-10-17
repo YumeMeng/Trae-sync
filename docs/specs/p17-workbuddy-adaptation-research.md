@@ -114,14 +114,25 @@
 - daemon 自动刷新（客户端运行期间周期调用；`lastRefreshTime` 与日志刷新调用吻合）；daemon RPC 通道实测存在 `auth:getCheckinStatus`/`auth:getAccountUsage` 等方法（wbipc）。
 - 身份三形态并存（捕获实施时核对关联）：本地 uid UUID（89b16d6b…）、uin 12 位（330126449009）、P17-T1 的 20 位平台 ID（wb-slot-configs 内嵌）；设备级 `~/.workbuddy/device-id`（UUID）。
 
-### 8.4 捕获编排凭据层设计（2026-10-17 第二轮深化后修订）
+### 8.4 捕获编排凭据层设计（2026-10-17 第三轮定稿：面 A 翻案并真机闭环验证）
 
-- **面 A（文件解密）定性不可行**（反编译实读定案）：字段信封 keyId=`9127dea1b44020a7`=`sha256(key)[0..16]`（deriveAtRestKeyId）；密钥经 `configureCredentialProtection` 注入（log-acl-guard），来源 `electron.workbuddyStorage.loggerGet()`——**魔改 Electron 原生 API，asar 内无对应 addon**，密钥仅存在于客户端进程内存；主进程→daemon/sidecar 经 IPC 分发（日志实测 `[CredentialBootstrap] daemon gate payload-received` / `sidecar delivery spawn symmetricAvailable:true`）。纯文件解密需逆向 Electron 二进制，不做。
-- **keyblob 语义修正**：`keyblob.keyId`(1f927d47)=keyblob 保护的主数据键（userKey，用于 whole-file 保护）；`slots[].protectorKeyId`(9127dea1)=保护键=symmetricKey=**字段加密键**；`wrapped`=`AtRestCrypto(protector).seal(masterKey)`。AES-256-GCM suite=1，AAD=`buildAuthenticatedContextAad(keyId, suite, {framing,purpose,resourceId,fieldPath}, scheme)`（上下文绑定）。
-- **面 B（wbipc RPC）= 唯一可行捕获路径**：wbipc broker（`~/.workbuddy/wbipc/endpoint.json`：管道+ticket，ticket 随启动轮换）→ JSON-RPC 风格 `{method, params, id, mode}`；broker 方法 `broker/ListPipes`（枚举服务管道）/`broker/GetPipe{pipe}`（解析方法表）/`$/cancel`；E_* 错误码族（NOT_DECLARED/CONSENT_REQUIRED/POLICY_DENIED…）。**auth 通道全表**（asar 通道名表 Fa 实读）：`auth:login`/`auth:logout`/`auth:getAccount`/`auth:getToken`/`auth:refreshToken`/`auth:refreshSession`/`auth:statusChanged`/`auth:sessionExpired`/`auth:getUserInfo`/`auth:getAccountUsage`/`auth:updateAccountNickname`/`auth:getOauthUser`/`auth:saveOauthToken`/`auth:revokeAll`/`auth:getCheckinStatus`/**`auth:claimDailyCheckin`**/`auth:getActivityBanner`/`auth:getAmbassadorStatus` 等。捕获=getToken/getAccount；切换=logout+saveOauthToken/login；**签到可直连 claimDailyCheckin（WorkBuddy 签到适配可能无需 HTTP 重实现——重大利好）**。
-- **文件面健康检测（无需密钥/无需客户端运行）已交付**：`expiresAt/refreshExpiresAt/uid/uin/scope/domain` 为明文——`workbuddy_credential.rs` 解析快照 + 状态判定（FileMissing/LoggedOut/AccessExpired/FullyExpired/Active/Unknown），登出标记 `{path}.logged-out` 优先（与客户端 restore 语义一致）。5/5 单测 + 真机核对（Active，access 剩 27 天）。
-- **登出机制**：`beginLogout()` 写 UUID 标记文件（原子写+PID+UUID），`clean()` 会话改名备份后删标记；watcher 监听外部变更调和（工具若写会话文件会被客户端感知——**切号实施必须走 RPC 或关闭编排**，不可直接改文件）。
-- **运行时探针**：`wbipc_probe_p17.rs`（broker 协议发现，只读）、`workbuddy_session_probe_p17.rs`（会话健康报告）——真实账号登录/捕获/切换测试时由用户配合执行。
+> 演进记录：第一轮（纯 asar 静态分析）定性「面 A 不可行」（密钥似仅存进程内存）；第二轮社区证据推翻该结论；第三轮本机复现验证——**面 A 完全可行且已闭环**。
+
+- **面 A 翻案（真机验证 ✅）**：`electron.workbuddyStorage.loggerGet()` 的底层原生绑定名 `electron_browser_workbuddy_storage` 可经 **ELECTRON_RUN_AS_NODE 模式直接调用**——`ELECTRON_RUN_AS_NODE=1 WorkBuddy.exe get_key.cjs` + `process._linkedBinding('electron_browser_workbuddy_storage').loggerGet()` 返回 `{version:1, atRestSecretKey, atRestDeveloperPublicKey}`。本机实测：atRestSecretKey 44 字符 → `sha256(secret utf8)` 32B → `sha256(key)前16hex = 9127dea1b44020a7` **与本机信封 keyId 逐字一致**；AES-256-GCM 解密真实信封成功（accessToken 1323 字符 JWT / refreshToken 700 字符 JWT，密钥与明文全程内存内零外显）。**客户端无需运行**（exe 静态存在即可，独立 node 进程，只读）。
+- **AAD 定案**（GCM 校验通过为准）：`"WB-AAD\0" + 0x01 + LP("WBEV1") + LP("sym-v1") + u32(suite) + LP(keyId) + 0x02 + 0x00 + 0x00`（field framing；sequence 缺省 + final=false）。
+- **与 Trae 方式同构定案**：Trae=读 storage.json 明文 blob → 铸造；WorkBuddy=读 .info 信封 + 客户端运行时取钥解密 → 明文 token。**捕获编排可整体复用 Trae 骨架（客户端关闭状态也能捕获/铸造）**，wbipc RPC 降级为客户端运行时的辅助面。
+- **社区对照（不重复造轮子的确认）**：
+  - [88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)（MIT）：与本文同构方案——「sym-v1/suite 1 信封由本机客户端自带运行时在隐藏子进程中解密，只通过内存管道返回 access token」；兼容明文（旧版）与信封（5.6.2+）；refresh token 不处理、登录续期由客户端负责（与本工具「客户端续期、工具只读」同构）；工程纪律可借鉴：写操作不重试（防重复提交）、查询可退避重试、`doctor` 本地能力自检、签到先查后领。
+  - 逆向文章（腾讯云 2755000）：WorkBuddy **5.6.2 起加密**（5.5.x 及更早为明文 JWT——社区「明文 JSON」说法适用旧版，本机 5.8.3 实测为信封）；key 不落盘=安全设计；token 有效期约 55 天（access）/60 天（refresh），过期回本机重新解密刷新。
+- **签到协议定案（官方接口，与 Trae 直连签到同构）**：
+  - 查询：`POST {domain}/v2/billing/meter/checkin-activity-status`（只读）
+  - 领取：`POST {domain}/v2/billing/meter/daily-checkin`（幂等，重复领返回 `code=10001`「今天已签到」）
+  - 请求体 `{}`；头：`Authorization: Bearer <accessToken>` + `X-User-Id: <uid>`（与 CLI 认证配置 usernameHeader=X-User-Id 一致）
+  - domain 以 `auth.domain` 为准（本机 www.workbuddy.cn；社区亦用 copilot.tencent.com——两者均在 internalDomain 族）
+  - 积分周期：第 1-6 天每天 100、第 7 天 1000（单周期 1600）
+  - 成长中心/猫猫旅行等扩展接口 88lin 仓库已逆向（域名与签到不同，可后续按需引入）
+- **辅助面（wbipc RPC，客户端运行时）与切号约束**：auth 通道全表（asar 通道名表实读）：`auth:login`/`auth:logout`/`auth:getAccount`/`auth:getToken`/`auth:refreshToken`/`auth:refreshSession`/`auth:getUserInfo`/`auth:getAccountUsage`/`auth:getOauthUser`/`auth:saveOauthToken`/`auth:revokeAll`/`auth:getCheckinStatus`/`auth:claimDailyCheckin` 等；broker 协议（ListPipes/GetPipe + JSON-RPC 风格）见 wbipc_probe_p17.rs。**切号写路径约束**：客户端 watcher 监听会话文件外部变更并调和（WB-44172 防误登出语义）——切号实施必须走 auth:login/logout/saveOauthToken RPC 或关闭编排，不可直接改写 .info 文件。
+- **待办实施顺序**：① workbuddy_credential.rs 扩展信封解密（Rust 端取钥子进程 + AES-256-GCM + AAD，兼容明文/信封双形态，5/5 单测已有骨架）；② 捕获编排（复用 Trae 骨架：快照 → 解密 → 在线复核 → WorkBuddy 登录代次容器铸造 → 档案登记）；③ 签到直连（status → claim → status，code=10001 幂等语义对齐 Trae already_checked_in）；④ 切号走 RPC（auth:logout → auth:login/saveOauthToken），破坏性单次确认。
 
 ### 8.5 备份范围缺口警示（T4b 后续建议）
 
