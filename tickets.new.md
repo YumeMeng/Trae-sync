@@ -1561,7 +1561,7 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 **Blocked by:** 遗留优先——新号真机验收（待新号）与 OAuth 清理完成后启动。
 
-- [x] P17-T1 探针：账号体系定论（CodeBuddy 账号 + OAuth 授权码流，asar 主代码分析）；登录态精确定位待用户登录 WorkBuddy 产生样本后重探（当前未登录，无 token 存储）
+- [x] P17-T1 探针：账号体系 + 标识层全部定论（隔离环境解析 2026-10-17）：平台用户 ID = 20 位数字（实测 2079418751248068608）、存储键 wb-slot-configs::*（Local Storage V8 序列化，解析器已验证）、设备标识 AEGIS_ID、实例租约 polling-lease-{SID}；token 层在 daemon/云端侧，随捕获实现时随登录流程观察补定位
 - [x] P17-T2 探针：数据层定性（未登录空壳）+ 进程/路径适配点（WorkBuddy.exe + ~/.workbuddy/app）+ 18488 LocalProbeServer 实测（/workbuddy/probe 端点可用）+ 资料库联邦协议线索
 - [ ] P17-T3 系统性 product descriptor 抽象（TraeProduct/LoginProduct/OAuthClient/存储根五层散落收口，fact-finder 盘点为基线）
 - [ ] P17-T4 双产品扩展实施（数据层/凭据层按探针结论，架构骨架复用闸门/备份/纪律/流程）

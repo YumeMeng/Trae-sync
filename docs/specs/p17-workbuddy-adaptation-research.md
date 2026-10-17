@@ -71,3 +71,15 @@
 
 ### T1 部分完成（待登录样本）
 - 登录态定位：本机 WorkBuddy 处于**未登录/低使用状态**（无 token 存储）——**精确定位需用户在 WorkBuddy 登录一次后重探**（localStorage/daemon 侧将出现可解析样本）。账号体系已定论（CodeBuddy 账号 + OAuth 授权码流，见第 6 节）。
+
+
+### T1 定稿 ✅（2026-10-17 隔离环境解析，commit 9800cad 后续）
+
+**隔离环境**：生产数据根完整复制到 `.scratch/p17-isolated/app`（52MB，零生产触碰）。
+
+- **用户标识定论**：**平台用户 ID = 20 位数字字符串**（实测 `2079418751248068608`，腾讯平台 ID 风格；与 Trae 的 16 位 user_id 形态区分）。
+- **标识存储**：Local Storage leveldb（`session/Local Storage/leveldb/`）键 `wb-slot-configs::{userUUID}:personal:zh:{tag}`，值为 **V8 序列化**（UTF-16-LE 交错，解析器已验证可提取）。
+- **设备/实例标识**：`AEGIS_ID`（Local Storage，UUID a900ba02-...）+ `polling-lease-{SID尾段}.json`（ownerId UUID + pid + heartbeat——多实例租约机制）。
+- **键名族**：`CODEBUDDY_DISABLE_AGENT_TEAMS`/`IDE_STORAGE_LANG`/`META:file://`（origin=file://）——配置与身份键族已摸清。
+- **token 层**：Local Storage 未见 access token（在 daemon 侧或云端会话——捕获实现时随登录流程观察补定位；账号标识层已足够支撑适配设计）。
+- **解析方法**：leveldb 值为 V8 序列化——UTF-16-LE 宽解码 + 交错剥离（python 片段见探针产物）。
