@@ -83,3 +83,44 @@
 - **键名族**：`CODEBUDDY_DISABLE_AGENT_TEAMS`/`IDE_STORAGE_LANG`/`META:file://`（origin=file://）——配置与身份键族已摸清。
 - **token 层**：Local Storage 未见 access token（在 daemon 侧或云端会话——捕获实现时随登录流程观察补定位；账号标识层已足够支撑适配设计）。
 - **解析方法**：leveldb 值为 V8 序列化——UTF-16-LE 宽解码 + 交错剥离（python 片段见探针产物）。
+
+## 8. T4c 凭据层定位定稿 ✅（2026-10-17 隔离环境解析 + 真机只读核对）
+
+> 结论先行：**本机在 P17-T1 时就有活跃登录态**（T1 的「未登录」结论仅在 `app/` + `~/.codebuddy` 扫描范围内成立，未覆盖 `~/.workbuddy` 根与 `%LOCALAPPDATA%\CodeBuddyExtension`）；登录态/token/加密链路/刷新端点全部定位完成，**用户无需重新登录采样**。
+
+### 8.1 存储位置（全部实测确认）
+
+| 对象 | 路径 | 说明 |
+|------|------|------|
+| **主登录会话** | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` | JSON（7905B）；路径规则 `{sharedDataPath}/auth/{authentication.id}.info`，`authentication.id` 来自 ACC 产品配置（值 `workbuddy-desktop`）；sharedDataPath 由主进程 FilePathServiceImpl 推导（win32 base=`%LOCALAPPDATA%\CodeBuddyExtension`，`Data/Public` 固定段） |
+| **密钥链** | `~/.workbuddy/keyblob` | JSON：`{version:1, keyId, slots:[{type:"static-v1", protectorKeyId, wrapped}]}`；wrapped 内层 `{suite:1, keyId, nonce, authTag, ciphertext}` |
+| **fallback 键** | `~/.workbuddy-key-fallback/connector-keys/{keyId}.key` | 32 字节原始 AES-256 键（连接器用） |
+| **每用户加密数据** | `~/.workbuddy/security/{uid}/data` | ACL 拒读（仅 SYSTEM/Administrators/守护进程身份）；持有者为沙箱中心命名管道——**直接文件捕获此路不通** |
+| **账号快照** | `~/.workbuddy/storage/skeleton/account-snapshot.json` | `{primary:{uid,nickname,type,editionType,...}}` |
+| **IPC 通道** | `~/.workbuddy/wbipc/endpoint.json` | `{endpoint:"\\\\.\\pipe\\wbipc-*", ticket}`——渲染层→daemon 的 RPC（凭据不过渲染层） |
+| 渲染层 Local Storage | `~/.workbuddy/app/session/Local Storage/leveldb` | **实测无 token**（命中全为 UI 内容/遥测 session id） |
+
+代码依据：`asar-full/main/file-authentication-storage.js`（FileAuthenticationStorage：store/restore/logout 标记/watcher 外部变更调和）、`app-lifetime-job.js`（at-rest 加密原语）、`workbuddy-paths.js`/`workbuddy-product-config.js`（configDir=`~/.workbuddy`）。
+
+### 8.2 会话文件结构（隔离副本脱敏解析）
+
+- `auth`：`accessToken`/`refreshToken` = **`{$wbEncrypted:1, envelope}` 加密信封**；`tokenType:"Bearer"`；`scope:"openid profile offline_access email"`（Keycloak 形态：sessionState/notBeforePolicy）；`domain:"www.workbuddy.cn"`；`expiresIn:2419200`（**access 28 天**）、`refreshExpiresIn:2592000`（**refresh 30 天**）；`lastRefreshTime/expiresAt/refreshExpiresAt` 毫秒时间戳。
+- `account`/`accounts`/`allAccounts`：`uid:"89b16d6b-0549-4e1e-8ced-918b5c8152ae"`（梦梦，free）、`uin:"330126449009"`；`nickname`/`phoneNumber` 同为加密信封。
+- 加密方案（app-lifetime-job.js 实读）：**AES-256-GCM（suite=1）**，12B nonce + 16B authTag，AAD=`buildAuthenticatedContextAad(keyId, suite, purpose, scheme)`（上下文绑定防挪用）；keyId 由键字节派生（16 hex）；keyblob static-v1 槽包裹数据键、protector 链同用户可解；失败类别含 `safe-storage`（Electron safeStorage=DPAPI 家族）。
+
+### 8.3 刷新机制（daemon 日志实测）
+
+- 端点：`https://www.workbuddy.cn/v2/plugin/auth/token/refresh`（daemon-server net-proxy 日志多次命中，DIRECT_TRUSTED no-proxy）。
+- daemon 自动刷新（客户端运行期间周期调用；`lastRefreshTime` 与日志刷新调用吻合）；daemon RPC 通道实测存在 `auth:getCheckinStatus`/`auth:getAccountUsage` 等方法（wbipc）。
+- 身份三形态并存（捕获实施时核对关联）：本地 uid UUID（89b16d6b…）、uin 12 位（330126449009）、P17-T1 的 20 位平台 ID（wb-slot-configs 内嵌）；设备级 `~/.workbuddy/device-id`（UUID）。
+
+### 8.4 捕获编排凭据层设计（只设计，铸造实施待单次确认）
+
+- **面 A（文件解密）**：读 `.info`（同用户可读，只读零破坏）→ 解析 `$wbEncrypted` 信封 → 按 keyblob/protector 链取 userKey（keyId 派生自键字节；AES-256-GCM open + AAD 上下文）→ 明文 token。解密链在实施时以真实数据验证。
+- **面 B（RPC，优先探明）**：wbipc 命名管道 + ticket（endpoint.json）→ daemon `auth:*` RPC 表（若存在会话/token 读取方法则优先走 B，不触碰加密层）。实施时先探 RPC 表再定 A/B。
+- **刷新**：工具侧只做只读健康检测；续期由 daemon 自理（与 Trae 融合版「客户端续期、工具只读」同构）；不写回会话文件。
+- **入池铸造**（WorkBuddy 登录代次容器）：待用户单次确认后按 Trae 捕获编排同构实施。
+
+### 8.5 备份范围缺口警示（T4b 后续建议）
+
+T4b 真机备份覆盖 `~/.workbuddy/app`（Electron userData：IndexedDB/LocalStorage/JSON）。以下凭据材料**不在备份范围**：登录会话（CodeBuddyExtension auth）、`keyblob`、`device-id`、`login-device-nonce`、`account-snapshot.json`。建议 T4b 扩展一个「凭据材料备份」入口（加密信封形态落盘，属凭据材料、按单次确认纪律执行）——待用户确认后实施。
