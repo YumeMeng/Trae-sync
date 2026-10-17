@@ -87,6 +87,8 @@ pub mod storage_deletion;
 pub mod product_descriptor;
 // P17-T4a：WorkBuddy 客户端实例管理（进程/本地探针 API/优雅关闭，descriptor 驱动）。
 pub mod workbuddy_instance;
+// P17-T4b：WorkBuddy 数据目录备份治理（目录树 zstd 压缩 + 清单 JSON + 恢复 + 保留裁剪）。
+pub mod workbuddy_backup;
 // P16-T2：存储根派生路径唯一来源（checkin/products-trae_cn/product-state/fused-login）。
 pub mod storage_roots;
 pub mod storage_root;

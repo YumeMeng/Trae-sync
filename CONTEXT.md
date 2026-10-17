@@ -1,5 +1,7 @@
 # Trae Sync
 
+2026-10-17 **P17-T4b 完成**：WorkBuddy 数据目录备份治理（workbuddy_backup.rs——目录树 zstd 压缩 + manifest 清单 + 恢复校验 + 保留裁剪，黑名单排除可再生缓存；真机 269 文件 24.30MB→23.11MB，体积大头 playbook-covers PNG 不可再压）。**当前关口 = P17-T4c 凭据层**（待用户 WorkBuddy 登录样本 → 登录态/token 定位 → 捕获编排设计，实施待单次确认）。
+
 2026-10-17 **Phase 16 全部完成**：账号捕获闭环（环境页「从客户端捕获账号」——blob 捕获→在线复核→.fused/.checkin 双铸造→档案登记→去重，入池即全功能，真机验收待新号补单次确认）+ 备份治理（E 盘软件旁 backups/ + zstd 管线——**SQLCipher 密文不可压**（诚实修正），迁移释放 C 盘 3.13GB）+ 移植性纪律（storage_roots 唯一来源/37 判定点 link_guard 统一/并发锁重试救回全部环境失败项 921/0+220/0/OAuth 链 deprecated）。**下一票 = 融合版新号真机验收（单次确认）+ OAuth 旧链清理 + WorkBuddy 适配立项调研**。
 
 2026-10-16 **P15-8 全部完成**：主库真实写操作验收通过（归并 chuDreamTool 重复项目 moved=1/空壳清理、删除 temp 会话+空壳清理、归档/恢复 site-packages 往返——探针 p15_acceptance 真实执行，库态五项核对全过，客户端结果用户确认；4 份 switch-bak 备份留痕）→ 注册表三项（library.archive/delete/work_project_merge）**Pending→Ready**，闸门进程规则保持，5 个测试按新事实演进（product_operations 11/11），**归档处按钮随重启 bat 解锁**。连同上午交付：readonly 泄漏修复（TEMP 稳态归零）+ junction 防逃逸加固（14 假红转绿）+ 并发 5 失败定性环境因素。**当前关口 = P15-9 文档收口**（含收编 incorporate 的 UI 能力核对、0.2.5 安装版更新评估、37 处同模式判定点统一替换评估、lib.rs probe 模式 unused import 警告清理）。

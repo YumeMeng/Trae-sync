@@ -1565,5 +1565,5 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - [x] P17-T2 探针：数据层定性（未登录空壳）+ 进程/路径适配点（WorkBuddy.exe + ~/.workbuddy/app）+ 18488 LocalProbeServer 实测（/workbuddy/probe 端点可用）+ 资料库联邦协议线索
 - [x] P17-T3 系统性 product descriptor 抽象（product_descriptor.rs：ClientIntegration 进程/路径/探针 API 事实 + UserIdShape 身份形态 + TRAE_CN/WORKBUDDY 双 descriptor 实例；WorkBuddy 探针实测事实填充——18488 端口组/probe 路径/20 位 ID/映像名/user-data-dir；expand-contract 纪律：新代码消费 descriptor，存量调用点随 T4 渐进替换；3/3 单测绿——workbuddy probe URL 同源校验/trae_cn 静态事实对齐/身份形态区分）
 - [x] P17-T4a 实例管理层（2026-10-17）：workbuddy_instance.rs——本地探针 API 客户端（descriptor 端口组逐试 + app==workbuddy-desktop 收紧判定）+ 进程清单（Win32_Process JSON 双形态解析）+ 关闭编排（主进程优雅→强杀→复查，trae_instance 同纪律）+ user-data-dir 解析（引号/裸值双形态）——5/5 单测绿
-- [ ] P17-T4b 备份治理扩展：IndexedDB/LocalStorage/JSON 数据目录的 zstd 压缩备份（未加密数据压缩真有效）——复用 backup 治理骨架
+- [x] P17-T4b 备份治理扩展（2026-10-17）：workbuddy_backup.rs——目录树 zstd 压缩备份（每成员独立标准 .zst 帧 + manifest.json 清单：相对路径/原字节/sha256）+ 恢复（双格式成员兼容 + 路径安全校验 + 逐成员校验失败清半写目标）+ 链枚举/保留裁剪（keep=0 禁用语义、非链散目录永不触碰）；黑名单制范围（可再生缓存目录 + lockfile 排除，登录后新增目录默认纳入）；前置编排 = close_workbuddy()（任一成员失败暂存清理零副作用）；11/11 单测 + 真机执行（269 文件 24.30MB→23.11MB 压缩比 0.951——体积大头为 playbook-covers PNG 不可再压，leveldb/JSON 可压部分仅约 0.3MB，回读校验 269 文件全一致）
 - [ ] P17-T4c 凭据层：捕获/登录代次铸造（**待登录流程观察**——CodeBuddy 协议参数 oauth_client_id/端点/设备绑定从登录会话填充）
