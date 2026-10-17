@@ -1,6 +1,6 @@
 # Trae Sync
 
-2026-10-18 **P17-T4c 实施推进：签到直连 Rust 化完成 + wbipc 协议定稿**：③workbuddy_checkin.rs（status/claim 官方接口，classify 纯函数 6/6 单测；端到端探针真机全绿——Active→解密→查询未签→claim +100 连签 5→6→复核翻转累计 600；先查后领/不重复领取纪律落地）；spec 8.6 wbipc 握手协议定稿（session_hello→challenge→prove[HMAC-SHA256(ticket, LP transcript)]→ack 带 pipes，切号 RPC 可实施）。T1/T2/T3 探针实测全通（10-17，首个真实功能闭环 +100 积分）。**当前关口**：②捕获编排（复用 Trae 骨架，铸造单次确认）④切号 RPC 实施（协议就绪，T6 需用户在场）+ 签到/账号面板进组合根与前端区块。
+2026-10-18 **P17-T4c 实施推进：签到直连 Rust 化 + 捕获容器/编排层完成 + wbipc 协议定稿**：③workbuddy_checkin.rs（6/6 单测；端到端真机全绿——10-17/10-18 各 +100 积分，连签 6 天，先查后领/复核翻转纪律）；②workbuddy_login_credential.rs（WBSESSN1 DPAPI 容器，纪律同构 fused：原子写+写后复核+绑定校验+脱敏 summary）+ workbuddy_capture.rs（捕获编排：快照 Active 校验→account-snapshot/device-id 身份→解密→uid 交叉校验→容器落盘；storage_roots 加 workbuddy-login 根）；spec 8.6 wbipc 握手协议定稿（切号 RPC 可实施）；infrastructure lib 966/0。**当前关口 = T5 捕获铸造真机执行（单次确认）** → 档案登记架构确认（AccountRegistry 并入 vs WorkBuddy 独立池，ADR 级）→ 切号 RPC（T6 需用户在场）→ 组合根/前端接线。
 
 2026-10-17 **Phase 16 全部完成**：账号捕获闭环（环境页「从客户端捕获账号」——blob 捕获→在线复核→.fused/.checkin 双铸造→档案登记→去重，入池即全功能，真机验收待新号补单次确认）+ 备份治理（E 盘软件旁 backups/ + zstd 管线——**SQLCipher 密文不可压**（诚实修正），迁移释放 C 盘 3.13GB）+ 移植性纪律（storage_roots 唯一来源/37 判定点 link_guard 统一/并发锁重试救回全部环境失败项 921/0+220/0/OAuth 链 deprecated）。**下一票 = 融合版新号真机验收（单次确认）+ OAuth 旧链清理 + WorkBuddy 适配立项调研**。
 

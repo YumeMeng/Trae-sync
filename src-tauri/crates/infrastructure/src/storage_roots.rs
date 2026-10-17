@@ -32,6 +32,13 @@ pub fn fused_login_root_from(storage_root: &Path) -> PathBuf {
     storage_root.join("fused-login")
 }
 
+/// WorkBuddy 登录代次容器根：`{storage_root}/workbuddy-login`（P17-T4c）。
+/// 与 Trae 融合版容器（fused-login）独立目录——跨产品凭据隔离（ADR-0029
+/// 产品分层：产品凭据分开建模，跨产品复制禁令继续有效）。
+pub fn workbuddy_login_root_from(storage_root: &Path) -> PathBuf {
+    storage_root.join("workbuddy-login")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +61,10 @@ mod tests {
         assert_eq!(
             fused_login_root_from(root),
             PathBuf::from("S").join("fused-login")
+        );
+        assert_eq!(
+            workbuddy_login_root_from(root),
+            PathBuf::from("S").join("workbuddy-login")
         );
     }
 }

@@ -93,6 +93,10 @@ pub mod workbuddy_backup;
 pub mod workbuddy_credential;
 // P17-T4c③：WorkBuddy 直连签到（官方接口 status/claim，幂等语义对齐 Trae）。
 pub mod workbuddy_checkin;
+// P17-T4c②：WorkBuddy 登录代次容器（WBSESSN1 DPAPI，纪律与 fused 同构）。
+pub mod workbuddy_login_credential;
+// P17-T4c②：WorkBuddy 账号捕获编排（快照→解密→容器落盘；铸造待单次确认）。
+pub mod workbuddy_capture;
 // P16-T2：存储根派生路径唯一来源（checkin/products-trae_cn/product-state/fused-login）。
 pub mod storage_roots;
 pub mod storage_root;
