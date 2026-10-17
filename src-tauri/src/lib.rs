@@ -113,6 +113,8 @@ mod library_archive;
 pub mod credential_handover;
 #[cfg(not(feature = "probe"))]
 mod credential_handover;
+// P17-T5 并列骨架：WorkBuddy 产品域命令 + 产品注册表/切换命令。
+mod workbuddy_commands;
 // P16-T4：新账号「从客户端捕获」入池编排（spec docs/specs/p16-account-capture.md）。
 mod account_capture;
 // P12-R3：插件域（P5-8b 插件 tab：ADR-0023 环境插件清单 + ADR-0026 实时同步）
@@ -151,7 +153,7 @@ pub(crate) const WORK_CN_SOURCE_RAW_KEY: &str =
     "3605f6691095a993f03d5009c918352ef5be31ae31e8f000212b81ff058da773";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeMode {
+pub(crate) enum RuntimeMode {
     Fixture,
     RealReadPreview,
 }
@@ -239,8 +241,8 @@ impl AuthorizationSlot {
 /// T03 新增 storage_root——从 env `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取，
 /// 作为快照发布与目录库存储根。各命令按需构造 service，不在 AppState 持有连接。
 #[derive(Clone)]
-struct AppState {
-    runtime_mode: RuntimeMode,
+pub(crate) struct AppState {
+    pub(crate) runtime_mode: RuntimeMode,
     /// 启动时冻结的安装能力，不接受前端或环境变量在运行中提升。
     capabilities: CapabilityManifest,
     /// 生产目录库运行材料只由启动组合根创建，不接受命令参数注入。
@@ -256,7 +258,7 @@ struct AppState {
     /// 存储根路径，从 env `TRAE_SYNC_FIXTURE_STORAGE_ROOT` 读取。
     /// 快照发布到 `<storage_root>/snapshots/`，目录库由 `catalog/current.json` 选定。
     /// 空字符串表示未配置——扫描命令返回错误。
-    storage_root: String,
+    pub(crate) storage_root: String,
     /// T08/T13 固定恢复区；未配置时所有需要恢复区的操作失败关闭。
     recovery_root: String,
     /// T08 后端进程观测器；前端传入的 process_state 不能替代它。
@@ -419,7 +421,7 @@ fn ensure_real_preview(state: &AppState) -> Result<(), String> {
 
 /// P12-R2a 真实模式门禁（登录域）：仅 RealReadPreview 可通过。
 /// fixture 模式拒绝并返回稳定错误码 `login_real_mode_required`（前端/e2e 契约，勿改）。
-fn ensure_login_real_mode(state: &AppState) -> Result<(), String> {
+pub(crate) fn ensure_login_real_mode(state: &AppState) -> Result<(), String> {
     if state.runtime_mode != RuntimeMode::RealReadPreview {
         return Err("login_real_mode_required".to_string());
     }
@@ -440,7 +442,7 @@ fn ensure_checkin_http_enabled(state: &AppState) -> Result<(), String> {
 /// `{域}_join_failed` 错误码；闭包自身的 `Result` 原样透传。
 /// 收敛自 spawn_blocking + `.await` + `map_err(|_| join 错误码)` 的重复样板；
 /// 形态特殊（发射后不管、无 join 处理）的调用点不强行迁移。
-async fn run_blocking<T, F>(join_failed_code: &str, f: F) -> Result<T, String>
+pub(crate) async fn run_blocking<T, F>(join_failed_code: &str, f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
@@ -1267,6 +1269,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_workspace_state,
             product_operations::get_product_operation_states,
+            // P17-T5 并列骨架：产品注册表/切换 + WorkBuddy 产品域命令。
+            workbuddy_commands::list_products,
+            workbuddy_commands::get_current_product,
+            workbuddy_commands::set_current_product,
+            workbuddy_commands::get_workbuddy_session_health,
+            workbuddy_commands::list_workbuddy_accounts,
+            workbuddy_commands::workbuddy_checkin_status,
+            workbuddy_commands::workbuddy_checkin_claim,
+            workbuddy_commands::capture_workbuddy_account,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,
             read_work_cn_state,

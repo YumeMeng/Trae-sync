@@ -103,6 +103,17 @@ pub const WORKBUDDY_DESCRIPTOR: ProductDescriptor = ProductDescriptor {
     database_relative_path: "",
 };
 
+/// 产品注册表（P17-T5 并列骨架）：全部已适配产品的 descriptor 清单。
+/// 前端产品管理页/切换器的数据源；新产品适配 = 在此追加一行。
+pub const ALL_PRODUCTS: &[ProductDescriptor] = &[TRAE_CN_DESCRIPTOR, WORKBUDDY_DESCRIPTOR];
+
+/// 按 product_id 查找 descriptor（未适配产品返回 None——调用方 fail-closed）。
+pub fn descriptor_by_product_id(product_id: &str) -> Option<&'static ProductDescriptor> {
+    ALL_PRODUCTS
+        .iter()
+        .find(|descriptor| descriptor.product_id == product_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +151,26 @@ mod tests {
             WORKBUDDY_DESCRIPTOR.product_id,
             TRAE_CN_DESCRIPTOR.product_id
         );
+    }
+
+    /// 产品注册表（P17-T5 并列骨架）：双产品在册 + 查找 fail-closed。
+    #[test]
+    fn product_registry_lists_and_fails_closed() {
+        assert_eq!(ALL_PRODUCTS.len(), 2);
+        assert_eq!(
+            descriptor_by_product_id("workbuddy")
+                .expect("workbuddy in registry")
+                .display_name,
+            "WorkBuddy"
+        );
+        assert_eq!(
+            descriptor_by_product_id("trae_cn")
+                .expect("trae_cn in registry")
+                .display_name,
+            "TRAE"
+        );
+        assert!(descriptor_by_product_id("work_cn").is_none());
+        assert!(descriptor_by_product_id("").is_none());
     }
 
     /// 对 product_adapter 的静态事实做同源校验（避免两处漂移）。

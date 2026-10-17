@@ -15,11 +15,14 @@
 //! 凭据来源：[`crate::workbuddy_credential::decrypt_session_tokens`]（客户端
 //! 运行时取钥解密）+ 会话快照的 uid/domain。本模块不落盘任何凭据。
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::workbuddy_credential::WorkBuddySessionSnapshot;
+use crate::workbuddy_credential::{
+    decrypt_session_tokens, WorkBuddySessionSnapshot,
+};
 
 /// 签到凭据上下文（明文 token 只在内存流转，调用方禁止落盘/写日志）。
 #[derive(Debug, Clone)]
@@ -240,6 +243,53 @@ pub fn checkin_claim(
 ) -> Result<WorkBuddyCheckinOutcome, WorkBuddyCheckinError> {
     let (status, body) = post_json(http, credentials, "/v2/billing/meter/daily-checkin")?;
     Ok(classify(status, &body))
+}
+
+// ===== 会话 facade（组合根入口：解密 + HTTP 客户端一次组装，多次动作）=====
+
+/// 已就绪的签到会话（凭据 + HTTP 客户端；组合根命令编排用）。
+pub struct WorkBuddyCheckinSession {
+    credentials: WorkBuddyCheckinCredentials,
+    http: reqwest::blocking::Client,
+}
+
+impl WorkBuddyCheckinSession {
+    pub fn credentials(&self) -> &WorkBuddyCheckinCredentials {
+        &self.credentials
+    }
+
+    /// 查询签到状态（只读）。
+    pub fn status(&self) -> Result<WorkBuddyCheckinOutcome, WorkBuddyCheckinError> {
+        checkin_status(&self.http, &self.credentials)
+    }
+
+    /// 领取每日签到（幂等）。
+    pub fn claim(&self) -> Result<WorkBuddyCheckinOutcome, WorkBuddyCheckinError> {
+        checkin_claim(&self.http, &self.credentials)
+    }
+}
+
+/// 从本机打开签到会话（解密借客户端运行时；token 只在内存流转）。
+/// `workbuddy_home` 为 `~/.workbuddy` 根（会话文件经由
+/// [`crate::workbuddy_credential::session_file`] 按 LOCALAPPDATA 解析，
+/// 与 workbuddy_home 无关——参数仅为签名对称性保留）。
+pub fn open_session_from_machine(
+    client_exe: &Path,
+    auth_id: &str,
+) -> Result<WorkBuddyCheckinSession, String> {
+    let snapshot = crate::workbuddy_credential::load_session_snapshot(auth_id)
+        .map_err(|error| error.code().to_string())?;
+    let info_path = crate::workbuddy_credential::session_file(auth_id)
+        .ok_or_else(|| "workbuddy_session_path_unavailable".to_string())?;
+    let tokens = decrypt_session_tokens(&info_path, client_exe)
+        .map_err(|error| format!("{}:{:?}", error.code(), error))?;
+    Ok(WorkBuddyCheckinSession {
+        credentials: WorkBuddyCheckinCredentials::from_parts(&snapshot, tokens.access_token),
+        http: reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|_| "workbuddy_checkin_client_failed".to_string())?,
+    })
 }
 
 #[cfg(test)]
