@@ -10,8 +10,18 @@ import { EnvironmentPage } from "./components/EnvironmentPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
+import { WorkBuddyCheckinPage, WorkBuddyPanel } from "./components/WorkBuddyPanel";
+import { CapabilitySection } from "./components/CapabilitySection";
 import type { LibraryRef } from "./components/LibrarySessionsPanel";
-import { detailLibraryRefFor } from "./platform/productRegistry";
+import {
+  detailLibraryRefFor,
+  loadCurrentProduct,
+  loadProductEntries,
+  setCurrentProduct,
+} from "./platform/productRegistry";
+import { CURRENT_PRODUCT_ID, WORKBUDDY_PRODUCT_ID } from "./types/product";
+import type { CurrentProductDto, ProductEntryDto } from "./types/product";
+import type { SectionKey } from "./platform/productRegistry";
 import { notify, Toaster } from "./platform/notify";
 import { safeUiErrorMessage } from "./utils/safeUiError";
 
@@ -21,6 +31,28 @@ import { safeUiErrorMessage } from "./utils/safeUiError";
 const STAGGER_LISTS = ["account-list", "account-card-grid", "checkin-flow"];
 const playedStaggerLists = new Set<string>();
 
+/**
+ * 未适配区块的诚实占位页（P17-T5 并列骨架一期）：页头保持与常规页一致的
+ * region/标题/焦点管理结构，正文渲染 pending 说明卡（CapabilitySection）。
+ */
+function ProductPendingPage({ section, title, note }: { section: SectionKey; title: string; note: string }) {
+  return (
+    <section className="workbuddy-page" role="region" aria-label={title}>
+      <header className="page-header">
+        <div className="page-header__copy">
+          <h1 data-page-title={section} tabIndex={-1}>{title}</h1>
+        </div>
+      </header>
+      <CapabilitySection
+        state="pending"
+        product={WORKBUDDY_PRODUCT_ID}
+        title={`${title}能力适配中`}
+        note={note}
+      />
+    </section>
+  );
+}
+
 /** 自动签到批次完成事件（auto-checkin-finished）载荷（与后端 DTO 同口径）。 */
 interface AutoCheckinFinishedEvent {
   total: number;
@@ -29,12 +61,19 @@ interface AutoCheckinFinishedEvent {
   skipped: number;
 }
 
-// 应用根组件：单产品塌缩（P15-10，ADR-0035）——融合版 TRAE 是唯一产品，
-// 导航工作区五页全部 ready，无产品切换状态；账号工作台固定走完整账号事务。
+// 应用根组件：P17-T5 并列骨架——产品上下文（标题栏切换器）驱动各页面槽位
+// 的分支渲染：TRAE 产品走完整工作区五页；WorkBuddy 产品当前只有账号与
+// 签到两个 ready 区块（WorkBuddyPanel / WorkBuddyCheckinPage），其余区块
+// 渲染 pending 说明卡（诚实占位）。settings 是应用级设置，两产品共用。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<AppPage>("overview");
+  // 产品上下文（P17-T5 并列骨架）：标题栏切换器 + 页面分支渲染的数据源。
+  // 注册表读取失败不阻塞渲染（products 留空 → 切换器不渲染）；当前产品读取
+  // 失败回退缺省 trae_cn（与后端指针缺失语义一致）。
+  const [products, setProducts] = useState<readonly ProductEntryDto[]>([]);
+  const [currentProduct, setCurrentProductState] = useState<CurrentProductDto | null>(null);
   const [workspaceRefreshPending, setWorkspaceRefreshPending] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const navigationMountedRef = useRef(false);
@@ -48,6 +87,9 @@ export default function App() {
 
   // 主库详情页的库实例（ADR-0032 决策 5）：环境页入口注入优先，缺省主库。
   const detailLibrary = detailLibraryRefFor(libraryDetail);
+
+  // 当前产品是否 WorkBuddy：决定各页面槽位的分支渲染（并列骨架一期）。
+  const isWorkBuddy = currentProduct?.product_id === WORKBUDDY_PRODUCT_ID;
 
   const handlePageChange = useCallback((page: AppPage) => {
     // 离开库详情页即重置库实例引用，避免下次进入主库详情残留副库上下文。
@@ -89,11 +131,31 @@ export default function App() {
     mountedRef.current = true;
     // 通过统一刷新入口拉取 Tauri 状态；前端不直接访问文件/数据库/认证。
     void refreshWorkspaceState();
+    // 产品上下文并行加载：注册表失败静默（无切换器），指针失败回退缺省产品。
+    void loadProductEntries()
+      .then(setProducts)
+      .catch(() => undefined);
+    void loadCurrentProduct()
+      .then(setCurrentProductState)
+      .catch(() =>
+        setCurrentProductState({ product_id: CURRENT_PRODUCT_ID, display_name: "TRAE" }),
+      );
     return () => {
       mountedRef.current = false;
       workspaceRefreshGenerationRef.current += 1;
     };
   }, [refreshWorkspaceState]);
+
+  // 切换产品：写后端指针 → 重读回显（含展示名）；失败提示且状态不变
+  // （select 受控值不动）。各页面槽位按当前产品分支，切换即重挂载重拉数据。
+  const handleSwitchProduct = useCallback(async (productId: string) => {
+    try {
+      await setCurrentProduct(productId);
+      setCurrentProductState(await loadCurrentProduct());
+    } catch (reason: unknown) {
+      notify.error(safeUiErrorMessage(reason, "产品切换未完成，请稍后重试。"));
+    }
+  }, []);
 
   useEffect(() => {
     // 自动签到跨页完成摘要（P11-1 切片②）：此前只有签到页监听该事件，
@@ -203,41 +265,80 @@ export default function App() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>
-      <TitleBar platform={state.platform} />
+      <TitleBar
+        platform={state.platform}
+        products={products}
+        currentProduct={currentProduct}
+        onSwitchProduct={(productId) => void handleSwitchProduct(productId)}
+      />
       <div className="app-body">
         <NavigationRail activePage={activePage} onPageChange={handlePageChange} />
         <main id="main-content" className="app-main" ref={mainRef}>
+          {/* 页面槽位按当前产品分支渲染：不同组件类型切换即卸载重挂载，
+              数据新鲜度天然由重挂载重拉保证，无需额外刷新信号。 */}
           {state && (
             <div className="app-page" hidden={activePage !== "overview"}>
-              <OverviewPage
-                state={state}
-                active={activePage === "overview"}
-                onNavigate={handlePageChange}
-              />
+              {isWorkBuddy ? (
+                <ProductPendingPage
+                  section="overview"
+                  title="总览"
+                  note="WorkBuddy 的对话统计与使用概览将随对话库适配开放。"
+                />
+              ) : (
+                <OverviewPage
+                  state={state}
+                  active={activePage === "overview"}
+                  onNavigate={handlePageChange}
+                />
+              )}
             </div>
           )}
           <div className="app-page" hidden={activePage !== "accounts"}>
-            <AccountWorkbench active={activePage === "accounts"} />
+            {isWorkBuddy ? (
+              <WorkBuddyPanel active={activePage === "accounts"} />
+            ) : (
+              <AccountWorkbench active={activePage === "accounts"} />
+            )}
           </div>
           <div className="app-page" hidden={activePage !== "checkin"}>
-            <CheckinPage
-              active={activePage === "checkin"}
-              onNavigate={handlePageChange}
-            />
+            {isWorkBuddy ? (
+              <WorkBuddyCheckinPage active={activePage === "checkin"} />
+            ) : (
+              <CheckinPage
+                active={activePage === "checkin"}
+                onNavigate={handlePageChange}
+              />
+            )}
           </div>
           <div className="app-page" hidden={activePage !== "environment"}>
-            <EnvironmentPage
-              active={activePage === "environment"}
-              onOpenMasterDetail={handleOpenMasterDetail}
-              onOpenLibraryDetail={handleOpenLibraryDetail}
-            />
+            {isWorkBuddy ? (
+              <ProductPendingPage
+                section="environment"
+                title="环境"
+                note="WorkBuddy 的环境管理将随客户端适配扩展开放。"
+              />
+            ) : (
+              <EnvironmentPage
+                active={activePage === "environment"}
+                onOpenMasterDetail={handleOpenMasterDetail}
+                onOpenLibraryDetail={handleOpenLibraryDetail}
+              />
+            )}
           </div>
           <div className="app-page" hidden={activePage !== "master-library"}>
-            <MasterLibraryDetail
-              active={activePage === "master-library"}
-              onNavigate={handlePageChange}
-              library={detailLibrary}
-            />
+            {isWorkBuddy ? (
+              <ProductPendingPage
+                section="master-library"
+                title="主库详情"
+                note="WorkBuddy 的对话库浏览将随对话库适配开放。"
+              />
+            ) : (
+              <MasterLibraryDetail
+                active={activePage === "master-library"}
+                onNavigate={handlePageChange}
+                library={detailLibrary}
+              />
+            )}
           </div>
           <div className="app-page" hidden={activePage !== "settings"}>
             <SettingsPanel active={activePage === "settings"} />

@@ -5,6 +5,71 @@
  */
 export const CURRENT_PRODUCT_ID = "trae_cn";
 
+/**
+ * WorkBuddy 产品协议标识（P17-T5 并列骨架）：与后端 descriptor 注册表
+ * 同源（product_descriptor.rs WORKBUDDY_DESCRIPTOR）；前端分支渲染使用。
+ */
+export const WORKBUDDY_PRODUCT_ID = "workbuddy";
+
+/** 产品注册表条目（切换器数据源；后端 descriptor 静态清单）。 */
+export interface ProductEntryDto {
+  readonly product_id: string;
+  readonly display_name: string;
+}
+
+/** 当前产品指针（product-state 文件；未初始化缺省 trae_cn）。 */
+export interface CurrentProductDto {
+  readonly product_id: string;
+  readonly display_name: string;
+}
+
+/** WorkBuddy 客户端登录会话状态（后端 current_session_status 判定）。 */
+export type WorkBuddySessionStatus =
+  | "active"
+  | "access_expired"
+  | "fully_expired"
+  | "logged_out"
+  | "file_missing"
+  | "unknown";
+
+/** WorkBuddy 会话健康（文件面只读；不含令牌材料）。 */
+export interface WorkBuddySessionHealthDto {
+  readonly status: WorkBuddySessionStatus;
+  /** 过期时间为 Unix 秒（0 = 未知）。 */
+  readonly access_expires_at_unix_seconds: number;
+  readonly refresh_expires_at_unix_seconds: number;
+  readonly domain: string;
+  /** 该账号是否已捕获入工具账号池。 */
+  readonly captured_in_pool: boolean;
+}
+
+/** WorkBuddy 签到状态（脱敏；不含令牌）。 */
+export interface WorkBuddyCheckinStatusDto {
+  readonly today_checked_in: boolean;
+  readonly streak_days: number;
+  readonly daily_credit: number;
+  readonly total_credits: number;
+}
+
+/** WorkBuddy 签到领取回执（verified = 复核翻转确认真实入账）。 */
+export interface WorkBuddyCheckinClaimDto {
+  readonly credit: number;
+  readonly streak_days: number;
+  readonly verified: boolean;
+}
+
+/** WorkBuddy 账号池脱敏清单行（不含令牌；profile_id 惯例 wb-{uid}）。 */
+export interface WorkBuddyLoginSummaryDto {
+  readonly profile_id: string;
+  readonly account_id: string;
+  readonly screen_name: string;
+  readonly domain: string;
+  readonly access_token_expires_at_unix_seconds: number;
+  readonly refresh_token_expires_at_unix_seconds: number;
+  readonly minted_at_unix_seconds: number;
+  readonly last_updated_at_unix_seconds: number;
+}
+
 export type OperationReadiness = "ready" | "pending" | "absent";
 
 /** checkin.claim 已随 P15-10 惰性注册表条目清理移除（无命令消费）。 */

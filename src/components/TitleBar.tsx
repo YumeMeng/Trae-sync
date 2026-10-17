@@ -2,16 +2,24 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, Waypoints, X } from "lucide-react";
 import type { PlatformContextDto } from "../types/workspace";
+import type { CurrentProductDto, ProductEntryDto } from "../types/product";
 
 interface TitleBarProps {
   platform: PlatformContextDto;
+  /** 产品注册表清单（切换器选项；空清单不渲染切换器）。 */
+  products: readonly ProductEntryDto[];
+  /** 当前产品指针（切换器选中值）。 */
+  currentProduct: CurrentProductDto | null;
+  /** 切换产品回调（App 负责写指针 + 刷新分支渲染）。 */
+  onSwitchProduct: (productId: string) => void;
 }
 
 // 标题栏 38px 单行（2026-08-27 精简，2026-09-03 移除三态徽章）：品牌 + 自绘窗控。
 // 证据信息（当前账号/重新检测）下沉总览页（overview-evidence）。
-// P15-10：产品切换器随单产品塌缩移除（子标题展示当前产品平台名）。
-// 无系统装饰（decorations: false）时代码即标题栏：拖拽/双击最大化/窗控全在此。
-export function TitleBar({ platform }: TitleBarProps) {
+// P17-T5：恢复产品切换器（并列骨架一期）——产品是空间级操作，原生 select
+// 紧贴品牌；子标题仍展示当前产品平台名。无系统装饰（decorations: false）
+// 时代码即标题栏：拖拽/双击最大化/窗控全在此。
+export function TitleBar({ platform, products, currentProduct, onSwitchProduct }: TitleBarProps) {
   const [maximized, setMaximized] = useState(false);
 
   // 最大化状态跟踪：窗口尺寸变化时重查（浏览器 preview 下 API 不可用则静默保持默认态）。
@@ -58,6 +66,25 @@ export function TitleBar({ platform }: TitleBarProps) {
         <span className="title-bar__brand">Trae Sync</span>
         <span className="title-bar__subtitle">{platform.display_name}</span>
       </div>
+      {/* 产品切换器（P17-T5 并列骨架）：brand-block 之外的 header 直接子元素
+          （brand-block 子元素 pointer-events:none 拖拽穿透，切换器需可交互）。
+          原生 select 保证键盘/读屏可用；空清单（注册表读取失败）不渲染。 */}
+      {products.length > 0 && currentProduct && (
+        <div className="title-bar__product-switcher">
+          <select
+            aria-label="当前产品"
+            data-testid="product-switcher"
+            value={currentProduct.product_id}
+            onChange={(event) => onSwitchProduct(event.target.value)}
+          >
+            {products.map((product) => (
+              <option key={product.product_id} value={product.product_id}>
+                {product.display_name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       {/* 自绘窗控（无系统边框）：最小化 / 最大化切换 / 关闭。
           三个按钮直接平铺在标题栏 flex 行内（无包裹容器）：首钮 margin-left:auto 推到右缘，
           末钮贴壳层圆角；按钮 align-self:stretch 拉满标题栏 38px 高（Windows 窗控惯例）。

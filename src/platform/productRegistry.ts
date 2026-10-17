@@ -1,8 +1,12 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { LibraryRef } from "../components/LibrarySessionsPanel";
+import type { CurrentProductDto, ProductEntryDto } from "../types/product";
 
 /**
- * 当前产品展示名（P15-10 单产品塌缩，ADR-0035）：融合版 TRAE 是唯一产品目标，
- * 界面、通知、问候语统一用此名称，零「TRAE Work CN」表述。
+ * 当前产品展示名（单产品语境）：TRAE 账号域文案统一用此名称。
+ * P17-T5 并列骨架恢复产品切换后，该常量只服务 TRAE 产品的文案拼装
+ * （如「TRAE：今日自动签到完成」通知前缀）；产品名随切换变化处一律
+ * 用 CurrentProductDto.display_name。
  */
 export const PRODUCT_DISPLAY_NAME = "TRAE";
 
@@ -35,9 +39,60 @@ export const PRODUCT_SECTION_STATES: Record<SectionKey, CapabilityState> = {
   settings: "ready",
 };
 
-/** 查询某区块的能力三态（单产品塌缩后简化为直查）。 */
+/** 查询某区块的能力三态（TRAE 语境；跨产品语境用 sectionStatesFor）。 */
 export function sectionStateOf(section: SectionKey): CapabilityState {
   return PRODUCT_SECTION_STATES[section];
+}
+
+/**
+ * WorkBuddy 的区块三态（P17-T5 并列骨架一期）：账号（健康/捕获/账号池）
+ * 与签到（直连协议）已就绪；总览统计、环境、主库随二期对话库适配推进，
+ * 先以 pending 说明卡诚实呈现。settings 是应用级设置（备份保留策略等），
+ * 与产品无关，保持 ready。
+ */
+const WORKBUDDY_SECTION_STATES: Record<SectionKey, CapabilityState> = {
+  overview: "pending",
+  accounts: "ready",
+  checkin: "ready",
+  environment: "pending",
+  "master-library": "pending",
+  settings: "ready",
+};
+
+/** 按产品查询区块三态（未注册产品 fail-closed 回退 pending）。 */
+export function sectionStatesFor(productId: string): Record<SectionKey, CapabilityState> {
+  switch (productId) {
+    case "workbuddy":
+      return WORKBUDDY_SECTION_STATES;
+    case "trae_cn":
+      return PRODUCT_SECTION_STATES;
+    default:
+      return {
+        overview: "pending",
+        accounts: "pending",
+        checkin: "pending",
+        environment: "pending",
+        "master-library": "pending",
+        settings: "ready",
+      };
+  }
+}
+
+// ===== 产品上下文（P17-T5 并列骨架）：切换器与产品分支渲染的数据源 =====
+
+/** 产品注册表清单（后端 descriptor 静态声明）。 */
+export function loadProductEntries(): Promise<readonly ProductEntryDto[]> {
+  return invoke<readonly ProductEntryDto[]>("list_products");
+}
+
+/** 当前产品指针（后端 product-state 文件；未初始化缺省 trae_cn）。 */
+export function loadCurrentProduct(): Promise<CurrentProductDto> {
+  return invoke<CurrentProductDto>("get_current_product");
+}
+
+/** 切换当前产品（只写指针，不动任何凭据/账号数据；注册表校验 fail-closed）。 */
+export async function setCurrentProduct(productId: string): Promise<void> {
+  await invoke("set_current_product", { productId });
 }
 
 /** 只读库实例 id（与后端写守卫同名的库引用；ADR-0032 决策 5；库实例概念保留）。 */

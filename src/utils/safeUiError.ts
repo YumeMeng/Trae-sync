@@ -620,6 +620,27 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /trae_cn_merge_backup_failed|trae_cn_merge_db_missing|trae_cn_merge_db_open_failed|trae_cn_merge_join_failed/i,
     "归并未完成，数据保持操作前状态；请稍后重试。",
   ],
+  // ===== P17-T5 WorkBuddy 并列骨架：WorkBuddy 域专属错误码 =====
+  [
+    /workbuddy_real_mode_required/i,
+    "WorkBuddy 功能只在本机真实数据模式下可用，演示模式不可用。",
+  ],
+  [
+    /workbuddy_client_exe_not_found/i,
+    "未找到 WorkBuddy 客户端安装位置，请确认已安装 WorkBuddy 桌面版。",
+  ],
+  [
+    /workbuddy_checkin_auth_mismatch/i,
+    "WorkBuddy 登录会话与本机客户端身份不一致，请在 WorkBuddy 中重新登录后再试。",
+  ],
+  [
+    /workbuddy_session_file_missing/i,
+    "未检测到 WorkBuddy 登录记录，请先在 WorkBuddy 客户端中登录。",
+  ],
+  [
+    /workbuddy_pool_invalid/i,
+    "WorkBuddy 账号池数据读取失败，请稍后重试。",
+  ],
   // ===== P13-3 Trae CN 归档/恢复：CN 实例生命周期专属拒绝码 =====
   //（DB 层错误沿用上方 master_archive_* 既有族，同一事务原语共用词表）
   [

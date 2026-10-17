@@ -75,6 +75,12 @@ describe("应用工作区入口", () => {
     resetRoutes();
     installFakeInvoke();
     mockRoute("get_workspace_state", () => workspace);
+    // 产品上下文（P17-T5 并列骨架）：缺省当前产品 trae_cn + 双产品注册表。
+    mockRoute("list_products", () => [
+      { product_id: "trae_cn", display_name: "TRAE" },
+      { product_id: "workbuddy", display_name: "WorkBuddy" },
+    ]);
+    mockRoute("get_current_product", () => ({ product_id: "trae_cn", display_name: "TRAE" }));
     mockRoute("get_environment_state", () => ({
       env_id: "master",
       current_profile_id: "profile-a",
@@ -326,8 +332,8 @@ describe("应用工作区入口", () => {
     });
   });
 
-  it("P15-10 单产品塌缩：无产品切换器，五页全开放且零 Work CN 表述", async () => {
-    // 全量 mock：唯一产品的五页全部 ready，各自激活所需命令。
+  it("P17-T5 并列骨架：产品切换器在册，TRAE 产品五页全 ready", async () => {
+    // 全量 mock：当前产品 trae_cn 的五页全部 ready，各自激活所需命令。
     mockRoute("get_workspace_state", () => workspace);
     mockRoute("get_environment_state", () => ({
       env_id: "master",
@@ -361,8 +367,11 @@ describe("应用工作区入口", () => {
     render(<App />);
     await screen.findByTestId("current-account-context");
 
-    // 产品切换器已随单产品塌缩移除。
-    expect(screen.queryByRole("combobox", { name: "当前产品" })).not.toBeInTheDocument();
+    // 产品切换器在册且选中当前产品（P15-10 的「无切换器」断言已随并列骨架恢复）。
+    const switcher = screen.getByRole("combobox", { name: "当前产品" });
+    expect(switcher).toHaveValue("trae_cn");
+    expect(within(switcher).getByRole("option", { name: "TRAE" })).toBeInTheDocument();
+    expect(within(switcher).getByRole("option", { name: "WorkBuddy" })).toBeInTheDocument();
 
     // 导航五页全部渲染（master-library 仍不生成导航项，从详情入口进入）。
     for (const page of ["overview", "accounts", "checkin", "environment", "settings"]) {
@@ -397,5 +406,72 @@ describe("应用工作区入口", () => {
     const settingsRegion = await screen.findByRole("region", { name: "设置" });
     expect(await within(settingsRegion).findByTestId("auto-checkin-settings")).toBeInTheDocument();
     expect(within(settingsRegion).queryByTestId("product-settings-empty")).not.toBeInTheDocument();
+  });
+
+  it("P17-T5：切到 WorkBuddy 后账号/签到走 WorkBuddy 面板，未适配区块渲染 pending 占位", async () => {
+    // 切换指针：写成功后重读回显新产品（组合根 get/set 语义的假实现）。
+    let current = { product_id: "trae_cn", display_name: "TRAE" };
+    mockRoute("get_current_product", () => current);
+    mockRoute("set_current_product", (args: { productId: string }) => {
+      current = args.productId === "workbuddy"
+        ? { product_id: "workbuddy", display_name: "WorkBuddy" }
+        : { product_id: "trae_cn", display_name: "TRAE" };
+      return undefined;
+    });
+    // WorkBuddy 域命令回执（脱敏形态，与真实 DTO 同构）。
+    mockRoute("get_workbuddy_session_health", () => ({
+      status: "active",
+      uid: "2079418751248068608",
+      uin: "2079418751248068608",
+      domain: "codebuddy.example",
+      access_expires_at_unix_seconds: 1799999999,
+      refresh_expires_at_unix_seconds: 1799999999,
+      captured_in_pool: false,
+    }));
+    mockRoute("list_workbuddy_accounts", () => []);
+    mockRoute("workbuddy_checkin_status", () => ({
+      today_checked_in: false,
+      streak_days: 6,
+      daily_credit: 100,
+      total_credits: 700,
+    }));
+
+    render(<App />);
+    await screen.findByTestId("current-account-context");
+    // 切换器随产品上下文异步挂载，先等它出现再操作。
+    const switcher = await screen.findByRole("combobox", { name: "当前产品" });
+
+    // 标题栏切到 WorkBuddy：写指针 → 重读回显 → 各槽位切换分支。
+    fireEvent.change(switcher, { target: { value: "workbuddy" } });
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "当前产品" })).toHaveValue("workbuddy");
+    });
+
+    // accounts = ready：WorkBuddy 面板（会话健康卡在册）。
+    fireEvent.click(screen.getByTestId("navigation-accounts"));
+    expect(await screen.findByTestId("workbuddy-health-card")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-health-status")).toHaveTextContent("已登录");
+
+    // checkin = ready：WorkBuddy 签到卡。
+    fireEvent.click(screen.getByTestId("navigation-checkin"));
+    expect(await screen.findByTestId("workbuddy-checkin-card")).toBeInTheDocument();
+
+    // environment = pending：未适配区块渲染诚实说明卡。
+    // （overview/master-library 槽位同样持有 hidden 的 pending 卡，
+    //   必须收在当前 region 内断言，避免多元素命中。）
+    fireEvent.click(screen.getByTestId("navigation-environment"));
+    const workbuddyEnvRegion = await screen.findByRole("region", { name: "环境" });
+    expect(within(workbuddyEnvRegion).getByTestId("capability-pending")).toBeInTheDocument();
+
+    // 切回 TRAE：账号页恢复完整账号工作台（重挂载重拉数据）。
+    fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {
+      target: { value: "trae_cn" },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "当前产品" })).toHaveValue("trae_cn");
+    });
+    fireEvent.click(screen.getByTestId("navigation-accounts"));
+    expect(await screen.findByRole("region", { name: "账号" })).toBeVisible();
+    expect(screen.queryByTestId("workbuddy-health-card")).not.toBeInTheDocument();
   });
 });

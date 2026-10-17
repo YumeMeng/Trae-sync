@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（93 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（102 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -13,11 +13,12 @@ export type CommandName =
   | "cancel_checkin_login"
   | "cancel_trae_cn_login"
   | "capture_current_account_credential"
+  | "capture_trae_cn_account"
+  | "capture_workbuddy_account"
   | "check_trae_cn_account_health"
   | "cleanup_master_empty_projects"
   | "clear_remote_device"
   | "close_environment_instance"
-  | "capture_trae_cn_account"
   | "complete_checkin_login"
   | "complete_trae_cn_login"
   | "create_environment"
@@ -34,6 +35,7 @@ export type CommandName =
   | "get_backup_retention"
   | "get_checkin_capability"
   | "get_checkin_overview"
+  | "get_current_product"
   | "get_environment_delete_preview"
   | "get_environment_state"
   | "get_managed_account_state"
@@ -51,6 +53,7 @@ export type CommandName =
   | "get_relay_ledger"
   | "get_storage_root_state"
   | "get_trae_instance_states"
+  | "get_workbuddy_session_health"
   | "get_workspace_state"
   | "import_recovery_package_command"
   | "incorporate_master_records"
@@ -59,9 +62,11 @@ export type CommandName =
   | "launch_master_library"
   | "list_checkin_accounts"
   | "list_environments"
+  | "list_products"
   | "list_remote_devices"
   | "list_trae_cn_accounts"
   | "list_trae_cn_foreign_projects"
+  | "list_workbuddy_accounts"
   | "login_environment"
   | "merge_master_projects"
   | "merge_trae_cn_project"
@@ -92,10 +97,13 @@ export type CommandName =
   | "set_auto_checkin_settings"
   | "set_backup_dir"
   | "set_backup_retention"
+  | "set_current_product"
   | "set_environment_current_account"
   | "switch_account"
   | "switch_and_handoff"
   | "switch_master_account"
   | "switch_trae_cn_account"
   | "uninstall_plugin_everywhere"
+  | "workbuddy_checkin_claim"
+  | "workbuddy_checkin_status"
 ;
