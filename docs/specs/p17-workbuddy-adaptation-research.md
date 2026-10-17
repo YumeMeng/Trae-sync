@@ -114,12 +114,14 @@
 - daemon 自动刷新（客户端运行期间周期调用；`lastRefreshTime` 与日志刷新调用吻合）；daemon RPC 通道实测存在 `auth:getCheckinStatus`/`auth:getAccountUsage` 等方法（wbipc）。
 - 身份三形态并存（捕获实施时核对关联）：本地 uid UUID（89b16d6b…）、uin 12 位（330126449009）、P17-T1 的 20 位平台 ID（wb-slot-configs 内嵌）；设备级 `~/.workbuddy/device-id`（UUID）。
 
-### 8.4 捕获编排凭据层设计（只设计，铸造实施待单次确认）
+### 8.4 捕获编排凭据层设计（2026-10-17 第二轮深化后修订）
 
-- **面 A（文件解密）**：读 `.info`（同用户可读，只读零破坏）→ 解析 `$wbEncrypted` 信封 → 按 keyblob/protector 链取 userKey（keyId 派生自键字节；AES-256-GCM open + AAD 上下文）→ 明文 token。解密链在实施时以真实数据验证。
-- **面 B（RPC，优先探明）**：wbipc 命名管道 + ticket（endpoint.json）→ daemon `auth:*` RPC 表（若存在会话/token 读取方法则优先走 B，不触碰加密层）。实施时先探 RPC 表再定 A/B。
-- **刷新**：工具侧只做只读健康检测；续期由 daemon 自理（与 Trae 融合版「客户端续期、工具只读」同构）；不写回会话文件。
-- **入池铸造**（WorkBuddy 登录代次容器）：待用户单次确认后按 Trae 捕获编排同构实施。
+- **面 A（文件解密）定性不可行**（反编译实读定案）：字段信封 keyId=`9127dea1b44020a7`=`sha256(key)[0..16]`（deriveAtRestKeyId）；密钥经 `configureCredentialProtection` 注入（log-acl-guard），来源 `electron.workbuddyStorage.loggerGet()`——**魔改 Electron 原生 API，asar 内无对应 addon**，密钥仅存在于客户端进程内存；主进程→daemon/sidecar 经 IPC 分发（日志实测 `[CredentialBootstrap] daemon gate payload-received` / `sidecar delivery spawn symmetricAvailable:true`）。纯文件解密需逆向 Electron 二进制，不做。
+- **keyblob 语义修正**：`keyblob.keyId`(1f927d47)=keyblob 保护的主数据键（userKey，用于 whole-file 保护）；`slots[].protectorKeyId`(9127dea1)=保护键=symmetricKey=**字段加密键**；`wrapped`=`AtRestCrypto(protector).seal(masterKey)`。AES-256-GCM suite=1，AAD=`buildAuthenticatedContextAad(keyId, suite, {framing,purpose,resourceId,fieldPath}, scheme)`（上下文绑定）。
+- **面 B（wbipc RPC）= 唯一可行捕获路径**：wbipc broker（`~/.workbuddy/wbipc/endpoint.json`：管道+ticket，ticket 随启动轮换）→ JSON-RPC 风格 `{method, params, id, mode}`；broker 方法 `broker/ListPipes`（枚举服务管道）/`broker/GetPipe{pipe}`（解析方法表）/`$/cancel`；E_* 错误码族（NOT_DECLARED/CONSENT_REQUIRED/POLICY_DENIED…）。**auth 通道全表**（asar 通道名表 Fa 实读）：`auth:login`/`auth:logout`/`auth:getAccount`/`auth:getToken`/`auth:refreshToken`/`auth:refreshSession`/`auth:statusChanged`/`auth:sessionExpired`/`auth:getUserInfo`/`auth:getAccountUsage`/`auth:updateAccountNickname`/`auth:getOauthUser`/`auth:saveOauthToken`/`auth:revokeAll`/`auth:getCheckinStatus`/**`auth:claimDailyCheckin`**/`auth:getActivityBanner`/`auth:getAmbassadorStatus` 等。捕获=getToken/getAccount；切换=logout+saveOauthToken/login；**签到可直连 claimDailyCheckin（WorkBuddy 签到适配可能无需 HTTP 重实现——重大利好）**。
+- **文件面健康检测（无需密钥/无需客户端运行）已交付**：`expiresAt/refreshExpiresAt/uid/uin/scope/domain` 为明文——`workbuddy_credential.rs` 解析快照 + 状态判定（FileMissing/LoggedOut/AccessExpired/FullyExpired/Active/Unknown），登出标记 `{path}.logged-out` 优先（与客户端 restore 语义一致）。5/5 单测 + 真机核对（Active，access 剩 27 天）。
+- **登出机制**：`beginLogout()` 写 UUID 标记文件（原子写+PID+UUID），`clean()` 会话改名备份后删标记；watcher 监听外部变更调和（工具若写会话文件会被客户端感知——**切号实施必须走 RPC 或关闭编排**，不可直接改文件）。
+- **运行时探针**：`wbipc_probe_p17.rs`（broker 协议发现，只读）、`workbuddy_session_probe_p17.rs`（会话健康报告）——真实账号登录/捕获/切换测试时由用户配合执行。
 
 ### 8.5 备份范围缺口警示（T4b 后续建议）
 

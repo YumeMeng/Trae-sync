@@ -89,6 +89,8 @@ pub mod product_descriptor;
 pub mod workbuddy_instance;
 // P17-T4b：WorkBuddy 数据目录备份治理（目录树 zstd 压缩 + 清单 JSON + 恢复 + 保留裁剪）。
 pub mod workbuddy_backup;
+// P17-T4c 准备：WorkBuddy 登录会话快照与健康检测（文件明文面，无需密钥）。
+pub mod workbuddy_credential;
 // P16-T2：存储根派生路径唯一来源（checkin/products-trae_cn/product-state/fused-login）。
 pub mod storage_roots;
 pub mod storage_root;
