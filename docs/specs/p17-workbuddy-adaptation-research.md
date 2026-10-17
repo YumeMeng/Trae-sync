@@ -146,3 +146,33 @@
 ### 8.7 备份范围缺口警示（T4b 后续建议）
 
 T4b 真机备份覆盖 `~/.workbuddy/app`（Electron userData：IndexedDB/LocalStorage/JSON）。以下凭据材料**不在备份范围**：登录会话（CodeBuddyExtension auth）、`keyblob`、`device-id`、`login-device-nonce`、`account-snapshot.json`。建议 T4b 扩展一个「凭据材料备份」入口（加密信封形态落盘，属凭据材料、按单次确认纪律执行）——待用户确认后实施。
+
+## 9. 产品并列化技术盘点（2026-10-18，用户方向确认：Trae 与 WorkBuddy 同级产品管理页）
+
+> 用户决策：后续做与 Trae 同级的**产品管理页面**（早期 Trae/Trae Work 并列的回归与升级），WorkBuddy 作为并列产品可随意切换。本节盘点全部扩展点与现状，保证适配扩展可快速完成。
+
+### 9.1 现状清单（P15-10 塌缩点 vs 已就绪资产）
+
+| 层 | 现状（塌缩后） | 并列化要动什么 | 已就绪资产 |
+|----|----------------|----------------|------------|
+| **产品事实** | `product_adapter::TraeProduct`（WorkCn/TraeCn，Trae 系内枚举）+ `product_descriptor`（TRAE_CN/WORKBUDDY 双 descriptor，T3 已建） | 收拢为**统一产品注册表**：descriptor 为唯一事实源；TraeProduct 渐进改为 descriptor 消费方（expand-contract） | WORKBUDDY descriptor 已含进程/路径/探针/身份形态全部实测事实 |
+| **组合根命令** | 命令大多隐含 trae_cn 单产品（`work_cn+None` 死分支已清）；`get_product_identity_state` 已按 product_id 返回 | 命令 product_id 参数化（账号/签到/实例域）；WorkBuddy 新命令组（capture/checkin/switch） | `get_product_identity_state` 的多产品形态是现成范式 |
+| **账号域前端** | `platform/accountAdapter.ts`：`AccountAdapter` 接口 + `accountAdapterFor(productId)` 工厂（注入架构保留）+ `CURRENT_PRODUCT_ID="trae_cn"` 常量塌缩 | 工厂注册 WorkBuddy adapter（数据源 = workbuddy-login 容器 + workbuddy_checkin）；`CURRENT_PRODUCT_ID` 常量 → 产品上下文状态（product-state 指针恢复使用） | **Adapter 注入架构原样可用**——P15-10 只塌缩了 UI 与常量 |
+| **产品切换 UI** | `TitleBar.tsx`：切换器已移除（P15-10，注释在位） | 产品管理页/切换器重建（数据源 = descriptor 注册表 + product-state 指针） | product-state 根目录约定在位（storage_roots） |
+| **签到域** | Trae=checkin_credential（SOLO 通道虚拟设备 + DPAPI .checkin 包） | WorkBuddy=workbuddy_checkin（客户端会话 token 直连，已实现③）——**两套签到域并列**，产品各自能力清单声明 ready/pending | workbuddy_checkin 已实现且真机全通 |
+| **登录凭据域** | Trae=fused-login 根（TSFUSED1） | WorkBuddy=workbuddy-login 根（WBSESSN1，已实现②）——目录隔离即产品隔离 | 容器+捕获编排已完成 |
+| **对话库域** | Trae=SQLCipher 主库（database.db 读写+归档/归并） | **WorkBuddy 对话库形态未定**——`~/.workbuddy/workbuddy.db`（SQLite：sessions/workspaces/automations 表）+ 云端 conversations；独立票研究 | 库域是 WorkBuddy 最大的独立票（对话管理四票之一） |
+| **能力清单** | 前端五区块三态（ready/pending/absent）按 trae_cn 单产品渲染 | 按产品渲染：WorkBuddy 初始能力 = 账号捕获/签到直连 ready，账号切换 pending（RPC 待实施），对话库 pending | ProductOperationSnapshotDto 形态可复用 |
+
+### 9.2 分期建议
+
+1. **第一期（产品并列骨架）**：统一产品注册表（descriptor 驱动）+ product-state 指针恢复 + TitleBar 产品管理入口 + AccountCenter 按 productId 选 adapter（WorkBuddy adapter：捕获/健康/签到，能力三态声明）。
+2. **第二期（WorkBuddy 账号完整域）**：捕获铸造入池（T5 单次确认）+ 档案池（独立 WorkBuddy 池，见 8.4 架构决策）+ 切号 RPC（T6）。
+3. **第三期（WorkBuddy 对话库）**：workbuddy.db 形态研究（sessions 表已探明）+ 对话管理四票适配。
+
+### 9.3 不变量（并列化不破坏的既有纪律）
+
+- 跨产品凭据复制禁令（workbuddy-login 与 fused-login/checkin 根互不触碰）；
+- 能力三态纪律（某产品某操作 ready 不证明其他产品 ready）；
+- 工具选中账号 ≠ 官方客户端身份（WorkBuddy 侧同样适用）；
+- 界面表达纪律（产品名用官方名 TRAE / WorkBuddy，不暴露内部 ID）。
