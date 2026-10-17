@@ -310,6 +310,160 @@ pub fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+// ===== P17-T4c 凭据解密（面 A：客户端运行时取钥 + AES-256-GCM 信封解密）=====
+
+/// 解密 helper（内嵌随编译产物；在 WorkBuddy.exe 的 ELECTRON_RUN_AS_NODE
+/// 模式下执行）。安全边界：atRestSecretKey 只存在于 node 子进程内存，
+/// 明文 token 仅经 stdout 管道返回工具进程——不落盘、不进日志。
+pub const DECRYPT_HELPER_SCRIPT: &str = include_str!("workbuddy_decrypt_helper.cjs");
+
+/// token 来源形态（双形态兼容：5.5.x 明文 / 5.6.2+ 加密信封）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkBuddyTokenSource {
+    /// 旧版明文字符串（无需解密）。
+    Plain,
+    /// 加密信封（经客户端运行时取钥解密）。
+    Envelope,
+}
+
+/// 解密后的会话凭据（明文；调用方负责按凭据容器纪律立即铸造/加密，禁止
+/// 落日志或导出）。
+#[derive(Debug, Clone)]
+pub struct WorkBuddyDecryptedTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_source: WorkBuddyTokenSource,
+    pub refresh_source: WorkBuddyTokenSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkBuddyDecryptError {
+    /// 客户端 exe 不存在（取钥必须借 WorkBuddy 自己的运行时）。
+    ClientExeMissing,
+    /// 临时脚本目录创建/写入失败。
+    TempScriptFailed,
+    /// 子进程启动失败。
+    SpawnFailed,
+    /// helper 返回失败（取钥失败/keyId 不匹配/GCM 校验失败等；错误串来自
+    /// helper，不含密钥或 token 明文）。
+    HelperFailed(String),
+    /// stdout 不是约定的 JSON 形态。
+    OutputInvalid,
+}
+
+impl WorkBuddyDecryptError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ClientExeMissing => "workbuddy_decrypt_client_exe_missing",
+            Self::TempScriptFailed => "workbuddy_decrypt_temp_script_failed",
+            Self::SpawnFailed => "workbuddy_decrypt_spawn_failed",
+            Self::HelperFailed(_) => "workbuddy_decrypt_helper_failed",
+            Self::OutputInvalid => "workbuddy_decrypt_output_invalid",
+        }
+    }
+}
+
+/// 解密会话文件的 token 字段（只读；借 WorkBuddy.exe 自己的运行时取钥）。
+///
+/// 流程：发布内嵌 helper 到独立临时目录（RAII 即删，P15 readonly 泄漏
+/// 修复同纪律）→ `ELECTRON_RUN_AS_NODE=1 WorkBuddy.exe helper.cjs <info>`
+/// → 解析 stdout JSON。客户端无需运行（exe 静态存在即可）；失败零副作用
+/// （临时目录即删，生产会话文件只读）。
+pub fn decrypt_session_tokens(
+    info_path: &Path,
+    client_exe: &Path,
+) -> Result<WorkBuddyDecryptedTokens, WorkBuddyDecryptError> {
+    use std::process::Command;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    if !client_exe.is_file() {
+        return Err(WorkBuddyDecryptError::ClientExeMissing);
+    }
+    // 专用临时父目录 + RAII 即删（TEMP 稳态归零纪律；.cjs 后缀避开
+    // 仓库 package.json 的 "type":"module" ESM 误判）。
+    let unique = format!(
+        "traesync-wb-decrypt-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
+    let temp_dir = std::env::temp_dir().join(unique);
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    if fs::create_dir_all(&temp_dir).is_err() {
+        return Err(WorkBuddyDecryptError::TempScriptFailed);
+    }
+    let _guard = TempDirGuard(temp_dir.clone());
+    let script_path = temp_dir.join("wb_decrypt_helper.cjs");
+    if fs::write(&script_path, DECRYPT_HELPER_SCRIPT).is_err() {
+        return Err(WorkBuddyDecryptError::TempScriptFailed);
+    }
+
+    let output = Command::new(client_exe)
+        .env("ELECTRON_RUN_AS_NODE", "1")
+        .arg(&script_path)
+        .arg(info_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|_| WorkBuddyDecryptError::SpawnFailed)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|_| WorkBuddyDecryptError::OutputInvalid)?;
+    if parsed.get("ok").and_then(|ok| ok.as_bool()) != Some(true) {
+        let reason = parsed
+            .get("error")
+            .and_then(|error| error.as_str())
+            .unwrap_or("unknown helper failure")
+            .to_string();
+        return Err(WorkBuddyDecryptError::HelperFailed(reason));
+    }
+    let access_token = parsed
+        .get("access_token")
+        .and_then(|token| token.as_str())
+        .ok_or(WorkBuddyDecryptError::OutputInvalid)?
+        .to_string();
+    let refresh_token = parsed
+        .get("refresh_token")
+        .and_then(|token| token.as_str())
+        .ok_or(WorkBuddyDecryptError::OutputInvalid)?
+        .to_string();
+    let source = |name: &str| {
+        match parsed.get(name).and_then(|value| value.as_str()) {
+            Some("plain") => WorkBuddyTokenSource::Plain,
+            _ => WorkBuddyTokenSource::Envelope,
+        }
+    };
+    Ok(WorkBuddyDecryptedTokens {
+        access_token,
+        refresh_token,
+        access_source: source("access_source"),
+        refresh_source: source("refresh_source"),
+    })
+}
+
+/// 解析 JWT payload claims（base64url 第二段；仅供健康复核/脱敏展示，
+/// 不校验签名——签名校验属在线复核阶段）。
+pub fn jwt_payload_claims(token: &str) -> Option<serde_json::Value> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let decoded = base64_url_decode(payload_b64)?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// 无 padding 宽容的 base64url 解码（JWT 惯例：去掉 padding、`-_` 字母表）。
+fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(input.trim_end_matches('='))
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +612,50 @@ mod tests {
             session_status_with(None, marker.exists(), 1792230528000),
             WorkBuddySessionStatus::LoggedOut
         );
+    }
+
+    /// helper 脚本静态断言：取钥绑定、AES-GCM、AAD、双形态兼容分支齐备。
+    #[test]
+    fn decrypt_helper_script_contains_required_parts() {
+        assert!(DECRYPT_HELPER_SCRIPT.contains("electron_browser_workbuddy_storage"));
+        assert!(DECRYPT_HELPER_SCRIPT.contains("loggerGet"));
+        assert!(DECRYPT_HELPER_SCRIPT.contains("aes-256-gcm"));
+        assert!(DECRYPT_HELPER_SCRIPT.contains("WB-AAD"));
+        assert!(DECRYPT_HELPER_SCRIPT.contains("$wbEncrypted"));
+        // 明文透传分支（旧版兼容）。
+        assert!(DECRYPT_HELPER_SCRIPT.contains("typeof field === 'string'"));
+    }
+
+    /// JWT payload 解析：合法 base64url 段解码出 claims；非 JWT 拒绝。
+    #[test]
+    fn jwt_payload_claims_parses_and_rejects() {
+        // 构造：header.payload.signature（payload={"uid":"u1","exp":123}）。
+        use base64::Engine;
+        let encode =
+            |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let payload = serde_json::json!({"uid": "u1", "exp": 123_u64});
+        let token = format!(
+            "{}.{}.{}",
+            encode(br#"{"alg":"RS256"}"#),
+            encode(payload.to_string().as_bytes()),
+            "sig"
+        );
+        let claims = jwt_payload_claims(&token).unwrap();
+        assert_eq!(claims.get("uid").and_then(|uid| uid.as_str()), Some("u1"));
+        assert_eq!(claims.get("exp").and_then(|exp| exp.as_u64()), Some(123));
+        // 非 JWT（无两段以上）拒绝。
+        assert!(jwt_payload_claims("not-a-jwt").is_none());
+    }
+
+    /// 客户端 exe 缺失 → ClientExeMissing（取钥前置检查，零副作用）。
+    #[test]
+    fn decrypt_rejects_missing_client_exe() {
+        let root = tempfile::tempdir().unwrap();
+        let error = decrypt_session_tokens(
+            root.path().join("info.json").as_path(),
+            root.path().join("no-such.exe").as_path(),
+        )
+        .unwrap_err();
+        assert_eq!(error, WorkBuddyDecryptError::ClientExeMissing);
     }
 }
