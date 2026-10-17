@@ -134,6 +134,15 @@
 - **辅助面（wbipc RPC，客户端运行时）与切号约束**：auth 通道全表（asar 通道名表实读）：`auth:login`/`auth:logout`/`auth:getAccount`/`auth:getToken`/`auth:refreshToken`/`auth:refreshSession`/`auth:getUserInfo`/`auth:getAccountUsage`/`auth:getOauthUser`/`auth:saveOauthToken`/`auth:revokeAll`/`auth:getCheckinStatus`/`auth:claimDailyCheckin` 等；broker 协议（ListPipes/GetPipe + JSON-RPC 风格）见 wbipc_probe_p17.rs。**切号写路径约束**：客户端 watcher 监听会话文件外部变更并调和（WB-44172 防误登出语义）——切号实施必须走 auth:login/logout/saveOauthToken RPC 或关闭编排，不可直接改写 .info 文件。
 - **待办实施顺序**：① workbuddy_credential.rs 扩展信封解密（Rust 端取钥子进程 + AES-256-GCM + AAD，兼容明文/信封双形态，5/5 单测已有骨架）；② 捕获编排（复用 Trae 骨架：快照 → 解密 → 在线复核 → WorkBuddy 登录代次容器铸造 → 档案登记）；③ 签到直连（status → claim → status，code=10001 幂等语义对齐 Trae already_checked_in）；④ 切号走 RPC（auth:logout → auth:login/saveOauthToken），破坏性单次确认。
 
-### 8.5 备份范围缺口警示（T4b 后续建议）
+### 8.6 wbipc 握手协议定稿（2026-10-18 asar 实读 + 探针实测，切号 RPC 实施就绪）
+
+- **帧**：newline-JSON（`JSON.stringify(frame)+"\n"`；帧上限 Ny 字节，超限 protocol violation 断连）。
+- **三态握手**（T4 探针实测：未握手发 JSON-RPC → `{"type":"session_hello_error","code":"bad_request"}`）：
+  1. 客户端 → `{type:"session_hello", protocol_min:1, protocol_max:1, client_nonce:<base64url>, ticket_id:<sha256(ticket utf8)前16hex>, client:{kind,id,version}}`（ticket_id 比对失败 → auth_failed）；
+  2. 服务端 → `{type:"session_c…"（challenge，含 serverNonce=<base64url 16B>）}`；客户端 → `{type:"session_prove", client_proof}`；
+  3. 证明算法：`client_proof = HMAC-SHA256(key=ticket utf8, encodeTranscript).base64url`，`encodeTranscript = concat(LP4BE 逐段: ["wbipc-c", "1", <endpoint 管道路径>, clientNonce, serverNonce])`（computeProof/encodeTranscript 实读）；通过后服务端 → `{type:"session_hello_ack", protocol:1, connection_epoch, max_inflight, pipes:[...]}`——**pipes 列表 ack 直接携带**（无需 ListPipes），随后 JSON-RPC 2.0（`replyResult/replyError`）。
+- ticket 本体 32B base64url（endpoint.json 的 ticket 字段）；`ticketId = sha256(ticket)[:16]`；`generateNonce = 16B base64url`。
+
+### 8.7 备份范围缺口警示（T4b 后续建议）
 
 T4b 真机备份覆盖 `~/.workbuddy/app`（Electron userData：IndexedDB/LocalStorage/JSON）。以下凭据材料**不在备份范围**：登录会话（CodeBuddyExtension auth）、`keyblob`、`device-id`、`login-device-nonce`、`account-snapshot.json`。建议 T4b 扩展一个「凭据材料备份」入口（加密信封形态落盘，属凭据材料、按单次确认纪律执行）——待用户确认后实施。

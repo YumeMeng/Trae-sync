@@ -91,6 +91,8 @@ pub mod workbuddy_instance;
 pub mod workbuddy_backup;
 // P17-T4c 准备：WorkBuddy 登录会话快照与健康检测（文件明文面，无需密钥）。
 pub mod workbuddy_credential;
+// P17-T4c③：WorkBuddy 直连签到（官方接口 status/claim，幂等语义对齐 Trae）。
+pub mod workbuddy_checkin;
 // P16-T2：存储根派生路径唯一来源（checkin/products-trae_cn/product-state/fused-login）。
 pub mod storage_roots;
 pub mod storage_root;
