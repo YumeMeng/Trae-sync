@@ -58,3 +58,16 @@
 - **本地服务**：`127.0.0.1:18488`（JSON API，`{"ok":false,"error":"Not Found"}` 形态）——路由表待 T2 从主代码解析。
 - **内核**：`@genie` 命名空间（browser-runtime/extension-im-channels/workbuddy-browser-use）+ **内嵌 CodeBuddy CLI**（cli/bin/codebuddy + codebuddy-lite-wb.mjs）——WorkBuddy 的 agent 能力由 CodeBuddy CLI 驱动（与本项目同生态）。
 - **对适配的直接影响**：Trae Sync 的捕获/铸造编排模式**可整体复用**，协议参数层（client_id/端点/设备绑定）按 CodeBuddy 协议重配——与"复用并扩展"的用户意图完全吻合。
+
+
+## 7. T1/T2 探针执行结果（2026-10-17）
+
+### T2 完成 ✅
+- **IndexedDB/LocalStorage 定性**：本机为空壳/低使用状态（IndexedDB 仅 `__ai_page_offline_probe__` 键；LocalStorage 无 token 痕迹）——数据层探针结论：WorkBuddy 数据在**登录后产生**，正式解析需登录样本。
+- **进程/路径适配点确认**：映像名 `WorkBuddy.exe`；数据根 `~/.workbuddy/app`（`--user-data-dir` 显式）；CodeBuddy CLI 工作目录 `~/.codebuddy/`（诊断+日志，凭据不在）。
+- **18488 路由表**：`LocalProbeServer`（默认端口组 18488/18489/18490）——`GET /workbuddy/probe` 实测返回 `{"ok":true,"app":"workbuddy-desktop","version":"5.8.3","platform":"win32"}`（**WorkBuddy 本地探针 API 可用，与 Trae Sync 探针同构——集成入口已验证**）。
+- **`/space/federation/v1`**：非本地服务——是 WorkBuddy **资料库联邦 URL 校验逻辑**（`AnonymousLibraryStaticRequest` + `normalizeEnterpriseLibraryOrigin`）——**WorkBuddy 存在"资料库/空间"产品概念与企业联邦端点协议**（对话/资料管理适配的对接线索）。
+- **内核补充**：asar 全量提取完成（`.scratch/p17-probe/asar-full/`），main 区 154 文件（account.js 440KB 等），探查产物可复用。
+
+### T1 部分完成（待登录样本）
+- 登录态定位：本机 WorkBuddy 处于**未登录/低使用状态**（无 token 存储）——**精确定位需用户在 WorkBuddy 登录一次后重探**（localStorage/daemon 侧将出现可解析样本）。账号体系已定论（CodeBuddy 账号 + OAuth 授权码流，见第 6 节）。
