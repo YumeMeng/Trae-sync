@@ -1,6 +1,6 @@
 # Trae Sync
 
-2026-10-17 **P17-T4b 完成 + T4c 研究定稿+解密闭环验证**：WorkBuddy 数据目录备份治理（workbuddy_backup.rs，真机 269 文件回读全一致）。T4c（spec 第 8.4 节，三轮演进定案）：**面 A 文件解密可行且已真机闭环**——ELECTRON_RUN_AS_NODE 调客户端原生绑定取 atRestSecretKey → sha256 派生 → AES-256-GCM+AAD 解密信封（accessToken 1323/refreshToken 700 字符 JWT，keyId 9127dea1… 吻合，密钥零外显，客户端无需运行）；与 Trae 捕获方式同构（可复用骨架）；社区对照 88lin/workbuddy-auto-signin（不造轮子确认）；签到协议定案（/v2/billing/meter/daily-checkin 幂等 code=10001，Bearer+X-User-Id）；切号走 auth:* RPC（watcher 禁直写）。文件面健康检测已交付（workbuddy_credential.rs 5/5 + 真机 Active 核对）。**当前关口 = 实施四步**：①credential.rs 扩展解密 ②捕获编排（复用 Trae 骨架）③签到直连 ④切号 RPC——真实账号测试待用户配合，铸造单次确认。
+2026-10-17 **P17-T4c 研究定稿+T1/T2/T3 真机全通（WorkBuddy 首个真实功能闭环）**：面 A 解密链定案（ELECTRON_RUN_AS_NODE 取钥 → sha256 派生 → AES-GCM+AAD 解密信封，keyId 9127dea1… 吻合，token 零外显，客户端可关可开）；workbuddy_credential.rs 解密 Rust 化（8/8 单测 + 内嵌 helper RAII 纪律）；**T3 签到直连实测：status 查询 → claim 领取 code=0（+100 积分，连签 4→5）→ status 复核翻转（total_credits 400→500）**——官方接口直连签到与 Trae 同构验证成立。**当前关口**：②捕获编排（复用 Trae 骨架，铸造单次确认）③签到直连 Rust 化进产品④切号 RPC（T4 wbipc 探针 → T6 需用户在场）。
 
 2026-10-17 **Phase 16 全部完成**：账号捕获闭环（环境页「从客户端捕获账号」——blob 捕获→在线复核→.fused/.checkin 双铸造→档案登记→去重，入池即全功能，真机验收待新号补单次确认）+ 备份治理（E 盘软件旁 backups/ + zstd 管线——**SQLCipher 密文不可压**（诚实修正），迁移释放 C 盘 3.13GB）+ 移植性纪律（storage_roots 唯一来源/37 判定点 link_guard 统一/并发锁重试救回全部环境失败项 921/0+220/0/OAuth 链 deprecated）。**下一票 = 融合版新号真机验收（单次确认）+ OAuth 旧链清理 + WorkBuddy 适配立项调研**。
 
