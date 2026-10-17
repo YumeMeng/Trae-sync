@@ -85,6 +85,8 @@ pub mod sqlcipher;
 pub mod storage_deletion;
 // P17-T3：产品描述符——跨产品差异点统一声明（进程/路径/探针 API/身份形态）。
 pub mod product_descriptor;
+// P17-T4a：WorkBuddy 客户端实例管理（进程/本地探针 API/优雅关闭，descriptor 驱动）。
+pub mod workbuddy_instance;
 // P16-T2：存储根派生路径唯一来源（checkin/products-trae_cn/product-state/fused-login）。
 pub mod storage_roots;
 pub mod storage_root;

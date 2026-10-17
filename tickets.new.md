@@ -1564,4 +1564,6 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - [x] P17-T1 探针：账号体系 + 标识层全部定论（隔离环境解析 2026-10-17）：平台用户 ID = 20 位数字（实测 2079418751248068608）、存储键 wb-slot-configs::*（Local Storage V8 序列化，解析器已验证）、设备标识 AEGIS_ID、实例租约 polling-lease-{SID}；token 层在 daemon/云端侧，随捕获实现时随登录流程观察补定位
 - [x] P17-T2 探针：数据层定性（未登录空壳）+ 进程/路径适配点（WorkBuddy.exe + ~/.workbuddy/app）+ 18488 LocalProbeServer 实测（/workbuddy/probe 端点可用）+ 资料库联邦协议线索
 - [x] P17-T3 系统性 product descriptor 抽象（product_descriptor.rs：ClientIntegration 进程/路径/探针 API 事实 + UserIdShape 身份形态 + TRAE_CN/WORKBUDDY 双 descriptor 实例；WorkBuddy 探针实测事实填充——18488 端口组/probe 路径/20 位 ID/映像名/user-data-dir；expand-contract 纪律：新代码消费 descriptor，存量调用点随 T4 渐进替换；3/3 单测绿——workbuddy probe URL 同源校验/trae_cn 静态事实对齐/身份形态区分）
-- [ ] P17-T4 双产品扩展实施（数据层/凭据层按探针结论，架构骨架复用闸门/备份/纪律/流程）。前置：T3 descriptor 已就绪（新代码按 descriptor 编排）；WorkBuddy 凭据协议参数（oauth_client_id/端点/设备绑定）待登录流程观察填充
+- [x] P17-T4a 实例管理层（2026-10-17）：workbuddy_instance.rs——本地探针 API 客户端（descriptor 端口组逐试 + app==workbuddy-desktop 收紧判定）+ 进程清单（Win32_Process JSON 双形态解析）+ 关闭编排（主进程优雅→强杀→复查，trae_instance 同纪律）+ user-data-dir 解析（引号/裸值双形态）——5/5 单测绿
+- [ ] P17-T4b 备份治理扩展：IndexedDB/LocalStorage/JSON 数据目录的 zstd 压缩备份（未加密数据压缩真有效）——复用 backup 治理骨架
+- [ ] P17-T4c 凭据层：捕获/登录代次铸造（**待登录流程观察**——CodeBuddy 协议参数 oauth_client_id/端点/设备绑定从登录会话填充）
