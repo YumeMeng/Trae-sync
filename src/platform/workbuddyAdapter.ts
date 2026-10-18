@@ -3,6 +3,7 @@ import type {
   WorkBuddyCheckinClaimDto,
   WorkBuddyCheckinStatusDto,
   WorkBuddyLoginSummaryDto,
+  WorkBuddyRefreshStatusDto,
   WorkBuddySessionHealthDto,
 } from "../types/product";
 
@@ -41,4 +42,12 @@ export function claimWorkBuddyCheckin(): Promise<WorkBuddyCheckinClaimDto> {
  */
 export function captureWorkBuddyAccount(): Promise<WorkBuddyLoginSummaryDto> {
   return invoke<WorkBuddyLoginSummaryDto>("capture_workbuddy_account");
+}
+
+/**
+ * 手动续期账号池凭据（与 Trae「刷新登录凭据」同语义）：access 充裕时
+ * 跳过（不轮换），临近过期自动刷新并原子写回新对。
+ */
+export function refreshWorkBuddyAccount(): Promise<WorkBuddyRefreshStatusDto> {
+  return invoke<WorkBuddyRefreshStatusDto>("refresh_workbuddy_account");
 }

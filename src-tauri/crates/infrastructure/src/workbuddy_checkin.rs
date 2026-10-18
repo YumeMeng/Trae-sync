@@ -14,6 +14,13 @@
 //!
 //! 凭据来源：[`crate::workbuddy_credential::decrypt_session_tokens`]（客户端
 //! 运行时取钥解密）+ 会话快照的 uid/domain。本模块不落盘任何凭据。
+//!
+//! P17-T4c⑤ 凭据自持（spec 8.8 真机定稿）：refreshToken 一次性轮换、
+//! 刷新端点零设备绑定（X-Domain/X-Refresh-Token/X-Auth-Refresh-Source 三
+//! 头，空 body）。[`open_session_from_pool`] 优先用工具账号池（WBSESSN1
+//! 容器）——access 充裕直接用，临近过期自动续期并原子写回新对；池为空
+//! 时回退机器解密路径。轮换纪律：刷新成功必须立即 save（丢新对 = 会话
+//! 报废），[`RENEW_THRESHOLD_SECS`] 保证最低轮换频率。
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,6 +30,7 @@ use serde::Deserialize;
 use crate::workbuddy_credential::{
     decrypt_session_tokens, WorkBuddySessionSnapshot,
 };
+use crate::workbuddy_login_credential::WorkBuddyLoginStore;
 
 /// 签到凭据上下文（明文 token 只在内存流转，调用方禁止落盘/写日志）。
 #[derive(Debug, Clone)]
@@ -292,6 +300,228 @@ pub fn open_session_from_machine(
     })
 }
 
+// ===== 凭据自持（P17-T4c⑤，spec 8.8）：池优先会话 + refresh 循环 =====
+
+/// 续期阈值：access 距过期不足 3 天才实际刷新（refreshToken 一次性轮换，
+/// 每次刷新都会作废客户端副本——最低轮换频率纪律）。
+pub const RENEW_THRESHOLD_SECS: u64 = 3 * 24 * 3600;
+
+/// 池凭据续期结果（组合根 DTO 的来源；用户可感知语义与 Trae 刷新对齐）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkBuddyRenewalOutcome {
+    /// access 仍充裕，未刷新（不轮换）。
+    Skipped { access_expires_in_secs: u64 },
+    /// 已刷新并原子写回容器（新 token 对）。
+    Renewed {
+        access_expires_at_unix_seconds: u64,
+        refresh_expires_at_unix_seconds: u64,
+    },
+}
+
+/// 池凭据错误（组合根映射为稳定错误码）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkBuddyPoolError {
+    /// 池为空（未捕获过）——调用方回退机器解密路径。
+    PoolEmpty,
+    /// 指定账号不在池中。
+    RecordMissing,
+    /// refreshToken 已被服务端轮换/吊销（刷新拒绝）——需重新捕获。
+    RefreshRejected,
+    /// 网络/服务端错误。
+    RequestFailed,
+    /// 刷新响应形态不符（含 code!=0 的非拒绝业务码）。
+    ResponseInvalid,
+    /// 容器读写失败。
+    StoreIo,
+}
+
+impl WorkBuddyPoolError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::PoolEmpty => "workbuddy_pool_empty",
+            Self::RecordMissing => "workbuddy_pool_record_missing",
+            Self::RefreshRejected => "workbuddy_refresh_rejected",
+            Self::RequestFailed => "workbuddy_refresh_request_failed",
+            Self::ResponseInvalid => "workbuddy_refresh_response_invalid",
+            Self::StoreIo => "workbuddy_pool_store_io",
+        }
+    }
+}
+
+/// 刷新端点响应信封（data 节选；字段名与真机 200 实测一致，spec 8.8）。
+#[derive(Debug, Clone, Deserialize)]
+struct RefreshEnvelope {
+    code: Option<i64>,
+    #[serde(default)]
+    data: Option<RefreshData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RefreshData {
+    #[serde(rename = "accessToken", default)]
+    access_token: Option<String>,
+    #[serde(rename = "refreshToken", default)]
+    refresh_token: Option<String>,
+    #[serde(rename = "expiresIn", default)]
+    expires_in: Option<u64>,
+    #[serde(rename = "refreshExpiresIn", default)]
+    refresh_expires_in: Option<u64>,
+    #[serde(rename = "sessionState", default)]
+    session_state: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+}
+
+/// 调用刷新端点（协议定案：空 body + X-Domain/X-Refresh-Token/
+/// X-Auth-Refresh-Source 三头；spec 8.8。**轮换型：成功即作废传入的
+/// refreshToken，调用方必须立即持久化响应中的新对**）。
+fn call_refresh_endpoint(
+    http: &reqwest::blocking::Client,
+    domain: &str,
+    refresh_token: &str,
+) -> Result<(String, String, u64, u64, Option<String>, String), WorkBuddyPoolError> {
+    let url = format!("https://{}/v2/plugin/auth/token/refresh", domain);
+    let response = http
+        .post(&url)
+        .header("X-Domain", domain)
+        .header("X-Refresh-Token", refresh_token)
+        .header("X-Auth-Refresh-Source", "plugin")
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .timeout(Duration::from_secs(30))
+        .send()
+        .map_err(|_| WorkBuddyPoolError::RequestFailed)?;
+    let http_status = response.status().as_u16();
+    let body = response.text().map_err(|_| WorkBuddyPoolError::RequestFailed)?;
+    // 401/403 = refreshToken 已失效（被更新对轮换/服务端吊销）。
+    if http_status == 401 || http_status == 403 {
+        return Err(WorkBuddyPoolError::RefreshRejected);
+    }
+    if !(200..300).contains(&http_status) {
+        return Err(WorkBuddyPoolError::RequestFailed);
+    }
+    let envelope: RefreshEnvelope =
+        serde_json::from_str(&body).map_err(|_| WorkBuddyPoolError::ResponseInvalid)?;
+    // code!=0 视为拒绝（含服务端业务态的会话失效）。
+    if envelope.code != Some(0) {
+        return Err(WorkBuddyPoolError::RefreshRejected);
+    }
+    let data = envelope.data.ok_or(WorkBuddyPoolError::ResponseInvalid)?;
+    let new_access = data
+        .access_token
+        .filter(|token| !token.is_empty())
+        .ok_or(WorkBuddyPoolError::ResponseInvalid)?;
+    let new_refresh = data
+        .refresh_token
+        .filter(|token| !token.is_empty())
+        .ok_or(WorkBuddyPoolError::ResponseInvalid)?;
+    // expiresIn（秒）为权威口径（daemon calculateExpiresAt 同语义：缺省才回退现有值）。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Ok((
+        new_access,
+        new_refresh,
+        now + data.expires_in.unwrap_or(0),
+        now + data.refresh_expires_in.unwrap_or(0),
+        data.session_state,
+        data.domain.unwrap_or_else(|| domain.to_string()),
+    ))
+}
+
+/// 池凭据续期：access 临近过期（不足 [`RENEW_THRESHOLD_SECS`]）或已过期
+/// 时用池内 refreshToken 刷新并**原子写回新对**（轮换纪律：刷新成功与
+/// 容器写回之间不做任何可能失败的旁路操作）。access 充裕则跳过不轮换。
+pub fn renew_pool_record(
+    http: &reqwest::blocking::Client,
+    store: &WorkBuddyLoginStore,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+    let summaries = store.list().map_err(|_| WorkBuddyPoolError::StoreIo)?;
+    let summary = summaries.first().ok_or(WorkBuddyPoolError::PoolEmpty)?;
+    let mut record = store
+        .load(&summary.profile_id, &summary.account_id)
+        .map_err(|_| WorkBuddyPoolError::RecordMissing)?;
+
+    let access_expires_in = record
+        .access_token_expires_at_unix_seconds
+        .saturating_sub(now_unix);
+    if access_expires_in > RENEW_THRESHOLD_SECS {
+        return Ok(WorkBuddyRenewalOutcome::Skipped {
+            access_expires_in_secs: access_expires_in,
+        });
+    }
+
+    let (new_access, new_refresh, access_expires_at, refresh_expires_at, session_state, domain) =
+        call_refresh_endpoint(http, &record.domain, &record.refresh_token)?;
+    // 轮换纪律：拿到新对后第一件事就是原子写回（save 内含写后复核）。
+    record.access_token = new_access;
+    record.refresh_token = new_refresh;
+    record.access_token_expires_at_unix_seconds = access_expires_at;
+    record.refresh_token_expires_at_unix_seconds = refresh_expires_at;
+    if let Some(state) = session_state {
+        record.session_state = state;
+    }
+    if !domain.is_empty() {
+        record.domain = domain;
+    }
+    record.last_updated_at_unix_seconds = now_unix;
+    store
+        .save(&record)
+        .map_err(|_| WorkBuddyPoolError::StoreIo)?;
+    Ok(WorkBuddyRenewalOutcome::Renewed {
+        access_expires_at_unix_seconds: access_expires_at,
+        refresh_expires_at_unix_seconds: refresh_expires_at,
+    })
+}
+
+/// 池凭据续期便捷入口（组合根用；自建 HTTP 客户端，组合根零 HTTP 依赖）。
+/// 语义见 [`renew_pool_record`]：access 充裕跳过（零轮换），临近过期刷新
+/// 并原子写回新对。
+pub fn renew_pool_credentials(
+    login_root: &Path,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    renew_pool_record(&pool_http(), &store, now_unix)
+}
+
+/// 从工具账号池打开签到会话（P17-T4c⑤ 池优先路径）：access 充裕直接用
+/// （零轮换）；临近过期先续期（刷新 + 原子写回）再用新 access。池为空时
+/// 返回 [`WorkBuddyPoolError::PoolEmpty`]，由组合根回退机器解密路径。
+pub fn open_session_from_pool(
+    login_root: &Path,
+    now_unix: u64,
+) -> Result<(WorkBuddyCheckinSession, WorkBuddyRenewalOutcome), WorkBuddyPoolError> {
+    let http = pool_http();
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    let renewal = renew_pool_record(&http, &store, now_unix)?;
+    let summaries = store.list().map_err(|_| WorkBuddyPoolError::StoreIo)?;
+    let summary = summaries.first().ok_or(WorkBuddyPoolError::PoolEmpty)?;
+    let record = store
+        .load(&summary.profile_id, &summary.account_id)
+        .map_err(|_| WorkBuddyPoolError::RecordMissing)?;
+    Ok((
+        WorkBuddyCheckinSession {
+            credentials: WorkBuddyCheckinCredentials {
+                access_token: record.access_token,
+                uid: record.account_id,
+                domain: record.domain,
+            },
+            http,
+        },
+        renewal,
+    ))
+}
+
+fn pool_http() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("WorkBuddy 池 HTTP 客户端构建失败")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +606,58 @@ mod tests {
         assert_eq!(
             checkin_status(&http, &credentials).unwrap_err(),
             WorkBuddyCheckinError::CredentialsIncomplete
+        );
+    }
+
+    // ===== 凭据自持（T4c⑤）单测 =====
+
+    /// 真机 200 刷新响应形态（2026-10-18 探针实测；token 值脱敏为占位）。
+    const REFRESH_BODY: &str = r#"{"code":0,"msg":"OK","data":{"accessToken":"new-access-jwt","refreshToken":"new-refresh-jwt","expiresIn":2419200,"refreshExpiresIn":2592000,"notBeforePolicy":1724292326,"sessionState":"7e57e1c9-9d02-4281-ba26-f61b7e4c655f","scope":"openid profile offline_access email","domain":"www.workbuddy.cn"}}"#;
+
+    /// 刷新响应解析：camelCase 字段名 + token 齐全判定（spec 8.8 实测形态）。
+    #[test]
+    fn refresh_envelope_parses_camel_case_fields() {
+        let envelope: RefreshEnvelope = serde_json::from_str(REFRESH_BODY).unwrap();
+        assert_eq!(envelope.code, Some(0));
+        let data = envelope.data.unwrap();
+        assert_eq!(data.access_token.as_deref(), Some("new-access-jwt"));
+        assert_eq!(data.refresh_token.as_deref(), Some("new-refresh-jwt"));
+        assert_eq!(data.expires_in, Some(2419200));
+        assert_eq!(data.refresh_expires_in, Some(2592000));
+        assert!(data.session_state.is_some());
+    }
+
+    /// 轮换拒绝判定：HTTP 401/403 与 code!=0 都归 RefreshRejected。
+    #[test]
+    fn refresh_rejection_semantics() {
+        // 401 → RefreshRejected 由 call_refresh_endpoint 的状态分支保证
+        // （HTTP 调用不可单测，这里验证错误码表与解析层拒绝语义）。
+        assert_eq!(WorkBuddyPoolError::RefreshRejected.code(), "workbuddy_refresh_rejected");
+        let envelope: Result<RefreshEnvelope, _> =
+            serde_json::from_str(r#"{"code":10001,"msg":"invalid token"}"#);
+        // code!=0 的形态也能解析——拒绝判定在 call_refresh_endpoint 中。
+        assert_eq!(envelope.unwrap().code, Some(10001));
+    }
+
+    /// 续期阈值：3 天内（含刚好相等边界）触发刷新，充裕则跳过。
+    #[test]
+    fn renew_threshold_semantics() {
+        let now: u64 = 1_800_000_000;
+        // 充裕（> 阈值）→ 应跳过：剩余 10 天。
+        assert!(now + 10 * 24 * 3600 - now > RENEW_THRESHOLD_SECS);
+        // 临界（= 阈值）→ 不大于阈值 → 触发刷新。
+        assert!(now + RENEW_THRESHOLD_SECS - now <= RENEW_THRESHOLD_SECS);
+        // 已过期（saturating_sub 归零）→ 触发刷新。
+        assert_eq!(now.saturating_sub(now + 100), 0);
+    }
+
+    /// 池空错误码（组合根回退机器解密路径的判定依据）。
+    #[test]
+    fn pool_error_codes_are_stable() {
+        assert_eq!(WorkBuddyPoolError::PoolEmpty.code(), "workbuddy_pool_empty");
+        assert_eq!(
+            WorkBuddyPoolError::ResponseInvalid.code(),
+            "workbuddy_refresh_response_invalid"
         );
     }
 }

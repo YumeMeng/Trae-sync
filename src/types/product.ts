@@ -58,6 +58,13 @@ export interface WorkBuddyCheckinClaimDto {
   readonly verified: boolean;
 }
 
+/** WorkBuddy 凭据续期回执（renewed=false = access 仍充裕，未轮换）。 */
+export interface WorkBuddyRefreshStatusDto {
+  readonly renewed: boolean;
+  readonly access_expires_at_unix_seconds: number;
+  readonly refresh_expires_at_unix_seconds: number;
+}
+
 /** WorkBuddy 账号池脱敏清单行（不含令牌；profile_id 惯例 wb-{uid}）。 */
 export interface WorkBuddyLoginSummaryDto {
   readonly profile_id: string;

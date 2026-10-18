@@ -25,7 +25,9 @@ use traesync_infrastructure::storage_roots::{
 };
 use traesync_infrastructure::workbuddy_capture::capture_workbuddy_login_from_machine;
 use traesync_infrastructure::workbuddy_checkin::{
-    open_session_from_machine, WorkBuddyCheckinOutcome,
+    open_session_from_machine, open_session_from_pool, renew_pool_credentials,
+    WorkBuddyCheckinOutcome, WorkBuddyCheckinSession, WorkBuddyPoolError,
+    WorkBuddyRenewalOutcome,
 };
 use traesync_infrastructure::workbuddy_credential::{
     current_session_status, load_session_snapshot, unix_ms_now, WorkBuddySessionStatus,
@@ -72,6 +74,15 @@ pub struct WorkBuddyCheckinStatusDto {
     pub streak_days: u32,
     pub daily_credit: u32,
     pub total_credits: u32,
+}
+
+/// 凭据续期回执（P17-T4c⑤；用户可感知语义与 Trae 刷新对齐）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddyRefreshStatusDto {
+    /// 是否发生了实际刷新（false = access 仍充裕，未轮换）。
+    pub renewed: bool,
+    pub access_expires_at_unix_seconds: u64,
+    pub refresh_expires_at_unix_seconds: u64,
 }
 
 /// 签到领取回执。
@@ -146,8 +157,9 @@ pub(crate) fn list_workbuddy_accounts(
 #[tauri::command]
 pub(crate) async fn workbuddy_checkin_status(state: State<'_, AppState>) -> Result<WorkBuddyCheckinStatusDto, String> {
     ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state).ok();
     run_blocking("workbuddy_checkin_join_failed", move || {
-        let session = open_session_from_machine(&workbuddy_client_exe()?, DEFAULT_AUTH_ID)?;
+        let session = open_checkin_session_any(login_root.as_deref(), &workbuddy_client_exe()?)?;
         match session.status() {
             Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok(WorkBuddyCheckinStatusDto {
                 today_checked_in: status.today_checked_in,
@@ -170,8 +182,9 @@ pub(crate) async fn workbuddy_checkin_status(state: State<'_, AppState>) -> Resu
 #[tauri::command]
 pub(crate) async fn workbuddy_checkin_claim(state: State<'_, AppState>) -> Result<WorkBuddyCheckinClaimDto, String> {
     ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state).ok();
     run_blocking("workbuddy_checkin_join_failed", move || {
-        let session = open_session_from_machine(&workbuddy_client_exe()?, DEFAULT_AUTH_ID)?;
+        let session = open_checkin_session_any(login_root.as_deref(), &workbuddy_client_exe()?)?;
         // 先查后领（写操作纪律：已签不重复发请求）。
         let before = match session.status() {
             Ok(WorkBuddyCheckinOutcome::Status(status)) => status,
@@ -217,6 +230,75 @@ pub(crate) async fn workbuddy_checkin_claim(state: State<'_, AppState>) -> Resul
             streak_days: claim.streak_days,
             verified: true,
         })
+    })
+    .await
+}
+
+/// 签到会话装配（P17-T4c⑤ 池优先）：池内凭据优先（access 充裕零轮换、
+/// 临近过期自动续期写回），池为空或不可用时回退机器解密（.info 现解密，
+/// 覆盖未捕获账号）。池错误仅在机器回退同样失败时优先暴露——refresh
+/// 拒绝（池 refresh 已轮换作废）引导重新捕获，比机器解密错误更有引导性。
+fn open_checkin_session_any(
+    login_root: Option<&Path>,
+    client_exe: &Path,
+) -> Result<WorkBuddyCheckinSession, String> {
+    let now = unix_ms_now() / 1000;
+    let pool_error = if let Some(root) = login_root {
+        match open_session_from_pool(root, now) {
+            Ok((session, _renewal)) => return Ok(session),
+            Err(error) => Some(error),
+        }
+    } else {
+        None
+    };
+    open_session_from_machine(client_exe, DEFAULT_AUTH_ID).map_err(|machine_error| {
+        match pool_error {
+            Some(error @ (WorkBuddyPoolError::RefreshRejected | WorkBuddyPoolError::RecordMissing)) => {
+                error.code().to_string()
+            }
+            _ => machine_error,
+        }
+    })
+}
+
+/// WorkBuddy 凭据手动续期（对齐 Trae「刷新登录凭据」入口语义）：
+/// access 充裕时跳过（不轮换——refreshToken 一次性，最低轮换频率纪律），
+/// 临近过期/已过期用池内 refreshToken 刷新并原子写回新对。
+#[tauri::command]
+pub(crate) async fn refresh_workbuddy_account(
+    state: State<'_, AppState>,
+) -> Result<WorkBuddyRefreshStatusDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state)?;
+    run_blocking("workbuddy_refresh_join_failed", move || {
+        let now = unix_ms_now() / 1000;
+        let outcome = renew_pool_credentials(&login_root, now)
+            .map_err(|error| error.code().to_string())?;
+        match outcome {
+            WorkBuddyRenewalOutcome::Skipped { .. } => {
+                // 跳过时回读容器现值，给前端完整的有效期展示。
+                use traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginStore;
+                let store = WorkBuddyLoginStore::new(login_root);
+                let summaries = store.list().map_err(|_| "workbuddy_pool_invalid".to_string())?;
+                let summary = summaries.first().ok_or("workbuddy_pool_empty".to_string())?;
+                let record = store
+                    .load(&summary.profile_id, &summary.account_id)
+                    .map_err(|_| "workbuddy_pool_record_missing".to_string())?;
+                Ok(WorkBuddyRefreshStatusDto {
+                    renewed: false,
+                    access_expires_at_unix_seconds: record.access_token_expires_at_unix_seconds,
+                    refresh_expires_at_unix_seconds: record.refresh_token_expires_at_unix_seconds,
+                })
+            }
+            WorkBuddyRenewalOutcome::Renewed {
+                access_expires_at_unix_seconds,
+                refresh_expires_at_unix_seconds,
+            } => Ok(WorkBuddyRefreshStatusDto {
+                renewed: true,
+                access_expires_at_unix_seconds,
+                refresh_expires_at_unix_seconds,
+            }),
+        }
     })
     .await
 }

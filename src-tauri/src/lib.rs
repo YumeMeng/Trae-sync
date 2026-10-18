@@ -1277,6 +1277,7 @@ pub fn run() {
             workbuddy_commands::list_workbuddy_accounts,
             workbuddy_commands::workbuddy_checkin_status,
             workbuddy_commands::workbuddy_checkin_claim,
+            workbuddy_commands::refresh_workbuddy_account,
             workbuddy_commands::capture_workbuddy_account,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,

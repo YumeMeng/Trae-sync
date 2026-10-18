@@ -12,6 +12,7 @@ import {
   fetchWorkBuddyCheckinStatus,
   listWorkBuddyAccounts,
   loadWorkBuddySessionHealth,
+  refreshWorkBuddyAccount,
 } from "../platform/workbuddyAdapter";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { EmptyState } from "./EmptyState";
@@ -98,6 +99,8 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   // 捕获：单次确认弹窗 → 执行 → 刷新健康与账号池。
   const [captureDialogOpen, setCaptureDialogOpen] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  // 凭据续期（与 Trae「刷新登录凭据」同语义）：access 充裕跳过不轮换。
+  const [renewing, setRenewing] = useState(false);
 
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
@@ -143,6 +146,27 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   // 客户端未登录时捕获必然失败（后端第一步就是会话 Active 校验），UI 提前禁用。
   const captureDisabled = health !== null && health.status !== "active";
 
+  // 凭据续期：renewed=true 已换新钥匙；false = 仍充裕（不轮换，保护客户端副本）。
+  const runRenew = useCallback(async () => {
+    setRenewing(true);
+    try {
+      const status = await refreshWorkBuddyAccount();
+      const until = formatUnixTime(status.access_expires_at_unix_seconds) ?? "未知";
+      if (status.renewed) {
+        notify.success(`WorkBuddy：登录凭据已更新，有效期至 ${until}`);
+      } else {
+        notify.info(`WorkBuddy：登录凭据仍充裕（有效期至 ${until}），本次未刷新`);
+      }
+      await refresh(false);
+    } catch (reason: unknown) {
+      notify.error(
+        `WorkBuddy：刷新登录凭据失败——${safeUiErrorMessage(reason, "凭据续期未完成，请稍后重试。")}`,
+      );
+    } finally {
+      setRenewing(false);
+    }
+  }, [refresh]);
+
   return (
     <section className="workbuddy-page" role="region" aria-label="账号">
       <header className="page-header">
@@ -159,6 +183,17 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           >
             <RefreshCw size={15} className={refreshing ? "icon-spin" : undefined} aria-hidden="true" />
             刷新
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void runRenew()}
+            disabled={renewing || loading || pool.length === 0}
+            data-testid="workbuddy-renew-credentials"
+            title={pool.length === 0 ? "还没有已保存的账号" : "续期账号池中的登录凭据（有效期充裕时自动跳过）"}
+          >
+            <RefreshCw size={15} className={renewing ? "icon-spin" : undefined} aria-hidden="true" />
+            刷新登录凭据
           </button>
           <button
             type="button"

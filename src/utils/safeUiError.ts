@@ -641,6 +641,19 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /workbuddy_pool_invalid/i,
     "WorkBuddy 账号池数据读取失败，请稍后重试。",
   ],
+  // ===== P17-T4c⑤ WorkBuddy 凭据自持：续期/账号池错误码 =====
+  [
+    /workbuddy_refresh_rejected/i,
+    "账号池中的登录凭据已失效（可能已被客户端刷新轮换），请在 WorkBuddy 中重新登录后重新保存账号。",
+  ],
+  [
+    /workbuddy_pool_empty|workbuddy_pool_record_missing/i,
+    "账号池中还没有可用的 WorkBuddy 账号，请先保存当前登录账号。",
+  ],
+  [
+    /workbuddy_refresh_request_failed|workbuddy_refresh_response_invalid|workbuddy_refresh_join_failed|workbuddy_pool_store_io/i,
+    "凭据续期未完成，请稍后重试。",
+  ],
   // ===== P13-3 Trae CN 归档/恢复：CN 实例生命周期专属拒绝码 =====
   //（DB 层错误沿用上方 master_archive_* 既有族，同一事务原语共用词表）
   [
