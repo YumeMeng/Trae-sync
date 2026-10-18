@@ -42,6 +42,8 @@ fn default_target() -> PathBuf {
 
 /// 独占打开探针：目标文件被任何进程持有句柄时打开失败（share_mode 0）。
 fn file_is_locked(path: &Path) -> bool {
+    // share_mode 需 Windows 扩展 trait 在作用域内（补缺失导入）。
+    use std::os::windows::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)

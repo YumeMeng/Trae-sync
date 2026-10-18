@@ -1,35 +1,43 @@
-//! P17-T4c②：WorkBuddy 登录代次容器（`{root}/{profile_id}.wbsess`）。
+//! P17-T4c②/P17-A1：WorkBuddy 登录代次容器（`{root}/{profile_id}.wbsess`）。
 //!
 //! 与 Trae 融合版容器（`fused_login_credential`，TSFUSED1）同构纪律、
-//! 独立目录独立魔数——跨产品凭据隔离（ADR-0029 产品分层；跨产品复制
-//! 禁令继续有效）。格式：`magic(8) || format_version(u32 LE) ||
-//! payload_len(u32 LE) || DPAPI 密文`；明文为 JSON 记录。
+//! 独立目录独立格式——跨产品凭据隔离（ADR-0029 产品分层；跨产品复制
+//! 禁令继续有效）。
+//!
+//! **P17-A1 明文化（spec 10.3，用户拍板：个人工具明文存储，不做防御性
+//! 措施）**：文件格式为**裸明文 JSON 记录**（`format_version = 2` 标记
+//! 明文形态——选实现最简的裸 JSON，无需魔数头）；DPAPI 加密层移除。
+//! 双格式兼容读取：新写入恒为明文 JSON；旧 `WBSESSN1` DPAPI 容器（
+//! `magic(8) || version(u32 LE) || payload_len(u32 LE) || DPAPI 密文`）
+//! 保留兼容读，经 [`WorkBuddyLoginStore::migrate_legacy_to_plain`] 幂等
+//! 迁移后不再产生。
 //!
 //! 字段差异（vs FusedLoginRecord）：WorkBuddy 凭据无 ICDRS 设备三元组
 //! （machine_id/device_public_key），新增 domain/session_state（官方接口
 //! 调用上下文）；device_id 为 `~/.workbuddy/device-id`（机器级 UUID）。
 //!
-//! 纪律（与 fused 同构）：整代次原子替换（tmp + rename）；读取校验
-//! profile_id ↔ account_id 绑定；令牌不进 Debug/日志（本类型不实现
-//! Debug）；续期由 WorkBuddy 客户端 daemon 自动完成，工具只做整代次
-//! 捕获落盘，不主动发起刷新请求。
+//! 纪律（与 fused 同构）：整代次原子替换（tmp + rename）+ 写后复核；
+//! 读取校验 profile_id ↔ account_id 绑定；续期由 WorkBuddy 客户端
+//! daemon 自动完成，工具只做整代次捕获落盘，不主动发起刷新请求。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::key_wrapper::{protect, unprotect};
+use crate::key_wrapper::unprotect;
 use traesync_ports::KeyWrapperError;
 
-/// 容器魔数。
+/// 旧 DPAPI 容器魔数（P17-A1 起仅作迁移窗口内的兼容读）。
 pub const WORKBUDDY_LOGIN_MAGIC: &[u8; 8] = b"WBSESSN1";
-/// 容器格式版本。
+/// 旧 DPAPI 容器格式版本。
 pub const WORKBUDDY_LOGIN_FORMAT_VERSION: u32 = 1;
-/// 单容器密文上限（防异常膨胀；正常记录约 1.5KB）。
+/// 明文 JSON 形态版本（P17-A1：2 = 裸明文 JSON 记录）。
+pub const WORKBUDDY_LOGIN_PLAIN_FORMAT_VERSION: u32 = 2;
+/// 单文件上限（防异常膨胀；正常记录约 1.5KB）。
 const MAX_PAYLOAD_BYTES: u64 = 64 * 1024;
-/// 头部长度：magic(8) + version(4) + payload_len(4)。
-const HEADER_LEN: usize = 16;
+/// 旧容器头部长度：magic(8) + version(4) + payload_len(4)。
+const LEGACY_HEADER_LEN: usize = 16;
 
 /// 容器错误。变体不含令牌或文件内容（凭据不进错误链）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,9 +181,10 @@ impl WorkBuddyLoginStore {
     }
 
     /// 整代次原子写入（捕获落盘与更新共用；tmp + rename + 写后复核）。
+    /// P17-A1：写入恒为明文 JSON 形态（format_version = 2）。
     pub fn save(&self, record: &WorkBuddyLoginRecord) -> Result<(), WorkBuddyLoginStoreError> {
         record.validate()?;
-        let payload = encode_payload(record)?;
+        let payload = encode_plain_payload(record)?;
         fs::create_dir_all(&self.root).map_err(|_| WorkBuddyLoginStoreError::Io)?;
         let destination = self.record_path(&record.profile_id);
         let temporary = self
@@ -183,7 +192,7 @@ impl WorkBuddyLoginStore {
             .join(format!("{}.wbsess.tmp", record.profile_id));
         fs::write(&temporary, &payload).map_err(|_| WorkBuddyLoginStoreError::Io)?;
         fs::rename(&temporary, &destination).map_err(|_| WorkBuddyLoginStoreError::Io)?;
-        // 写后复核：解密回读并校验账号一致（写入半成功即在此暴露）。
+        // 写后复核：回读并校验账号一致（写入半成功即在此暴露）。
         let readback = self
             .load(&record.profile_id, &record.account_id)
             .map_err(|_| WorkBuddyLoginStoreError::Io)?;
@@ -195,7 +204,8 @@ impl WorkBuddyLoginStore {
         Ok(())
     }
 
-    /// 解密读取并校验绑定；任何失败不产生写副作用。
+    /// 读取并校验绑定（双格式：明文 JSON 优先、旧 DPAPI 容器兼容读）；
+    /// 任何失败不产生写副作用。
     pub fn load(
         &self,
         profile_id: &str,
@@ -211,19 +221,19 @@ impl WorkBuddyLoginStore {
                 WorkBuddyLoginStoreError::Io
             }
         })?;
-        let record = decode_payload(&payload)?;
+        let record = decode_record_file(&payload)?;
         if record.profile_id != profile_id || record.account_id != expected_account_id {
             return Err(WorkBuddyLoginStoreError::BindingMismatch);
         }
         Ok(record)
     }
 
-    /// 容器是否存在（不解密；清单展示与迁移判断用）。
+    /// 容器是否存在（不读取；清单展示与迁移判断用）。
     pub fn exists(&self, profile_id: &str) -> bool {
         self.record_path(profile_id).is_file()
     }
 
-    /// 脱敏清单：扫描容器目录全部 `.wbsess` 文件并解密取摘要。
+    /// 脱敏清单：扫描容器目录全部 `.wbsess` 文件并读取摘要。
     /// 损坏文件跳过（清单是展示面，坏一个不拖垮全部）。
     pub fn list(&self) -> Result<Vec<WorkBuddyLoginSummary>, WorkBuddyLoginStoreError> {
         let mut summaries = Vec::new();
@@ -240,18 +250,92 @@ impl WorkBuddyLoginStore {
             let Ok(payload) = fs::read(&path) else {
                 continue;
             };
-            if let Ok(record) = decode_payload(&payload) {
+            if let Ok(record) = decode_record_file(&payload) {
                 summaries.push(record.summary());
             }
         }
         summaries.sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
         Ok(summaries)
     }
+
+    /// P17-A1 存量迁移：旧 DPAPI 容器 → 明文 JSON（幂等）。
+    ///
+    /// 逐文件处理：明文形态跳过（`already_plain`）；旧 DPAPI 容器解密 →
+    /// 先把旧密文字节备份到 `legacy_backup_dir`（Some 时，同文件名原样
+    /// 副本——迁移前的保险，密文形态不引入明文泄漏面）→ 原子替换为明文
+    /// JSON（`save` 自带 tmp + rename + 写后复核）→ 替换即旧密文消失
+    /// （同路径覆盖 = 彻底删除，不走回收站）。单文件失败记录后继续
+    /// （清单面纪律：坏一个不拖垮全部），失败文件的旧密文原位保留。
+    pub fn migrate_legacy_to_plain(
+        &self,
+        legacy_backup_dir: Option<&Path>,
+    ) -> Result<WorkBuddyLoginMigrationOutcome, WorkBuddyLoginStoreError> {
+        let mut outcome = WorkBuddyLoginMigrationOutcome::default();
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(outcome),
+            Err(_) => return Err(WorkBuddyLoginStoreError::Io),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("wbsess") {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let profile_id = file_name.trim_end_matches(".wbsess").to_string();
+            let Ok(payload) = fs::read(&path) else {
+                outcome.failed.push(profile_id);
+                continue;
+            };
+            if payload.first() == Some(&b'{') {
+                // 已是明文形态：幂等跳过。
+                outcome.already_plain += 1;
+                continue;
+            }
+            let record = match decode_legacy_payload(&payload) {
+                Ok(record) => record,
+                Err(_) => {
+                    outcome.failed.push(profile_id);
+                    continue;
+                }
+            };
+            // 迁移前旧密文备份（存在才拷；同内容重复覆盖安全）。
+            if let Some(backup_root) = legacy_backup_dir {
+                if fs::create_dir_all(backup_root).is_err()
+                    || fs::copy(&path, backup_root.join(&file_name)).is_err()
+                {
+                    outcome.failed.push(profile_id);
+                    continue;
+                }
+            }
+            match self.save(&record) {
+                Ok(()) => outcome.migrated += 1,
+                Err(_) => outcome.failed.push(profile_id),
+            }
+        }
+        Ok(outcome)
+    }
 }
 
-fn encode_payload(record: &WorkBuddyLoginRecord) -> Result<Vec<u8>, WorkBuddyLoginStoreError> {
+/// P17-A1 存量迁移回执（不含任何凭据材料）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkBuddyLoginMigrationOutcome {
+    /// 本次由 DPAPI 容器转换为明文 JSON 的文件数。
+    pub migrated: usize,
+    /// 迁移前已是明文形态、幂等跳过的文件数。
+    pub already_plain: usize,
+    /// 迁移失败的 profile_id 清单（旧文件原位保留，可重试）。
+    pub failed: Vec<String>,
+}
+
+/// 明文 JSON 编码（P17-A1）：裸 JSON 记录，`format_version = 2` 标记
+/// 明文形态。无魔数头——实现最简；格式识别靠首字节（`{` = 明文 JSON，
+/// 其余按旧 DPAPI 容器兼容读）。
+fn encode_plain_payload(
+    record: &WorkBuddyLoginRecord,
+) -> Result<Vec<u8>, WorkBuddyLoginStoreError> {
     let serialized = SerializableRecord {
-        format_version: WORKBUDDY_LOGIN_FORMAT_VERSION,
+        format_version: WORKBUDDY_LOGIN_PLAIN_FORMAT_VERSION,
         profile_id: record.profile_id.clone(),
         account_id: record.account_id.clone(),
         screen_name: record.screen_name.clone(),
@@ -266,22 +350,57 @@ fn encode_payload(record: &WorkBuddyLoginRecord) -> Result<Vec<u8>, WorkBuddyLog
         minted_at_unix_seconds: record.minted_at_unix_seconds,
         last_updated_at_unix_seconds: record.last_updated_at_unix_seconds,
     };
-    let plaintext =
-        serde_json::to_vec(&serialized).map_err(|_| WorkBuddyLoginStoreError::Invalid)?;
-    let encrypted = protect(&plaintext).map_err(map_key_wrapper_error)?;
-    if encrypted.is_empty() || encrypted.len() as u64 > MAX_PAYLOAD_BYTES {
+    let payload = serde_json::to_vec(&serialized).map_err(|_| WorkBuddyLoginStoreError::Invalid)?;
+    if payload.is_empty() || payload.len() as u64 > MAX_PAYLOAD_BYTES {
         return Err(WorkBuddyLoginStoreError::Invalid);
     }
-    let mut payload = Vec::with_capacity(HEADER_LEN + encrypted.len());
-    payload.extend_from_slice(WORKBUDDY_LOGIN_MAGIC);
-    payload.extend_from_slice(&WORKBUDDY_LOGIN_FORMAT_VERSION.to_le_bytes());
-    payload.extend_from_slice(&(encrypted.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&encrypted);
     Ok(payload)
 }
 
-fn decode_payload(payload: &[u8]) -> Result<WorkBuddyLoginRecord, WorkBuddyLoginStoreError> {
-    if payload.len() <= HEADER_LEN || &payload[..8] != WORKBUDDY_LOGIN_MAGIC {
+/// 双格式文件解码：首字节 `{` = 明文 JSON（P17-A1）；否则按旧 DPAPI
+/// 容器兼容读（迁移窗口；迁移后不再产生）。
+fn decode_record_file(payload: &[u8]) -> Result<WorkBuddyLoginRecord, WorkBuddyLoginStoreError> {
+    if payload.first() == Some(&b'{') {
+        return decode_plain_payload(payload);
+    }
+    decode_legacy_payload(payload)
+}
+
+/// 明文 JSON 解码。
+fn decode_plain_payload(payload: &[u8]) -> Result<WorkBuddyLoginRecord, WorkBuddyLoginStoreError> {
+    if payload.is_empty() || payload.len() as u64 > MAX_PAYLOAD_BYTES {
+        return Err(WorkBuddyLoginStoreError::Invalid);
+    }
+    let serialized: SerializableRecord =
+        serde_json::from_slice(payload).map_err(|_| WorkBuddyLoginStoreError::Invalid)?;
+    if serialized.format_version != WORKBUDDY_LOGIN_PLAIN_FORMAT_VERSION {
+        return Err(WorkBuddyLoginStoreError::Invalid);
+    }
+    let record = WorkBuddyLoginRecord {
+        profile_id: serialized.profile_id,
+        account_id: serialized.account_id,
+        screen_name: serialized.screen_name,
+        masked_mobile: serialized.masked_mobile,
+        access_token: serialized.access_token,
+        refresh_token: serialized.refresh_token,
+        access_token_expires_at_unix_seconds: serialized.access_expires_at,
+        refresh_token_expires_at_unix_seconds: serialized.refresh_expires_at,
+        domain: serialized.domain,
+        session_state: serialized.session_state,
+        device_id: serialized.device_id,
+        minted_at_unix_seconds: serialized.minted_at_unix_seconds,
+        last_updated_at_unix_seconds: serialized.last_updated_at_unix_seconds,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// 旧 DPAPI 容器解码（P17-A1 迁移窗口兼容读；`magic(8) || version(u32 LE)
+/// || payload_len(u32 LE) || DPAPI 密文`）。
+fn decode_legacy_payload(
+    payload: &[u8],
+) -> Result<WorkBuddyLoginRecord, WorkBuddyLoginStoreError> {
+    if payload.len() <= LEGACY_HEADER_LEN || &payload[..8] != WORKBUDDY_LOGIN_MAGIC {
         return Err(WorkBuddyLoginStoreError::Invalid);
     }
     let version = u32::from_le_bytes(
@@ -299,11 +418,11 @@ fn decode_payload(payload: &[u8]) -> Result<WorkBuddyLoginRecord, WorkBuddyLogin
     ) as usize;
     if encrypted_len == 0
         || encrypted_len as u64 > MAX_PAYLOAD_BYTES
-        || payload.len() != HEADER_LEN + encrypted_len
+        || payload.len() != LEGACY_HEADER_LEN + encrypted_len
     {
         return Err(WorkBuddyLoginStoreError::Invalid);
     }
-    let plaintext = unprotect(&payload[HEADER_LEN..]).map_err(map_key_wrapper_error)?;
+    let plaintext = unprotect(&payload[LEGACY_HEADER_LEN..]).map_err(map_key_wrapper_error)?;
     let serialized: SerializableRecord =
         serde_json::from_slice(&plaintext).map_err(|_| WorkBuddyLoginStoreError::Invalid)?;
     let record = WorkBuddyLoginRecord {
@@ -335,6 +454,7 @@ fn map_key_wrapper_error(error: KeyWrapperError) -> WorkBuddyLoginStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::key_wrapper::protect;
     use tempfile::tempdir;
 
     const FIXTURE_UID: &str = "89b16d6b-0549-4e1e-8ced-918b5c8152ae";
@@ -355,6 +475,145 @@ mod tests {
             minted_at_unix_seconds: 1_800_000_000,
             last_updated_at_unix_seconds: 1_800_000_000,
         }
+    }
+
+    /// P17-A1：落盘为明文 JSON（首字节 `{`，format_version = 2），不再
+    /// 经过 DPAPI 加密层。
+    #[test]
+    fn save_writes_plain_json_format() {
+        let root = tempdir().expect("tempdir");
+        let store = WorkBuddyLoginStore::new(root.path());
+        let record = fixture_record();
+        store.save(&record).expect("save");
+        let path = root.path().join(format!("{}.wbsess", record.profile_id));
+        let payload = fs::read(&path).expect("read");
+        assert_eq!(payload.first(), Some(&b'{'), "明文 JSON 首字节应为 '{{'");
+        let value: serde_json::Value = serde_json::from_slice(&payload).expect("valid json");
+        assert_eq!(
+            value["format_version"],
+            WORKBUDDY_LOGIN_PLAIN_FORMAT_VERSION
+        );
+        assert_eq!(value["account_id"], FIXTURE_UID);
+        // 无旧容器魔数头。
+        assert!(&payload[..8] != WORKBUDDY_LOGIN_MAGIC);
+    }
+
+    /// P17-A1 旧格式兼容读：手工构造的 DPAPI 容器仍可 load（迁移窗口）。
+    #[test]
+    fn legacy_dpapi_container_still_loadable() {
+        let record = fixture_record();
+        let legacy = encode_legacy_fixture(&record);
+        let root = tempdir().expect("tempdir");
+        let store = WorkBuddyLoginStore::new(root.path());
+        fs::write(
+            root.path().join(format!("{}.wbsess", record.profile_id)),
+            legacy,
+        )
+        .expect("write legacy container");
+        let loaded = store
+            .load(&record.profile_id, FIXTURE_UID)
+            .expect("legacy load");
+        assert_eq!(loaded.access_token, record.access_token);
+    }
+
+    /// P17-A1 迁移：DPAPI 容器 → 明文 JSON；旧密文先备份到 legacy 目录；
+    /// 幂等（二次运行为 already_plain）；迁移后读取结果一致。
+    #[test]
+    fn migrate_legacy_to_plain_is_idempotent_and_backs_up_legacy() {
+        let record = fixture_record();
+        let root = tempdir().expect("tempdir");
+        let store = WorkBuddyLoginStore::new(root.path());
+        let path = root.path().join(format!("{}.wbsess", record.profile_id));
+        fs::write(&path, encode_legacy_fixture(&record)).expect("write legacy container");
+        let backup_dir = root.path().join("legacy-backup");
+
+        let outcome = store
+            .migrate_legacy_to_plain(Some(&backup_dir))
+            .expect("migrate");
+        assert_eq!(outcome.migrated, 1);
+        assert_eq!(outcome.already_plain, 0);
+        assert!(outcome.failed.is_empty());
+        // 文件已替换为明文 JSON；旧密文备份在位。
+        let payload = fs::read(&path).expect("read");
+        assert_eq!(payload.first(), Some(&b'{'));
+        let legacy_backup = fs::read(backup_dir.join(format!("{}.wbsess", record.profile_id)))
+            .expect("legacy backup");
+        assert_eq!(&legacy_backup[..8], WORKBUDDY_LOGIN_MAGIC, "备份为旧密文");
+        // 迁移后读取一致。
+        let loaded = store.load(&record.profile_id, FIXTURE_UID).expect("load");
+        assert_eq!(loaded.access_token, record.access_token);
+        assert_eq!(loaded.session_state, record.session_state);
+
+        // 幂等：二次运行全部跳过，不再迁移、备份不重复产生变化。
+        let outcome2 = store
+            .migrate_legacy_to_plain(Some(&backup_dir))
+            .expect("migrate again");
+        assert_eq!(outcome2.migrated, 0);
+        assert_eq!(outcome2.already_plain, 1);
+        assert!(outcome2.failed.is_empty());
+    }
+
+    /// P17-A1：损坏明文 JSON 拒绝（非法 JSON / 版本不符 / 截断）。
+    #[test]
+    fn load_rejects_corrupted_plain_json() {
+        let root = tempdir().expect("tempdir");
+        let store = WorkBuddyLoginStore::new(root.path());
+        let record = fixture_record();
+        store.save(&record).expect("save");
+        let path = root.path().join(format!("{}.wbsess", record.profile_id));
+        // 非 JSON 内容（首字节非 `{` 也非魔数）。
+        fs::write(&path, b"garbage").expect("write");
+        assert_eq!(
+            store.load(&record.profile_id, FIXTURE_UID).err(),
+            Some(WorkBuddyLoginStoreError::Invalid)
+        );
+        // 恢复合法明文后再篡改版本号（前一步已把文件写成坏样本）。
+        store.save(&record).expect("restore plain");
+        // JSON 合法但版本不符（=1 的明文形态不存在，拒绝）。
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        value["format_version"] = serde_json::json!(1);
+        fs::write(&path, value.to_string()).expect("write");
+        assert_eq!(
+            store.load(&record.profile_id, FIXTURE_UID).err(),
+            Some(WorkBuddyLoginStoreError::Invalid)
+        );
+        // 截断。
+        let mut payload = fs::read(&path).expect("read");
+        payload.truncate(10);
+        fs::write(&path, &payload).expect("write");
+        assert_eq!(
+            store.load(&record.profile_id, FIXTURE_UID).err(),
+            Some(WorkBuddyLoginStoreError::Invalid)
+        );
+    }
+
+    /// 测试辅助：按旧 DPAPI 容器格式编码 fixture 记录（兼容读/迁移用）。
+    fn encode_legacy_fixture(record: &WorkBuddyLoginRecord) -> Vec<u8> {
+        let serialized = SerializableRecord {
+            format_version: WORKBUDDY_LOGIN_FORMAT_VERSION,
+            profile_id: record.profile_id.clone(),
+            account_id: record.account_id.clone(),
+            screen_name: record.screen_name.clone(),
+            masked_mobile: record.masked_mobile.clone(),
+            access_token: record.access_token.clone(),
+            refresh_token: record.refresh_token.clone(),
+            access_expires_at: record.access_token_expires_at_unix_seconds,
+            refresh_expires_at: record.refresh_token_expires_at_unix_seconds,
+            domain: record.domain.clone(),
+            session_state: record.session_state.clone(),
+            device_id: record.device_id.clone(),
+            minted_at_unix_seconds: record.minted_at_unix_seconds,
+            last_updated_at_unix_seconds: record.last_updated_at_unix_seconds,
+        };
+        let plaintext = serde_json::to_vec(&serialized).expect("serialize");
+        let encrypted = protect(&plaintext).expect("dpapi protect");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(WORKBUDDY_LOGIN_MAGIC);
+        payload.extend_from_slice(&WORKBUDDY_LOGIN_FORMAT_VERSION.to_le_bytes());
+        payload.extend_from_slice(&(encrypted.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&encrypted);
+        payload
     }
 
     #[test]

@@ -9,8 +9,9 @@
 //! 接力台账读取（P5-3），以及全部内嵌测试。
 //! 环境实例生命周期命令在 environment 模块；主库切号五步事务留守组合根，
 //! 经 `crate::` 引用组合根原语、本模块备份工具回供
-//! `crate::library_archive::{resolve_master_backup_dir, prune_backups_if_enabled,
-//! resolve_library_backup_dir, prune_backups_if_enabled_in}`。命令体、
+//! `crate::library_archive::{resolve_master_backup_dir, resolve_library_backup_dir,
+//! prune_backups_if_enabled_in}`（P17-A3：prune_backups_if_enabled 无生产
+//! 调用方——切号/手动备份已滚动单份化，保留给链式现场兜底）。命令体、
 //! 错误码与 wire 形态零变化。
 
 use std::future::Future;
@@ -29,9 +30,12 @@ use traesync_infrastructure::archive_draft_store::{
 };
 use traesync_infrastructure::backup_retention::{
     load_backup_dir_override, migrate_master_backups as migrate_master_backups_inner,
-    prune_master_backups, BackupMigrationOutcome, BackupRetentionError, BackupRetentionSettings,
-    BackupRetentionStore, MAX_BACKUP_DIR_BYTES,
+    BackupMigrationOutcome, BackupRetentionError, BackupRetentionSettings, BackupRetentionStore,
+    MAX_BACKUP_DIR_BYTES,
 };
+// P17-A3：prune_master_backups（滚动单份语义）仅备份策略单测引用。
+#[cfg(test)]
+use traesync_infrastructure::backup_retention::prune_master_backups;
 use traesync_infrastructure::environment_registry::{
     environment_registry_error_code, master_data_dir, master_data_dir_for, secondary_data_dir,
     EnvironmentRegistry, MASTER_ENV_ID,
@@ -42,15 +46,22 @@ use traesync_infrastructure::master_history::{
 };
 use traesync_infrastructure::trae_instance::{self as trae_instance_module, close_instance};
 use traesync_infrastructure::{
-    apply_master_archive_changes as apply_master_archive_changes_inner, backup_master_trio_stamped,
-    backup_master_trio_to, delete_master_sessions as delete_master_sessions_inner,
-    delete_master_sessions_with_backup_dir, handover_master_records, list_master_backups_in,
-    master_backup_db_name, master_database_path, master_db_activity_detected,
-    merge_master_projects_with_backup_dir, merge_trae_cn_project_records_with_progress,
+    apply_master_archive_changes as apply_master_archive_changes_inner,
+    backup_master_trio_rolling_stamped, delete_master_sessions_with_backup_dir,
+    handover_master_records, list_master_backups_in, master_backup_db_name,
+    master_database_path, master_db_activity_detected,
+    merge_master_projects as merge_master_projects_inner,
+    merge_trae_cn_project_records_with_progress,
     preview_trae_cn_project_merge as preview_trae_cn_project_merge_infra,
     read_trae_cn_foreign_projects, AccountRegistry, MasterArchiveError, MasterDeleteOutcome,
     MasterHandover, MasterHandoverError, MasterMergeOutcome, OperationLease, RelayLedger,
     RelayLedgerEntry, TraeProduct,
+};
+// P17-A3：备份触发点收敛后，低层备份原语与删除原语仅 probe 验收探针
+// 直接引用（acceptance_probe 为 `--features probe` 门控模块）。
+#[cfg(feature = "probe")]
+use traesync_infrastructure::{
+    backup_master_trio_rolling, delete_master_sessions as delete_master_sessions_inner,
 };
 
 use crate::{
@@ -919,17 +930,10 @@ fn incorporate_master_records_inner(
         crate::process_guard::close_failure_code(error, "master_incorporate_close_failed")
     })?;
 
-    // 第 2 步：三件套备份（ADR-0018 铁律；create_new 永不覆盖备份链）。
-    emit("backing_up");
-    // P11-4①/P11-5⑤：写入当前库作用域活动备份目录（副环境链与主库链隔离）。
-    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
-    let backup_path =
-        backup_master_trio_to(&db_path, Some(&backup_dir)).map_err(|error| match error {
-            MasterHandoverError::DbUnavailable => "master_switch_db_missing".to_string(),
-            _ => "master_switch_backup_failed".to_string(),
-        })?;
-    // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前库的链）。
-    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
+    // P17-A3（spec 10.2 触发点收敛）：收编不再自动触发备份——自动备份
+    // 仅保留切号与删除会话两个高危触发点；收编走单事务（handover 原语）
+    // 保证原子性。原 `backing_up` 进度阶段与 backup_path 一并退役
+    // （DTO 字段保留为前端契约兼容，恒空串）。
 
     // 第 3 步：归属改写 + 换腿 + 完整性校验（交接原语单事务；非空
     // UNIQUE 冲突报人工决策，禁止静默覆盖）。
@@ -974,7 +978,8 @@ fn incorporate_master_records_inner(
         transferred_projects: handover.transferred_projects as u32,
         removed_mirror_rows: handover.removed_mirror_rows as u32,
         switched_sessions: handover.switched_sessions.len() as u32,
-        backup_path: backup_path.display().to_string(),
+        // P17-A3：收编不再自动备份；字段保留为前端契约兼容，恒空串。
+        backup_path: String::new(),
         relay_ledger_written,
         relaunch_outcome,
     })
@@ -1491,21 +1496,10 @@ fn run_trae_cn_project_merge(
         return Err("trae_cn_merge_busy".to_string());
     }
 
-    // 备份先行（ADR-0018 家族铁律；写入 CN 库作用域活动备份目录）。
-    on_progress(TraeCnMergeProgressEvent {
-        stage: "backing_up",
-        current: 0,
-        total: 0,
-        label: String::new(),
-    });
-    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
-    let backup_path =
-        backup_master_trio_to(&db_path, Some(&backup_dir)).map_err(|error| match error {
-            MasterHandoverError::DbUnavailable => "trae_cn_merge_db_missing".to_string(),
-            _ => "trae_cn_merge_backup_failed".to_string(),
-        })?;
-    // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前库的链）。
-    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
+    // P17-A3（spec 10.2 触发点收敛）：CN 归并不再自动触发备份——自动
+    // 备份仅保留切号与删除会话两个高危触发点；归并走单事务原子写。
+    // 原 `backing_up` 进度阶段与 backup_path 一并退役（DTO 字段保留为
+    // 前端契约兼容，恒空串）。
 
     // 单事务归并（mapping/executing/verifying 进度逐项转发）。
     let handover = merge_trae_cn_project_records_with_progress(
@@ -1551,7 +1545,8 @@ fn run_trae_cn_project_merge(
             .map(|session| session.message_count)
             .sum::<i64>()
             .max(0) as u32,
-        backup_path: backup_path.display().to_string(),
+        // P17-A3：CN 归并不再自动备份；字段保留为前端契约兼容，恒空串。
+        backup_path: String::new(),
         relay_ledger_written,
     })
 }
@@ -1561,7 +1556,7 @@ fn run_trae_cn_project_merge(
 pub(crate) struct MasterEmptyProjectCleanupDto {
     /// 删除的空项目记录行数。
     deleted_projects: u32,
-    /// 清理前自动创建的备份路径（人工恢复定位）。
+    /// P17-A3：清理空项目不再自动备份；字段保留为前端契约兼容，恒空串。
     backup_path: String,
     /// 主库重启结果。
     relaunch_outcome: String,
@@ -1569,9 +1564,10 @@ pub(crate) struct MasterEmptyProjectCleanupDto {
 
 /// P5-5 清理空项目：硬删除体检诊断出的空项目记录行（破坏性批量操作）。
 ///
-/// 编排与收编同构（关实例 → 备份 → 删除 → 重启）；执行前自动
-/// `.switch-bak-*` 备份（ADR-0018 铁律，备份失败不执行）。生成中拒绝
-/// （`cleanup_master_busy`）；孤儿行保持只报告不处理（保守口径）。
+/// 编排与收编同构（关实例 → 删除 → 重启）；P17-A3（spec 10.2 触发点
+/// 收敛）不再自动备份——自动备份仅保留切号与删除会话两个高危触发点，
+/// 空项目行删除走单事务原子写。生成中拒绝（`cleanup_master_busy`）；
+/// 孤儿行保持只报告不处理（保守口径）。
 /// P11-5⑤：`library_id` 为库实例引用（缺省主库；副环境同义）。
 #[tauri::command]
 pub(crate) async fn cleanup_master_empty_projects(
@@ -1656,21 +1652,8 @@ fn cleanup_master_empty_projects_inner(
         let _ = ctx.relaunch(&window_title);
     };
 
-    // 第 2 步：三件套备份（ADR-0018 铁律；create_new 永不覆盖备份链）。
-    // P11-4①/P11-5⑤：写入当前库作用域活动备份目录（副环境链与主库链隔离）。
-    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
-    let backup_path = match backup_master_trio_to(&db_path, Some(&backup_dir)) {
-        Ok(path) => path,
-        Err(error) => {
-            restart_after_failure();
-            return Err(match error {
-                MasterHandoverError::DbUnavailable => "master_switch_db_missing".to_string(),
-                _ => "cleanup_master_backup_failed".to_string(),
-            });
-        }
-    };
-    // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前库的链）。
-    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
+    // P17-A3（spec 10.2 触发点收敛）：清理空项目不再自动触发备份——
+    // 自动备份仅保留切号与删除会话两个高危触发点；删除走单事务原子写。
 
     // 第 3 步：单事务删除空项目行（范围与体检口径一致，返回实际删除数）。
     let deleted_projects = match delete_master_empty_projects(&ctx.dir, raw_key) {
@@ -1695,7 +1678,8 @@ fn cleanup_master_empty_projects_inner(
 
     Ok(MasterEmptyProjectCleanupDto {
         deleted_projects: deleted_projects as u32,
-        backup_path: backup_path.display().to_string(),
+        // P17-A3：清理空项目不再自动备份；字段保留为前端契约兼容，恒空串。
+        backup_path: String::new(),
         relaunch_outcome,
     })
 }
@@ -1769,8 +1753,9 @@ fn master_backup_chain_inner(
 
 /// P5-4：手动创建主库数据备份（设置页入口）。
 ///
-/// 备份复制主库三件套为 `.switch-bak-{时间戳}`（create_new 永不覆盖既有
-/// 备份链），写入当前活动备份目录（P11-4①：backup_dir 覆盖或 db 同目录）。
+/// P17-A3 滚动单份（spec 10.2）：写新份成功后彻底删除目录内其余旧链条目
+/// （含凭据子目录）——同一时刻全目录只有一份备份；keep=N 链式保留退役。
+/// 写入当前活动备份目录（P11-4①：backup_dir 覆盖或 db 同目录）。
 /// 主库实例运行中拒绝（`master_backup_running`）：运行中复制可能捕获不一致
 /// 快照，先关闭主库再备份（与切号事务第 1 步同纪律）。
 /// `include_credentials`（P11-4②）：为 true 时把签到凭据材料白名单整拷到
@@ -1781,7 +1766,7 @@ pub(crate) async fn create_master_backup(
     include_credentials: bool,
 ) -> Result<String, String> {
     ensure_real_preview(&state)?;
-    // P5-9：裁剪配置的存储根（闭包外拷出，State 引用不能进 spawn_blocking）。
+    // 闭包外拷出（tauri::State 引用不能进 spawn_blocking 闭包）。
     let storage_root_for_backup = state.storage_root.clone();
     let recovery_root = PathBuf::from(&state.recovery_root);
     run_blocking("master_backup_join_failed", move || {
@@ -1804,14 +1789,13 @@ pub(crate) async fn create_master_backup(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let backup = backup_master_trio_stamped(&db_path, Some(&active_dir), stamp)
+        // P17-A3：滚动单份备份（写新份 → 彻底删除其余旧链）。
+        let backup = backup_master_trio_rolling_stamped(&db_path, &active_dir, stamp)
             .map(|path| path.display().to_string())
             .map_err(|_| "master_backup_failed".to_string())?;
         if include_credentials {
             copy_credentials_backup(&storage.join("checkin"), &active_dir, stamp)?;
         }
-        // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动当前目录链）。
-        prune_backups_if_enabled(&db_path, storage);
         Ok(backup)
     })
     .await
@@ -1993,22 +1977,11 @@ fn copy_credentials_dir(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// P5-9 备份保留策略：读配置，启用时裁剪备份链（静默容错）。
-///
-/// 配置读取失败（损坏/IO 错误）不裁剪——保留策略失效宁可多留不可误删；
-/// 裁剪本身失败也静默（下次备份生成时再试），不阻断任何主流程。
-/// P11-4①：只裁剪当前活动备份目录下的链，位置变更前的旧目录不碰。
-pub(crate) fn prune_backups_if_enabled(db_path: &Path, storage_root: &Path) {
-    if storage_root.as_os_str().is_empty() {
-        return;
-    }
-    let active_dir = resolve_master_backup_dir(storage_root, db_path);
-    prune_backups_if_enabled_in(db_path, storage_root, &active_dir);
-}
-
 /// P11-4①：库作用域裁剪（P11-5⑤ 泛化）——裁剪指定活动备份目录内的
 /// `{db 名}.switch-bak-*` 链。目录由调用方按库解析（主库 = 覆盖根或
 /// db 同目录；副环境 = 覆盖目录下环境子目录或 db 同目录），互不越界。
+/// P17-A3：生产路径全部滚动单份化后无调用方，保留给备份策略单测。
+#[cfg(test)]
 pub(crate) fn prune_backups_if_enabled_in(db_path: &Path, storage_root: &Path, active_dir: &Path) {
     if storage_root.as_os_str().is_empty() {
         return;
@@ -2587,19 +2560,8 @@ fn apply_library_archive_for_context(
     let restart_after_failure = || {
         let _ = relaunch_instance(&ctx, &window_title);
     };
-    // P11-4①/P11-5⑤：备份落在当前库作用域，副环境与主库链隔离。
-    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
-    let _backup_path = match backup_master_trio_to(&db_path, Some(&backup_dir)) {
-        Ok(path) => path,
-        Err(error) => {
-            restart_after_failure();
-            return Err(match error {
-                MasterHandoverError::DbUnavailable => "master_archive_no_data".to_string(),
-                _ => "master_archive_backup_failed".to_string(),
-            });
-        }
-    };
-    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
+    // P17-A3（spec 10.2 触发点收敛）：归档/恢复不再自动触发备份——自动
+    // 备份仅保留切号与删除会话两个高危触发点；归档/恢复走单事务原子写。
 
     let outcome = match apply_master_archive_changes_inner(
         &ctx.dir,
@@ -2636,7 +2598,7 @@ fn apply_library_archive_for_context(
 /// DB 层错误沿用既有 `master_archive_*` 族（同一事务原语与词表共享）；
 /// CN 生命周期拒绝使用 `trae_cn_archive_*` 专属码。
 fn run_trae_cn_archive_apply(
-    storage_root: &Path,
+    _storage_root: &Path,
     raw_key: &str,
     ctx: &LibraryContext,
     account_id: &str,
@@ -2656,15 +2618,8 @@ fn run_trae_cn_archive_apply(
     if master_db_activity_detected(&db_path, std::time::Duration::from_millis(800)) {
         return Err("trae_cn_archive_busy".to_string());
     }
-    // 备份先行（ADR-0018 家族铁律；写入 CN 库作用域活动备份目录）。
-    let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
-    if let Err(error) = backup_master_trio_to(&db_path, Some(&backup_dir)) {
-        return Err(match error {
-            MasterHandoverError::DbUnavailable => "master_archive_no_data".to_string(),
-            _ => "master_archive_backup_failed".to_string(),
-        });
-    }
-    prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
+    // P17-A3（spec 10.2 触发点收敛）：CN 归档/恢复不再自动触发备份——
+    // 自动备份仅保留切号与删除会话两个高危触发点；归档走单事务原子写。
     let outcome = apply_master_archive_changes_inner(
         &ctx.dir,
         raw_key,
@@ -2718,8 +2673,6 @@ pub(crate) async fn delete_master_sessions(
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let recovery_root = PathBuf::from(&state.recovery_root);
-    // P5-9：删除前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
-    let storage_root_for_prune = state.storage_root.clone();
     run_blocking("master_archive_join_failed", move || {
         let (ctx, _lease) =
             acquire_library_write_lease(&recovery_root, &storage_root, library_id.as_deref())?;
@@ -2731,8 +2684,8 @@ pub(crate) async fn delete_master_sessions(
             &ctx.dir,
             "master_delete_running",
         )?;
-        // P16-T1：删除内置备份写入库作用域活动备份目录（新默认 = exe 旁
-        // backups/，不再落客户端目录）；裁剪目标同源。
+        // P16-T1/P17-A3：删除内置滚动备份写入库作用域活动备份目录（新默认
+        // = exe 旁 backups/，不再落客户端目录）。
         let db_path_for_backup = master_database_path(&ctx.dir);
         let backup_dir = resolve_library_backup_dir(&storage_root, &db_path_for_backup, &ctx.env_id);
         let result = delete_master_sessions_with_backup_dir(
@@ -2749,17 +2702,8 @@ pub(crate) async fn delete_master_sessions(
             backup_path: outcome.backup_path,
         })
         .map_err(map_master_archive_error);
-        // P5-9：删除链已生成新备份，按保留策略清理旧备份（静默容错）。
-        // P11-5⑤：裁剪目标 = 库作用域活动目录（副环境不误伤主库链）。
-        if result.is_ok() {
-            let db_path = master_database_path(&ctx.dir);
-            let backup_dir = resolve_library_backup_dir(
-                Path::new(&storage_root_for_prune),
-                &db_path,
-                &ctx.env_id,
-            );
-            prune_backups_if_enabled_in(&db_path, Path::new(&storage_root_for_prune), &backup_dir);
-        }
+        // P17-A3：删除会话的备份为滚动单份语义（原语内写新份后彻底删除
+        // 旧链），无需再做保留策略裁剪。
         result
     })
     .await
@@ -2776,15 +2720,15 @@ pub(crate) struct MasterMergeResultDto {
     moved_sessions: u32,
     /// 被清理的空壳源分组行数。
     removed_projects: u32,
-    /// 合并前自动创建的备份路径（人工恢复定位）。
+    /// P17-A3：归并不再自动备份；字段保留为前端契约兼容，恒空串。
     backup_path: String,
 }
 
 /// P5-8c：合并分组（源分组全部会话并入目标分组，空壳源行清理）。
 ///
 /// 批量迁移属破坏性操作：主库实例运行中拒绝（`master_merge_running`，
-/// 与删除/切号同纪律）；执行前自动创建 `.switch-bak-*` 备份
-/// （ADR-0018 铁律，备份失败合并不执行）。`library_id` 为库实例引用
+/// 与删除/切号同纪律）。P17-A3（spec 10.2 触发点收敛）：归并不再自动
+/// 备份，单事务回滚保证替代备份保险。`library_id` 为库实例引用
 /// （ADR-0025，缺省主库）。
 #[tauri::command]
 pub(crate) async fn merge_master_projects(
@@ -2807,8 +2751,6 @@ pub(crate) async fn merge_master_projects(
     let material_root = checkin_material_root(&state)?;
     let storage_root = PathBuf::from(&state.storage_root);
     let recovery_root = PathBuf::from(&state.recovery_root);
-    // P5-9：合并前备份后的保留策略清理（闭包外拷出，State 引用不进闭包）。
-    let storage_root_for_prune = state.storage_root.clone();
     run_blocking("master_archive_join_failed", move || {
         let (ctx, lifecycle_lease) =
             prepare_library_write_context(&recovery_root, &storage_root, library_id.as_deref())?;
@@ -2823,7 +2765,6 @@ pub(crate) async fn merge_master_projects(
         run_master_project_merge_with_lease(
             &recovery_root,
             &storage_root,
-            Path::new(&storage_root_for_prune),
             &material_root,
             &raw_key,
             ctx,
@@ -2841,11 +2782,10 @@ pub(crate) async fn merge_master_projects(
     })
 }
 
-/// Work 项目归并生产/合成库共用：目录租约覆盖账号解析、进程检查、备份与数据库写入。
+/// Work 项目归并生产/合成库共用：目录租约覆盖账号解析、进程检查与数据库写入。
 fn run_master_project_merge_with_lease(
     recovery_root: &Path,
     storage_root: &Path,
-    storage_root_for_prune: &Path,
     material_root: &Path,
     raw_key: &str,
     ctx: LibraryContext,
@@ -2860,31 +2800,22 @@ fn run_master_project_merge_with_lease(
     ctx.ensure_writable()?;
     let current_account = require_library_account(material_root, storage_root, &ctx)?;
     ensure_stopped(&ctx)?;
-    // P16-T1：合并内置备份写入库作用域活动备份目录（新默认 = exe 旁
-    // backups/，不再落客户端目录）。
-    let backup_dir = resolve_library_backup_dir(
-        storage_root,
-        &master_database_path(&ctx.dir),
-        &ctx.env_id,
-    );
-    let result = merge_master_projects_with_backup_dir(
+    // P17-A3：归并不再自动备份（触发点收敛，spec 10.2）。
+    let result = merge_master_projects_inner(
         &ctx.dir,
         raw_key,
         source_project_ids,
         target_project_id,
         &current_account.account_id,
-        Some(&backup_dir),
     )
     .map(|outcome: MasterMergeOutcome| MasterMergeResultDto {
         moved_sessions: outcome.moved_sessions as u32,
         removed_projects: outcome.removed_projects as u32,
+        // P17-A3：字段保留为前端契约兼容，恒空串。
         backup_path: outcome.backup_path,
     })
     .map_err(map_master_archive_error);
     if result.is_ok() {
-        let db_path = master_database_path(&ctx.dir);
-        let backup_dir = resolve_library_backup_dir(storage_root_for_prune, &db_path, &ctx.env_id);
-        prune_backups_if_enabled_in(&db_path, storage_root_for_prune, &backup_dir);
         after_commit();
     }
     result
@@ -3952,7 +3883,8 @@ mod trae_cn_merge_tests {
         assert_eq!(receipt.switched_sessions, 2);
         assert_eq!(receipt.moved_messages, 2);
         assert!(receipt.relay_ledger_written);
-        // 备份先行：CN 库作用域活动目录（db 同目录）落了 .switch-bak-* 链。
+        // P17-A3：归并不再自动备份（spec 10.2 触发点收敛）——CN 库目录
+        // 不产生 .switch-bak-*，回执 backup_path 恒空串。
         let db_dir = fixture.cn_dir.join("ModularData").join("ai-agent");
         let backups: Vec<_> = std::fs::read_dir(&db_dir)
             .unwrap()
@@ -3960,11 +3892,8 @@ mod trae_cn_merge_tests {
             .map(|entry| entry.file_name().into_string().unwrap())
             .filter(|name| name.starts_with("database.db.switch-bak-"))
             .collect();
-        assert_eq!(backups.len(), 1, "归并前应生成一份三件套备份");
-        assert_eq!(
-            Path::new(&receipt.backup_path).parent(),
-            Some(db_dir.as_path())
-        );
+        assert_eq!(backups.len(), 0, "归并不应产生备份");
+        assert_eq!(receipt.backup_path, "");
         // 接力台账：CN 库作用域独立文件（environments/relay-ledgers/trae_cn）。
         assert!(fixture
             .root
@@ -3986,14 +3915,15 @@ mod trae_cn_merge_tests {
             )
             .unwrap();
         assert_eq!(owner, "222");
-        // 进度事件：backing_up → mapping/executing/verifying → done 全链路。
+        // 进度事件：mapping/executing/verifying → done（P17-A3 起无
+        // backing_up 阶段——归并不再自动备份）。
         let stages: Vec<&str> = events
             .lock()
             .unwrap()
             .iter()
             .map(|event| event.stage)
             .collect();
-        assert_eq!(stages.first().copied(), Some("backing_up"));
+        assert_eq!(stages.first().copied(), Some("mapping"));
         assert!(
             stages.contains(&"mapping")
                 && stages.contains(&"executing")
@@ -4113,7 +4043,8 @@ mod trae_cn_merge_tests {
         );
         assert_eq!(fixture.project_owner(), "222");
         assert_eq!(fixture.hidden_session_count(), 0);
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归并不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
 
         release_tx.send(()).unwrap();
         assert!(merge.join().unwrap().unwrap().relay_ledger_written);
@@ -4137,7 +4068,8 @@ mod trae_cn_merge_tests {
             1
         );
         assert_eq!(fixture.hidden_session_count(), 1);
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：归并/归档均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
     }
 
     #[test]
@@ -4204,13 +4136,15 @@ mod trae_cn_merge_tests {
             0
         );
         assert_eq!(fixture.hidden_session_count(), 1);
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归档不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
 
         release_tx.send(()).unwrap();
         assert_eq!(archive.join().unwrap().unwrap().archived_sessions, 1);
         assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(fixture.hidden_session_count(), 1);
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归档不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
     }
 
     #[test]
@@ -4269,7 +4203,8 @@ mod trae_cn_merge_tests {
             .starts_with("operation_lease_unavailable:"));
         assert!(duplicate_events.lock().unwrap().is_empty());
         assert_eq!(fixture.project_owner(), "222");
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归并不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert_eq!(
             RelayLedger::new(&ledger_root).load().unwrap().len(),
             committed_ledger_count
@@ -4278,7 +4213,8 @@ mod trae_cn_merge_tests {
         release_tx.send(()).unwrap();
         assert!(merge.join().unwrap().unwrap().relay_ledger_written);
         assert_eq!(fixture.project_owner(), "222");
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归并不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert_eq!(
             RelayLedger::new(&ledger_root).load().unwrap().len(),
             committed_ledger_count
@@ -4345,7 +4281,8 @@ mod trae_cn_merge_tests {
         );
         assert_eq!(fixture.project_owner(), "111");
         assert_eq!(fixture.hidden_session_count(), 1);
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归档不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert!(!storage_root
             .join("environments/relay-ledgers/trae_cn/relay-ledger.json")
             .exists());
@@ -4368,7 +4305,8 @@ mod trae_cn_merge_tests {
         );
         assert_eq!(fixture.project_owner(), "222");
         assert_eq!(fixture.hidden_session_count(), 1);
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：归并不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert!(!merge_events.lock().unwrap().is_empty());
     }
 
@@ -4669,8 +4607,8 @@ mod trae_cn_archive_tests {
         assert_eq!(receipt.archived_sessions, 1);
         assert_eq!(receipt.restored_sessions, 0);
         assert_eq!(receipt.relaunch_outcome, "not_requested");
-        // 备份先行：CN 库作用域活动目录（db 同目录）落了 .switch-bak-* 链。
-        assert_eq!(fixture.backup_count(), 1, "归档应用前应生成一份三件套备份");
+        // P17-A3：CN 归档不再自动备份（spec 10.2 触发点收敛）。
+        assert_eq!(fixture.backup_count(), 0, "归档不应产生备份");
         {
             let conn = fixture.open_db();
             let hidden: String = conn
@@ -5286,7 +5224,6 @@ mod p14_4c_archive_caller_tests {
         run_master_project_merge_with_lease(
             &fixture.recovery_root,
             &fixture.storage_root,
-            &fixture.storage_root,
             &fixture.material_root,
             &fixture.raw_key,
             ctx,
@@ -5345,7 +5282,8 @@ mod p14_4c_archive_caller_tests {
             assert_eq!(process_check_calls.load(Ordering::SeqCst), 1);
             assert!(!fixture.project_exists("project-2"));
             assert_eq!(fixture.session_project_for_title("归并源会话"), "project-1");
-            assert_eq!(fixture.backup_count(), 1);
+            // P17-A3：归并不再自动备份。
+            assert_eq!(fixture.backup_count(), 0);
 
             release_tx.send(()).unwrap();
             merge.join().unwrap().unwrap()
@@ -5354,7 +5292,7 @@ mod p14_4c_archive_caller_tests {
         assert_eq!(receipt.moved_sessions, 1);
         assert!(!fixture.project_exists("project-2"));
         assert_eq!(fixture.session_project_for_title("归并源会话"), "project-1");
-        assert_eq!(fixture.backup_count(), 1);
+        assert_eq!(fixture.backup_count(), 0);
         assert_eq!(process_check_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -5447,7 +5385,8 @@ mod p14_4c_archive_caller_tests {
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
         assert_eq!(relaunch_calls.load(Ordering::SeqCst), 1);
         assert!(fixture.hidden_status().is_some());
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：切号滚动单份 1 份 + 归档不再自动备份。
+        assert_eq!(fixture.backup_count(), 1);
     }
 
     /// 子进程执行真实主库切号，并在提交后持锁等待父进程释放。
@@ -5624,6 +5563,7 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-2");
         assert_eq!(fixture.hidden_status(), None);
+        // P17-A3：切号滚动单份备份仍在位（1 份）。
         assert_eq!(fixture.backup_count(), 1);
     }
 
@@ -5727,7 +5667,8 @@ mod p14_4c_archive_caller_tests {
         assert_eq!(auth_while_archive_holds_lease.as_deref(), Some("account-1"));
         assert_eq!(owner_while_archive_holds_lease, "account-1");
         assert!(status_while_archive_holds_lease.is_some());
-        assert_eq!(backups_while_archive_holds_lease, 1);
+        // P17-A3：归档不再自动备份。
+        assert_eq!(backups_while_archive_holds_lease, 0);
         assert_eq!(archive_result.unwrap().archived_sessions, 1);
         assert_eq!(archive_close_calls.load(Ordering::SeqCst), 1);
         assert_eq!(archive_relaunch_calls.load(Ordering::SeqCst), 1);
@@ -5764,7 +5705,8 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-1");
         assert!(fixture.hidden_status().is_some());
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：仅切号滚动单份 1 份（归档不再自动备份）。
+        assert_eq!(fixture.backup_count(), 1);
     }
 
     /// 关闭失败发生在备份之前，真实 caller 应保留切换前状态且不继续后续步骤。
@@ -5899,7 +5841,6 @@ mod p14_4c_archive_caller_tests {
 
         let error = run_master_project_merge_with_lease(
             &fixture.recovery_root,
-            &fixture.storage_root,
             &fixture.storage_root,
             &fixture.material_root,
             &fixture.raw_key,
@@ -6039,6 +5980,7 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-1");
         assert_eq!(fixture.session_id(), old_session_id);
+        // P17-A3：切号滚动单份备份仍在位（1 份）。
         assert_eq!(fixture.backup_count(), 1);
         let conn = Connection::open_with_flags(
             master_database_path(&fixture.master_dir),
@@ -6231,6 +6173,7 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-2");
         assert_ne!(fixture.session_id(), old_session_id);
+        // P17-A3：切号滚动单份备份仍在位（1 份）。
         assert_eq!(fixture.backup_count(), 1);
         assert_eq!(
             registry
@@ -6372,7 +6315,8 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-2");
         assert_ne!(fixture.session_id(), old_session_id);
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：副环境登录不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert_eq!(
             EnvironmentRegistry::new(&fixture.storage_root)
                 .find(&fixture.env_id)
@@ -6434,7 +6378,8 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-1");
         assert_eq!(fixture.session_id(), old_session_id);
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：副环境登录不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         let conn = Connection::open_with_flags(
             master_database_path(&fixture.master_dir),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -6522,7 +6467,8 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-2");
         assert_eq!(fixture.hidden_status(), None);
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：副环境登录不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
 
         release_tx.send(()).unwrap();
         assert!(login.join().unwrap().is_ok());
@@ -6541,7 +6487,8 @@ mod p14_4c_archive_caller_tests {
         assert!(fixture.hidden_status().is_some());
         assert_eq!(archive_close_calls.load(Ordering::SeqCst), 1);
         assert_eq!(archive_relaunch_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：副环境登录/归档均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert_ne!(session_id_before_login, fixture.session_id());
     }
 
@@ -6609,7 +6556,8 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-1");
         assert!(fixture.hidden_status().is_some());
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归档/副环境登录均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
 
         release_tx.send(()).unwrap();
         assert_eq!(archive.join().unwrap().unwrap().archived_sessions, 1);
@@ -6651,7 +6599,8 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-1");
         assert!(fixture.hidden_status().is_some());
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：归档/副环境登录均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
     }
 
     #[test]
@@ -6715,7 +6664,8 @@ mod p14_4c_archive_caller_tests {
         assert_eq!(fixture.project_owner(), "account-2");
         assert!(fixture.project_exists("project-2"));
         assert_eq!(fixture.session_project_for_title("归并源会话"), "project-2");
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：副环境登录/归并均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
 
         release_tx.send(()).unwrap();
         assert!(login.join().unwrap().is_ok());
@@ -6733,7 +6683,8 @@ mod p14_4c_archive_caller_tests {
         assert_eq!(process_check_calls.load(Ordering::SeqCst), 1);
         assert!(!fixture.project_exists("project-2"));
         assert_eq!(fixture.session_project_for_title("归并源会话"), "project-1");
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：副环境登录/归并均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
     }
 
     #[test]
@@ -6766,7 +6717,6 @@ mod p14_4c_archive_caller_tests {
             };
             run_master_project_merge_with_lease(
                 &recovery_root,
-                &storage_root,
                 &storage_root,
                 &material_root,
                 &raw_key,
@@ -6812,7 +6762,8 @@ mod p14_4c_archive_caller_tests {
         assert_eq!(fixture.project_owner(), "account-1");
         assert!(!fixture.project_exists("project-2"));
         assert_eq!(fixture.session_project_for_title("归并源会话"), "project-1");
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：副环境登录/归并均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
 
         release_tx.send(()).unwrap();
         assert_eq!(merge.join().unwrap().unwrap().moved_sessions, 1);
@@ -6847,7 +6798,8 @@ mod p14_4c_archive_caller_tests {
         );
         assert_eq!(fixture.project_owner(), "account-2");
         assert_eq!(fixture.session_project_for_title("归并源会话"), "project-1");
-        assert_eq!(fixture.backup_count(), 2);
+        // P17-A3：副环境登录/归并均不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
     }
 
     #[test]
@@ -6915,7 +6867,8 @@ mod p14_4c_archive_caller_tests {
             Some("account-2")
         );
         assert_eq!(fixture.project_owner(), "account-2");
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：副环境登录不再自动备份（删除环境目录不动主库备份链）。
+        assert_eq!(fixture.backup_count(), 0);
 
         release_tx.send(()).unwrap();
         assert!(login.join().unwrap().is_ok());
@@ -7082,7 +7035,8 @@ mod p14_4c_archive_caller_tests {
             Some("account-2")
         );
         assert_eq!(fixture.project_owner(), "account-2");
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：副环境登录不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert_eq!(
             EnvironmentRegistry::new(&fixture.storage_root)
                 .find(&fixture.env_id)
@@ -7477,7 +7431,8 @@ mod p14_4c_archive_caller_tests {
         let receipt = fixture.apply(&close_calls, &relaunch_calls).unwrap();
         assert_eq!(receipt.archived_sessions, 1);
         assert!(fixture.hidden_status().is_some());
-        assert_eq!(fixture.backup_count(), 1);
+        // P17-A3：归档不再自动备份。
+        assert_eq!(fixture.backup_count(), 0);
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
         assert_eq!(relaunch_calls.load(Ordering::SeqCst), 1);
     }
@@ -7664,8 +7619,8 @@ mod p14_4c_archive_caller_tests {
 ///
 /// 仅 `--features probe` 编译；与 UI 命令共享同一编排核心（本文件私有
 /// 函数），仅绕过 Tauri State 与就绪注册表闸门——注册表三项的解锁依据
-/// 正是本探针产出的真实验收证据。每个写入口执行前自动三件套备份
-/// （ADR-0018 铁律），删除/归并核心另有内建备份。
+/// 正是本探针产出的真实验收证据。P17-A3：自动备份仅删除会话路径保留
+/// （滚动单份）；归并/归档不再自动备份（spec 10.2 触发点收敛）。
 #[cfg(feature = "probe")]
 pub mod acceptance_probe {
     use super::*;
@@ -7693,12 +7648,13 @@ pub mod acceptance_probe {
         Ok(key.to_string())
     }
 
-    /// 验收安全网：三件套手动备份（独立于各写入口的内建备份）。
+    /// 验收安全网：三件套滚动备份（独立于各写入口的内建备份；P17-A3
+    /// 滚动单份语义——写新份后彻底删除旧链）。
     fn guard_backup(storage_root: &Path) -> Result<String, String> {
         let ctx = resolve_library_context(None, storage_root)?;
         let db_path = master_database_path(&ctx.dir);
         let backup_dir = resolve_library_backup_dir(storage_root, &db_path, &ctx.env_id);
-        let path = backup_master_trio_to(&db_path, Some(&backup_dir))
+        let path = backup_master_trio_rolling(&db_path, &backup_dir)
             .map_err(|error| format!("pre_acceptance_backup_failed:{error:?}"))?;
         Ok(path.display().to_string())
     }
@@ -7804,7 +7760,6 @@ pub mod acceptance_probe {
         let result = run_master_project_merge_with_lease(
             &recovery_root,
             &storage_root,
-            &storage_root,
             &material_root,
             &raw_key,
             ctx,
@@ -7823,7 +7778,7 @@ pub mod acceptance_probe {
         }))
     }
 
-    /// 删除会话（含备份与保留策略清理）。
+    /// 删除会话（滚动单份备份；P17-A3 起无保留策略裁剪）。
     pub fn delete_sessions(session_ids: Vec<String>) -> Result<Value, String> {
         let (storage_root, recovery_root, material_root) = production_roots()?;
         let raw_key = source_key()?;
@@ -7844,9 +7799,8 @@ pub mod acceptance_probe {
             &current_account.account_id,
         )
         .map_err(map_master_archive_error)?;
-        let db_path = master_database_path(&ctx.dir);
-        let backup_dir = resolve_library_backup_dir(&storage_root, &db_path, &ctx.env_id);
-        prune_backups_if_enabled_in(&db_path, &storage_root, &backup_dir);
+        // P17-A3：删除会话备份为滚动单份语义（原语内写新份后彻底删除旧链），
+        // 无需再做保留策略裁剪。
         traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
         Ok(json!({
             "deleted_sessions": outcome.deleted_sessions,

@@ -1,26 +1,34 @@
-//! P17-T4b：WorkBuddy 数据目录备份治理（zstd 压缩 + 清单 JSON + 恢复 + 保留裁剪）。
+//! P17-T4b/P17-A3：WorkBuddy 数据目录备份治理（zstd 压缩 + 清单 JSON +
+//! 恢复 + 滚动单份）。
+//!
+//! P17-A3 改造（spec 10.2 定案，2026-10-18）：
+//! - **备份范围收窄：黑名单改白名单制**——仅登录凭据 + 配置文件（凭据
+//!   明文为用户拍板）；对话/IndexedDB/LocalStorage/缓存/封面全部不备
+//!   （跟号走，属可再生/跟随登录态的数据）。白名单三元组见
+//!   [`WorkBuddyBackupSources`]：
+//!   1. `app-config.json`（`~/.workbuddy/app` 应用配置）；
+//!   2. 登录凭据来源容器（`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth`
+//!      下文件名含 `.info` 的会话/登出标记文件——登出标记属登录状态证据，
+//!      按铁律一并保留）；
+//!   3. 工具侧登录代次容器（`{storage_root}/workbuddy-login/wb-*.wbsess`）。
+//! - **滚动单份**：同一时刻备份目录内只有一份 `workbuddy-data-{stamp}`；
+//!   旧份在新份发布成功后彻底删除（`hard_delete_workbuddy_backup` 直删，
+//!   **不走回收站**——备份属可再生数据，spec 10.4 删除纪律）；keep=N
+//!   链式保留退役。
 //!
 //! 与 Trae 侧（`backup_retention` / `master_handover`）同纪律的差异适配：
-//! - WorkBuddy 数据是**未加密文件**（IndexedDB/LocalStorage leveldb + JSON），
-//!   zstd 压缩真有效（对比 SQLCipher 密文约 1:1 的诚实修正，见 P16-T1）；
-//! - 备份对象是**目录树**而非三件套：沿用 P16-T1「每成员独立标准 zstd 帧、
-//!   无自定义容器」决策——按文件逐个压缩为 `{相对路径}.zst`，目录内相对
-//!   结构镜像保存，`manifest.json` 记录全部成员（相对路径/原字节/sha256）；
-//! - leveldb 文件在客户端运行时可能被锁/写入中：备份编排的前置是
-//!   `workbuddy_instance::close_workbuddy()`（编排层职责，本模块只做纯
-//!   文件操作）；任一成员压缩失败 → 删除暂存目录整体失败（fail-closed，
-//!   不产出不完整备份，零副作用退出）。
-//!
-//! 备份范围（黑名单制，登录后新增目录默认纳入）：
-//! - 目录名精确命中黑名单（Electron/Chromium 可再生缓存惯例名）→ 排除；
-//! - `lockfile`（运行锁文件，运行时被独占锁定）→ 排除；
-//! - 其余全部纳入：Local Storage、IndexedDB、Session Storage、Network
-//!   （Trust Tokens/未来 Cookies）、Partitions 各 webview 子区数据、
-//!   playbook-covers（用户内容资源）、data/、memory/、根部 JSON。
+//! - 备份对象是**多源小文件集**（白名单成员通常 < 20 个、总量 KB 级），
+//!   沿用 P16-T1「每成员独立标准 zstd 帧、无自定义容器」决策——按文件
+//!   逐个压缩为 `{命名空间}/{相对名}.zst`，`manifest.json` 记录全部成员
+//!   （相对路径/原字节/sha256）；
+//! - 备份编排的前置是 `workbuddy_instance::close_workbuddy()`（编排层
+//!   职责，本模块只做纯文件操作）；任一成员压缩失败 → 删除暂存目录
+//!   整体失败（fail-closed，不产出不完整备份，零副作用）。
 //!
 //! 布局：`{target_dir}/workbuddy-data-{stamp}/manifest.json` +
-//! `{相对路径}.zst`。恢复读 manifest 逐成员解压并 sha256 校验；恢复路径
-//! 对压缩（`.zst`）与未压缩（原始文件）双形态成员兼容。
+//! `{app-config.json|auth/…|containers/…}.zst`。恢复按命名空间前缀映射
+//! 回各源位置并 sha256 校验；恢复路径对压缩（`.zst`）与未压缩（原始
+//! 文件）双形态成员兼容。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,51 +45,37 @@ const MANIFEST_NAME: &str = "manifest.json";
 /// manifest 读取上限（成员清单按 200 字节/条估算，数千成员仍在限内）。
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
-/// 可再生缓存目录名黑名单（任意层级精确匹配）。实测来源：P17-T4b 隔离
-/// 副本盘点——顶层 `cache`/`CodeCache`/`Crashpad` + `session` 下 Chromium
-/// 缓存族（Cache/Code Cache/GPUCache/Dawn*/VideoDecodeStats/Shared
-/// Dictionary/shared_proto_db/Service Worker）。排除理由：可再生缓存不属
-/// 数据安全网，且图片缓存等压缩率低、体积占比高。
-const EXCLUDED_DIR_NAMES: &[&str] = &[
-    "cache",
-    "Cache",
-    "CodeCache",
-    "Code Cache",
-    "Crashpad",
-    "GPUCache",
-    "DawnGraphiteCache",
-    "DawnWebGPUCache",
-    "VideoDecodeStats",
-    "Shared Dictionary",
-    "shared_proto_db",
-    "Service Worker",
-];
+/// P17-A3 白名单：应用配置成员名（`app_config_root` 根部精确命中）。
+const APP_CONFIG_MEMBER: &str = "app-config.json";
+/// 恢复命名空间前缀：登录凭据来源容器成员。
+const AUTH_NAMESPACE: &str = "auth/";
+/// 恢复命名空间前缀：工具侧登录代次容器成员。
+const CONTAINERS_NAMESPACE: &str = "containers/";
 
-/// 排除的文件名：`lockfile`（运行锁，复制无意义且运行时被独占锁定）。
-const EXCLUDED_FILE_NAMES: &[&str] = &["lockfile"];
-
-/// 备份范围判定（相对路径，`/` 分隔；目录与文件通用）：任一段命中目录
-/// 黑名单 → 排除（目录调用即剪枝整棵子树）；末段命中文件黑名单 → 排除。
-fn is_backup_member(relative: &str) -> bool {
-    let segments: Vec<&str> = relative.split('/').collect();
-    if segments
-        .iter()
-        .any(|segment| EXCLUDED_DIR_NAMES.contains(segment))
-    {
-        return false;
-    }
-    if let Some((file, _)) = segments.split_last() {
-        if EXCLUDED_FILE_NAMES.contains(file) {
-            return false;
-        }
-    }
-    true
+/// P17-A3 备份源三元组（白名单制的三个来源根）。
+///
+/// 纪律：`app_config_root` 必须存在（WorkBuddy 应用数据根，备份的锚点）；
+/// `auth_dir` 与 `login_container_dir` 可缺失（从未登录/从未捕获时对应
+/// 命名空间为空，不视为错误）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkBuddyBackupSources {
+    /// WorkBuddy 应用配置根（`~/.workbuddy/app`）——白名单仅
+    /// `app-config.json`。
+    pub app_config_root: PathBuf,
+    /// 登录凭据来源容器目录
+    /// （`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth`）——白名单仅
+    /// 文件名含 `.info` 的会话/登出标记文件。
+    pub auth_dir: PathBuf,
+    /// 工具侧登录代次容器目录（`{storage_root}/workbuddy-login`）——
+    /// 白名单仅 `wb-*.wbsess`。
+    pub login_container_dir: PathBuf,
 }
 
 /// 清单成员：备份目录内相对路径 + 原始字节 + sha256（hex）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkBuddyBackupMember {
-    /// 相对路径（`/` 分隔，无 `.zst` 后缀）。
+    /// 相对路径（`/` 分隔，无 `.zst` 后缀；命名空间前缀见
+    /// `AUTH_NAMESPACE` / `CONTAINERS_NAMESPACE`，配置成员在根部）。
     pub path: String,
     /// 原始字节数。
     pub bytes: u64,
@@ -114,11 +108,13 @@ pub struct WorkBuddyBackupOutcome {
     pub source_bytes: u64,
     /// 压缩成员字节合计（含 manifest 自身）。
     pub compressed_bytes: u64,
+    /// 本次滚动清理删除的旧备份数（P17-A3；首份备份为 0）。
+    pub rolled_over: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkBuddyBackupError {
-    /// 源目录不存在（数据根未安装/路径错）。
+    /// 应用配置根不存在（数据根未安装/路径错）。
     SourceUnavailable,
     /// 同 stamp 目标已存在（永不覆盖既有备份）。
     TargetExists,
@@ -144,67 +140,99 @@ fn unix_seconds_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// 递归收集备份计划（相对路径 `/` 分隔，排序保证 manifest 稳定）。
-/// 符号链接等非常规对象拒绝（fail-closed，与 backup_retention 同纪律）。
-fn collect_backup_plan(root: &Path) -> Result<Vec<String>, WorkBuddyBackupError> {
-    fn walk(dir: &Path, relative: &str, plan: &mut Vec<String>) -> Result<(), WorkBuddyBackupError> {
-        let entries = fs::read_dir(dir).map_err(|_| WorkBuddyBackupError::Io)?;
+/// P17-A3 白名单收集备份计划：(源绝对路径, 备份目录内相对路径)。
+///
+/// 相对路径按命名空间组织（排序保证 manifest 稳定）；白名单之外的任何
+/// 文件一律不收——防御性保证对话/IndexedDB/LocalStorage/缓存/封面不进
+/// 备份（跟号走）。白名单命中但非常规对象（符号链接等）拒绝（fail-closed，
+/// 不猜测内容）。
+fn collect_scope_plan(
+    sources: &WorkBuddyBackupSources,
+) -> Result<Vec<(PathBuf, String)>, WorkBuddyBackupError> {
+    let mut plan: Vec<(PathBuf, String)> = Vec::new();
+    // 1) 应用配置：根部 app-config.json（存在才收；缺失 = 未首次启动，
+    //    不视为错误——凭据容器仍是备份主体）。
+    let app_config = sources.app_config_root.join(APP_CONFIG_MEMBER);
+    if app_config.is_file() {
+        plan.push((app_config, APP_CONFIG_MEMBER.to_string()));
+    }
+    // 2) 登录凭据来源容器：文件名含 `.info`（会话 .info 与登出标记
+    //    `.info.{hash}.observation.json`——登出标记属登录状态证据）。
+    if sources.auth_dir.is_dir() {
+        let entries = fs::read_dir(&sources.auth_dir).map_err(|_| WorkBuddyBackupError::Io)?;
         for entry in entries {
             let entry = entry.map_err(|_| WorkBuddyBackupError::Io)?;
-            // DirEntry::metadata 不跟随符号链接（防逃逸判定与
-            // backup_retention::collect_dir_files 同语义）。
-            let metadata = entry.metadata().map_err(|_| WorkBuddyBackupError::Io)?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let child_relative = if relative.is_empty() {
-                name.to_string()
-            } else {
-                format!("{relative}/{name}")
-            };
-            if metadata.is_dir() {
-                if EXCLUDED_DIR_NAMES.contains(&name.as_ref()) {
-                    continue;
-                }
-                walk(&entry.path(), &child_relative, plan)?;
-            } else if metadata.is_file() {
-                // 文件级判定走统一规则（is_backup_member：黑名单文件名排除）。
-                if !is_backup_member(&child_relative) {
-                    continue;
-                }
-                plan.push(child_relative);
-            } else {
-                // 符号链接等非常规对象：不猜测内容，fail-closed。
+            if !name.contains(".info") {
+                continue;
+            }
+            // DirEntry::metadata 不跟随符号链接（fail-closed，防逃逸）。
+            if !entry
+                .metadata()
+                .map_err(|_| WorkBuddyBackupError::Io)?
+                .is_file()
+            {
                 return Err(WorkBuddyBackupError::Io);
             }
+            plan.push((
+                entry.path(),
+                format!("{AUTH_NAMESPACE}{name}"),
+            ));
         }
-        Ok(())
     }
-    let mut plan = Vec::new();
-    walk(root, "", &mut plan)?;
-    plan.sort();
+    // 3) 工具侧登录代次容器：`wb-*.wbsess`（原子写暂存 `.tmp` 不匹配，
+    //    天然排除半成品）。
+    if sources.login_container_dir.is_dir() {
+        let entries =
+            fs::read_dir(&sources.login_container_dir).map_err(|_| WorkBuddyBackupError::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| WorkBuddyBackupError::Io)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with("wb-") && name.ends_with(".wbsess")) {
+                continue;
+            }
+            if !entry
+                .metadata()
+                .map_err(|_| WorkBuddyBackupError::Io)?
+                .is_file()
+            {
+                return Err(WorkBuddyBackupError::Io);
+            }
+            plan.push((
+                entry.path(),
+                format!("{CONTAINERS_NAMESPACE}{name}"),
+            ));
+        }
+    }
+    plan.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(plan)
 }
 
-/// 备份 WorkBuddy 数据目录到 target_dir（新建 `workbuddy-data-{stamp}`）。
+/// 备份 WorkBuddy 凭据+配置白名单到 target_dir（滚动单份）。
 ///
-/// 流程：收集计划 → 暂存目录逐文件压缩（create_new）→ 写 manifest →
-/// 同卷改名发布。任一步失败清理暂存返回 Err（零副作用）；最终名已存在
-/// → 拒绝（永不覆盖既有备份）。前置编排（关闭 WorkBuddy）由调用方负责。
-pub fn backup_workbuddy_data_to(
-    source_root: &Path,
+/// 流程：收集白名单计划 → 暂存目录逐文件压缩（create_new）→ 写 manifest
+/// → 同卷改名发布 → **彻底删除其余旧份**（滚动单份；先写后删的失败安全
+/// 顺序——写失败退化为保留旧份，备份系统的失败模式必须是「多留」而非
+/// 「丢失」，与 Trae 侧 `backup_master_trio_rolling_stamped` 同决策）。
+/// 任一步失败清理暂存返回 Err（零副作用）；最终名已存在 → 拒绝。
+/// 前置编排（关闭 WorkBuddy）由调用方负责。
+pub fn backup_workbuddy_scope_to(
+    sources: &WorkBuddyBackupSources,
     target_dir: &Path,
 ) -> Result<WorkBuddyBackupOutcome, WorkBuddyBackupError> {
-    backup_workbuddy_data_stamped(source_root, target_dir, unix_seconds_now())
+    backup_workbuddy_scope_stamped(sources, target_dir, unix_seconds_now())
 }
 
-/// 显式时间戳版本（编排层可统一发号；测试确定性构造冲突现场）。
-/// 语义与 [`backup_workbuddy_data_to`] 完全一致。
-pub fn backup_workbuddy_data_stamped(
-    source_root: &Path,
+/// 显式时间戳版本（编排层可统一发号；测试确定性构造现场）。
+/// 语义与 [`backup_workbuddy_scope_to`] 完全一致。
+pub fn backup_workbuddy_scope_stamped(
+    sources: &WorkBuddyBackupSources,
     target_dir: &Path,
     stamp: u64,
 ) -> Result<WorkBuddyBackupOutcome, WorkBuddyBackupError> {
-    if !source_root.is_dir() {
+    if !sources.app_config_root.is_dir() {
         return Err(WorkBuddyBackupError::SourceUnavailable);
     }
     std::fs::create_dir_all(target_dir).map_err(|_| WorkBuddyBackupError::Io)?;
@@ -212,33 +240,34 @@ pub fn backup_workbuddy_data_stamped(
     if final_dir.exists() {
         return Err(WorkBuddyBackupError::TargetExists);
     }
-    let plan = collect_backup_plan(source_root)?;
+    let plan = collect_scope_plan(sources)?;
 
     // 暂存压缩：任一成员失败 → 清暂存、零副作用退出（不产出不完整备份）。
+    // 空白名单计划（如凭据容器全缺）同样需要暂存目录落 manifest。
     let staging = target_dir.join(format!(".wb-baking-{stamp}"));
+    fs::create_dir_all(&staging).map_err(|_| WorkBuddyBackupError::Io)?;
     let cleanup = |staging: &Path| {
         let _ = fs::remove_dir_all(staging);
     };
     let mut members = Vec::with_capacity(plan.len());
     let mut source_bytes = 0_u64;
     let mut compressed_bytes = 0_u64;
-    for relative in &plan {
+    for (source, relative) in &plan {
         // Path::join 接受 `/` 分隔的相对串（Windows API 亦兼容 `/`）。
-        let source = source_root.join(relative);
         let target = staging.join(format!("{relative}.zst"));
         let Some(parent) = target.parent() else {
             cleanup(&staging);
             return Err(WorkBuddyBackupError::Io);
         };
         if fs::create_dir_all(parent).is_err()
-            || compress_file_create_new(&source, &target).is_err()
+            || compress_file_create_new(source, &target).is_err()
         {
             cleanup(&staging);
             return Err(WorkBuddyBackupError::Io);
         }
-        let bytes = fs::metadata(&source).map(|meta| meta.len()).unwrap_or(0);
+        let bytes = fs::metadata(source).map(|meta| meta.len()).unwrap_or(0);
         let compressed = fs::metadata(&target).map(|meta| meta.len()).unwrap_or(0);
-        let sha256 = crate::snapshot_store::sha256_file(&source).ok_or_else(|| {
+        let sha256 = crate::snapshot_store::sha256_file(source).ok_or_else(|| {
             cleanup(&staging);
             WorkBuddyBackupError::Io
         })?;
@@ -280,12 +309,30 @@ pub fn backup_workbuddy_data_stamped(
         cleanup(&staging);
         return Err(WorkBuddyBackupError::Io);
     }
+
+    // P17-A3 滚动单份：发布成功后彻底删除其余旧份（直删不走回收站）。
+    let mut rolled_over = 0_usize;
+    for other in list_workbuddy_backup_stamps(target_dir) {
+        if other != stamp && hard_delete_workbuddy_backup(target_dir, other) {
+            rolled_over += 1;
+        }
+    }
+
     Ok(WorkBuddyBackupOutcome {
         backup_dir: final_dir,
         file_count: manifest.file_count,
         source_bytes: manifest.source_bytes,
         compressed_bytes,
+        rolled_over,
     })
+}
+
+/// P17-A3 彻底删除原语：整目录 `remove_dir_all` 直删一份 WorkBuddy 备份，
+/// **不走回收站**（备份属可再生数据，spec 10.4 删除纪律——safe-delete
+/// 回收站 shim 仅用于用户可能误删需找回的场景）。返回是否实际删除。
+pub fn hard_delete_workbuddy_backup(target_dir: &Path, stamp: u64) -> bool {
+    let dir = target_dir.join(format!("{BACKUP_DIR_PREFIX}{stamp}"));
+    dir.is_dir() && fs::remove_dir_all(&dir).is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,7 +341,8 @@ pub enum WorkBuddyRestoreError {
     ManifestMissing,
     /// manifest 损坏/超限/格式版本不符。
     ManifestInvalid,
-    /// 清单成员路径不安全（绝对路径/`..`/反斜杠——防清单被篡改写入任意位置）。
+    /// 清单成员路径不安全（绝对路径/`..`/反斜杠/未知命名空间——防清单被
+    /// 篡改写入任意位置）。
     UnsafePath,
     /// 清单成员在备份目录无对应文件。
     MemberMissing(String),
@@ -337,15 +385,37 @@ fn member_path_is_safe(relative: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-/// 从备份目录恢复数据树到 target_root（逐成员解压 + sha256 校验）。
+/// P17-A3：清单成员相对路径 → 还原目标（按命名空间前缀映射回源位置）。
+/// 配置成员在根部；`auth/` 前缀 → 凭据来源容器目录；`containers/` 前缀 →
+/// 工具侧代次容器目录。未知前缀返回 None（调用方按 UnsafePath 拒绝）。
+fn resolve_scope_target(sources: &WorkBuddyBackupSources, relative: &str) -> Option<PathBuf> {
+    if relative == APP_CONFIG_MEMBER {
+        return Some(sources.app_config_root.join(APP_CONFIG_MEMBER));
+    }
+    if let Some(rest) = relative.strip_prefix(AUTH_NAMESPACE) {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(sources.auth_dir.join(rest));
+    }
+    if let Some(rest) = relative.strip_prefix(CONTAINERS_NAMESPACE) {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(sources.login_container_dir.join(rest));
+    }
+    None
+}
+
+/// 从备份目录恢复白名单成员到各源位置（逐成员解压 + sha256 校验）。
 ///
 /// 双格式兼容：成员优先取 `{path}.zst`（压缩形态），缺席时回退原始文件
 /// `{path}`（手工维护/未来未压缩成员）。目标既有文件被覆盖（恢复语义 =
 /// 目标内容替换为备份内容）；重复恢复结果一致（幂等）。任一成员校验
 /// 失败 → 删除该半写目标并中止（不产出部分校验通过的状态混存）。
-pub fn restore_workbuddy_data_from(
+pub fn restore_workbuddy_scope_from(
     backup_dir: &Path,
-    target_root: &Path,
+    sources: &WorkBuddyBackupSources,
 ) -> Result<WorkBuddyRestoreOutcome, WorkBuddyRestoreError> {
     let manifest = read_manifest(backup_dir)?;
     let mut restored_files = 0_usize;
@@ -354,9 +424,12 @@ pub fn restore_workbuddy_data_from(
         if !member_path_is_safe(&member.path) {
             return Err(WorkBuddyRestoreError::UnsafePath);
         }
+        // 未知命名空间/空段：fail-closed（清单不可信，不猜测落点）。
+        let Some(target) = resolve_scope_target(sources, &member.path) else {
+            return Err(WorkBuddyRestoreError::UnsafePath);
+        };
         let compressed = backup_dir.join(format!("{}.zst", member.path));
         let raw = backup_dir.join(&member.path);
-        let target = target_root.join(&member.path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|_| WorkBuddyRestoreError::Io)?;
         }
@@ -479,23 +552,23 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-/// 保留裁剪：保留最新 `keep` 份，更旧的整目录删除。keep=0 时不删任何
-/// 东西（禁用语义，与 Trae 侧 prune_master_backups 同口径）；删除失败
-/// 静默跳过（该份下次再试）；命名不符的散目录永不触碰。返回删除份数。
+/// 保留裁剪（P17-A3 keep=N 链式保留退役）：**滚动单份**语义——保留最新
+/// 1 份，更旧的整目录彻底删除（`hard_delete_workbuddy_backup` 直删，不走
+/// 回收站）。`keep` 语义变为开关：0 = 不删任何东西（禁用语义）；≥1 一律
+/// 按保留最新 1 份执行。删除失败静默跳过（该份下次再试）；命名不符的
+/// 散目录永不触碰。返回删除份数。
 pub fn prune_workbuddy_backups(target_dir: &Path, keep: u32) -> usize {
     if keep == 0 {
         return 0;
     }
-    let mut stamps = list_workbuddy_backup_stamps(target_dir);
-    stamps.sort_unstable();
-    let mut removed = 0;
-    for stamp in stamps.iter().rev().skip(keep as usize) {
-        let dir = target_dir.join(format!("{BACKUP_DIR_PREFIX}{stamp}"));
-        if fs::remove_dir_all(&dir).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
+    let stamps = list_workbuddy_backup_stamps(target_dir);
+    // stamps 升序；保留最后一份（最新），其余直删。
+    stamps
+        .iter()
+        .rev()
+        .skip(1)
+        .filter(|stamp| hard_delete_workbuddy_backup(target_dir, **stamp))
+        .count()
 }
 
 #[cfg(test)]
@@ -503,109 +576,98 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// 构造模拟数据根：登录态关键目录 + 黑名单缓存目录 + 根部杂项。
-    fn make_source(dir: &Path) {
-        let local_storage = dir.join("session").join("Local Storage").join("leveldb");
-        fs::create_dir_all(&local_storage).unwrap();
-        fs::write(local_storage.join("000003.log"), b"log-bytes").unwrap();
-        fs::write(local_storage.join("000005.ldb"), vec![7_u8; 4096]).unwrap();
-        let indexed_db = dir
-            .join("session")
-            .join("IndexedDB")
-            .join("file__0.indexeddb.leveldb");
-        fs::create_dir_all(&indexed_db).unwrap();
-        fs::write(indexed_db.join("000001.log"), b"idb-bytes").unwrap();
-        let network = dir.join("session").join("Network");
-        fs::create_dir_all(&network).unwrap();
-        fs::write(network.join("Trust Tokens"), b"trust-tokens").unwrap();
-        // 黑名单目录（顶层 + 嵌套）与运行锁文件：不应进备份。
-        fs::create_dir_all(dir.join("CodeCache")).unwrap();
-        fs::write(dir.join("CodeCache").join("blob"), b"cache").unwrap();
-        let gpu = dir.join("session").join("GPUCache");
-        fs::create_dir_all(&gpu).unwrap();
-        fs::write(gpu.join("data_0"), b"gpu").unwrap();
-        fs::write(dir.join("lockfile"), b"").unwrap();
-        // 根部 JSON 与用户内容目录：应进备份。
-        fs::write(dir.join("app-config.json"), b"{\"version\":1}").unwrap();
-        let memory = dir.join("memory");
-        fs::create_dir_all(&memory).unwrap();
-        fs::write(memory.join("polling-lease-1.json"), b"lease").unwrap();
-        let covers = dir.join("playbook-covers");
+    /// 构造白名单三元组源：配置 + 登录凭据来源容器 + 工具侧代次容器，
+    /// 外加全部应被排除的干扰对象（对话/缓存/封面/半成品 tmp）。
+    fn make_sources(root: &Path) -> WorkBuddyBackupSources {
+        let app_root = root.join("app");
+        fs::create_dir_all(&app_root).unwrap();
+        fs::write(app_root.join("app-config.json"), b"{\"version\":1}").unwrap();
+        // 排除面：Chromium 会话树（IndexedDB/LocalStorage/缓存）与封面。
+        let session = app_root.join("session").join("IndexedDB");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("000001.log"), b"idb-bytes").unwrap();
+        let storage = app_root.join("session").join("Local Storage");
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(storage.join("000003.log"), b"ls-bytes").unwrap();
+        fs::create_dir_all(app_root.join("CodeCache")).unwrap();
+        fs::write(app_root.join("CodeCache").join("blob"), b"cache").unwrap();
+        let covers = app_root.join("playbook-covers");
         fs::create_dir_all(&covers).unwrap();
         fs::write(covers.join("a.png"), vec![9_u8; 2048]).unwrap();
+        fs::write(app_root.join("lockfile"), b"").unwrap();
+
+        let auth_dir = root.join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(auth_dir.join("workbuddy-desktop.info"), b"auth-info-bytes").unwrap();
+        // 登出标记（含 .info 的证据文件）：白名单内。
+        fs::write(
+            auth_dir.join("workbuddy-desktop.info.5d63bdd69323e571.observation.json"),
+            b"logout-marker",
+        )
+        .unwrap();
+        // 干扰文件：不含 .info → 排除。
+        fs::write(auth_dir.join("unrelated.txt"), b"noise").unwrap();
+
+        let containers = root.join("workbuddy-login");
+        fs::create_dir_all(&containers).unwrap();
+        fs::write(containers.join("wb-uid-1.wbsess"), b"container-bytes").unwrap();
+        // 原子写暂存半成品：不匹配 wb-*.wbsess → 排除。
+        fs::write(containers.join("wb-uid-1.wbsess.tmp"), b"half-written").unwrap();
+        fs::write(containers.join("notes.txt"), b"text").unwrap();
+
+        WorkBuddyBackupSources {
+            app_config_root: app_root,
+            auth_dir,
+            login_container_dir: containers,
+        }
     }
 
-    /// 备份范围规则：黑名单目录/锁文件排除，登录态目录与根部 JSON 纳入。
+    /// P17-A3 白名单范围：仅 app-config.json + `.info` 族 + wb-*.wbsess
+    /// 进备份；对话/IndexedDB/LocalStorage/缓存/封面/暂存半成品全部排除。
     #[test]
-    fn backup_scope_excludes_cache_dirs_and_lockfile() {
-        assert!(!is_backup_member("CodeCache/blob"));
-        assert!(!is_backup_member("session/GPUCache/data_0"));
-        assert!(!is_backup_member("session/Code Cache/js/x.js"));
-        assert!(!is_backup_member("session/Partitions/p1/Cache/f"));
-        assert!(!is_backup_member("session/Service Worker/CacheStorage/x"));
-        assert!(!is_backup_member("lockfile"));
-        // 登录态与用户内容纳入。
-        assert!(is_backup_member("session/Local Storage/leveldb/000003.log"));
-        assert!(is_backup_member("session/IndexedDB/file__0.indexeddb.leveldb/000001.log"));
-        assert!(is_backup_member("session/Network/Trust Tokens"));
-        assert!(is_backup_member("session/Partitions/p1/Local Storage/leveldb/000003.log"));
-        assert!(is_backup_member("playbook-covers/a.png"));
-        assert!(is_backup_member("app-config.json"));
-        assert!(is_backup_member("memory/polling-lease-1.json"));
-    }
-
-    /// 压缩写出：manifest 字段/成员齐全，黑名单对象未进备份，成员为
-    /// zstd 压缩形态（magic 帧头 0x28 B5 2F FD）。
-    #[test]
-    fn backup_writes_zstd_members_and_manifest() {
+    fn backup_scope_is_whitelist_of_credentials_and_config() {
         let root = tempdir().unwrap();
-        let source = root.path().join("app");
-        make_source(&source);
+        let sources = make_sources(root.path());
         let target = root.path().join("backups");
 
-        let outcome = backup_workbuddy_data_to(&source, &target).unwrap();
-        assert_eq!(outcome.file_count, 7);
-        // 源字节：9(log-bytes)+4096+9(idb-bytes)+12+13+5(lease)+2048。
-        assert_eq!(outcome.source_bytes, 9 + 4096 + 9 + 12 + 13 + 5 + 2048);
-        // 备份目录内：7 成员 + manifest；黑名单对象不存在。
+        let outcome = backup_workbuddy_scope_to(&sources, &target).unwrap();
+        assert_eq!(outcome.file_count, 4);
+        assert_eq!(outcome.rolled_over, 0, "首份备份无旧份可滚动");
+        // 源字节：app-config 13 + .info 15 + 登出标记 13 + 容器 15。
+        assert_eq!(outcome.source_bytes, 13 + 15 + 13 + 15);
+
         let backup = &outcome.backup_dir;
         assert!(backup.join("manifest.json").is_file());
         assert!(backup.join("app-config.json.zst").is_file());
+        assert!(backup.join("auth/workbuddy-desktop.info.zst").is_file());
         assert!(backup
-            .join("session/Local Storage/leveldb/000003.log.zst")
+            .join("auth/workbuddy-desktop.info.5d63bdd69323e571.observation.json.zst")
             .is_file());
-        assert!(backup
-            .join("session/IndexedDB/file__0.indexeddb.leveldb/000001.log.zst")
-            .is_file());
-        assert!(backup.join("session/Network/Trust Tokens.zst").is_file());
-        assert!(backup.join("playbook-covers/a.png.zst").is_file());
-        assert!(backup.join("memory/polling-lease-1.json.zst").is_file());
+        assert!(backup.join("containers/wb-uid-1.wbsess.zst").is_file());
+        // 排除面全部不进备份。
+        assert!(!backup.join("session").exists());
         assert!(!backup.join("CodeCache").exists());
-        assert!(!backup.join("session/GPUCache").exists());
+        assert!(!backup.join("playbook-covers").exists());
         assert!(!backup.join("lockfile.zst").exists());
+        assert!(!backup.join("containers/notes.txt.zst").exists());
+        assert!(!backup.join("containers/wb-uid-1.wbsess.tmp.zst").exists());
+        assert!(!backup.join("auth/unrelated.txt.zst").exists());
         // zstd 帧头（标准帧 magic）。
         let head = fs::read(backup.join("app-config.json.zst")).unwrap();
         assert_eq!(&head[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
-        // manifest 统计与回执一致；压缩产物小于源（可压缩样本）。
+        // manifest 统计与回执一致。
         let manifest = read_manifest(backup).unwrap();
-        assert_eq!(manifest.file_count, 7);
+        assert_eq!(manifest.file_count, 4);
         assert_eq!(manifest.source_bytes, outcome.source_bytes);
-        assert_eq!(
-            outcome.compressed_bytes,
-            manifest.compressed_bytes + fs::metadata(backup.join("manifest.json")).unwrap().len()
-        );
-        assert!(outcome.compressed_bytes < outcome.source_bytes);
     }
 
     /// 同 stamp 目标已存在 → 拒绝且不覆盖（永不覆盖既有备份纪律）。
-    /// 用显式时间戳版本确定性构造冲突现场（不依赖时钟推进）。
     #[test]
     fn backup_refuses_existing_target() {
         let root = tempdir().unwrap();
-        let source = root.path().join("app");
-        make_source(&source);
+        let sources = make_sources(root.path());
         let target = root.path().join("backups");
-        let first = backup_workbuddy_data_stamped(&source, &target, 1000).unwrap();
+        let first = backup_workbuddy_scope_stamped(&sources, &target, 1000).unwrap();
         assert_eq!(
             first.backup_dir,
             target.join("workbuddy-data-1000"),
@@ -613,43 +675,71 @@ mod tests {
         );
         // 同 stamp 重跑：TargetExists，占位内容未被破坏。
         assert_eq!(
-            backup_workbuddy_data_stamped(&source, &target, 1000).unwrap_err(),
+            backup_workbuddy_scope_stamped(&sources, &target, 1000).unwrap_err(),
             WorkBuddyBackupError::TargetExists
         );
         assert!(first.backup_dir.join("manifest.json").is_file());
-        // 不同 stamp 正常出第二份（链内并存）。
-        assert!(backup_workbuddy_data_stamped(&source, &target, 2000).is_ok());
-        assert_eq!(list_workbuddy_backup_stamps(&target), vec![1000, 2000]);
+    }
+
+    /// P17-A3 滚动单份：第二次备份后旧份整目录彻底删除（直删不进回收站
+    /// ——目录不存在即证）；同一时刻目录内只有一份备份。
+    #[test]
+    fn rolling_backup_keeps_single_copy() {
+        let root = tempdir().unwrap();
+        let sources = make_sources(root.path());
+        let target = root.path().join("backups");
+        // 旧份遗留现场（模拟 P17-A3 前的链式备份 + 命名散目录）。
+        let legacy = target.join("workbuddy-data-900");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("manifest.json"), b"{}").unwrap();
+        let stray = target.join("workbuddy-data-abc");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("x"), b"stray").unwrap();
+
+        let second = backup_workbuddy_scope_stamped(&sources, &target, 2000).unwrap();
+        assert_eq!(second.rolled_over, 1, "旧份 900 被滚动删除");
+        assert!(!legacy.exists(), "旧份已被彻底删除（不走回收站）");
+        // 命名不符的散目录永不触碰（铁律：失败证据不清）。
+        assert!(stray.is_dir());
+        // 目录内只剩新份一条。
+        assert_eq!(list_workbuddy_backup_stamps(&target), vec![2000]);
+        // 第三次滚动：同样只留一份。
+        backup_workbuddy_scope_stamped(&sources, &target, 3000).unwrap();
+        assert_eq!(list_workbuddy_backup_stamps(&target), vec![3000]);
+        assert!(!second.backup_dir.exists());
     }
 
     /// 恢复往返：恢复内容与源逐文件字节一致；重复恢复幂等。
     #[test]
     fn restore_roundtrip_byte_identical_and_idempotent() {
         let root = tempdir().unwrap();
-        let source = root.path().join("app");
-        make_source(&source);
+        let sources = make_sources(root.path());
         let target = root.path().join("backups");
-        backup_workbuddy_data_to(&source, &target).unwrap();
+        backup_workbuddy_scope_to(&sources, &target).unwrap();
 
-        let restored = root.path().join("restored");
+        // 先改源再恢复：证明恢复把目标内容替换为备份内容。
+        fs::write(sources.app_config_root.join("app-config.json"), b"drifted").unwrap();
         let backup_dir = target.join(format!(
             "workbuddy-data-{}",
             list_workbuddy_backup_stamps(&target)[0]
         ));
-        let outcome = restore_workbuddy_data_from(&backup_dir, &restored).unwrap();
-        assert_eq!(outcome.restored_files, 7);
-        // 逐文件字节一致（源计划内文件）。
-        for relative in collect_backup_plan(&source).unwrap() {
-            assert_eq!(
-                fs::read(source.join(&relative)).unwrap(),
-                fs::read(restored.join(&relative)).unwrap(),
-                "member {relative} 字节不一致"
-            );
-        }
-        // 黑名单对象不在恢复结果（备份范围即恢复范围）。
-        assert!(!restored.join("CodeCache").exists());
+        let outcome = restore_workbuddy_scope_from(&backup_dir, &sources).unwrap();
+        assert_eq!(outcome.restored_files, 4);
+        assert_eq!(
+            fs::read(sources.app_config_root.join("app-config.json")).unwrap(),
+            b"{\"version\":1}",
+            "漂移后的配置被备份内容覆盖"
+        );
+        assert_eq!(
+            fs::read(sources.auth_dir.join("workbuddy-desktop.info")).unwrap(),
+            b"auth-info-bytes"
+        );
+        assert_eq!(
+            fs::read(sources.login_container_dir.join("wb-uid-1.wbsess")).unwrap(),
+            b"container-bytes"
+        );
         // 幂等：重复恢复结果一致。
-        let second = restore_workbuddy_data_from(&backup_dir, &restored).unwrap();
+        let second = restore_workbuddy_scope_from(&backup_dir, &sources).unwrap();
         assert_eq!(second, outcome);
     }
 
@@ -682,11 +772,16 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let restored = root.path().join("restored");
-        let outcome = restore_workbuddy_data_from(&backup, &restored).unwrap();
+        let sources = WorkBuddyBackupSources {
+            app_config_root: root.path().join("app"),
+            auth_dir: root.path().join("auth"),
+            login_container_dir: root.path().join("containers"),
+        };
+        fs::create_dir_all(&sources.app_config_root).unwrap();
+        let outcome = restore_workbuddy_scope_from(&backup, &sources).unwrap();
         assert_eq!(outcome.restored_files, 1);
         assert_eq!(
-            fs::read(restored.join("app-config.json")).unwrap(),
+            fs::read(sources.app_config_root.join("app-config.json")).unwrap(),
             b"{\"raw\":true}"
         );
     }
@@ -695,10 +790,9 @@ mod tests {
     #[test]
     fn restore_fails_on_corrupt_member() {
         let root = tempdir().unwrap();
-        let source = root.path().join("app");
-        make_source(&source);
+        let sources = make_sources(root.path());
         let target = root.path().join("backups");
-        backup_workbuddy_data_to(&source, &target).unwrap();
+        backup_workbuddy_scope_to(&sources, &target).unwrap();
         let backup_dir = target.join(format!(
             "workbuddy-data-{}",
             list_workbuddy_backup_stamps(&target)[0]
@@ -707,46 +801,55 @@ mod tests {
         // restore_corrupt_frame_cleans_partial_target）。
         let tampered = zstd::stream::encode_all(std::io::Cursor::new(b"tampered"), 3).unwrap();
         fs::write(backup_dir.join("app-config.json.zst"), tampered).unwrap();
-        let restored = root.path().join("restored");
-        let error = restore_workbuddy_data_from(&backup_dir, &restored).unwrap_err();
+        let error = restore_workbuddy_scope_from(&backup_dir, &sources).unwrap_err();
         match error {
             WorkBuddyRestoreError::VerifyFailed(path) => assert_eq!(path, "app-config.json"),
             other => panic!("期望 VerifyFailed，实际 {other:?}"),
         }
         // 半写目标已清理。
-        assert!(!restored.join("app-config.json").exists());
+        assert!(sources
+            .app_config_root
+            .join("app-config.json")
+            .metadata()
+            .is_err());
     }
 
     /// 坏帧成员（非法 zstd 数据）→ Io 分支且半写目标被清理（fail-closed）。
     #[test]
     fn restore_corrupt_frame_cleans_partial_target() {
         let root = tempdir().unwrap();
-        let source = root.path().join("app");
-        make_source(&source);
+        let sources = make_sources(root.path());
         let target = root.path().join("backups");
-        backup_workbuddy_data_to(&source, &target).unwrap();
+        backup_workbuddy_scope_to(&sources, &target).unwrap();
         let backup_dir = target.join(format!(
             "workbuddy-data-{}",
             list_workbuddy_backup_stamps(&target)[0]
         ));
         fs::write(backup_dir.join("app-config.json.zst"), b"corrupt").unwrap();
-        let restored = root.path().join("restored");
         assert_eq!(
-            restore_workbuddy_data_from(&backup_dir, &restored).unwrap_err(),
+            restore_workbuddy_scope_from(&backup_dir, &sources).unwrap_err(),
             WorkBuddyRestoreError::Io
         );
         // 解压失败的半写目标已清理。
-        assert!(!restored.join("app-config.json").exists());
+        assert!(sources
+            .app_config_root
+            .join("app-config.json")
+            .metadata()
+            .is_err());
     }
 
-    /// 恢复错误：manifest 缺失；成员缺失；不安全路径拒绝。
+    /// 恢复错误：manifest 缺失；成员缺失；不安全路径与未知命名空间拒绝。
     #[test]
     fn restore_error_branches() {
         let root = tempdir().unwrap();
+        let sources = WorkBuddyBackupSources {
+            app_config_root: root.path().join("app"),
+            auth_dir: root.path().join("auth"),
+            login_container_dir: root.path().join("containers"),
+        };
         // manifest 缺失。
         assert_eq!(
-            restore_workbuddy_data_from(&root.path(), &root.path().join("out"))
-                .unwrap_err(),
+            restore_workbuddy_scope_from(&root.path(), &sources).unwrap_err(),
             WorkBuddyRestoreError::ManifestMissing
         );
         // manifest 损坏。
@@ -754,7 +857,7 @@ mod tests {
         fs::create_dir_all(&backup).unwrap();
         fs::write(backup.join(MANIFEST_NAME), "not json").unwrap();
         assert_eq!(
-            restore_workbuddy_data_from(&backup, &root.path().join("out")).unwrap_err(),
+            restore_workbuddy_scope_from(&backup, &sources).unwrap_err(),
             WorkBuddyRestoreError::ManifestInvalid
         );
         // 成员缺失（manifest 声明但无对应文件）。
@@ -767,14 +870,14 @@ mod tests {
                 "file_count": 1,
                 "source_bytes": 1,
                 "compressed_bytes": 1,
-                "files": [{"path": "a.json", "bytes": 1, "sha256": "00"}]
+                "files": [{"path": "auth/a.info", "bytes": 1, "sha256": "00"}]
             })
             .to_string(),
         )
         .unwrap();
         assert_eq!(
-            restore_workbuddy_data_from(&backup, &root.path().join("out")).unwrap_err(),
-            WorkBuddyRestoreError::MemberMissing("a.json".to_string())
+            restore_workbuddy_scope_from(&backup, &sources).unwrap_err(),
+            WorkBuddyRestoreError::MemberMissing("auth/a.info".to_string())
         );
         // 不安全路径（.. 段）。
         fs::write(
@@ -786,13 +889,32 @@ mod tests {
                 "file_count": 1,
                 "source_bytes": 1,
                 "compressed_bytes": 1,
-                "files": [{"path": "../escape.json", "bytes": 1, "sha256": "00"}]
+                "files": [{"path": "auth/../escape.info", "bytes": 1, "sha256": "00"}]
             })
             .to_string(),
         )
         .unwrap();
         assert_eq!(
-            restore_workbuddy_data_from(&backup, &root.path().join("out")).unwrap_err(),
+            restore_workbuddy_scope_from(&backup, &sources).unwrap_err(),
+            WorkBuddyRestoreError::UnsafePath
+        );
+        // 未知命名空间（映射不到任何源位置）：同样 fail-closed 拒绝。
+        fs::write(
+            backup.join(MANIFEST_NAME),
+            serde_json::json!({
+                "format_version": 1,
+                "product": "workbuddy",
+                "stamp_unix_seconds": 1,
+                "file_count": 1,
+                "source_bytes": 1,
+                "compressed_bytes": 1,
+                "files": [{"path": "unknown/x.json", "bytes": 1, "sha256": "00"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            restore_workbuddy_scope_from(&backup, &sources).unwrap_err(),
             WorkBuddyRestoreError::UnsafePath
         );
         // 绝对路径与反斜杠同样拒绝（纯校验函数）。
@@ -800,16 +922,16 @@ mod tests {
         assert!(!member_path_is_safe("a\\b"));
     }
 
-    /// 链枚举与裁剪：升序枚举、保留最新 keep 份、旧份整目录删；散目录
-    /// 与 keep=0 不触碰。
+    /// 链枚举与裁剪（P17-A3 滚动单份）：升序枚举、只留最新 1 份、旧份整
+    /// 目录直删；散目录与 keep=0 不触碰。
     #[test]
-    fn prune_keeps_newest_and_ignores_non_chain_dirs() {
+    fn prune_rolls_to_newest_and_ignores_non_chain_dirs() {
         let target = tempdir().unwrap();
         for stamp in [800_u64, 900, 1000] {
             let dir = target.path().join(format!("workbuddy-data-{stamp}"));
-            fs::create_dir_all(dir.join("session")).unwrap();
+            fs::create_dir_all(dir.join("auth")).unwrap();
             fs::write(dir.join("manifest.json"), b"{}").unwrap();
-            fs::write(dir.join("session").join("a.json"), b"{}").unwrap();
+            fs::write(dir.join("auth").join("a.info"), b"{}").unwrap();
         }
         // 非链命名：带后缀 / 非数字 / 散文件 / 暂存目录——永不触碰。
         fs::create_dir_all(target.path().join("workbuddy-data-700-extra")).unwrap();
@@ -819,10 +941,10 @@ mod tests {
 
         assert_eq!(list_workbuddy_backup_stamps(target.path()), vec![800, 900, 1000]);
         assert_eq!(prune_workbuddy_backups(target.path(), 0), 0);
-        assert_eq!(prune_workbuddy_backups(target.path(), 2), 1);
-        // 最新两份保留，最旧 800 整目录删除。
+        // P17-A3：keep 数值不再生效，≥1 一律滚动单份（删 2 份）。
+        assert_eq!(prune_workbuddy_backups(target.path(), 2), 2);
         assert!(target.path().join("workbuddy-data-1000").is_dir());
-        assert!(target.path().join("workbuddy-data-900").is_dir());
+        assert!(!target.path().join("workbuddy-data-900").exists());
         assert!(!target.path().join("workbuddy-data-800").exists());
         // 非链对象全部原样。
         assert!(target.path().join("workbuddy-data-700-extra").is_dir());
@@ -835,26 +957,43 @@ mod tests {
     #[test]
     fn list_entries_reports_manifest_and_disk_bytes() {
         let root = tempdir().unwrap();
-        let source = root.path().join("app");
-        make_source(&source);
+        let sources = make_sources(root.path());
         let target = root.path().join("backups");
-        let outcome = backup_workbuddy_data_to(&source, &target).unwrap();
+        let outcome = backup_workbuddy_scope_to(&sources, &target).unwrap();
         let entries = list_workbuddy_backups(&target);
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
-        assert_eq!(entry.file_count, Some(7));
+        assert_eq!(entry.file_count, Some(4));
         assert_eq!(entry.source_bytes, Some(outcome.source_bytes));
         // 磁盘字节 ≥ 压缩成员合计（还含 manifest）。
         assert!(entry.compressed_bytes >= outcome.compressed_bytes);
     }
 
-    /// 源目录不存在 → SourceUnavailable（不创建任何目标内容）。
+    /// 源目录不存在 → SourceUnavailable（不创建任何目标内容）；
+    /// 凭据容器目录缺失不报错（从未登录/从未捕获时对应命名空间为空）。
     #[test]
-    fn backup_rejects_missing_source() {
+    fn backup_source_guards() {
         let root = tempdir().unwrap();
-        let error = backup_workbuddy_data_to(&root.path().join("nope"), &root.path().join("b"))
-            .unwrap_err();
+        let missing = WorkBuddyBackupSources {
+            app_config_root: root.path().join("nope"),
+            auth_dir: root.path().join("auth"),
+            login_container_dir: root.path().join("containers"),
+        };
+        let error =
+            backup_workbuddy_scope_to(&missing, &root.path().join("b")).unwrap_err();
         assert_eq!(error, WorkBuddyBackupError::SourceUnavailable);
         assert!(!root.path().join("b").exists());
+
+        // app 根存在但凭据容器全缺：0 成员备份成功（空清单合法）。
+        let app_root = root.path().join("app");
+        fs::create_dir_all(&app_root).unwrap();
+        let bare = WorkBuddyBackupSources {
+            app_config_root: app_root.clone(),
+            auth_dir: root.path().join("auth-missing"),
+            login_container_dir: root.path().join("containers-missing"),
+        };
+        let outcome = backup_workbuddy_scope_to(&bare, &root.path().join("b")).unwrap();
+        assert_eq!(outcome.file_count, 0);
+        assert_eq!(outcome.source_bytes, 0);
     }
 }

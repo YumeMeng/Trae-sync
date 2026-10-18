@@ -1,32 +1,57 @@
-//! P17-T4b 真机备份执行器（P17 立项授权：需要 WorkBuddy 退出操作的任务）。
+//! P17-T4b/P17-A3 真机备份执行器（P17 立项授权：需要 WorkBuddy 退出操作的任务）。
+//!
+//! P17-A3 备份范围收窄（spec 10.2）：白名单三元组——仅登录凭据（auth
+//! `.info` 来源容器 + 工具侧 `wb-*.wbsess` 代次容器）+ 应用配置
+//! （`app-config.json`）；对话/IndexedDB/LocalStorage/缓存/封面不再备份
+//! （跟号走）。备份为滚动单份：旧份在新份发布成功后彻底删除。
 //!
 //! 执行序列：
 //! 1. 探活 WorkBuddy 本地探针 API（运行中则打印状态）；
 //! 2. `close_workbuddy()` 优雅关闭（用户已在 P17 立项时授权）；关闭失败
 //!    中止（fail-closed，零副作用）；
-//! 3. `backup_workbuddy_data_to` 备份数据目录（暂存压缩 → manifest →
-//!    发布；任一成员失败整体失败，零副作用）；
-//! 4. 回读校验：恢复到隔离校验目录，逐成员 sha256 比对 manifest + 与
-//!    当前源文件比对（证明备份捕获了源现状），校验后清理校验目录；
-//! 5. 打印体积与压缩比报告。完成后 WorkBuddy 可由用户重开。
+//! 3. `backup_workbuddy_scope_to` 白名单备份（暂存压缩 → manifest → 发布
+//!    → 滚动删除旧份；任一成员失败整体失败，零副作用）；
+//! 4. 回读校验：恢复到隔离校验目录（命名空间映射到暂存镜像），逐成员
+//!    sha256 比对 manifest + 与当前源文件比对，校验后清理校验目录；
+//! 5. 打印体积与滚动报告。完成后 WorkBuddy 可由用户重开。
 //!
-//! 用法：`workbuddy_backup_p17 [source_dir] [target_dir]`
-//!   默认 source = `%USERPROFILE%\.workbuddy\app`
-//!   默认 target = `E:\trae-sync\Trae Sync\backups\workbuddy`（软件本体旁
-//!   backups/ 的 workbuddy 子目录，与 P16 备份治理位置同口径）。
+//! 用法：`workbuddy_backup_p17 [app_root] [auth_dir] [containers_dir] [target_dir]`
+//!   默认 app_root = `%USERPROFILE%\.workbuddy\app`
+//!   默认 auth_dir = `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth`
+//!   默认 containers_dir = `%LOCALAPPDATA%\Trae Sync\data\workbuddy-login`
+//!   默认 target = `E:\trae-sync\Trae Sync\backups\workbuddy`
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use traesync_infrastructure::workbuddy_backup::{
-    backup_workbuddy_data_to, list_workbuddy_backups, restore_workbuddy_data_from,
+    backup_workbuddy_scope_to, list_workbuddy_backups, restore_workbuddy_scope_from,
+    WorkBuddyBackupSources,
 };
 use traesync_infrastructure::workbuddy_instance::{close_workbuddy, probe_local_api, CloseOutcome};
 
-fn default_source() -> PathBuf {
-    let profile = std::env::var("USERPROFILE").unwrap_or_default();
-    Path::new(&profile).join(".workbuddy").join("app")
+fn user_profile() -> PathBuf {
+    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
+}
+
+fn local_appdata() -> PathBuf {
+    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
+}
+
+fn default_sources() -> WorkBuddyBackupSources {
+    WorkBuddyBackupSources {
+        app_config_root: user_profile().join(".workbuddy").join("app"),
+        auth_dir: local_appdata()
+            .join("CodeBuddyExtension")
+            .join("Data")
+            .join("Public")
+            .join("auth"),
+        login_container_dir: local_appdata()
+            .join("Trae Sync")
+            .join("data")
+            .join("workbuddy-login"),
+    }
 }
 
 fn default_target() -> PathBuf {
@@ -40,10 +65,19 @@ fn verify_dir() -> PathBuf {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let source = PathBuf::from(args.get(1).cloned().unwrap_or_default()).abs_or(default_source());
-    let target = PathBuf::from(args.get(2).cloned().unwrap_or_default()).abs_or(default_target());
+    let fallback = default_sources();
+    let sources = WorkBuddyBackupSources {
+        app_config_root: PathBuf::from(args.get(1).cloned().unwrap_or_default())
+            .abs_or(fallback.app_config_root),
+        auth_dir: PathBuf::from(args.get(2).cloned().unwrap_or_default()).abs_or(fallback.auth_dir),
+        login_container_dir: PathBuf::from(args.get(3).cloned().unwrap_or_default())
+            .abs_or(fallback.login_container_dir),
+    };
+    let target = PathBuf::from(args.get(4).cloned().unwrap_or_default()).abs_or(default_target());
 
-    println!("源数据根：{}", source.display());
+    println!("配置根：{}", sources.app_config_root.display());
+    println!("凭据来源容器：{}", sources.auth_dir.display());
+    println!("代次容器：{}", sources.login_container_dir.display());
     println!("备份目标：{}", target.display());
 
     // 第 1 步：探活（状态可见性；不作为门禁——关闭编排自行判定进程态）。
@@ -76,9 +110,9 @@ fn main() -> ExitCode {
     }
     println!("关闭耗时 {:.1}s", started.elapsed().as_secs_f64());
 
-    // 第 3 步：备份（fail-closed：任一成员失败 → 暂存清理 + 零副作用）。
+    // 第 3 步：白名单滚动备份（fail-closed：任一成员失败 → 暂存清理 + 零副作用）。
     let started = Instant::now();
-    let outcome = match backup_workbuddy_data_to(&source, &target) {
+    let outcome = match backup_workbuddy_scope_to(&sources, &target) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("中止：备份失败（{}）——零副作用退出", error.code());
@@ -87,13 +121,14 @@ fn main() -> ExitCode {
     };
     println!("备份耗时 {:.1}s", started.elapsed().as_secs_f64());
     println!("备份目录：{}", outcome.backup_dir.display());
+    println!("滚动删除旧份：{} 份", outcome.rolled_over);
 
     // 第 4 步：回读校验——恢复到隔离目录并逐成员与当前源比对。
     let backup_dir = outcome.backup_dir.clone();
     let verify = verify_dir();
     let _ = std::fs::remove_dir_all(&verify);
     let started = Instant::now();
-    if let Err(error) = restore_workbuddy_data_from(&backup_dir, &verify) {
+    if let Err(error) = restore_workbuddy_scope_from(&backup_dir, &sources) {
         eprintln!("中止：回读恢复失败（{:?}）", error);
         return ExitCode::FAILURE;
     }
@@ -113,8 +148,13 @@ fn main() -> ExitCode {
         );
     }
     for relative in walk_member_paths(&backup_dir) {
+        // 命名空间映射回源位置（与恢复同一映射纪律）。
+        let Some(origin) = scope_source_path(&sources, &relative) else {
+            mismatch += 1;
+            eprintln!("  比对定位失败：{relative}");
+            continue;
+        };
         let restored = verify.join(&relative);
-        let origin = source.join(&relative);
         match (
             traesync_infrastructure::snapshot_store::sha256_file(&restored),
             traesync_infrastructure::snapshot_store::sha256_file(&origin),
@@ -140,16 +180,29 @@ fn main() -> ExitCode {
     } else {
         0.0
     };
-    println!("---- P17-T4b 备份报告 ----");
-    println!("  备份成员：{} 文件", outcome.file_count);
+    println!("---- P17-A3 备份报告 ----");
+    println!("  备份成员：{} 文件（白名单：凭据+配置）", outcome.file_count);
     println!("  源字节：{}", format_bytes(outcome.source_bytes));
     println!(
-        "  压缩后：{}（压缩比 {ratio:.3}，节省 {:.1}%）",
-        format_bytes(outcome.compressed_bytes),
-        (1.0 - ratio) * 100.0
+        "  压缩后：{}（压缩比 {ratio:.3}）",
+        format_bytes(outcome.compressed_bytes)
     );
     println!("WorkBuddy 现在可以重新打开。");
     ExitCode::SUCCESS
+}
+
+/// 备份目录内成员相对路径 → 源位置（命名空间映射，与恢复同规则）。
+fn scope_source_path(sources: &WorkBuddyBackupSources, relative: &str) -> Option<PathBuf> {
+    if relative == "app-config.json" {
+        return Some(sources.app_config_root.join("app-config.json"));
+    }
+    if let Some(rest) = relative.strip_prefix("auth/") {
+        return Some(sources.auth_dir.join(rest));
+    }
+    if let Some(rest) = relative.strip_prefix("containers/") {
+        return Some(sources.login_container_dir.join(rest));
+    }
+    None
 }
 
 /// 收集备份目录内全部成员相对路径（含 manifest 自身——排除）。

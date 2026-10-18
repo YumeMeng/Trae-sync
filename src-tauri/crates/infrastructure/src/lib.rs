@@ -203,7 +203,6 @@ pub use logging::{
 pub use master_archive::{
     apply_master_archive_changes,
     delete_master_sessions, delete_master_sessions_with_backup_dir, merge_master_projects,
-    merge_master_projects_with_backup_dir,
     MasterArchiveApplyOutcome, MasterArchiveError, MasterDeleteOutcome, MasterMergeOutcome,
     ARCHIVE_HIDDEN_STATUS,
 };
@@ -213,13 +212,14 @@ pub use master_checkup::{
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_handover::{
-    backup_master_trio, backup_master_trio_stamped, backup_master_trio_to, handover_master_records,
+    backup_master_trio, backup_master_trio_rolling, backup_master_trio_rolling_stamped,
+    backup_master_trio_stamped, backup_master_trio_to, handover_master_records,
     handover_master_records_from_merge_with_progress, handover_master_records_from_with_progress,
-    handover_master_records_with_progress, list_master_backups, list_master_backups_in,
-    master_backup_db_name, master_database_path, master_db_activity_detected,
-    merge_trae_cn_project_records_with_progress, preview_trae_cn_project_merge, HandoverProgress,
-    HandoverSession, MasterBackupEntry, MasterHandover, MasterHandoverError, TraeCnMergeRow,
-    TraeCnProjectMergePreview,
+    handover_master_records_with_progress, hard_delete_master_backup, list_master_backups,
+    list_master_backups_in, master_backup_db_name, master_database_path,
+    master_db_activity_detected, merge_trae_cn_project_records_with_progress,
+    preview_trae_cn_project_merge, HandoverProgress, HandoverSession, MasterBackupEntry,
+    MasterHandover, MasterHandoverError, TraeCnMergeRow, TraeCnProjectMergePreview,
 };
 #[cfg(feature = "sqlcipher")]
 pub use master_history::{

@@ -234,6 +234,67 @@ pub fn backup_master_trio_stamped(
     Ok(backup)
 }
 
+/// P17-A3 彻底删除原语：直删一份主库备份链条目（db/wal/shm 成员 +
+/// 同 stamp 凭据子目录），**不走回收站**。
+///
+/// 纪律依据（spec 10.4，2026-10-18）：删除类操作分两档——safe-delete
+/// （回收站 shim）仅用于用户可能误删、需找回的场景；备份文件属**可再生
+/// 数据**（可由当前主库重新生成），进入回收站只会持续占用 E 盘水位
+/// （单份 1.6GB+），因此备份清理一律走本原语 `std::fs::remove_file` /
+/// `remove_dir_all` 直删。返回实际删除的成员文件数（凭据子目录不计数）。
+pub fn hard_delete_master_backup(backup_dir: &Path, db_name: &str, stamp: u64) -> usize {
+    let mut removed = 0;
+    for name in backup_member_file_names(db_name, stamp) {
+        let member = backup_dir.join(&name);
+        // 直删；文件不存在时 remove 失败但也不存在（幂等，不计入）。
+        if std::fs::remove_file(&member).is_ok() {
+            removed += 1;
+        }
+    }
+    // R0-P3：同 stamp 凭据子目录随主备份连带直删（存在才删，失败静默）。
+    let credentials = backup_dir.join(format!("credentials-{stamp}"));
+    if credentials.is_dir() {
+        let _ = std::fs::remove_dir_all(&credentials);
+    }
+    removed
+}
+
+/// P17-A3 滚动单份备份（spec 10.2）：写新份成功后，彻底删除目录内其余
+/// 全部旧链条目（含凭据子目录）——同一时刻全目录只有一份备份；keep=N
+/// 链式保留退役。
+///
+/// 顺序决策（与任务书「先删后写」的差异，选更安全的等价实现）：
+/// **先写新份、成功后再删旧份**。若先删后写，压缩中途失败会让目录内
+/// 零备份（唯一的保险副本被先毁）；先写后删在最坏情况（新份写失败）
+/// 下退化为保留旧份——备份系统的失败模式必须是「多留」而非「丢失」。
+/// 可观察结果与任务书一致：成功路径结束后目录内只有新份一份。
+pub fn backup_master_trio_rolling_stamped(
+    db_path: &Path,
+    target_dir: &Path,
+    stamp: u64,
+) -> Result<PathBuf, MasterHandoverError> {
+    let backup = backup_master_trio_stamped(db_path, Some(target_dir), stamp)?;
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(MasterHandoverError::Io)?;
+    // 滚动清理：新份之外的全部链条目（旧未压缩/旧压缩/凭据子目录）直删。
+    for entry in list_master_backups_in(target_dir, db_name) {
+        if entry.stamp_unix_seconds != stamp {
+            hard_delete_master_backup(target_dir, db_name, entry.stamp_unix_seconds);
+        }
+    }
+    Ok(backup)
+}
+
+/// 滚动单份备份（当前时间戳版本；语义见 [`backup_master_trio_rolling_stamped`]）。
+pub fn backup_master_trio_rolling(
+    db_path: &Path,
+    target_dir: &Path,
+) -> Result<PathBuf, MasterHandoverError> {
+    backup_master_trio_rolling_stamped(db_path, target_dir, unix_seconds_now())
+}
+
 /// P16-T1：备份链成员候选文件名（双格式）——旧未压缩与新压缩 `.zst`
 /// 各 3 个（db/wal/shm）。枚举、裁剪、迁移共用一份命名事实源。
 pub fn backup_member_file_names(db_name: &str, stamp: u64) -> Vec<String> {
@@ -2915,6 +2976,77 @@ mod tests {
             .collect();
         assert_eq!(left.len(), 2, "原目录只剩 db 与 wal");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P17-A3 滚动单份语义：第二次备份后旧份不存在；同目录同时刻只有
+    /// 一份备份；旧链的凭据子目录与未压缩旧格式散件一并彻底删除（直删，
+    /// 不进回收站——文件不存在即证）。
+    #[test]
+    fn rolling_backup_keeps_single_copy() {
+        let root = temp_db_path("rolling");
+        let db_path = root.join("data").join("database.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, [1u8; 64]).unwrap();
+        std::fs::write(
+            db_path.parent().unwrap().join("database.db-wal"),
+            [2u8; 8],
+        )
+        .unwrap();
+        let target = root.join("backups");
+        std::fs::create_dir_all(&target).unwrap();
+        // 旧链条目现场：未压缩旧格式散件 + 凭据子目录（P16 前遗留形态）。
+        std::fs::write(target.join("database.db.switch-bak-900"), [3u8; 16]).unwrap();
+        std::fs::create_dir_all(target.join("credentials-900")).unwrap();
+        std::fs::write(target.join("credentials-900").join("accounts.json"), b"{}").unwrap();
+
+        // 第一次滚动备份（显式 stamp 保证确定性）。
+        let first = backup_master_trio_rolling_stamped(&db_path, &target, 1000).unwrap();
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("database.db.switch-bak-1000.zst")
+        );
+        // 旧份与凭据子目录已被彻底删除。
+        assert!(!target.join("database.db.switch-bak-900").exists());
+        assert!(!target.join("credentials-900").exists());
+        // 目录内只剩新份一条链（db + 存在的 wal）。
+        let chain = list_master_backups_in(&target, "database.db");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].stamp_unix_seconds, 1000);
+        assert!(chain[0].has_wal);
+
+        // 第二次滚动：新份替换旧份（旧份不存在 = 滚动单份核心断言）。
+        std::fs::write(&db_path, [9u8; 32]).unwrap();
+        backup_master_trio_rolling_stamped(&db_path, &target, 2000).unwrap();
+        let chain = list_master_backups_in(&target, "database.db");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].stamp_unix_seconds, 2000);
+        assert!(!first.exists(), "第一份备份已被滚动删除");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P17-A3 彻底删除原语：成员与凭据子目录直删；对不存在的 stamp 幂等
+    /// （无文件可删返回 0，不报错）。
+    #[test]
+    fn hard_delete_master_backup_is_direct_and_idempotent() {
+        let dir = temp_db_path("hard-delete");
+        let dir = dir.parent().unwrap().join("backups");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("database.db.switch-bak-800"), [1u8; 4]).unwrap();
+        std::fs::write(dir.join("database.db.switch-bak-800-wal"), [1u8; 2]).unwrap();
+        std::fs::create_dir_all(dir.join("credentials-800")).unwrap();
+        std::fs::write(dir.join("credentials-800").join("profiles"), b"p").unwrap();
+        // 直删：db 成员 + wal 成员 = 2 个文件；凭据子目录连带删除。
+        assert_eq!(hard_delete_master_backup(&dir, "database.db", 800), 2);
+        assert!(!dir.join("database.db.switch-bak-800").exists());
+        assert!(!dir.join("database.db.switch-bak-800-wal").exists());
+        assert!(!dir.join("database.db.switch-bak-800-shm").exists());
+        assert!(!dir.join("credentials-800").exists());
+        // 幂等：重复删除返回 0（无文件可删），不报错。
+        assert_eq!(hard_delete_master_backup(&dir, "database.db", 800), 0);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     /// backup_master_trio_to(None)：等价原 backup_master_trio 同目录行为

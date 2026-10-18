@@ -42,7 +42,7 @@ use traesync_infrastructure::trae_instance::{
     list_trae_processes, native_account_dir,
 };
 use traesync_infrastructure::{
-    archive_login_user_id, backup_master_trio_to, capture_location_identity,
+    archive_login_user_id, backup_master_trio_rolling, capture_location_identity,
     capture_location_witness, construct_auth_identity, fetch_installed_plugins, get_user_info,
     get_user_info_full, get_user_info_full_for_oauth_client, handover_master_records_with_progress,
     load_account_fingerprint_salt, load_or_create_account_fingerprint_salt, master_login_material,
@@ -75,7 +75,9 @@ use crate::error_mapping::{
     trae_cn_health_error_code,
 };
 use crate::instance_tools::{launch_instance_common, trae_instance_account_id};
-use crate::library_archive::{prune_backups_if_enabled, resolve_master_backup_dir};
+// P17-A3：prune_backups_if_enabled 随 keep=N 链式保留退役移除——切号备份
+// 为滚动单份语义，无需再做保留策略裁剪。
+use crate::library_archive::resolve_master_backup_dir;
 // P12-R3：清单构造原语随插件域迁 plugins。
 use crate::plugins::manifest_entries_from_cloud;
 
@@ -4609,18 +4611,16 @@ pub(crate) fn switch_master_account_at_with_identity_switch<R: tauri::Runtime>(
         eprintln!("[master-switch] 切出回存完成：{saved_profile:?}");
     }
 
-    // 第 2 步：三件套备份（ADR-0018 铁律：破坏性批量操作前先备份；
-    // create_new 保证永不覆盖既有备份链）。
+    // 第 2 步：三件套备份（ADR-0018 铁律：破坏性批量操作前先备份）。
+    // P17-A3：切号是保留自动备份的两个触发点之一；备份为滚动单份语义
+    // （写新份成功后彻底删除旧链，同一时刻目录内只有一份，spec 10.2）。
     emit("backing_up");
     // P11-4①：写入当前活动备份目录（backup_dir 覆盖或 db 同目录）。
     let backup_dir = resolve_master_backup_dir(storage_root, &db_path);
-    let backup_path =
-        backup_master_trio_to(&db_path, Some(&backup_dir)).map_err(|error| match error {
-            MasterHandoverError::DbUnavailable => "master_switch_db_missing".to_string(),
-            _ => "master_switch_backup_failed".to_string(),
-        })?;
-    // P5-9：备份生成后按保留策略清理旧备份（静默容错，不影响切号流程）。
-    prune_backups_if_enabled(&db_path, storage_root);
+    let backup_path = backup_master_trio_rolling(&db_path, &backup_dir).map_err(|error| match error {
+        MasterHandoverError::DbUnavailable => "master_switch_db_missing".to_string(),
+        _ => "master_switch_backup_failed".to_string(),
+    })?;
 
     // P7-2 回滚材料：第 3 步改写前的主库登录态原始字节。读不到（文件
     // 缺失/无登录键）时第 3 步必然报 TargetAuthUnavailable 而不会写库，
@@ -5147,13 +5147,10 @@ pub(crate) async fn purge_account_records(
             .filter(|path| path.is_absolute())
             .ok_or_else(|| "storage_root_unavailable".to_string())?;
         let processes = list_trae_processes().map_err(|e| e.code().to_string())?;
-        // P11-4③：主库三件套备份定位（与切号/收编同源；解析失败 fail-closed 拒绝）。
-        let master_db_path = master_database_path(&master_dir);
         purge_account_records_inner(
             &material_root,
             &storage_root,
             &appdata,
-            &master_db_path,
             &profile_id,
             &processes,
         )
@@ -5165,7 +5162,6 @@ fn purge_account_records_inner(
     material_root: &Path,
     storage_root: &Path,
     appdata: &Path,
-    master_db_path: &Path,
     profile_id: &str,
     processes: &[trae_instance_module::TraeProcessInfo],
 ) -> Result<(), String> {
@@ -5198,17 +5194,9 @@ fn purge_account_records_inner(
         );
         crate::process_guard::ensure_stopped(native_process_state, "purge_instance_running")?;
     }
-    // 备份铁律（ADR-0018 / P11-4③）：purge 前备份主库三件套（与切号/收编/
-    // 环境登录同家族纪律）；主库 db 不存在（TRAE 从未启动）无需备份。
-    // 备份失败一律拒绝执行——无备份不动数据。
-    if master_db_path.is_file() {
-        // P11-4①：写入当前活动备份目录（backup_dir 覆盖或 db 同目录）。
-        let backup_dir = resolve_master_backup_dir(storage_root, master_db_path);
-        backup_master_trio_to(master_db_path, Some(&backup_dir))
-            .map_err(|_| "purge_backup_failed".to_string())?;
-        // P5-9：备份生成后按保留策略清理旧备份（静默容错，与家族一致）。
-        prune_backups_if_enabled(master_db_path, storage_root);
-    }
+    // P17-A3（spec 10.2 触发点收敛）：purge 不再自动备份主库三件套——
+    // 自动备份仅保留切号与删除会话两个高危触发点；purge 删除的是账号
+    // 实例目录/原生目录/索引缓存，主库 db 不在删除范围内。
     // 删除 1：实例数据目录（缺失视为成功——幂等）。
     remove_dir_all_if_exists(&instance_dir)?;
     // 删除 2：原生账号目录（account_id 非纯数字时无目录可删，跳过）。
@@ -6473,7 +6461,6 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
-            &root.path().join("master").join("database.db"),
             "profile-a",
             &processes,
         )
@@ -6493,8 +6480,6 @@ mod real_checkin_tests {
         std::fs::write(instance_dir.join("storage.json"), b"keep-instance").unwrap();
         let master_dir = root.path().join("master");
         std::fs::create_dir_all(&master_dir).unwrap();
-        let master_db = master_dir.join("database.db");
-        std::fs::write(&master_db, b"master-db-bytes").unwrap();
         let appdata = tempfile::tempdir().unwrap();
         let native_dir = appdata.path().join("TRAE SOLO CN_1234567890");
         std::fs::create_dir_all(native_dir.join("User").join("globalStorage")).unwrap();
@@ -6519,7 +6504,6 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
-            &master_db,
             "profile-a",
             &processes,
         )
@@ -6556,8 +6540,6 @@ mod real_checkin_tests {
         std::fs::write(instance_dir.join("storage.json"), b"keep").unwrap();
         let master_dir = root.path().join("master");
         std::fs::create_dir_all(&master_dir).unwrap();
-        let master_db = master_dir.join("database.db");
-        std::fs::write(&master_db, b"master-db-bytes").unwrap();
         let appdata = tempfile::tempdir().unwrap();
         let processes = [trae_instance_module::TraeProcessInfo {
             pid: 4244,
@@ -6569,7 +6551,6 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
-            &master_db,
             "profile-a",
             &processes,
         )
@@ -6596,14 +6577,11 @@ mod real_checkin_tests {
         std::fs::write(instance_dir.join("storage.json"), b"keep-instance").unwrap();
         let master_dir = root.path().join("master");
         std::fs::create_dir_all(&master_dir).unwrap();
-        let master_db = master_dir.join("database.db");
-        std::fs::write(&master_db, b"master-db-bytes").unwrap();
 
         let error = purge_account_records_inner(
             &root.path().join("checkin"),
             root.path(),
             Path::new("relative-appdata"),
-            &master_db,
             "profile-a",
             &[],
         )
@@ -6626,7 +6604,6 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
-            &root.path().join("master").join("database.db"),
             "profile-404",
             &[],
         )
@@ -6667,7 +6644,6 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
-            &root.path().join("master").join("database.db"),
             "profile-a",
             &[],
         )
@@ -6686,129 +6662,51 @@ mod real_checkin_tests {
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
-            &root.path().join("master").join("database.db"),
             "profile-a",
             &[],
         )
         .unwrap();
     }
 
-    /// P11-4③：purge 备份先行——主库 db 存在时先留三件套备份（create_new
-    /// 永不覆盖既有链），备份成功后再执行删除。
-    /// P16-T1：备份为压缩 .zst 形态，测试显式配置 backup_dir 覆盖指向
-    /// 夹具 master 目录（新默认 = exe 同级 backups/，测试必须隔离）。
+    /// P17-A3（spec 10.2 触发点收敛）：purge 不再自动备份主库三件套——
+    /// 自动备份仅保留切号与删除会话两个高危触发点；purge 删除的是账号
+    /// 实例目录/原生目录/索引缓存，主库 db 不在删除范围内。删除照常执行。
     #[test]
-    fn purge_backs_up_master_trio_before_deletion() {
+    fn purge_does_not_back_up_master_and_deletion_proceeds() {
         let root = tempfile::tempdir().unwrap();
         registered_account_with_id(root.path(), "profile-a", "1234567890");
         let instance_dir = root.path().join("trae-instances").join("profile-a");
         std::fs::create_dir_all(&instance_dir).unwrap();
         std::fs::write(instance_dir.join("storage.json"), b"{}").unwrap();
-        // 主库 db + wal 现场（备份只做文件复制，字节内容任意）。
+        // 主库 db 现场（历史上会触发备份；P17-A3 起不再触碰）。
         let master_dir = root.path().join("master");
         std::fs::create_dir_all(&master_dir).unwrap();
-        let master_db = master_dir.join("database.db");
-        std::fs::write(&master_db, b"master-db-bytes").unwrap();
-        std::fs::write(master_dir.join("database.db-wal"), b"wal-bytes").unwrap();
+        std::fs::write(master_dir.join("database.db"), b"master-db-bytes").unwrap();
         let appdata = tempfile::tempdir().unwrap();
-        // P16-T1：覆盖备份目录到夹具内，隔离 exe 同级默认目录。
-        traesync_infrastructure::backup_retention::BackupRetentionStore::new(root.path())
-            .save(&traesync_infrastructure::backup_retention::BackupRetentionSettings {
-                enabled: true,
-                keep: 5,
-                backup_dir: Some(master_dir.display().to_string()),
-            })
-            .unwrap();
 
         purge_account_records_inner(
             &root.path().join("checkin"),
             root.path(),
             appdata.path(),
-            &master_db,
             "profile-a",
             &[],
         )
         .unwrap();
 
-        // 备份生成：压缩形态解压后与 db 一致，且带 wal 压缩附属件。
-        let backup_main = std::fs::read_dir(&master_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .find(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                name.starts_with("database.db.switch-bak-")
-                    && name.ends_with(".zst")
-                    && !name.ends_with("-wal.zst")
-                    && !name.ends_with("-shm.zst")
-            })
-            .expect("备份主文件应存在");
-        let restored = root.path().join("restored-db");
-        traesync_infrastructure::master_handover::decompress_backup_member(
-            &backup_main.path(),
-            &restored,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&restored).unwrap(), b"master-db-bytes");
-        let backup_name = backup_main.file_name().to_string_lossy().into_owned();
-        let restored_wal = root.path().join("restored-wal");
-        traesync_infrastructure::master_handover::decompress_backup_member(
-            &master_dir.join(format!("{backup_name}").replace(".zst", "-wal.zst")),
-            &restored_wal,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&restored_wal).unwrap(), b"wal-bytes");
-        // 备份先行不阻断删除主流程：三处现场照常清理。
+        // 删除主流程照常：实例目录已清理。
         assert!(!instance_dir.exists());
-    }
-
-    /// P11-4③：备份失败一律拒绝执行（无备份不动数据），删除零发生。
-    /// 预占未来数秒的同名压缩备份位使 create_new 撞车，确定性触发备份失败。
-    /// P16-T1：压缩写出 → 预占位也用 .zst 名；备份目录经覆盖指向夹具。
-    #[test]
-    fn purge_rejects_when_master_backup_fails() {
-        let root = tempfile::tempdir().unwrap();
-        registered_account_with_id(root.path(), "profile-a", "1234567890");
-        let instance_dir = root.path().join("trae-instances").join("profile-a");
-        std::fs::create_dir_all(&instance_dir).unwrap();
-        std::fs::write(instance_dir.join("storage.json"), b"{}").unwrap();
-        let master_dir = root.path().join("master");
-        std::fs::create_dir_all(&master_dir).unwrap();
-        let master_db = master_dir.join("database.db");
-        std::fs::write(&master_db, b"master-db-bytes").unwrap();
-        // P16-T1：覆盖备份目录到夹具内，隔离 exe 同级默认目录。
-        traesync_infrastructure::backup_retention::BackupRetentionStore::new(root.path())
-            .save(&traesync_infrastructure::backup_retention::BackupRetentionSettings {
-                enabled: true,
-                keep: 5,
-                backup_dir: Some(master_dir.display().to_string()),
-            })
-            .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        // 触发点收敛：主库目录不产生任何备份文件。
+        let backups = std::fs::read_dir(&master_dir)
             .unwrap()
-            .as_secs();
-        for stamp in now - 2..=now + 5 {
-            std::fs::write(
-                master_dir.join(format!("database.db.switch-bak-{stamp}.zst")),
-                b"occupied",
-            )
-            .unwrap();
-        }
-        let appdata = tempfile::tempdir().unwrap();
-
-        let error = purge_account_records_inner(
-            &root.path().join("checkin"),
-            root.path(),
-            appdata.path(),
-            &master_db,
-            "profile-a",
-            &[],
-        )
-        .unwrap_err();
-
-        assert_eq!(error, "purge_backup_failed");
-        // 守卫生效：实例目录原样保留（未发生任何删除）。
-        assert!(instance_dir.join("storage.json").is_file());
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".switch-bak-")
+            })
+            .count();
+        assert_eq!(backups, 0, "purge 不应再产生主库备份");
     }
 }
 

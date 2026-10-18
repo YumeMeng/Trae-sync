@@ -26,7 +26,7 @@ use traesync_infrastructure::trae_instance::{
 };
 use traesync_infrastructure::TraeProduct;
 use traesync_infrastructure::{
-    archive_login_user_id, backup_master_trio_to, handover_master_records, master_database_path,
+    archive_login_user_id, handover_master_records, master_database_path,
     master_db_activity_detected, AccountRegistry, AuthSwitchError, MasterHandoverError,
     OperationLease,
 };
@@ -850,9 +850,9 @@ pub(crate) fn login_environment_inner_with_ops(
     ) -> Result<(), AuthSwitchError>,
     before_return: &dyn Fn(),
 ) -> Result<EnvironmentLoginReceiptDto, String> {
-    // 库作用域备份工具随库域下沉：P12-R3 起经 crate::library_archive 引用
-    // （与切号/收编/清理共用同一套备份目录解析与裁剪实现）。
-    use crate::library_archive::{prune_backups_if_enabled_in, resolve_library_backup_dir};
+    // 库作用域备份工具随库域下沉：P12-R3 起经 crate::library_archive 引用。
+    // P17-A3：副环境登录不再自动备份（触发点收敛），备份目录解析与裁剪
+    // 引用一并移除。
 
     // 主库登录 = 切号五步事务（含插件同步与重启），入口在账号页。
     if env_id == environment_registry_module::MASTER_ENV_ID {
@@ -895,16 +895,9 @@ pub(crate) fn login_environment_inner_with_ops(
         | trae_instance_module::InstanceLoginState::Stale => {
             // 既有登录 → 双路径互换（E2 凭据构造首选 / E1 存档移植降级，
             // 与主库切号第 3 步同一编排，仅目标目录不同）。
-            // 备份铁律（ADR-0018）：交接动库前先留三件套副本。
-            if db_path.is_file() {
-                // P11-4①/P11-5⑤：写入库作用域活动备份目录——副环境链落在
-                // 覆盖目录的环境子目录（未覆盖时 db 同目录），不与主库链混放。
-                let backup_dir = resolve_library_backup_dir(storage_root, &db_path, env_id);
-                backup_master_trio_to(&db_path, Some(&backup_dir))
-                    .map_err(|_| "environment_login_backup_failed".to_string())?;
-                // P5-9：备份生成后按保留策略清理旧备份（静默容错，只动该库链）。
-                prune_backups_if_enabled_in(&db_path, storage_root, &backup_dir);
-            }
+            // P17-A3（spec 10.2 触发点收敛）：副环境登录不再自动触发备份
+            // ——自动备份仅保留切号（credential_handover 主库切号路径）与
+            // 删除会话两个高危触发点；库内改写走 handover 单事务原子性。
             // 回滚材料：互换前的登录态原始字节（P7-2 杂交态防线）。
             let storage_path = env_dir
                 .join("User")

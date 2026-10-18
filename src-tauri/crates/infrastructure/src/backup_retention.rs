@@ -1,9 +1,13 @@
-//! 备份保留策略：定次自动裁剪（P5-9，2026-09-02 grill 定案）。
+//! 备份保留策略（P17-A3 改造，2026-10-18 spec 10.2 定案）：滚动单份。
 //!
-//! 每次新备份生成后，删除超出保留数的旧备份（`.switch-bak-{时间戳}`
-//! 主文件 + wal/shm 附属件 + 同 stamp 凭据子目录连带删；R0-P3）。保留数
-//! 默认 5、可调（1-50）、可关闭；关闭时完全不自动删除（回退为永不自动
-//! 删）。裁剪失败静默跳过（下次备份生成时再试），不阻断备份与切号主流程。
+//! 原定次自动裁剪（P5-9，保留最近 N 份）**退役**：keep=N 链式保留语义
+//! 变更为「滚动单份」——每次触发备份（切号/删除会话/手动备份）写新份
+//! 成功后，其余旧链全部彻底删除（不走回收站，见
+//! `master_handover::hard_delete_master_backup`），同一时刻全目录只有
+//! 一份备份。配置文件（`backup-retention.json`）与字段仍保留：`enabled`
+//! 语义变为滚动清理开关；`keep` 数值不再生效（≥1 一律按保留最新 1 份
+//! 执行），仅为兼容旧配置文件继续读写。裁剪失败静默跳过（下次触发时
+//! 再试），不阻断备份与切号主流程。
 //!
 //! 文件布局：`{storage_root}/backup-retention.json`；损坏时报错不静默重建
 //! （与台账/档案同纪律——配置文件是用户决策的证据）。
@@ -14,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_publish::publish_replacing;
-use crate::master_handover::{backup_member_file_names, list_master_backups_in};
+use crate::master_handover::{backup_member_file_names, hard_delete_master_backup, list_master_backups_in};
 use crate::operation_lease::FileOperationLock;
 
 const STORE_FILE: &str = "backup-retention.json";
@@ -40,7 +44,8 @@ pub enum BackupRetentionError {
 pub struct BackupRetentionSettings {
     /// 自动清理开关；false = 永不自动删除（回退原「永不自动删」行为）。
     pub enabled: bool,
-    /// 保留最近 N 份（含刚生成的最新备份）。
+    /// P17-A3：保留份数语义退役（滚动单份定案，spec 10.2）——本字段仅
+    /// 为兼容旧配置文件继续读写，不再生效（≥1 一律按保留最新 1 份执行）。
     pub keep: u32,
     /// 备份位置覆盖（P11-4①）：Some = 绝对路径目录，所有新备份写到该目录；
     /// None/缺省 = 主库 db 同目录（原行为）。serde default 兼容旧配置文件。
@@ -178,51 +183,34 @@ pub fn load_backup_dir_override(storage_root: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// 裁剪备份链：保留最新 `keep` 份，更旧的删除（附属件连带删）。
+/// 裁剪备份链（P17-A3 keep=N 链式保留退役）：**滚动单份**语义——
+/// 保留最新 1 份，其余全部彻底删除（`hard_delete_master_backup` 直删，
+/// 不走回收站；备份属可再生数据，spec 10.4 删除纪律）。
 ///
-/// P11-4①：只处理 `backup_dir` 指定目录内的链——位置变更后旧目录的备份
-/// 不再被自动清理（铁律：不自动删快照，旧位置由用户手动处置）。
-/// R0-P3：删除某份主备份时，同 stamp 的凭据子目录（`credentials-{stamp}`）
-/// 同进同退连带删除（存在才删，失败静默跳过）；keep 计数完全以主备份链
-/// 为准，凭据子目录不参与计数；孤儿凭据子目录（对应主备份已不在）永不
-/// 触碰（铁律：不自动删证据，由恢复指引提示用户手动清理）。
-/// 返回删除的备份数。删除失败静默跳过（该份下次再试，不影响其余）；
-/// `keep` 为 0 时不删任何东西（防御：调用方语义上应先确认启用）。
-/// 只按 `list_master_backups_in` 的枚举结果删——命名异常的散件不属备份链，
-/// 永不触碰（铁律：失败证据不清）。
+/// `keep` 参数语义变更（配置仍存但语义变为开关）：0 = 关闭（永不自动
+/// 删除，与原 enabled=false 口径一致）；≥1 一律按「保留最新 1 份」执行，
+/// 原保留份数不再生效（滚动单份定案，spec 10.2）。
+/// R0-P3 边界保持：同 stamp 凭据子目录随主备份连带删（在
+/// `hard_delete_master_backup` 内处理）；孤儿凭据子目录（对应主备份已
+/// 不在）永不触碰；只按 `list_master_backups_in` 枚举结果删——命名异常
+/// 散件不属备份链，永不触碰（铁律：失败证据不清）。
+/// 返回删除的备份数。删除失败静默跳过（该份下次再试，不影响其余）。
 pub fn prune_master_backups(backup_dir: &Path, db_name: &str, keep: u32) -> usize {
     if keep == 0 {
         return 0;
     }
     let chain = list_master_backups_in(backup_dir, db_name);
-    // chain 已按时间戳倒序（最新在前）；跳过前 keep 份，其余逐份删除。
-    let mut removed = 0;
-    for entry in chain.iter().skip(keep as usize) {
-        let stamp = entry.stamp_unix_seconds;
-        let mut removed_this = true;
-        // P16-T1 双格式：旧未压缩与新压缩 .zst 成员名都在候选清单里
-        // （不存在的名字 remove 失败但文件也不存在 → 视为已删，静默）。
-        for name in backup_member_file_names(db_name, stamp) {
-            let member = backup_dir.join(&name);
-            // 删除失败不中断整体裁剪；该份下次备份生成时再试。
-            if fs::remove_file(&member).is_err() {
-                // 仅当文件不存在视为已删；其他失败标记该份未完全清理。
-                if member.exists() {
-                    removed_this = false;
-                }
-            }
-        }
-        // R0-P3：同 stamp 凭据子目录随主备份一并删除（存在才删，失败
-        // 静默跳过——与主备份删除同口径，不影响主备份计数）。
-        let credentials_dir = backup_dir.join(format!("credentials-{stamp}"));
-        if credentials_dir.exists() {
-            let _ = fs::remove_dir_all(&credentials_dir);
-        }
-        if removed_this {
-            removed += 1;
-        }
-    }
-    removed
+    // chain 已按时间戳倒序（最新在前）；保留第 1 份，其余逐份彻底删除。
+    // P17-A3：删除动作收口到 hard_delete_master_backup（含凭据子目录与
+    // 双格式成员名），此处只负责「保留最新 1 份」的滚动语义。
+    chain
+        .iter()
+        .skip(1)
+        .map(|entry| {
+            hard_delete_master_backup(backup_dir, db_name, entry.stamp_unix_seconds);
+            entry.stamp_unix_seconds
+        })
+        .count()
 }
 
 /// 迁移回执：成功落位文件数 + 逐文件失败清单（不回滚，已复制的保留）。
@@ -677,19 +665,20 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_newest_and_removes_older_with_sides() {
+    fn prune_rolls_to_single_newest_backup() {
         let dir = tempdir().unwrap();
         // 3 份备份：1000（带 wal/shm）、900、800。
         write_backup(dir.path(), "database.db", 1000, true);
         write_backup(dir.path(), "database.db", 900, false);
         write_backup(dir.path(), "database.db", 800, false);
+        // P17-A3 滚动单份：keep 数值不再生效（≥1 一律保留最新 1 份）。
         let removed = prune_master_backups(dir.path(), "database.db", 2);
-        assert_eq!(removed, 1);
-        // 最新两份在位（1000 含附属件），最旧的 800 连主文件一起删除。
+        assert_eq!(removed, 2);
+        // 只有最新 1000 在位（含附属件），900/800 全部删除。
         assert!(dir.path().join("database.db.switch-bak-1000").is_file());
         assert!(dir.path().join("database.db.switch-bak-1000-wal").is_file());
         assert!(dir.path().join("database.db.switch-bak-1000-shm").is_file());
-        assert!(dir.path().join("database.db.switch-bak-900").is_file());
+        assert!(!dir.path().join("database.db.switch-bak-900").is_file());
         assert!(!dir.path().join("database.db.switch-bak-800").is_file());
     }
 
@@ -699,18 +688,19 @@ mod tests {
         write_backup(dir.path(), "database.db", 1000, false);
         write_backup(dir.path(), "database.db", 900, false);
         assert_eq!(prune_master_backups(dir.path(), "database.db", 0), 0);
-        // 调用方语义：keep=0（禁用）时不删任何备份。
+        // 调用方语义：keep=0（开关关闭）时不删任何备份。
         assert!(dir.path().join("database.db.switch-bak-900").is_file());
     }
 
+    /// P17-A3：keep 大于链长也按滚动单份执行（原「容量内不删」语义退役）。
     #[test]
-    fn prune_within_capacity_removes_nothing() {
+    fn prune_rolls_even_when_keep_exceeds_chain() {
         let dir = tempdir().unwrap();
         write_backup(dir.path(), "database.db", 1000, false);
         write_backup(dir.path(), "database.db", 900, false);
-        assert_eq!(prune_master_backups(dir.path(), "database.db", 5), 0);
+        assert_eq!(prune_master_backups(dir.path(), "database.db", 5), 1);
         assert!(dir.path().join("database.db.switch-bak-1000").is_file());
-        assert!(dir.path().join("database.db.switch-bak-900").is_file());
+        assert!(!dir.path().join("database.db.switch-bak-900").is_file());
     }
 
     #[test]
@@ -745,17 +735,18 @@ mod tests {
         write_credentials_dir(dir.path(), 1000);
         write_credentials_dir(dir.path(), 900);
         write_credentials_dir(dir.path(), 800);
+        // P17-A3 滚动单份：900/800 连同各自凭据子目录一起删除。
         let removed = prune_master_backups(dir.path(), "database.db", 2);
-        assert_eq!(removed, 1);
-        // 最旧的 800 主备份连带同 stamp 凭据子目录一起删除。
+        assert_eq!(removed, 2);
+        assert!(!dir.path().join("database.db.switch-bak-900").is_file());
+        assert!(!dir.path().join("credentials-900").exists());
         assert!(!dir.path().join("database.db.switch-bak-800").is_file());
         assert!(!dir.path().join("credentials-800").exists());
-        // 保留份（1000/900）的凭据子目录原样保留。
+        // 保留份（1000）的凭据子目录原样保留。
         assert!(dir.path().join("credentials-1000").is_dir());
-        assert!(dir.path().join("credentials-900").is_dir());
     }
 
-    /// keep 计数完全以主备份链为准：凭据子目录不参与链计数（不顶替保留份数）。
+    /// 凭据子目录不参与链计数（不顶替保留份）；孤儿凭据目录永不触碰。
     #[test]
     fn prune_keep_count_ignores_credentials_dirs() {
         let dir = tempdir().unwrap();
@@ -765,11 +756,12 @@ mod tests {
         write_credentials_dir(dir.path(), 1000);
         write_credentials_dir(dir.path(), 900);
         write_credentials_dir(dir.path(), 700);
-        // 链只数主备份：2 份主备份 keep=2 → 一份不删。
-        assert_eq!(prune_master_backups(dir.path(), "database.db", 2), 0);
+        // 链只数主备份：滚动单份删除 900；孤儿 credentials-700 不触碰。
+        assert_eq!(prune_master_backups(dir.path(), "database.db", 2), 1);
         assert!(dir.path().join("database.db.switch-bak-1000").is_file());
-        assert!(dir.path().join("database.db.switch-bak-900").is_file());
+        assert!(!dir.path().join("database.db.switch-bak-900").is_file());
         assert!(dir.path().join("credentials-700").is_dir());
+        assert!(dir.path().join("credentials-1000").is_dir());
     }
 
     /// 孤儿凭据子目录（对应主备份已被手动删除）不自动清理
@@ -899,10 +891,12 @@ mod tests {
         write_backup(&current, "database.db", 800, false);
         write_backup(&legacy, "database.db", 500, false);
         write_backup(&legacy, "database.db", 400, false);
+        // P17-A3 滚动单份：当前目录滚动到只剩最新 1 份。
         let removed = prune_master_backups(&current, "database.db", 2);
-        assert_eq!(removed, 1);
-        // 当前目录：最旧的 800 被清理。
+        assert_eq!(removed, 2);
+        // 当前目录：只有最新 1000 在位。
         assert!(!current.join("database.db.switch-bak-800").is_file());
+        assert!(!current.join("database.db.switch-bak-900").is_file());
         assert!(current.join("database.db.switch-bak-1000").is_file());
         // 旧目录链不碰。
         assert!(legacy.join("database.db.switch-bak-500").is_file());

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::master_handover::{backup_master_trio_to, master_database_path};
+use crate::master_handover::{backup_master_trio_to, backup_master_trio_rolling, master_database_path};
 
 /// 借用的原生隐藏枚举（会话列表排除式白名单成员）。
 pub const ARCHIVE_HIDDEN_STATUS: &str = "voice_discussion";
@@ -414,9 +414,14 @@ pub fn delete_master_sessions_with_backup_dir(
     drop(conn);
 
     // ADR-0018 铁律：破坏性批量操作前必须先备份（失败则删除不执行）。
-    // P16-T1：备份目录由调用方按库作用域解析（Some = 活动目录）。
-    let backup =
-        backup_master_trio_to(&db_path, backup_dir).map_err(|_| MasterArchiveError::BackupFailed)?;
+    // P17-A3：删除会话是保留自动备份的两个触发点之一；备份为滚动单份
+    // 语义（写新份成功后彻底删除旧链，同一时刻目录内只有一份，spec 10.2）。
+    // None（db 同目录旧行为）保留给既有测试调用方，不做滚动清理。
+    let backup = match backup_dir {
+        Some(dir) => backup_master_trio_rolling(&db_path, dir),
+        None => backup_master_trio_to(&db_path, None),
+    }
+    .map_err(|_| MasterArchiveError::BackupFailed)?;
 
     let conn = open_with_key_readwrite(&db_path, raw_key)?;
     verify_key_readable(&conn)?;
@@ -523,16 +528,18 @@ pub struct MasterMergeOutcome {
     pub moved_sessions: usize,
     /// 被清理的空壳源分组行数。
     pub removed_projects: usize,
-    /// 合并前自动创建的备份路径（人工恢复定位）。
+    /// P17-A3：归并不再自动备份（触发点收敛）；字段保留为前端契约兼容，
+    /// 恒为空串。
     pub backup_path: String,
 }
 
 /// 合并分组（P5-8c，批量迁移属破坏性操作）：源分组的全部会话改挂
 /// 目标分组（含归档/软删会话，归位语义一致），空壳源分组行随事务清理。
 ///
-/// 前置条件：主库 TRAE 实例已关闭（调用方检测，与删除/切号同纪律）；
-/// 执行前自动创建 `.switch-bak-*` 备份（ADR-0018 铁律，备份失败不执行）。
-/// 事务内任何一步失败整体回滚，库保持合并前状态。
+/// 前置条件：主库 TRAE 实例已关闭（调用方检测，与删除/切号同纪律）。
+/// P17-A3（spec 10.2 触发点收敛）：**分组归并不再自动触发备份**——自动
+/// 备份仅保留切号与删除会话两个高危触发点；本操作有单事务回滚保证
+/// （事务内任何一步失败整体回滚，库保持合并前状态）。
 pub fn merge_master_projects(
     master_data_dir: &Path,
     raw_key: &str,
@@ -540,25 +547,23 @@ pub fn merge_master_projects(
     target_project_id: &str,
     current_user_id: &str,
 ) -> Result<MasterMergeOutcome, MasterArchiveError> {
-    merge_master_projects_with_backup_dir(
+    merge_master_projects_inner(
         master_data_dir,
         raw_key,
         source_project_ids,
         target_project_id,
         current_user_id,
-        None,
     )
 }
 
-/// 带活动备份目录的合并（P16-T1）：备份写入调用方解析的活动备份目录
-/// （Some = 指定目录；None = db 同目录旧行为，保留给既有测试调用方）。
-pub fn merge_master_projects_with_backup_dir(
+/// 合并分组主体（P17-A3：备份步骤随触发点收敛移除，`backup_dir` 参数
+/// 连同其调用链一并退役）。
+fn merge_master_projects_inner(
     master_data_dir: &Path,
     raw_key: &str,
     source_project_ids: &[String],
     target_project_id: &str,
     current_user_id: &str,
-    backup_dir: Option<&Path>,
 ) -> Result<MasterMergeOutcome, MasterArchiveError> {
     // 参数防御：目标不能在来源集合中（改挂目标必须是被保留的分组）。
     if source_project_ids.is_empty() || source_project_ids.iter().any(|id| id == target_project_id)
@@ -605,10 +610,8 @@ pub fn merge_master_projects_with_backup_dir(
     }
     drop(conn);
 
-    // ADR-0018 铁律：批量迁移前必须先备份（失败则合并不执行）。
-    // P16-T1：备份目录由调用方按库作用域解析（Some = 活动目录）。
-    let backup =
-        backup_master_trio_to(&db_path, backup_dir).map_err(|_| MasterArchiveError::BackupFailed)?;
+    // P17-A3：归并路径不再自动备份（触发点收敛，spec 10.2）；单事务
+    // 回滚保证替代备份保险（见 merge_master_projects 文档注释）。
 
     let conn = open_with_key_readwrite(&db_path, raw_key)?;
     verify_key_readable(&conn)?;
@@ -644,7 +647,8 @@ pub fn merge_master_projects_with_backup_dir(
             Ok(MasterMergeOutcome {
                 moved_sessions,
                 removed_projects,
-                backup_path: backup.display().to_string(),
+                // P17-A3：归并不再自动备份；字段保留为前端契约兼容，恒空串。
+                backup_path: String::new(),
             })
         }
         Err(error) => {
@@ -1016,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_moves_all_sessions_and_removes_source_projects_with_backup() {
+    fn merge_moves_all_sessions_and_removes_source_projects_without_backup() {
         let dir = temp_dir("merge");
         let key = "11".repeat(32);
         create_archive_fixture(&master_database_path(&dir), &key);
@@ -1025,7 +1029,8 @@ mod tests {
         let outcome = merge_master_projects(&dir, &key, &["p2".into()], "p1", "111").unwrap();
         assert_eq!(outcome.moved_sessions, 1);
         assert_eq!(outcome.removed_projects, 1);
-        assert!(outcome.backup_path.contains(".switch-bak-"));
+        // P17-A3：归并不再自动备份（触发点收敛），backup_path 恒空串。
+        assert!(outcome.backup_path.is_empty());
 
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
         let conn = Connection::open_with_flags(master_database_path(&dir), flags).unwrap();
