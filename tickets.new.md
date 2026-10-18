@@ -1569,3 +1569,38 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - [ ] P17-T4c 凭据层：捕获/登录代次铸造（**研究定稿+解密闭环真机验证 2026-10-17，spec 第 8.4/8.6 节**——**面 A 翻案可行**：ELECTRON_RUN_AS_NODE 调 `electron_browser_workbuddy_storage.loggerGet()` 取 atRestSecretKey → sha256 派生 → AES-256-GCM + AAD 解密信封，真机验证 accessToken/refreshToken 均解出 JWT（keyId 9127dea1…逐字吻合，密钥/token 全程内存零外显，客户端无需运行）；社区同构确认：88lin/workbuddy-auto-signin（MIT，明文/信封双兼容+写不重试纪律）；签到协议定案：POST {auth.domain}/v2/billing/meter/daily-checkin（幂等 code=10001）+ checkin-activity-status，Bearer+X-User-Id；切号走 auth:login/logout/saveOauthToken RPC（watcher 感知外部文件变更，禁直写 .info）。**实施①③②容器层已完成（2026-10-18）**：①workbuddy_credential.rs 解密（内嵌 helper .cjs + RAII + 双形态兼容，8/8 单测）；③workbuddy_checkin.rs 签到直连 Rust 化（classify 纯函数 6/6 单测 + 端到端探针真机全绿：claim +100 连签 5→6 复核翻转累计 600，10-17 再 +100 连签 6 天）；②容器与编排——workbuddy_login_credential.rs（WBSESSN1 DPAPI 容器，纪律同构 fused：原子写+写后复核+绑定校验+脱敏 summary，7/7 单测）+ workbuddy_capture.rs（捕获编排：会话快照 Active 校验 → account-snapshot/device-id 身份读取 → 解密 → uid 交叉校验 → 纯构造 → 容器落盘，4/4 单测；storage_roots 加 workbuddy-login 根；infrastructure lib 966/0 全绿）。**T4 wbipc 握手协议定稿（spec 8.6）**；T1/T2/T3 探针实测全通。**待办**：~~捕获铸造真机执行~~（✅ 2026-10-18 用户单次确认后真机捕获成功，wb-89b16d6b….wbsess 2790B 落盘）→ 档案登记架构确认（AccountRegistry 并入 vs WorkBuddy 独立池，ADR 级决策）→ ④切号 RPC 实施（协议就绪，需用户在场）→ ~~签到/账号面板进组合根与前端区块~~（✅ 4d5d866 一期并列骨架）；**⑤凭据自持可行性探针（2026-10-18 用户决策立项：WorkBuddy 登录同为网页 OAuth 授权码流，spec 第 6 节形态同构，评估按 TRAE 路程工具自走）——✅ 真机实测完成（spec 第 8.8 节定稿）**：刷新协议定案（POST /v2/plugin/auth/token/refresh 空 body + X-Domain/X-Refresh-Token/X-Auth-Refresh-Source: plugin 三头，enterpriseHeaders 实读仅 X-Domain——**无 Authorization 无设备签名**）+ **轮换判定：refreshToken 一次性**（200 实测响应发新对）+ **自持可行性判定：高**（续期半边零客户端依赖，工具凭池内 refresh 独立续期 200 实测通过；登录半边 openAuthUrl/loopGetToken/web_handoff 网页授权码流形态确认，全量自走障碍清除）；多副本协同权衡（谁刷新谁持有）→ 二期 saveOauthToken 写回设计；**副作用留痕：真机验证消耗当时唯一有效 refresh（新对随探针进程销毁未持久化），用户需重登 WorkBuddy 客户端并重新捕获**；教训：轮换型凭据实验必须先持久化新对。探针产物 .scratch/wb-refresh-probe/（不入库）。**⑤续期正式实现已完成（2026-10-18，commit a75dca4）**：infra workbuddy_checkin.rs 扩展——call_refresh_endpoint（三头协议 + camelCase rename）+ renew_pool_record（阈值 3 天内才轮换 + 刷新后原子写回 WBSESSN1，轮换纪律：刷新与写回之间零旁路操作）+ open_session_from_pool + renew_pool_credentials 便捷入口（组合根零 HTTP 依赖）；组合根——签到 status/claim 改池优先（open_checkin_session_any：池可用即用、池空/不可用回退机器解密，RefreshRejected 仅在回退也失败时优先暴露引导重新捕获）+ 新命令 refresh_workbuddy_account（对齐 Trae refresh_checkin_credentials 语义：renewed=false = access 充裕未轮换）；前端 WorkBuddyPanel 加「刷新登录凭据」按钮（AccountCenter 同语义，notify 回执），错误码入 safeUiError 词表；commandNames 103。验证：infra lib 975/0（+4 续期单测：camelCase 解析/轮换拒绝/阈值边界/错误码稳定）+ 主 crate 220/0 + typecheck 绿 + vitest 394/394。**真机验收待用户**：重登客户端 → 重新捕获 → 面板点「刷新登录凭据」（充裕应回执未刷新）→ 次日签到走池路径
 - [x] P17-T5 产品并列化技术盘点（2026-10-18，spec 第 9 节；用户方向：Trae 与 WorkBuddy 同级产品管理页）——八层现状清单（产品事实/组合根命令/账号域前端/切换 UI/签到域/登录凭据域/对话库域/能力清单）+ 已就绪资产（descriptor 双实例、AccountAdapter 注入架构保留、product-state 根在位、get_product_identity_state 多产品范式）+ 三期分期（一期并列骨架/二期 WorkBuddy 账号完整域/三期对话库 workbuddy.db）+ 不变量（跨产品凭据复制禁令/能力三态/工具选择≠官方身份/界面表达纪律）
 - [x] P17-T5 一期并列骨架实施（2026-10-18，commit 3c646f0 后端 + 4d5d866 前端）——后端：组合根 workbuddy_commands.rs 8 命令（list_products/get_current_product/set_current_product + WorkBuddy 域健康/账号池/签到 status+claim/捕获铸造单次确认入口），域门禁 workbuddy_real_mode_required；前端：types/product.ts 双产品 DTO + workbuddyAdapter invoke 封装（错误码入 safeUiError 中心词表）+ productRegistry 产品上下文（load/set + sectionStatesFor 按产品三态：workbuddy accounts/checkin ready、overview/environment/master-library pending、settings 应用级共用）+ TitleBar 恢复产品切换器（原生 select，P15-10 移除的 CSS 在位复用）+ WorkBuddyPanel（会话健康卡/捕获单次确认弹窗/账号池清单）+ WorkBuddyCheckinPage（直连签到卡）+ App 按产品分支渲染（切产品即重挂载重拉，未适配区块 ProductPendingPage 诚实占位）；commandNames.ts 重生成（102 命令）；验证：typecheck 绿 + vitest 394/394 两轮全绿（App.test 改写 P15-10 断言为 P17-T5 语义 + 新增切产品分支用例）；**待用户**：T5 捕获铸造真机执行（单次确认）、T4c 档案池架构决策（独立池 vs AccountRegistry 并入）
+
+
+### P17 后续实施包（2026-10-18 grilling 定稿重组，spec 第 10 节）
+
+**来源 Spec：** 同上 + `docs/specs/p17-unified-account-pool-research.md`（统一档案池 v2，记录为演进方向）。
+**执行模式：** agent 团队开发到验收全过程，用户只验收成果。
+
+#### A1 凭据明文化（两产品）
+- [ ] WorkBuddy WBSESSN1 容器改明文 JSON 存储（DPAPI 层移除；原子写/写后复核纪律保留）；存量 wb-*.wbsess 迁移
+- [ ] Trae TSFUSED1 容器改明文（16 存量一次性解密迁移）；FusedLoginStore 读写路径同步
+- [ ] 两产品凭据字段/结构注释更新（明文形态）；相关单测全绿
+
+#### A2 手动恢复主库入口
+- [ ] restore 命令（选择备份文件 → 校验 → 还原；前置关 Trae 实例）+ UI 入口
+- [ ] 恢复后体检自动触发；单测
+
+#### A3 备份策略改造（滚动单备份）
+- [ ] backup 触发点收敛：仅切号/删除会话保留自动触发（其余 4 处移除）；触发前旧备份彻底删除（hard-delete 原语，不走回收站）
+- [ ] prune/keep 链式保留退役（单份滚动语义）；WorkBuddy 备份范围收窄至凭据+配置
+- [ ] 单测 + 真机：切号触发 → 单份滚动确认 → E 盘水位 3.2GB→1.73GB
+
+#### A4 WorkBuddy 切号 RPC（T4c④）
+- [ ] wbipc 握手 + auth:login/logout/saveOauthToken 编排（spec 8.6）+ 对话跟号走验证（云端自动，确认无需额外同步）
+- [ ] 单次确认纪律；真机切号验证（需用户在场）；单测
+
+#### A5 WorkBuddy 签到自动调度
+- [ ] 调度器扩展：WorkBuddy 账号（统一池/独立池）纳入每日 claim；断连自动续期兜底（renew_pool_record 对接）
+- [ ] 失败重试/日志与 Trae 同策略；单测 + 真机一次
+
+#### A6 Trae 提升（UI 体验 + 签到稳定性）
+- [ ] 产品切换器形态优化 + 账号页统一视图（T5 二期联动）
+- [ ] 签到调度器稳定性审计（漏签/重试/日志）
+
+#### A7 工程自查（主理人）
+- [ ] 代码质量/技术债/遗留项盘点，产出清单后逐项处理
