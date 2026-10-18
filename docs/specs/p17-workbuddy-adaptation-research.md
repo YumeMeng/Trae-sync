@@ -147,6 +147,17 @@
 
 T4b 真机备份覆盖 `~/.workbuddy/app`（Electron userData：IndexedDB/LocalStorage/JSON）。以下凭据材料**不在备份范围**：登录会话（CodeBuddyExtension auth）、`keyblob`、`device-id`、`login-device-nonce`、`account-snapshot.json`。建议 T4b 扩展一个「凭据材料备份」入口（加密信封形态落盘，属凭据材料、按单次确认纪律执行）——待用户确认后实施。
 
+### 8.8 凭据自持可行性探针定稿（2026-10-18，T4c⑤ 真机实测，commit 后补）
+
+> 用户决策背景：WorkBuddy 登录与 Trae 同为网页 OAuth 授权码流（第 6 节形态同构），用户主张按 TRAE 路程评估工具自走。本节以最小实测裁决「续期半边」的可行性。
+
+- **刷新协议定案（asar codebuddy-lite-wb.mjs `refreshSession` 实读 + 真机 200 验证）**：`POST {domain}/v2/plugin/auth/token/refresh`，**空 JSON body**；头 = `X-Domain: <auth.domain>`（enterpriseHeaders 全部内容，仅此一个）+ `X-Refresh-Token: <refreshToken>` + `X-Auth-Refresh-Source: plugin`；响应 `data.data` = 新 auth 对象（accessToken/refreshToken/expiresIn 2419200/refreshExpiresIn 2592000/sessionState/scope）。**无 Authorization、无设备签名头**——刷新链路服务端信任完全建立在 refreshToken 本身（daemon 层实读 + 真机验证双确认）。
+- **轮换判定（真机 200 实测）**：refreshToken **一次性轮换**——同一 refresh 成功刷新一次后响应返回全新 token 对（新 refresh anchor ≠ 原值），旧 refresh 失效。工具自续期的实现语义 = 「刷新成功 → 原子保存新 token 对 → 下轮用新值」（WBSESSN1 容器整代次原子替换直接适配）。
+- **自持可行性判定**：**高**。续期半边（refresh 循环）零设备绑定、零客户端依赖，工具可独立完成——「TRAE 路程」中最不确定的设备信任假说在刷新链路上被证伪。登录半边（createSession）形态同步确认存在：`openAuthUrl`（浏览器打开授权页）+ `loopGetToken`（轮询/回调取 token）+ `web_handoff` 事件（desktop_to_web）——标准授权码流，参数（client_id/authorize URL）在 daemon 配置/asar 可逆向，全量自走的技术障碍清除。
+- **多副本协同的固有权衡（二期设计题）**：refresh 轮换 = 「谁刷新谁持有最新对」——工具池与客户端各自持同一 session 的 token 副本时，一方刷新会使另一方失效。自然解 = 切号/写回走 `auth:saveOauthToken` RPC（T4c④），让客户端始终拿到工具刷新后的最新对；工具侧签到用池内 access（28 天）在客户端刷新后仍独立有效。
+- **探针副作用记录（诚实留痕）**：真机验证消耗了当时唯一的有效 refreshToken（服务端轮换发放的新对在探针进程内存中随退出销毁，未持久化）——客户端 .info 内旧 refresh 随之作废，**用户需在 WorkBuddy 客户端重新登录一次**（并建议重新执行捕获刷新池快照）。教训：轮换型凭据的存活实验必须先持久化新对再做下一次调用；本轮以最小调用次数（3 次 400 格式探测 + 1 次 200）完成，400 探测无服务端副作用。
+- **探针产物**：`.scratch/wb-refresh-probe/`（一次性探针，令牌全程内存零外显，输出仅 SHA-256 前 12 hex 锚点）；不入库。
+
 ## 9. 产品并列化技术盘点（2026-10-18，用户方向确认：Trae 与 WorkBuddy 同级产品管理页）
 
 > 用户决策：后续做与 Trae 同级的**产品管理页面**（早期 Trae/Trae Work 并列的回归与升级），WorkBuddy 作为并列产品可随意切换。本节盘点全部扩展点与现状，保证适配扩展可快速完成。
