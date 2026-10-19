@@ -1613,13 +1613,13 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 **UI 对齐原则**：共通功能保持一致性；不为一侧没有的功能造 UI。
 
 #### B1 会话过户产品化（wb_transfer.py → Rust）
-- [ ] 协议/发现层：数据根 ~/.workbuddy、安装路径三级探测（注册表/常见路径/进程命令行，注意 userData 与数据根区分）
-- [ ] 读取层：workbuddy.db 只读（WAL 安全）；账号分布/会话归属/当前 uid（日志解析 AuthenticationManager userId changed）
-- [ ] 过户事务：BEGIN IMMEDIATE → UPDATE user_id（AND transport='local'，含 deleted_at 行）→ cloud 残留防御检查 → COMMIT → wal_checkpoint(TRUNCATE)
-- [ ] 进程安全：完全退出复用 P14-2 边界（Unknown 拒写）；重启后进程数确认
-- [ ] 验证：正文 jsonl 抽验（cwd 转义规则）；输出更新行数/残留/缺失
-- [ ] UI：「转移历史会话」（昵称+会话数+时间表达，不展示 uid）；单次确认
-- [ ] 单测（.scratch db 副本做 fixture）+ 真机一轮
+- [x] 协议/发现层：数据根 ~/.workbuddy、安装路径三级探测（注册表/常见路径/进程命令行，注意 userData 与数据根区分）（2026-10-19 workbuddy_transfer.rs）
+- [x] 读取层：workbuddy.db 只读（WAL 安全）；账号分布/会话归属/当前 uid（日志解析 AuthenticationManager userId changed）（方向识别含日志+sessions 最近活跃双路径）
+- [x] 过户事务：BEGIN IMMEDIATE → UPDATE user_id（AND transport='local'，含 deleted_at 行）→ cloud 残留防御检查 → COMMIT → wal_checkpoint(TRUNCATE)
+- [x] 进程安全：完全退出复用 P14-2 边界（Unknown 拒写，注入式可测）；重启后进程数回执确认
+- [x] 验证：正文 jsonl 抽验（cwd 转义规则——2026-10-19 真机取证修正：仅盘符小写、其余大小写保留，wb_transfer.py 整串 lower 为 NTFS 掩盖的偏差）；输出更新行数/残留/缺失
+- [x] UI：「转移历史会话」（昵称+会话数+时间表达，不展示 uid）；单次确认（dry_run 计划 → ConfirmDialog → 执行）；随票修正 WorkBuddyPanel 切号文案/注释的「云端跟号」错误认知（原 B3 项提前完成）
+- [x] 单测（tempdir 现造最小 fixture db，19 例全绿：方向双路径/含 deleted_at 过户/cloud 红线/Unknown 拒写/dry_run 零副作用/schema 漂移）；真机一轮待主理人单次确认后执行（破坏性批量操作纪律）
 
 #### B2 切号实验与实现（关-写-开）
 - [ ] 实验：客户端关闭 → .info token 改写（明文/工具加密信封两形态）→ 冷启动接受度（风险知情：失败可重登，重捕链已有）
@@ -1632,4 +1632,4 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - [ ] 视觉规格统一（替换 workbuddy-* 自定义 class 为统一设计系统）
 - [ ] 签到卡对齐（状态/领取/自动签到设置与 Trae CheckinPage 规格一致）
 - [ ] 空态/错误态完整设计
-- [ ] 范围红线：不为一侧没有的功能造 UI（实例启停/主库管理不造）；代码注释修正（WorkBuddyPanel L180 "对话存云端"错误注释随 B1 修正）
+- [ ] 范围红线：不为一侧没有的功能造 UI（实例启停/主库管理不造）；代码注释修正（WorkBuddyPanel L180 "对话存云端"错误注释已随 B1 于 2026-10-19 修正完成）

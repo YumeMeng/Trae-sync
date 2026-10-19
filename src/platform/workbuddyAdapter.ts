@@ -6,6 +6,7 @@ import type {
   WorkBuddyRefreshStatusDto,
   WorkBuddySessionHealthDto,
   WorkBuddySwitchDto,
+  WorkBuddyTransferDto,
 } from "../types/product";
 
 /**
@@ -55,12 +56,31 @@ export function refreshWorkBuddyAccount(): Promise<WorkBuddyRefreshStatusDto> {
 
 /**
  * 切换 WorkBuddy 客户端登录账号（P17-T6/A4，单次确认入口：UI 弹窗确认后
- * 调用）。编排：客户端运行中 wbipc `auth:logout` → `auth:saveOauthToken`
- * （写池内最新代次）→ `auth:getAccount` 回读校验。对话存云端按账号隔离，
- * 切号=换登录态自动跟随。
+ * 调用）。切号只换客户端登录态；本地会话索引按账号隔离（workbuddy.db
+ * sessions.user_id），切号后如看不到历史会话，用「转移历史会话」过户
+ * 恢复（P18-B1）。
  */
 export function switchWorkBuddyAccount(profileId: string): Promise<WorkBuddySwitchDto> {
   return invoke<WorkBuddySwitchDto>("switch_workbuddy_account", { profileId });
+}
+
+// ===== P18-B1 会话过户 =====
+
+/**
+ * 生成会话转移计划（dry_run，零副作用）：识别「上一个登录账号 → 当前登录
+ * 账号」方向并统计待过户本地会话数；不关闭客户端、不写库。
+ */
+export function planWorkBuddySessionTransfer(): Promise<WorkBuddyTransferDto> {
+  return invoke<WorkBuddyTransferDto>("transfer_workbuddy_sessions", { dryRun: true });
+}
+
+/**
+ * 执行会话转移（单次确认入口：UI 弹窗确认后调用）。编排：完全退出
+ * WorkBuddy（进程状态未知时拒绝写副作用）→ 事务内改写本地会话索引归属
+ * （仅本地会话，不删除任何会话、不触碰云端会话）→ 正文抽验 → 重启客户端。
+ */
+export function transferWorkBuddySessions(): Promise<WorkBuddyTransferDto> {
+  return invoke<WorkBuddyTransferDto>("transfer_workbuddy_sessions", { dryRun: false });
 }
 
 // ===== P17-A5 WorkBuddy 自动签到调度 =====

@@ -14,6 +14,7 @@
 //! `workbuddy_real_mode_required`）。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::State;
@@ -382,6 +383,191 @@ pub(crate) async fn switch_workbuddy_account(
         // 4) 切号写路径在 wbipc 面不存在（A4 定案）——稳定错误码交由
         //    UI 呈现；机制重设计后此处接入新编排。
         Err("workbuddy_switch_pipe_unavailable".to_string())
+    })
+    .await
+}
+
+// ===== P18-B1 会话过户（wb_transfer.py 产品化；单次确认入口） =====
+
+/// WorkBuddy 会话过户 DTO（dry_run 计划 + 执行回执合一；界面表达纪律：
+/// 账号一律用昵称标签，uid 原文不进 UI）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddyTransferDto {
+    pub dry_run: bool,
+    /// 无需转移（无上一账号或待过户为 0）——UI 直接提示，不出确认弹窗。
+    pub nothing_to_transfer: bool,
+    /// 当前登录账号展示名（昵称优先，缺省自然语言标签）。
+    pub current_label: String,
+    /// 上一个登录账号展示名（None = 无上一账号）。
+    pub previous_label: Option<String>,
+    /// 上一账号名下待过户的本地会话数（含软删除行）。
+    pub pending_local_rows: u64,
+    /// 当前账号现有会话数。
+    pub current_account_rows: u64,
+    /// 上一账号名下云端会话数（红线：不碰；>0 时 UI 明示）。
+    pub cloud_residual_rows: u64,
+    /// 其余更早账号的本地会话数（不在本次范围）。
+    pub other_account_rows: u64,
+    /// 方向识别来源（"log" = 日志权威；"sessions_fallback" = 最近活跃回退）。
+    pub direction_source: &'static str,
+    // ---- 执行回执（dry_run=false 时填充） ----
+    pub updated_rows: Option<u64>,
+    pub verified_sessions: Option<u64>,
+    pub missing_body_files: Option<u64>,
+    pub restarted: Option<bool>,
+    pub process_count_after_restart: Option<usize>,
+}
+
+/// 方向来源 → DTO 字符串（前端契约值稳定）。
+fn direction_source_str(
+    source: traesync_infrastructure::workbuddy_transfer::DirectionSource,
+) -> &'static str {
+    match source {
+        traesync_infrastructure::workbuddy_transfer::DirectionSource::LogEvents => "log",
+        traesync_infrastructure::workbuddy_transfer::DirectionSource::SessionsFallback => {
+            "sessions_fallback"
+        }
+    }
+}
+
+/// uid → 展示名：账号池昵称优先（profile_id 惯例 wb-{uid}），缺省自然语言
+/// 标签兜底。uid 只在容器查询内部使用，不落到返回值。
+fn workbuddy_account_label(
+    uid: &str,
+    login_root: Option<&Path>,
+    fallback: &str,
+) -> String {
+    let from_pool = login_root
+        .and_then(|root| {
+            let store = WorkBuddyLoginStore::new(root.to_path_buf());
+            store.list().ok()
+        })
+        .and_then(|summaries| {
+            let profile_id =
+                traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginRecord::profile_id_for(uid);
+            summaries
+                .into_iter()
+                .find(|summary| summary.profile_id == profile_id)
+                .map(|summary| summary.screen_name)
+                .filter(|name| !name.trim().is_empty())
+        });
+    from_pool.unwrap_or_else(|| fallback.to_string())
+}
+
+/// WorkBuddy 会话过户（**单次确认入口**：UI 弹窗确认后调用）。
+///
+/// dry_run=true 只出转移计划（零副作用，关闭客户端之前）；false 执行完整
+/// 编排（方向识别 → 计划 → 完全退出前置校验〔进程 Unknown 拒绝一切写
+/// 副作用〕→ 事务过户（仅 transport='local'，云会话红线不碰）→
+/// wal_checkpoint 落盘 → 正文抽验 → 重启 + 进程数确认）。
+#[tauri::command]
+pub(crate) async fn transfer_workbuddy_sessions(
+    dry_run: bool,
+    state: State<'_, AppState>,
+) -> Result<WorkBuddyTransferDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state).ok();
+    // 重启入口：三级探测安装路径；探测失败时跳过重启（回执如实报告），
+    // 不阻塞过户本体——用户可手动重启客户端。
+    let install_exe =
+        traesync_infrastructure::workbuddy_transfer::discover_install().map(|found| found.exe);
+    run_blocking("workbuddy_transfer_join_failed", move || {
+        let data_root = traesync_infrastructure::workbuddy_transfer::default_data_root()
+            .ok_or("workbuddy_data_root_unavailable".to_string())?;
+        let observe = || traesync_infrastructure::workbuddy_transfer::observe_client_real();
+        let close = || traesync_infrastructure::workbuddy_transfer::close_client_real();
+        let start_exe = install_exe.clone();
+        let start = move || {
+            start_exe
+                .as_deref()
+                .map(traesync_infrastructure::workbuddy_transfer::start_client_real)
+                .unwrap_or(false)
+        };
+        let count_processes =
+            || traesync_infrastructure::workbuddy_transfer::count_client_processes_real();
+        let deps = traesync_infrastructure::workbuddy_transfer::TransferClientDeps {
+            observe: &observe,
+            close: &close,
+            start: Some(&start),
+            count_processes: Some(&count_processes),
+            restart_settle: Duration::from_secs(3),
+        };
+        let outcome = traesync_infrastructure::workbuddy_transfer::execute_transfer(
+            &data_root, &deps, dry_run,
+        )
+        .map_err(|error| error.code().to_string())?;
+        Ok(match outcome {
+            traesync_infrastructure::workbuddy_transfer::TransferOutcome::Plan(plan) => {
+                WorkBuddyTransferDto {
+                    dry_run: true,
+                    nothing_to_transfer: false,
+                    current_label: workbuddy_account_label(
+                        &plan.current_uid,
+                        login_root.as_deref(),
+                        "当前登录的账号",
+                    ),
+                    previous_label: Some(workbuddy_account_label(
+                        &plan.previous_uid,
+                        login_root.as_deref(),
+                        "上一个登录的账号",
+                    )),
+                    pending_local_rows: plan.pending_local_rows,
+                    current_account_rows: plan.current_account_rows,
+                    cloud_residual_rows: plan.cloud_residual_rows,
+                    other_account_rows: plan.other_account_rows,
+                    direction_source: direction_source_str(plan.source),
+                    updated_rows: None,
+                    verified_sessions: None,
+                    missing_body_files: None,
+                    restarted: None,
+                    process_count_after_restart: None,
+                }
+            }
+            traesync_infrastructure::workbuddy_transfer::TransferOutcome::Executed(receipt) => {
+                WorkBuddyTransferDto {
+                    dry_run: false,
+                    nothing_to_transfer: false,
+                    current_label: workbuddy_account_label(
+                        &receipt.current_uid,
+                        login_root.as_deref(),
+                        "当前登录的账号",
+                    ),
+                    previous_label: Some(workbuddy_account_label(
+                        &receipt.previous_uid,
+                        login_root.as_deref(),
+                        "上一个登录的账号",
+                    )),
+                    pending_local_rows: 0,
+                    current_account_rows: receipt.transfer.verified_sessions,
+                    cloud_residual_rows: receipt.transfer.cloud_residual_rows,
+                    other_account_rows: 0,
+                    direction_source: direction_source_str(receipt.source),
+                    updated_rows: Some(receipt.transfer.updated_rows),
+                    verified_sessions: Some(receipt.transfer.verified_sessions),
+                    missing_body_files: Some(receipt.transfer.missing_body_files),
+                    restarted: Some(receipt.restarted),
+                    process_count_after_restart: receipt.process_count_after_restart,
+                }
+            }
+            traesync_infrastructure::workbuddy_transfer::TransferOutcome::NothingToTransfer {
+                ..
+            } => WorkBuddyTransferDto {
+                dry_run,
+                nothing_to_transfer: true,
+                current_label: String::new(),
+                previous_label: None,
+                pending_local_rows: 0,
+                current_account_rows: 0,
+                cloud_residual_rows: 0,
+                other_account_rows: 0,
+                direction_source: "log",
+                updated_rows: None,
+                verified_sessions: None,
+                missing_body_files: None,
+                restarted: None,
+                process_count_after_restart: None,
+            },
+        })
     })
     .await
 }

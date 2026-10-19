@@ -96,6 +96,10 @@ pub mod workbuddy_checkin;
 // P17-T4c②：WorkBuddy 登录代次容器（WBSESSN1 DPAPI，纪律与 fused 同构）。
 pub mod workbuddy_login_credential;
 pub mod workbuddy_wbipc;
+// P18-B1：WorkBuddy 会话过户产品化（wb_transfer.py 三轮真机验证流程 → Rust；
+// 只碰 transport='local'、云会话红线、进程 Unknown 拒写——模块头红线清单）。
+#[cfg(feature = "sqlcipher")]
+pub mod workbuddy_transfer;
 // P17-T4c②：WorkBuddy 账号捕获编排（快照→解密→容器落盘；铸造待单次确认）。
 pub mod workbuddy_capture;
 // P17-T5 并列骨架：当前产品指针（产品管理页/切换器持久化状态，注册表校验）。
@@ -284,6 +288,15 @@ pub use storage_root::{
 pub use work_cn_location::{
     TraeReadLocation, TraeReadLocationError, WorkCnReadLocation, WorkCnReadLocationError,
     DEFAULT_WORK_CN_DB_RELATIVE_PATH, DEFAULT_WORK_CN_ROOT_NAME,
+};
+// P18-B1：WorkBuddy 会话过户公开 API（计划/事务/编排/发现层）。
+#[cfg(feature = "sqlcipher")]
+pub use workbuddy_transfer::{
+    build_transfer_plan, discover_install, escape_cwd_dir, execute_transfer,
+    read_account_distribution, resolve_account_direction, transfer_sessions,
+    validate_schema, verify_body_files, AccountDistribution, ClientProcessState,
+    DirectionSource, InstallDiscovery, InstallSource, TransferClientDeps, TransferDirection,
+    TransferError, TransferOutcome, TransferPlan, TransferReceipt,
 };
 #[cfg(feature = "sqlcipher")]
 pub use work_cn_normalizer::WorkCnSourceNormalizer;

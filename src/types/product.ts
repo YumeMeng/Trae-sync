@@ -87,6 +87,34 @@ export interface WorkBuddyLoginSummaryDto {
   readonly last_updated_at_unix_seconds: number;
 }
 
+/**
+ * P18-B1 WorkBuddy 会话过户 DTO（计划 + 执行回执合一；账号一律昵称标签，
+ * uid 原文不进前端）。
+ */
+export interface WorkBuddyTransferDto {
+  /** true = 只出转移计划（零副作用）；false = 执行回执。 */
+  readonly dry_run: boolean;
+  /** 无需转移（无上一账号或待过户为 0）。 */
+  readonly nothing_to_transfer: boolean;
+  readonly current_label: string;
+  readonly previous_label: string | null;
+  /** 上一账号名下待过户的本地会话数（含软删除行）。 */
+  readonly pending_local_rows: number;
+  readonly current_account_rows: number;
+  /** 上一账号名下云端会话数（不碰；>0 时 UI 明示）。 */
+  readonly cloud_residual_rows: number;
+  /** 其余更早账号的本地会话数（不在本次范围）。 */
+  readonly other_account_rows: number;
+  /** 方向识别来源："log"（日志权威）| "sessions_fallback"（最近活跃回退）。 */
+  readonly direction_source: "log" | "sessions_fallback";
+  // ---- 执行回执（dry_run=false 时填充） ----
+  readonly updated_rows: number | null;
+  readonly verified_sessions: number | null;
+  readonly missing_body_files: number | null;
+  readonly restarted: boolean | null;
+  readonly process_count_after_restart: number | null;
+}
+
 export type OperationReadiness = "ready" | "pending" | "absent";
 
 /** checkin.claim 已随 P15-10 惰性注册表条目清理移除（无命令消费）。 */

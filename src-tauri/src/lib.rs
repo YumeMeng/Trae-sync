@@ -1289,6 +1289,8 @@ pub fn run() {
             workbuddy_commands::refresh_workbuddy_account,
             workbuddy_commands::capture_workbuddy_account,
             workbuddy_commands::switch_workbuddy_account,
+            // P18-B1 会话过户（单次确认入口；dry_run=true 只出计划不动库）。
+            workbuddy_commands::transfer_workbuddy_sessions,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,
             read_work_cn_state,

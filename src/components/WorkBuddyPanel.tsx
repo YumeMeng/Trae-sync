@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { CheckCircle2, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
+import { ArrowRightLeft, CheckCircle2, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import type {
   WorkBuddySessionHealthDto,
   WorkBuddyCheckinStatusDto,
   WorkBuddyLoginSummaryDto,
+  WorkBuddyTransferDto,
 } from "../types/product";
 import {
   captureWorkBuddyAccount,
@@ -13,10 +14,12 @@ import {
   fetchWorkBuddyCheckinStatus,
   listWorkBuddyAccounts,
   loadWorkBuddySessionHealth,
+  planWorkBuddySessionTransfer,
   refreshWorkBuddyAccount,
   setWorkBuddyAccountAutoCheckin,
   setWorkBuddyAutoCheckinSettings,
   switchWorkBuddyAccount,
+  transferWorkBuddySessions,
   type WorkBuddyAutoCheckinStatusDto,
 } from "../platform/workbuddyAdapter";
 import { ProductBadge } from "./ProductBadge";
@@ -85,6 +88,32 @@ function InfoRow({ label, children }: { label: string; children: ReactNode }) {
       <span className="workbuddy-row__value">{children}</span>
     </div>
   );
+}
+
+/**
+ * P18-B1 过户确认弹窗文案（界面表达纪律：昵称+数量表达，不用 uid/内部
+ * 编号；方向识别走回退路径时如实告知「按最近活跃识别」）。
+ */
+function transferDialogLines(plan: WorkBuddyTransferDto): string[] {
+  const lines = [
+    `将把上一个登录账号（${plan.previous_label ?? "未知"}）名下的 ${plan.pending_local_rows} 条本地会话转移给当前登录账号（${plan.current_label}）。`,
+    "转移只改写本机会话索引的归属标记：不删除任何会话，也不触碰云端会话；会话正文文件零改动。",
+  ];
+  if (plan.cloud_residual_rows > 0) {
+    lines.push(
+      `检测到上一账号名下有 ${plan.cloud_residual_rows} 条云端会话，本次不会改动它们。`,
+    );
+  }
+  if (plan.other_account_rows > 0) {
+    lines.push(
+      `另有 ${plan.other_account_rows} 条更早账号的本地会话不在本次转移范围。`,
+    );
+  }
+  if (plan.direction_source === "sessions_fallback") {
+    lines.push("账号方向按本机会话记录的最近活跃情况识别（未找到登录日志）。");
+  }
+  lines.push("执行时需要完全退出 WorkBuddy 客户端，转移完成后会自动重启。");
+  return lines;
 }
 
 // ============================================================================
@@ -177,7 +206,9 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   }, [refresh]);
 
   // P17-T6/A4 切号：wbipc RPC 编排在后端（logout → saveOauthToken →
-  // 回读校验）；对话存云端按账号隔离，切号=换登录态自动跟随。
+  // 回读校验）。P18-B1 认知修正：会话 = 本地 SQLite 索引（按账号隔离）+
+  // 本地 jsonl 正文（全局共享）；切号只换登录态，历史会话不可见需用
+  // 「转移历史会话」过户（改写索引归属，不碰正文与云端会话）。
   const runSwitch = useCallback(async () => {
     if (!switchTarget) return;
     setSwitching(true);
@@ -199,6 +230,51 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       setSwitching(false);
     }
   }, [refresh, switchTarget]);
+
+  // P18-B1 会话过户：先出计划（dry_run，零副作用）→ 单次确认弹窗 → 执行。
+  const [transferPlan, setTransferPlan] = useState<WorkBuddyTransferDto | null>(null);
+  const [planningTransfer, setPlanningTransfer] = useState(false);
+  const [transferring, setTransferring] = useState(false);
+
+  const openTransferPlan = useCallback(async () => {
+    setPlanningTransfer(true);
+    try {
+      const plan = await planWorkBuddySessionTransfer();
+      if (plan.nothing_to_transfer) {
+        notify.info("WorkBuddy：没有需要转移的历史会话，当前账号已是最新。");
+        return;
+      }
+      setTransferPlan(plan);
+    } catch (reason: unknown) {
+      notify.error(
+        `WorkBuddy：无法生成转移计划——${safeUiErrorMessage(reason, "请稍后重试。")}`,
+      );
+    } finally {
+      setPlanningTransfer(false);
+    }
+  }, []);
+
+  const runTransfer = useCallback(async () => {
+    if (!transferPlan) return;
+    setTransferring(true);
+    try {
+      const receipt = await transferWorkBuddySessions();
+      const missing = receipt.missing_body_files ?? 0;
+      const restartNote = receipt.restarted ? "，WorkBuddy 已重启" : "（客户端未自动重启，可手动启动）";
+      notify.success(
+        `WorkBuddy：已转移 ${receipt.updated_rows ?? 0} 条会话${restartNote}` +
+          (missing > 0 ? `；正文抽验发现 ${missing} 条缺失，详见转移记录` : "") ,
+      );
+      setTransferPlan(null);
+      await refresh(false);
+    } catch (reason: unknown) {
+      notify.error(
+        `WorkBuddy：转移未完成——${safeUiErrorMessage(reason, "会话转移未完成，数据未被改动，请稍后重试。")}`,
+      );
+    } finally {
+      setTransferring(false);
+    }
+  }, [refresh, transferPlan]);
 
   return (
     <section className="workbuddy-page" role="region" aria-label="账号">
@@ -229,6 +305,17 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           >
             <RefreshCw size={15} className={renewing ? "icon-spin" : undefined} aria-hidden="true" />
             刷新登录凭据
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void openTransferPlan()}
+            disabled={planningTransfer || transferring || loading}
+            data-testid="workbuddy-transfer-button"
+            title="把上一个登录账号的本地历史会话转移给当前登录账号（切换账号后看不到历史会话时使用）"
+          >
+            <ArrowRightLeft size={15} className={transferring ? "icon-spin" : undefined} aria-hidden="true" />
+            转移历史会话
           </button>
           <button
             type="button"
@@ -311,7 +398,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
                       onClick={() => setSwitchTarget(account.profile_id)}
                       disabled={switching}
                       data-testid={`workbuddy-switch-${account.profile_id}`}
-                      title="让 WorkBuddy 客户端切换登录到此账号（对话记录存云端，跟随账号自动切换）"
+                      title="让 WorkBuddy 客户端切换登录到此账号（切换后如看不到历史会话，可用「转移历史会话」恢复可见）"
                     >
                       切换到此账号
                     </button>
@@ -346,7 +433,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           title="切换 WorkBuddy 登录账号"
           lines={[
             "将让 WorkBuddy 客户端退出当前账号并登录到所选账号（写入客户端登录态）。",
-            "对话记录保存在云端并按账号隔离，切换后自动跟随新账号。",
+            "历史会话记录在本机并按账号隔离；切换后如看不到历史会话，可在本页使用「转移历史会话」恢复可见。",
             "需要 WorkBuddy 客户端处于运行状态；切换完成后客户端即已登录新账号。",
           ]}
           confirmLabel="确认切换"
@@ -357,6 +444,22 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           }}
           onConfirm={() => void runSwitch()}
           testId="workbuddy-switch-dialog"
+        />
+      )}
+
+      {/* P18-B1 会话过户单次确认（破坏性批量操作纪律；计划由后端 dry_run 生成）。 */}
+      {transferPlan && (
+        <ConfirmDialog
+          title="转移历史会话"
+          lines={transferDialogLines(transferPlan)}
+          confirmLabel="确认转移"
+          busyLabel="转移中…"
+          busy={transferring}
+          onCancel={() => {
+            if (!transferring) setTransferPlan(null);
+          }}
+          onConfirm={() => void runTransfer()}
+          testId="workbuddy-transfer-dialog"
         />
       )}
     </section>
