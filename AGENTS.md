@@ -1,4 +1,4 @@
-# 项目规则
+- **删除纪律（2026-10-19 五修定稿——删除保护已关闭，恢复正常删除）**：**WorkBuddy 删除保护已由用户于 2026-10-19 关闭并重启客户端生效**（此前五版纪律记录的沙箱重定向问题已终结）——bash 任意形态/cargo/rustc/Node fs 的删除均为**直接删除**，回收站零增量（实测验证：裸 rm 与 find -delete 均真删）。**保留的纪律**：①Rust 代码内删除用 `std::fs::remove_file` / `fs::remove_dir_all`；②构建产物清理用 `cargo clean`；③**删后验证习惯保留**——大批量删除后运行 `python scripts/diag-recyclebin.py` 监控回收站增量（防止设置回滚或机制变化）；④**回收站异常膨胀仍先取证**（diag 脚本解析 $I 元数据）再清空。历史背景（沙箱重定向四版实验记录）见 git log 本条目演进。# 项目规则
 
 - 使用中文交流；生成代码时使用中文注释。
 - 开始工作前读取 `CONTEXT.md`、`docs/DECISIONS-20260822-GRILL.md`（注意其头部取代标注）、相关 ADR 和 `tickets.new.md`。
