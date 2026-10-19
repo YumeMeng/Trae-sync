@@ -29,6 +29,7 @@ import {
   type LoginSlotState,
 } from "./StatusBadges";
 import { MasterSwitchDialog, type MasterSwitchTarget } from "./MasterSwitchDialog";
+import { ProductBadge } from "./ProductBadge";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { EmptyState } from "./EmptyState";
 import type {
@@ -898,6 +899,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
         <header className="page-header">
           <div className="page-header__copy">
             <h1 data-page-title="accounts" tabIndex={-1}>账号</h1>
+            <ProductBadge productId="trae_cn" />
           </div>
         </header>
         <EmptyState role="status" className="account-center__empty" description="正在读取账号信息…" />
@@ -983,6 +985,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
       <header className="page-header">
         <div className="page-header__copy">
           <h1 data-page-title="accounts" tabIndex={-1}>账号</h1>
+            <ProductBadge productId="trae_cn" />
         </div>
         <div className="page-header__actions">
           <span className="status-badge status-badge--neutral"><ShieldCheck size={14} aria-hidden="true" />登录信息仅本机加密保存</span>

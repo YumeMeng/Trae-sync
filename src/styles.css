@@ -11,3 +11,42 @@
 @import "./styles/master-detail.css";
 @import "./styles/notify.css";
 @import "./styles/workbuddy.css";
+
+/* ===== P17-T5 二期/A6：产品徽标（账号页统一视图 + 切换器形态） ===== */
+.product-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+  user-select: none;
+}
+
+.product-badge--trae {
+  color: var(--color-accent, #3b82f6);
+  background: color-mix(in srgb, var(--color-accent, #3b82f6) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-accent, #3b82f6) 32%, transparent);
+}
+
+.product-badge--workbuddy {
+  color: #a78bfa;
+  background: rgba(167, 139, 250, 0.14);
+  border: 1px solid rgba(167, 139, 250, 0.32);
+}
+
+.product-badge--neutral {
+  color: var(--color-text-secondary, #94a3b8);
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+/* 切换器：徽标 + 原生 select 并排（徽标为主标识，select 收窄）。 */
+.title-bar__product-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}

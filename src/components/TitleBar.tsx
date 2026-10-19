@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, Waypoints, X } from "lucide-react";
 import type { PlatformContextDto } from "../types/workspace";
 import type { CurrentProductDto, ProductEntryDto } from "../types/product";
+import { ProductBadge } from "./ProductBadge";
 
 interface TitleBarProps {
   platform: PlatformContextDto;
@@ -71,6 +72,11 @@ export function TitleBar({ platform, products, currentProduct, onSwitchProduct }
           原生 select 保证键盘/读屏可用；空清单（注册表读取失败）不渲染。 */}
       {products.length > 0 && currentProduct && (
         <div className="title-bar__product-switcher">
+          {/* P17-T5 二期/A6：当前产品徽标（形态优化主标识）；原生 select
+              保留键盘/读屏可用性。 */}
+          <ProductBadge productId={currentProduct.product_id}>
+            {currentProduct.display_name}
+          </ProductBadge>
           <select
             aria-label="当前产品"
             data-testid="product-switcher"

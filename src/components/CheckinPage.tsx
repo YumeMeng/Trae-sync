@@ -1,4 +1,5 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+﻿import { ProductBadge } from "./ProductBadge";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -330,6 +331,7 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
         <header className="page-header">
           <div className="page-header__copy">
             <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
+            <ProductBadge productId="trae_cn" />
           </div>
         </header>
         <EmptyState role="status" className="checkin-page__empty" description="正在读取签到信息…" />
@@ -342,6 +344,7 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
       <header className="page-header">
         <div className="page-header__copy">
           <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
+            <ProductBadge productId="trae_cn" />
         </div>
         {/* G15 纯本地刷新：重读缓存零联网，与签到/补签的网络操作分工。 */}
         {realMode && poolIds.length > 0 && (
