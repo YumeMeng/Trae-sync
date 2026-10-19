@@ -5,6 +5,7 @@ import type {
   WorkBuddyLoginSummaryDto,
   WorkBuddyRefreshStatusDto,
   WorkBuddySessionHealthDto,
+  WorkBuddySwitchDto,
 } from "../types/product";
 
 /**
@@ -50,4 +51,14 @@ export function captureWorkBuddyAccount(): Promise<WorkBuddyLoginSummaryDto> {
  */
 export function refreshWorkBuddyAccount(): Promise<WorkBuddyRefreshStatusDto> {
   return invoke<WorkBuddyRefreshStatusDto>("refresh_workbuddy_account");
+}
+
+/**
+ * 切换 WorkBuddy 客户端登录账号（P17-T6/A4，单次确认入口：UI 弹窗确认后
+ * 调用）。编排：客户端运行中 wbipc `auth:logout` → `auth:saveOauthToken`
+ * （写池内最新代次）→ `auth:getAccount` 回读校验。对话存云端按账号隔离，
+ * 切号=换登录态自动跟随。
+ */
+export function switchWorkBuddyAccount(profileId: string): Promise<WorkBuddySwitchDto> {
+  return invoke<WorkBuddySwitchDto>("switch_workbuddy_account", { profileId });
 }

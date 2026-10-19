@@ -1279,6 +1279,7 @@ pub fn run() {
             workbuddy_commands::workbuddy_checkin_claim,
             workbuddy_commands::refresh_workbuddy_account,
             workbuddy_commands::capture_workbuddy_account,
+            workbuddy_commands::switch_workbuddy_account,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,
             read_work_cn_state,
@@ -1367,6 +1368,7 @@ pub fn run() {
             library_archive::get_master_library_stats,
             library_archive::get_master_backup_chain,
             library_archive::create_master_backup,
+            library_archive::restore_master_backup,
             library_archive::get_backup_retention,
             library_archive::set_backup_retention,
             library_archive::get_backup_dir,

@@ -34,6 +34,9 @@ use traesync_infrastructure::workbuddy_credential::{
     WorkBuddySessionSnapshot, DEFAULT_AUTH_ID,
 };
 use traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginStore;
+use traesync_infrastructure::workbuddy_wbipc::{
+    parse_endpoint, switch_workbuddy_account_via_rpc, PipeTransport, WbipcTransport,
+};
 
 use crate::{ensure_login_real_mode, run_blocking, AppState};
 
@@ -319,6 +322,103 @@ pub(crate) async fn capture_workbuddy_account(
         let record = capture_workbuddy_login_from_machine(&client_exe, &store, unix_ms_now())
             .map_err(|error| format!("{}:{:?}", error.code(), error))?;
         Ok(record.summary())
+    })
+    .await
+}
+
+/// WorkBuddy 切号回执（P17-T6/A4；脱敏）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddySwitchDto {
+    /// 切换到的账号展示名（界面表达纪律：uid 不进主视野）。
+    pub screen_name: String,
+    /// 本次是否先做了池凭据续期（false = access 充裕，未轮换）。
+    pub renewed: bool,
+}
+
+/// WorkBuddy 切号（**单次确认入口**：UI 弹窗确认后调用；真机切号验证
+/// 需用户在场，由主理人协调）。
+///
+/// 编排（spec 8.4 写路径约束 + 8.8 多副本协同）：
+/// 1. 客户端必须运行中（wbipc broker 随主进程持有）；
+/// 2. 池凭据先续期（access 充裕自动跳过）——saveOauthToken 写给客户端的
+///    是工具侧最新代次，客户端始终拿到最新对；
+/// 3. wbipc 三态握手 → `auth:logout` → `auth:saveOauthToken` →
+///    `auth:getAccount` 回读 uid 交叉校验（宁可不报成功，不可错登）。
+/// 对话跟号走：对话存 CodeBuddy 云端按账号隔离，切号=换登录态自动跟随，
+/// 编排内不做对话同步（真机验证记录留证据）。
+#[tauri::command]
+pub(crate) async fn switch_workbuddy_account(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<WorkBuddySwitchDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state)?;
+    run_blocking("workbuddy_switch_join_failed", move || {
+        // 1) 客户端运行中（探针端口组；未运行 = wbipc 通道不存在）。
+        traesync_infrastructure::workbuddy_instance::probe_local_api_default()
+            .map_err(|error| error.code().to_string())
+            .map_err(|code| {
+                if code == "workbuddy_probe_all_ports_failed" {
+                    "workbuddy_switch_client_offline".to_string()
+                } else {
+                    code
+                }
+            })?;
+
+        // 2) 池凭据先续期（写回最新代次；access 充裕跳过不轮换）。
+        let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
+        let renewed = match traesync_infrastructure::workbuddy_checkin::renew_pool_credentials(
+            &login_root,
+            now,
+        ) {
+            Ok(outcome) => matches!(
+                outcome,
+                traesync_infrastructure::workbuddy_checkin::WorkBuddyRenewalOutcome::Renewed { .. }
+            ),
+            Err(error) => {
+                return Err(match error {
+                    traesync_infrastructure::workbuddy_checkin::WorkBuddyPoolError::PoolEmpty
+                    | traesync_infrastructure::workbuddy_checkin::WorkBuddyPoolError::RecordMissing => {
+                        "workbuddy_switch_account_missing".to_string()
+                    }
+                    traesync_infrastructure::workbuddy_checkin::WorkBuddyPoolError::RefreshRejected => {
+                        "workbuddy_switch_refresh_rejected".to_string()
+                    }
+                    _ => "workbuddy_switch_refresh_failed".to_string(),
+                })
+            }
+        };
+
+        // 3) 目标账号在池（容器读取 + 绑定校验）。
+        let store = WorkBuddyLoginStore::new(&login_root);
+        let summaries = store.list().map_err(|_| "workbuddy_pool_invalid".to_string())?;
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.profile_id == profile_id)
+            .ok_or("workbuddy_switch_account_missing")?;
+        let record = store
+            .load(&summary.profile_id, &summary.account_id)
+            .map_err(|_| "workbuddy_switch_account_missing".to_string())?;
+
+        // 4) wbipc 端点（ticket 随客户端启动轮换；不可读 = 客户端未运行）。
+        let endpoint_path =
+            traesync_infrastructure::workbuddy_wbipc::default_endpoint_path()
+                .ok_or("workbuddy_switch_endpoint_missing".to_string())?;
+        let endpoint_raw = std::fs::read_to_string(&endpoint_path)
+            .map_err(|_| "workbuddy_switch_endpoint_missing".to_string())?;
+        let endpoint = parse_endpoint(&endpoint_raw)
+            .map_err(|error| error.code())?;
+
+        // 5) RPC 切号 + 回读校验。
+        let outcome = switch_workbuddy_account_via_rpc(&endpoint, &record, renewed, now, &|| {
+            traesync_infrastructure::workbuddy_wbipc::PipeTransport::connect(&endpoint.pipe_path)
+                .map(|transport| Box::new(transport) as Box<dyn WbipcTransport>)
+        })
+        .map_err(|error| error.code())?;
+        Ok(WorkBuddySwitchDto {
+            screen_name: outcome.screen_name,
+            renewed: outcome.renewed,
+        })
     })
     .await
 }

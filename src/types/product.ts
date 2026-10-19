@@ -59,6 +59,16 @@ export interface WorkBuddyCheckinClaimDto {
 }
 
 /** WorkBuddy 凭据续期回执（renewed=false = access 仍充裕，未轮换）。 */
+/**
+ * P17-T6/A4 WorkBuddy 切号回执（switch_workbuddy_account 返回；脱敏）。
+ */
+export interface WorkBuddySwitchDto {
+  /** 切换到的账号展示名（uid 不进主视野）。 */
+  readonly screen_name: string;
+  /** 本次是否先做了池凭据续期（false = access 充裕，未轮换）。 */
+  readonly renewed: boolean;
+}
+
 export interface WorkBuddyRefreshStatusDto {
   readonly renewed: boolean;
   readonly access_expires_at_unix_seconds: number;

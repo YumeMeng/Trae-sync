@@ -95,6 +95,7 @@ pub mod workbuddy_credential;
 pub mod workbuddy_checkin;
 // P17-T4c②：WorkBuddy 登录代次容器（WBSESSN1 DPAPI，纪律与 fused 同构）。
 pub mod workbuddy_login_credential;
+pub mod workbuddy_wbipc;
 // P17-T4c②：WorkBuddy 账号捕获编排（快照→解密→容器落盘；铸造待单次确认）。
 pub mod workbuddy_capture;
 // P17-T5 并列骨架：当前产品指针（产品管理页/切换器持久化状态，注册表校验）。

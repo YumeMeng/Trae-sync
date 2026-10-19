@@ -75,6 +75,16 @@ pub fn probe_local_api(
     Err(WorkBuddyProbeError::AllPortsFailed)
 }
 
+/// 探测 WorkBuddy 本地探针 API（自建 HTTP 客户端；组合根零 HTTP 依赖纪律
+/// ——切号编排前置「客户端运行中」检查用）。
+pub fn probe_local_api_default() -> Result<WorkBuddyProbeInfo, WorkBuddyProbeError> {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|_| WorkBuddyProbeError::AllPortsFailed)?;
+    probe_local_api(&http)
+}
+
 /// WorkBuddy 进程信息（映像匹配 + 命令行，供关闭编排与 user-data-dir 推导）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkBuddyProcessInfo {

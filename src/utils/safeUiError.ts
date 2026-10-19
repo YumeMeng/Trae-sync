@@ -258,6 +258,35 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /backup_retention_join_failed/i,
     "备份清理设置未能读取或保存，请稍后重试。",
   ],
+  // ===== P17-A2 从备份还原主库 =====
+  [
+    /master_restore_running/i,
+    "TRAE 正在运行且无法自动关闭，请手动关闭后重试还原。",
+  ],
+  [
+    /master_restore_close_failed/i,
+    "TRAE 自动关闭未成功，主库数据未被改动；请手动关闭 TRAE 后重试。",
+  ],
+  [
+    /master_restore_backup_missing/i,
+    "所选备份不存在或已不在备份目录内，请刷新备份列表后重试。",
+  ],
+  [
+    /master_restore_backup_invalid/i,
+    "备份校验未通过（文件损坏或与当前账号密钥不符），主库数据未被改动。",
+  ],
+  [
+    /master_restore_failed/i,
+    "主库还原未完成，请稍后重试；若反复失败请保留备份目录并反馈。",
+  ],
+  [
+    /master_restore_relaunch_failed/i,
+    "主库已还原，但 TRAE 自动启动失败；请手动打开 TRAE。",
+  ],
+  [
+    /master_restore_join_failed/i,
+    "主库还原未能执行，请稍后重试。",
+  ],
   [
     /master_delete_running/i,
     "主库正在运行，真实删除需先关闭 TRAE（删除前会自动创建备份）。",
@@ -653,6 +682,39 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
   [
     /workbuddy_refresh_request_failed|workbuddy_refresh_response_invalid|workbuddy_refresh_join_failed|workbuddy_pool_store_io/i,
     "凭据续期未完成，请稍后重试。",
+  ],
+  // ===== P17-T6/A4 WorkBuddy 切号 RPC 错误码 =====
+  [
+    /workbuddy_switch_client_offline|workbuddy_probe_all_ports_failed/i,
+    "WorkBuddy 客户端未运行，请先打开 WorkBuddy 再切换账号。",
+  ],
+  [
+    /workbuddy_switch_endpoint_missing/i,
+    "未找到 WorkBuddy 切号通道（客户端可能刚启动或未运行），请确认客户端运行后重试。",
+  ],
+  [
+    /workbuddy_switch_handshake_failed/i,
+    "与 WorkBuddy 客户端的切号通道握手失败，请重试；反复失败请反馈。",
+  ],
+  [
+    /workbuddy_switch_rpc_rejected/i,
+    "WorkBuddy 客户端拒绝了切号请求，客户端可能停在登出状态；请在客户端重新登录或重试切换。",
+  ],
+  [
+    /workbuddy_switch_verify_failed/i,
+    "切号后校验未通过（客户端登录账号与目标不符），请重试；反复失败请反馈。",
+  ],
+  [
+    /workbuddy_switch_account_missing/i,
+    "所选账号不在账号池中，请先保存该账号再切换。",
+  ],
+  [
+    /workbuddy_switch_refresh_rejected/i,
+    "账号池中的登录凭据已失效，请重新保存该账号后再切换。",
+  ],
+  [
+    /workbuddy_switch_refresh_failed|workbuddy_switch_join_failed|workbuddy_switch_io|workbuddy_switch_frame_too_large/i,
+    "切号未完成，请稍后重试。",
   ],
   // ===== P13-3 Trae CN 归档/恢复：CN 实例生命周期专属拒绝码 =====
   //（DB 层错误沿用上方 master_archive_* 既有族，同一事务原语共用词表）

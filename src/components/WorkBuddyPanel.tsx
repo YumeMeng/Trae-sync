@@ -13,6 +13,7 @@ import {
   listWorkBuddyAccounts,
   loadWorkBuddySessionHealth,
   refreshWorkBuddyAccount,
+  switchWorkBuddyAccount,
 } from "../platform/workbuddyAdapter";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { EmptyState } from "./EmptyState";
@@ -101,6 +102,9 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   const [capturing, setCapturing] = useState(false);
   // 凭据续期（与 Trae「刷新登录凭据」同语义）：access 充裕跳过不轮换。
   const [renewing, setRenewing] = useState(false);
+  // P17-T6/A4 切号：单次确认弹窗（目标 profile_id）→ 执行 → 刷新健康与池。
+  const [switchTarget, setSwitchTarget] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
 
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
@@ -166,6 +170,30 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       setRenewing(false);
     }
   }, [refresh]);
+
+  // P17-T6/A4 切号：wbipc RPC 编排在后端（logout → saveOauthToken →
+  // 回读校验）；对话存云端按账号隔离，切号=换登录态自动跟随。
+  const runSwitch = useCallback(async () => {
+    if (!switchTarget) return;
+    setSwitching(true);
+    try {
+      const receipt = await switchWorkBuddyAccount(switchTarget);
+      const label = receipt.screen_name || "WorkBuddy 账号";
+      notify.success(
+        receipt.renewed
+          ? `WorkBuddy：已切换到「${label}」（凭据已先续期为最新）`
+          : `WorkBuddy：已切换到「${label}」`,
+      );
+      setSwitchTarget(null);
+      await refresh(false);
+    } catch (reason: unknown) {
+      notify.error(
+        `WorkBuddy：切换未完成——${safeUiErrorMessage(reason, "切号未完成，客户端可能停在登出状态，请在客户端重新登录或重试。")}`,
+      );
+    } finally {
+      setSwitching(false);
+    }
+  }, [refresh, switchTarget]);
 
   return (
     <section className="workbuddy-page" role="region" aria-label="账号">
@@ -269,6 +297,17 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
                       {" · "}
                       更新于 {formatUnixTime(account.last_updated_at_unix_seconds) ?? "未知"}
                     </span>
+                    {/* P17-T6/A4 切号：单次确认（覆盖客户端登录态）。 */}
+                    <button
+                      type="button"
+                      className="btn btn--quiet"
+                      onClick={() => setSwitchTarget(account.profile_id)}
+                      disabled={switching}
+                      data-testid={`workbuddy-switch-${account.profile_id}`}
+                      title="让 WorkBuddy 客户端切换登录到此账号（对话记录存云端，跟随账号自动切换）"
+                    >
+                      切换到此账号
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -291,6 +330,26 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           onCancel={() => setCaptureDialogOpen(false)}
           onConfirm={() => void runCapture()}
           testId="workbuddy-capture-dialog"
+        />
+      )}
+
+      {/* P17-T6/A4 切号单次确认（覆盖性操作：改写客户端登录态）。 */}
+      {switchTarget && (
+        <ConfirmDialog
+          title="切换 WorkBuddy 登录账号"
+          lines={[
+            "将让 WorkBuddy 客户端退出当前账号并登录到所选账号（写入客户端登录态）。",
+            "对话记录保存在云端并按账号隔离，切换后自动跟随新账号。",
+            "需要 WorkBuddy 客户端处于运行状态；切换完成后客户端即已登录新账号。",
+          ]}
+          confirmLabel="确认切换"
+          busyLabel="切换中…"
+          busy={switching}
+          onCancel={() => {
+            if (!switching) setSwitchTarget(null);
+          }}
+          onConfirm={() => void runSwitch()}
+          testId="workbuddy-switch-dialog"
         />
       )}
     </section>
