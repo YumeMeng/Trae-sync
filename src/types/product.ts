@@ -32,6 +32,18 @@ export type WorkBuddySessionStatus =
   | "file_missing"
   | "unknown";
 
+/** WorkBuddy 深度健康检测实时面结果（P18-B3）。 */
+export type WorkBuddyLiveHealthStatus =
+  | "verified" // 客户端运行中且 wbipc 只读回读通过
+  | "client_offline" // 客户端未运行（仅完成本地检测，正常态）
+  | "probe_failed"; // 客户端运行中但探针回读异常
+
+/** WorkBuddy 深度健康检测回执（文件面 + 实时面；只读零写副作用）。 */
+export interface WorkBuddyDeepHealthDto {
+  readonly status: WorkBuddySessionStatus;
+  readonly live_status: WorkBuddyLiveHealthStatus;
+}
+
 /** WorkBuddy 会话健康（文件面只读；不含令牌材料）。 */
 export interface WorkBuddySessionHealthDto {
   readonly status: WorkBuddySessionStatus;

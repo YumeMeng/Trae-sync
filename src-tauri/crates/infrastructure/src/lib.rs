@@ -100,6 +100,9 @@ pub mod workbuddy_wbipc;
 // 只碰 transport='local'、云会话红线、进程 Unknown 拒写——模块头红线清单）。
 #[cfg(feature = "sqlcipher")]
 pub mod workbuddy_transfer;
+// P18-B2：WorkBuddy 切号实验执行器（骨架完整实现、真机执行入口锁定待
+// 统一验收——组合根无命令注册，示例执行器双重确认门禁）。
+pub mod workbuddy_switch_experiment;
 // P17-T4c②：WorkBuddy 账号捕获编排（快照→解密→容器落盘；铸造待单次确认）。
 pub mod workbuddy_capture;
 // P17-T5 并列骨架：当前产品指针（产品管理页/切换器持久化状态，注册表校验）。
@@ -297,6 +300,12 @@ pub use workbuddy_transfer::{
     validate_schema, verify_body_files, AccountDistribution, ClientProcessState,
     DirectionSource, InstallDiscovery, InstallSource, TransferClientDeps, TransferDirection,
     TransferError, TransferOutcome, TransferPlan, TransferReceipt,
+};
+// P18-B2：切号实验公开 API（信封构造/取钥/编排；执行入口锁定待统一验收）。
+pub use workbuddy_switch_experiment::{
+    build_envelope_value, build_session_json, derive_key_id, fetch_derived_key,
+    field_aad, random_nonce, run_switch_experiment, DerivedKey, ExperimentDeps,
+    ExperimentError, ExperimentReceipt, TargetTokens, WriteMode,
 };
 #[cfg(feature = "sqlcipher")]
 pub use work_cn_normalizer::WorkCnSourceNormalizer;

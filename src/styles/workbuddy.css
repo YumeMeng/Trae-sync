@@ -1,4 +1,7 @@
-/* WorkBuddy 产品域页面（P17-T5 并列骨架一期）：账号页面板 + 签到页。 */
+/* WorkBuddy 产品域页面（P17-T5 并列骨架一期；P18-B3 视觉对齐后收缩）。
+   徽章已统一走 accounts.css 的 G10 slot-badge 体系；账号池/自动签到清单
+   已对齐 account-list/account-item 行结构；签到页容器复用 checkin-page。
+   本文件仅保留 WB 独有的玻璃信息卡与两列信息行。 */
 
 /* 页面容器：与既有页面同一网格节奏（窄内容列，卡间 16px）。 */
 .workbuddy-page {
@@ -57,68 +60,10 @@
   font-weight: 550;
 }
 
-/* 状态徽章：三档色调（正常绿 / 提示琥珀 / 异常红），软底 + 细线。 */
-.workbuddy-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 650;
-  white-space: nowrap;
-}
-
-.workbuddy-badge--ok {
-  border: 1px solid var(--ok-line);
-  background: var(--ok-soft-bg);
-  color: var(--ok);
-}
-
-.workbuddy-badge--warn {
-  border: 1px solid var(--warn-line);
-  background: var(--warn-soft-bg);
-  color: var(--warn);
-}
-
-.workbuddy-badge--bad {
-  border: 1px solid var(--danger-line);
-  background: var(--danger-soft);
-  color: var(--danger);
-}
-
-/* 账号池清单：行式列表（名称 + 元信息），行间发丝线分隔。 */
-.workbuddy-pool {
-  display: flex;
-  flex-direction: column;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.workbuddy-pool__item {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 10px 0;
-  border-top: 1px solid var(--line-hair);
-}
-
-.workbuddy-pool__item:first-child {
-  border-top: none;
-  padding-top: 2px;
-}
-
-.workbuddy-pool__name {
-  color: var(--text-1);
-  font-size: 13.5px;
-  font-weight: 650;
-}
-
-.workbuddy-pool__meta {
-  color: var(--text-3);
-  font-size: 12px;
-}
+/* 状态徽章已删除（P18-B3）：统一走 accounts.css 的 G10 slot-badge 体系
+   （WorkBuddyLoginSlotBadge / WorkBuddyPoolSlotBadge / CheckinSlotBadge）。
+   账号池清单样式已删除（P18-B3）：对齐 AccountCenter 的
+   account-list / account-item 行结构（accounts.css 承载）。 */
 
 @media (max-width: 720px) {
   .workbuddy-row {

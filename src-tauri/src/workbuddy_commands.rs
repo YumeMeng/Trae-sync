@@ -572,6 +572,63 @@ pub(crate) async fn transfer_workbuddy_sessions(
     .await
 }
 
+/// WorkBuddy 深度健康检测回执（P18-B3；文件面 + 实时面双口径）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddyDeepHealthDto {
+    /// 文件面登录态（与 session_health_dto.status 同口径）。
+    pub status: &'static str,
+    /// 实时凭据验证：`verified`（客户端运行中且 wbipc 只读回读通过）/
+    /// `client_offline`（客户端未运行，仅完成本地检测）/
+    /// `probe_failed`（客户端运行中但探针回读异常）。
+    pub live_status: &'static str,
+}
+
+/// WorkBuddy 深度健康检测（P18-B3「健康检测按钮」后端；只读零写副作用）。
+/// 文件面：.info 快照 + 登出标记判定（不依赖客户端运行）；实时面：客户端
+/// 运行中时经 wbipc 管道做一次只读会话验证（同切号命令的验证步骤，但
+/// 不做任何凭据操作）。
+#[tauri::command]
+pub(crate) async fn check_workbuddy_login_health(
+    state: State<'_, AppState>,
+) -> Result<WorkBuddyDeepHealthDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    run_blocking("workbuddy_health_join_failed", move || {
+        let status = current_session_status(DEFAULT_AUTH_ID, unix_ms_now());
+        // 实时面（best-effort）：探针端口组不可达 = 客户端未运行（正常态，
+        // 不是错误）；可达但回读失败 = 探针异常（如实报告）。
+        let live_status = if traesync_infrastructure::workbuddy_instance::probe_local_api_default().is_err() {
+            "client_offline"
+        } else {
+            let verified = (|| -> Result<(), String> {
+                let endpoint_path =
+                    traesync_infrastructure::workbuddy_wbipc::default_endpoint_path()
+                        .ok_or("workbuddy_health_endpoint_missing".to_string())?;
+                let endpoint_raw = std::fs::read_to_string(&endpoint_path)
+                    .map_err(|_| "workbuddy_health_endpoint_missing".to_string())?;
+                let endpoint =
+                    parse_endpoint(&endpoint_raw).map_err(|error| error.code())?;
+                verify_client_session_via_rpc(&endpoint, &|| {
+                    traesync_infrastructure::workbuddy_wbipc::PipeTransport::connect(
+                        &endpoint.pipe_path,
+                    )
+                    .map(|transport| Box::new(transport) as Box<dyn WbipcTransport>)
+                })
+                .map_err(|error| error.code())?;
+                Ok(())
+            })();
+            match verified {
+                Ok(()) => "verified",
+                Err(_) => "probe_failed",
+            }
+        };
+        Ok(WorkBuddyDeepHealthDto {
+            status: session_status_str(status),
+            live_status,
+        })
+    })
+    .await
+}
+
 // ===== 内部 helper =====
 
 /// WorkBuddy 域真实模式门禁（独立错误码；fixture 模式无 WorkBuddy 基建）。

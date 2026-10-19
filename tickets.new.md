@@ -1622,14 +1622,14 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - [x] 单测（tempdir 现造最小 fixture db，19 例全绿：方向双路径/含 deleted_at 过户/cloud 红线/Unknown 拒写/dry_run 零副作用/schema 漂移）；真机一轮待主理人单次确认后执行（破坏性批量操作纪律）
 
 #### B2 切号实验与实现（关-写-开）
-- [ ] 实验：客户端关闭 → .info token 改写（明文/工具加密信封两形态）→ 冷启动接受度（风险知情：失败可重登，重捕链已有）
-- [ ] 实验通过 → 切号编排实现（关客户端→写 .info→开客户端→健康复核）；与 B1 过户串联（切号后自动过户选项）
+- [x] 实验执行器骨架（2026-10-19 workbuddy_switch_experiment.rs：ELECTRON_RUN_AS_NODE 取钥 helper〔原始密钥不出子进程，只出派生值〕→ AES-256-GCM 正向加密 + 信封/AAD 与解密链逐字节互逆〔字面量单测锁定〕→ .info 两形态改写〔明文/信封，滚动单备份〕→ 冷启动 → 文件面健康复核；10 例单测全绿）。真机执行入口 = examples/wb_switch_experiment_executor.rs 双重确认门禁（CLI 旗标 + 环境变量），组合根零命令注册；实验真机执行随统一验收
+- [ ] 实验真机执行（冷启动接受度取证）→ 通过后切号编排实现（关客户端→写 .info→开客户端→健康复核）；与 B1 过户串联（切号后自动过户选项）
 - [ ] spec 8.4 修订（原前提推翻的正式记录）
 
 #### B3 UI 全套对齐（共通功能一致性）
-- [ ] 账号卡形态对齐：徽章体系（登录状态徽章沿用 Trae 规格）/积分入账号卡/信息密度
-- [ ] 健康检测按钮（WB 侧等价：登录四态深度检测）
-- [ ] 视觉规格统一（替换 workbuddy-* 自定义 class 为统一设计系统）
-- [ ] 签到卡对齐（状态/领取/自动签到设置与 Trae CheckinPage 规格一致）
-- [ ] 空态/错误态完整设计
-- [ ] 范围红线：不为一侧没有的功能造 UI（实例启停/主库管理不造）；代码注释修正（WorkBuddyPanel L180 "对话存云端"错误注释已随 B1 于 2026-10-19 修正完成）
+- [x] 账号卡形态对齐：徽章体系（WB 登录态/账号池徽章入 G10 slot-badge 体系 StatusBadges，deriveWorkBuddyLoginSlotState/deriveWorkBuddyPoolLoginState 双纯函数判定）/积分入账号卡（健康卡新增积分余额+连续签到行）/信息密度对齐 AccountCenter（账号池/自动签到清单改 account-list/account-item 行结构）（2026-10-19 代码完成，真机验收随统一验收）
+- [x] 健康检测按钮（WB 侧等价：check_workbuddy_login_health 文件面 + wbipc 只读实时面〔verified/client_offline/probe_failed 三态〕；结果常驻健康卡）
+- [x] 视觉规格统一：workbuddy-badge/pool 自定义 class 删除——徽章统一 slot-badge、清单统一 account-list 行、签到页容器复用 checkin-page + checkin-page__meta；workbuddy.css 收缩为仅玻璃信息卡+信息行（无共享等价物）
+- [x] 签到卡对齐（今日状态走 CheckinSlotBadge 统一签到槽；自动签到状态行对齐 CheckinPage meta 规格）
+- [x] 空态/错误态：共享 EmptyState + workbench__error 词汇沿用（既有）；深度检测失败态经 notify 全局通知
+- [x] 范围红线：实例启停/主库管理不造 UI（未触碰）；代码注释修正已完成（随 B1）

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   WorkBuddyCheckinClaimDto,
   WorkBuddyCheckinStatusDto,
+  WorkBuddyDeepHealthDto,
   WorkBuddyLoginSummaryDto,
   WorkBuddyRefreshStatusDto,
   WorkBuddySessionHealthDto,
@@ -21,6 +22,14 @@ import type {
 /** 读取本机客户端登录会话健康（文件面只读）。 */
 export function loadWorkBuddySessionHealth(): Promise<WorkBuddySessionHealthDto> {
   return invoke<WorkBuddySessionHealthDto>("get_workbuddy_session_health");
+}
+
+/**
+ * 深度健康检测（P18-B3）：文件面登录态 + 客户端运行中时的 wbipc 只读
+ * 会话验证（零写副作用；客户端未运行时 live_status=client_offline）。
+ */
+export function checkWorkBuddyLoginHealth(): Promise<WorkBuddyDeepHealthDto> {
+  return invoke<WorkBuddyDeepHealthDto>("check_workbuddy_login_health");
 }
 
 /** 读取工具账号池（workbuddy-login 容器脱敏清单）。 */

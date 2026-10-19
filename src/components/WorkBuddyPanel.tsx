@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowRightLeft, CheckCircle2, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
+import { Activity, ArrowRightLeft, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import type {
   WorkBuddySessionHealthDto,
   WorkBuddyCheckinStatusDto,
   WorkBuddyLoginSummaryDto,
   WorkBuddyTransferDto,
+  WorkBuddyDeepHealthDto,
 } from "../types/product";
 import {
   captureWorkBuddyAccount,
+  checkWorkBuddyLoginHealth,
   claimWorkBuddyCheckin,
   fetchWorkBuddyAutoCheckinStatus,
   fetchWorkBuddyCheckinStatus,
@@ -22,6 +24,13 @@ import {
   transferWorkBuddySessions,
   type WorkBuddyAutoCheckinStatusDto,
 } from "../platform/workbuddyAdapter";
+import {
+  CheckinSlotBadge,
+  WorkBuddyLoginSlotBadge,
+  WorkBuddyPoolSlotBadge,
+  deriveCheckinSlotState,
+  deriveWorkBuddyPoolLoginState,
+} from "./StatusBadges";
 import { ProductBadge } from "./ProductBadge";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { EmptyState } from "./EmptyState";
@@ -53,31 +62,18 @@ function formatUnixTime(unixSeconds: number): string | null {
   });
 }
 
-/** 健康状态 → 展示文案（后端 current_session_status 判定结果的人话映射）。 */
-function healthStatusLabel(status: WorkBuddySessionHealthDto["status"]): string {
-  switch (status) {
-    case "active":
-      return "已登录";
-    case "access_expired":
-      return "登录已过期（可用刷新凭据）";
-    case "fully_expired":
-      return "登录已失效";
-    case "logged_out":
-      return "已在 WorkBuddy 中登出";
-    case "file_missing":
-      return "未检测到 WorkBuddy 登录记录";
+/** 深度健康检测实时面 → 展示文案（P18-B3）。 */
+function liveHealthLabel(liveStatus: WorkBuddyDeepHealthDto["live_status"]): string {
+  switch (liveStatus) {
+    case "verified":
+      return "已验证可用（客户端运行中，凭据实时回读通过）";
+    case "client_offline":
+      return "客户端未运行，已完成本地检测";
+    case "probe_failed":
+      return "客户端运行中但凭据回读异常，建议重启客户端后重试";
     default:
       return "状态未知";
   }
-}
-
-/** 健康状态 → 徽章色调档位（正常 / 提示 / 异常）。 */
-type HealthTone = "ok" | "warn" | "bad";
-
-function healthStatusTone(status: WorkBuddySessionHealthDto["status"]): HealthTone {
-  if (status === "active") return "ok";
-  if (status === "access_expired" || status === "unknown") return "warn";
-  return "bad";
 }
 
 /** 信息行：label + value 的两列展示（卡内统一行结构）。 */
@@ -116,6 +112,16 @@ function transferDialogLines(plan: WorkBuddyTransferDto): string[] {
   return lines;
 }
 
+/** P18-B3 对齐 CheckinPage 口径：WorkBuddy 自动签到台账文案。 */
+function wbAutoLedgerLabel(status: WorkBuddyAutoCheckinStatusDto): string {
+  const ledger = status.ledger;
+  if (!ledger) return "今日尚未发起";
+  const parts = [`成功 ${ledger.completed}/${ledger.total}`];
+  if (ledger.failed > 0) parts.push(`失败 ${ledger.failed}`);
+  if (ledger.skipped > 0) parts.push(`跳过 ${ledger.skipped}`);
+  return ledger.running ? `今日执行中（${parts.join("，")}）` : `今日已完成（${parts.join("，")}）`;
+}
+
 // ============================================================================
 // 账号页：WorkBuddy 会话健康 + 捕获入池 + 工具账号池
 // ============================================================================
@@ -131,6 +137,11 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // P18-B3：积分入账号卡（签到状态 best-effort 读取，失败不阻塞健康卡）。
+  const [checkinStatus, setCheckinStatus] = useState<WorkBuddyCheckinStatusDto | null>(null);
+  // P18-B3：深度健康检测（文件面 + 实时面；按钮单发，结果常驻健康卡）。
+  const [deepHealth, setDeepHealth] = useState<WorkBuddyDeepHealthDto | null>(null);
+  const [checkingHealth, setCheckingHealth] = useState(false);
   // 捕获：单次确认弹窗 → 执行 → 刷新健康与账号池。
   const [captureDialogOpen, setCaptureDialogOpen] = useState(false);
   const [capturing, setCapturing] = useState(false);
@@ -151,11 +162,37 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       setHealth(nextHealth);
       setPool(nextPool);
       setLoadError(null);
+      // 积分数据 best-effort：失败只影响积分行显示（置空），不阻塞健康卡。
+      fetchWorkBuddyCheckinStatus()
+        .then((status) => setCheckinStatus(status))
+        .catch(() => setCheckinStatus(null));
     } catch (reason: unknown) {
       setLoadError(safeUiErrorMessage(reason, "WorkBuddy 登录状态暂时不可读取，请稍后重试。"));
     } finally {
       setLoading(false);
       setRefreshing(false);
+    }
+  }, []);
+
+  // P18-B3 深度健康检测：文件面 + 实时面（只读零写副作用）；结果常驻健康卡。
+  const runDeepHealth = useCallback(async () => {
+    setCheckingHealth(true);
+    try {
+      const result = await checkWorkBuddyLoginHealth();
+      setDeepHealth(result);
+      if (result.live_status === "verified") {
+        notify.success("WorkBuddy：健康检测通过（本地登录态有效，实时凭据验证可用）");
+      } else if (result.live_status === "probe_failed") {
+        notify.error("WorkBuddy：健康检测发现异常——客户端运行中但凭据回读失败，建议重启客户端。");
+      } else {
+        notify.info("WorkBuddy：本地健康检测完成（客户端未运行，未做实时验证）。");
+      }
+    } catch (reason: unknown) {
+      notify.error(
+        `WorkBuddy：健康检测未完成——${safeUiErrorMessage(reason, "请稍后重试。")}`,
+      );
+    } finally {
+      setCheckingHealth(false);
     }
   }, []);
 
@@ -277,7 +314,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   }, [refresh, transferPlan]);
 
   return (
-    <section className="workbuddy-page" role="region" aria-label="账号">
+    <section className="account-center" role="region" aria-label="账号">
       <header className="page-header">
         <div className="page-header__copy">
           <h1 data-page-title="accounts" tabIndex={-1}>
@@ -305,6 +342,17 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           >
             <RefreshCw size={15} className={renewing ? "icon-spin" : undefined} aria-hidden="true" />
             刷新登录凭据
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void runDeepHealth()}
+            disabled={checkingHealth || loading}
+            data-testid="workbuddy-deep-health-button"
+            title="检测本地登录态与客户端实时凭据（只读，不修改任何数据）"
+          >
+            <Activity size={15} className={checkingHealth ? "icon-spin" : undefined} aria-hidden="true" />
+            健康检测
           </button>
           <button
             type="button"
@@ -351,12 +399,8 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
             <div className="workbuddy-card" data-testid="workbuddy-health-card">
               <div className="workbuddy-card__title">客户端登录状态</div>
               <InfoRow label="登录状态">
-                <span
-                  className={`workbuddy-badge workbuddy-badge--${healthStatusTone(health.status)}`}
-                  data-testid="workbuddy-health-status"
-                >
-                  {healthStatusLabel(health.status)}
-                </span>
+                {/* P18-B3：徽章统一走 G10 slot-badge 体系（与账号页/签到页同义同色）。 */}
+                <WorkBuddyLoginSlotBadge status={health.status} />
               </InfoRow>
               <InfoRow label="账号池">
                 {health.captured_in_pool
@@ -369,6 +413,24 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
               <InfoRow label="续期凭据有效期至">
                 {formatUnixTime(health.refresh_expires_at_unix_seconds) ?? "未知"}
               </InfoRow>
+              {/* P18-B3：积分入账号卡（签到数据面已有；读取失败显示未知）。 */}
+              <InfoRow label="积分余额">
+                {checkinStatus ? `${checkinStatus.total_credits} 积分` : "未知"}
+              </InfoRow>
+              <InfoRow label="已连续签到">
+                {checkinStatus ? `${checkinStatus.streak_days} 天` : "未知"}
+              </InfoRow>
+              {deepHealth && (
+                <InfoRow label="健康检测">
+                  <span
+                    className={`slot-badge ${deepHealth.live_status === "verified" ? "slot-badge--ok" : deepHealth.live_status === "probe_failed" ? "slot-badge--danger" : "slot-badge--idle"}`}
+                    data-testid="workbuddy-deep-health-result"
+                  >
+                    <i className="slot-badge__dot" aria-hidden="true" />
+                    {liveHealthLabel(deepHealth.live_status)}
+                  </span>
+                </InfoRow>
+              )}
             </div>
           )}
 
@@ -380,30 +442,54 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
                 description="还没有保存 WorkBuddy 账号。在 WorkBuddy 客户端登录后，点击右上角「保存当前登录账号」。"
               />
             ) : (
-              <ul className="workbuddy-pool" data-testid="workbuddy-pool-list">
-                {pool.map((account) => (
-                  <li key={account.profile_id} className="workbuddy-pool__item">
-                    <span className="workbuddy-pool__name">
-                      {account.screen_name || "WorkBuddy 账号"}
-                    </span>
-                    <span className="workbuddy-pool__meta">
-                      登录有效期至 {formatUnixTime(account.access_token_expires_at_unix_seconds) ?? "未知"}
-                      {" · "}
-                      更新于 {formatUnixTime(account.last_updated_at_unix_seconds) ?? "未知"}
-                    </span>
-                    {/* P17-T6/A4 切号：单次确认（覆盖客户端登录态）。 */}
-                    <button
-                      type="button"
-                      className="btn btn--quiet"
-                      onClick={() => setSwitchTarget(account.profile_id)}
-                      disabled={switching}
-                      data-testid={`workbuddy-switch-${account.profile_id}`}
-                      title="让 WorkBuddy 客户端切换登录到此账号（切换后如看不到历史会话，可用「转移历史会话」恢复可见）"
-                    >
-                      切换到此账号
-                    </button>
-                  </li>
-                ))}
+              <ul className="account-list" data-testid="workbuddy-pool-list">
+                {pool.map((account) => {
+                  // P18-B3：账号池行对齐 AccountCenter 列表规格（account-item 结构
+                  // + G10 登录徽章）；凭据状态按双过期时刻推导。
+                  const poolState = deriveWorkBuddyPoolLoginState({
+                    access_expires_at_unix_seconds: account.access_token_expires_at_unix_seconds,
+                    refresh_expires_at_unix_seconds: account.refresh_token_expires_at_unix_seconds,
+                    now_unix_seconds: Math.floor(Date.now() / 1000),
+                  });
+                  return (
+                    <li key={account.profile_id}>
+                      <div className="account-list__row">
+                        <div className="account-item__main">
+                          <span className="account-card__avatar" aria-hidden="true">
+                            {(account.screen_name || "W").trim().charAt(0).toUpperCase()}
+                          </span>
+                          <div className="account-item__id">
+                            <div className="account-item__name-row">
+                              <strong className="account-item__name">
+                                {account.screen_name || "WorkBuddy 账号"}
+                              </strong>
+                              <WorkBuddyPoolSlotBadge state={poolState} />
+                            </div>
+                            <div className="account-meta-group">
+                              <p className="account-item__meta">
+                                登录有效期至 {formatUnixTime(account.access_token_expires_at_unix_seconds) ?? "未知"}
+                                {" · "}
+                                更新于 {formatUnixTime(account.last_updated_at_unix_seconds) ?? "未知"}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="account-item__side">
+                          <button
+                            type="button"
+                            className="btn btn--quiet"
+                            onClick={() => setSwitchTarget(account.profile_id)}
+                            disabled={switching}
+                            data-testid={`workbuddy-switch-${account.profile_id}`}
+                            title="让 WorkBuddy 客户端切换登录到此账号（切换后如看不到历史会话，可用「转移历史会话」恢复可见）"
+                          >
+                            切换到此账号
+                          </button>
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>
@@ -561,7 +647,7 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   }, [refresh]);
 
   return (
-    <section className="workbuddy-page" role="region" aria-label="签到">
+    <section className="checkin-page" role="region" aria-label="签到">
       <header className="page-header">
         <div className="page-header__copy">
           <h1 data-page-title="checkin" tabIndex={-1}>
@@ -584,6 +670,14 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
         )}
       </header>
 
+      {/* P18-B3 对齐 CheckinPage 规格的常驻自动签到状态行。 */}
+      {autoStatus && (
+        <p className="checkin-page__meta" role="status" data-testid="workbuddy-auto-checkin-meta">
+          自动签到：{autoStatus.enabled ? `每日 ${autoStatus.daily_time_hhmm} 触发` : "已关闭"}
+          {autoStatus.enabled ? ` · ${wbAutoLedgerLabel(autoStatus)}` : ""}
+        </p>
+      )}
+
       {loading ? (
         <EmptyState role="status" className="workbuddy-page__empty" description="正在读取签到状态…" />
       ) : loadError ? (
@@ -602,14 +696,8 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
         <div className="workbuddy-card" data-testid="workbuddy-checkin-card">
           <div className="workbuddy-card__title">每日签到</div>
           <InfoRow label="今日状态">
-            {status.today_checked_in ? (
-              <span className="workbuddy-badge workbuddy-badge--ok">
-                <CheckCircle2 size={13} aria-hidden="true" />
-                今日已签到
-              </span>
-            ) : (
-              <span className="workbuddy-badge workbuddy-badge--warn">今日未签到</span>
-            )}
+            {/* P18-B3：签到槽徽章统一走 G10 CheckinSlotBadge（与 Trae 签到页同义同色）。 */}
+            <CheckinSlotBadge state={deriveCheckinSlotState({ checked_in: status.today_checked_in })} />
           </InfoRow>
           <InfoRow label="已连续签到">{status.streak_days} 天</InfoRow>
           <InfoRow label="今日可得">+{status.daily_credit} 积分</InfoRow>
@@ -675,24 +763,37 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
             )}
           </div>
           {autoStatus.accounts.length > 0 && (
-            <ul className="workbuddy-pool" data-testid="workbuddy-auto-checkin-accounts">
+            <ul className="account-list" data-testid="workbuddy-auto-checkin-accounts">
               {autoStatus.accounts.map((account) => (
-                <li key={account.profile_id} className="workbuddy-pool__item">
-                  <span className="workbuddy-pool__name">
-                    {account.screen_name || "WorkBuddy 账号"}
-                  </span>
-                  <label className="account-center__target-field">
-                    <span>参与自动签到</span>
-                    <input
-                      type="checkbox"
-                      checked={account.enabled}
-                      disabled={autoBusy}
-                      onChange={(event) =>
-                        handleToggleAccount(account.profile_id, event.target.checked)
-                      }
-                      data-testid={`workbuddy-auto-checkin-account-${account.profile_id}`}
-                    />
-                  </label>
+                <li key={account.profile_id}>
+                  <div className="account-list__row">
+                    <div className="account-item__main">
+                      <span className="account-card__avatar" aria-hidden="true">
+                        {(account.screen_name || "W").trim().charAt(0).toUpperCase()}
+                      </span>
+                      <div className="account-item__id">
+                        <div className="account-item__name-row">
+                          <strong className="account-item__name">
+                            {account.screen_name || "WorkBuddy 账号"}
+                          </strong>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="account-item__side">
+                      <label className="account-center__target-field">
+                        <span>参与自动签到</span>
+                        <input
+                          type="checkbox"
+                          checked={account.enabled}
+                          disabled={autoBusy}
+                          onChange={(event) =>
+                            handleToggleAccount(account.profile_id, event.target.checked)
+                          }
+                          data-testid={`workbuddy-auto-checkin-account-${account.profile_id}`}
+                        />
+                      </label>
+                    </div>
+                  </div>
                 </li>
               ))}
             </ul>

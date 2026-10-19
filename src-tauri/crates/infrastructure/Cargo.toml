@@ -56,6 +56,9 @@ base64 = "0.22"
 # U-7 blob 保活：AES-128-CBC(PKCS7) 解密/重加密登录 blob（与 C0 探针同版本）。
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
+# P18-B2 切号实验：WorkBuddy .info token 信封 AES-256-GCM 加密（解密链反向
+# ——workbuddy_decrypt_helper.cjs 的 Rust 侧正向实现；nonce 随机来自 getrandom）。
+aes-gcm = "0.10"
 rusty-leveldb = "4.0.1"
 tempfile = "3"
 # P16-T1 备份治理：主库三件套备份 zstd 压缩写出（每成员独立 .zst 帧，

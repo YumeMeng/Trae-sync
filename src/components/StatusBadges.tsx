@@ -265,8 +265,7 @@ export function InstanceSlotBadge({
   running: boolean;
   processState?: EnvironmentProcessState;
   loginState?: TraeInstanceLoginState;
-}) {
-  const isRunning = processState ? processState === "running" : running;
+}) {  const isRunning = processState ? processState === "running" : running;
   if (processState === "unknown") {
     return (
       <span
@@ -349,4 +348,148 @@ export function InstanceSlotBadge({
       {loggedIn ? "运行中 · 已登录" : "运行中"}
     </span>
   );
+}
+
+// ===== P18-B3 WorkBuddy 登录槽（G10 四色语义映射） =====
+
+/** WorkBuddy 客户端登录状态（与 WorkBuddySessionHealthDto.status 同源）。 */
+export type WorkBuddyHealthStatus =
+  | "active"
+  | "access_expired"
+  | "fully_expired"
+  | "logged_out"
+  | "file_missing"
+  | "unknown";
+
+/**
+ * WorkBuddy 客户端登录态 → G10 登录槽枚举：
+ * active=正常（绿）；access_expired=已过期（琥珀，daemon 可自动刷新）；
+ * fully_expired=需重登（红，双过期不可自动恢复）；logged_out=待登录（琥珀，
+ * 已在客户端登出）；file_missing/unknown=未登录（灰，无信息量占位）。
+ */
+export function deriveWorkBuddyLoginSlotState(
+  status: WorkBuddyHealthStatus,
+): LoginSlotState {
+  switch (status) {
+    case "active":
+      return "ok";
+    case "access_expired":
+      return "expired";
+    case "fully_expired":
+      return "relogin";
+    case "logged_out":
+      return "pending";
+    default:
+      return "signed_out";
+  }
+}
+
+/** WorkBuddy 客户端登录徽章：复用 slot-badge 视觉规格，文案 WB 化。 */
+export function WorkBuddyLoginSlotBadge({ status }: { status: WorkBuddyHealthStatus }) {
+  const state = deriveWorkBuddyLoginSlotState(status);
+  switch (state) {
+    case "ok":
+      return (
+        <span className="slot-badge slot-badge--ok" title="WorkBuddy 客户端当前已登录且登录凭据有效">
+          <i className="slot-badge__dot" aria-hidden="true" />已登录
+        </span>
+      );
+    case "expired":
+      return (
+        <span
+          className="slot-badge slot-badge--warn"
+          title="登录凭据已过期；WorkBuddy 运行中会自动刷新，无需手动处理"
+        >
+          <i className="slot-badge__dot slot-badge__dot--warn" aria-hidden="true" />登录已过期
+        </span>
+      );
+    case "relogin":
+      return (
+        <span
+          className="slot-badge slot-badge--danger"
+          title="登录凭据已完全失效；请在 WorkBuddy 客户端重新登录一次（对话记录不受影响）"
+        >
+          <i className="slot-badge__dot" aria-hidden="true" />登录已失效
+        </span>
+      );
+    case "pending":
+      return (
+        <span
+          className="slot-badge slot-badge--warn"
+          title="WorkBuddy 客户端当前处于登出状态；在客户端登录后即可保存/切换"
+        >
+          <i className="slot-badge__dot slot-badge__dot--warn" aria-hidden="true" />已在客户端登出
+        </span>
+      );
+    default:
+      return (
+        <span className="slot-badge slot-badge--idle" title="未检测到 WorkBuddy 登录记录">
+          <i className="slot-badge__dot slot-badge__dot--hollow" aria-hidden="true" />未登录
+        </span>
+      );
+  }
+}
+
+/**
+ * WorkBuddy 账号池条目登录徽章判定（纯函数）：按池内凭据双过期时刻推导
+ * G10 登录槽——refresh 过期=需重登（不可自动恢复）；仅 access 过期=已过期
+ * （可续期）；双未知=待关注（琥珀）；其余=正常。
+ */
+export function deriveWorkBuddyPoolLoginState(input: {
+  access_expires_at_unix_seconds: number;
+  refresh_expires_at_unix_seconds: number;
+  now_unix_seconds: number;
+}): LoginSlotState {
+  const { access_expires_at_unix_seconds, refresh_expires_at_unix_seconds, now_unix_seconds } = input;
+  const refreshKnown = refresh_expires_at_unix_seconds > 0;
+  const accessKnown = access_expires_at_unix_seconds > 0;
+  if (refreshKnown && refresh_expires_at_unix_seconds <= now_unix_seconds) return "relogin";
+  if (accessKnown && access_expires_at_unix_seconds <= now_unix_seconds) return "expired";
+  if (!accessKnown && !refreshKnown) return "pending";
+  return "ok";
+}
+
+/** WorkBuddy 账号池条目登录徽章（词与 Trae 登录槽一致，悬浮提示 WB 化）。 */
+export function WorkBuddyPoolSlotBadge({ state }: { state: LoginSlotState }) {
+  switch (state) {
+    case "ok":
+      return (
+        <span className="slot-badge slot-badge--ok" title="该账号的登录凭据验证可用，切换账号时直接可用">
+          <i className="slot-badge__dot" aria-hidden="true" />正常
+        </span>
+      );
+    case "expired":
+      return (
+        <span
+          className="slot-badge slot-badge--warn"
+          title="该账号的登录凭据已过期；可用「刷新登录凭据」续期后继续使用"
+        >
+          <i className="slot-badge__dot slot-badge__dot--warn" aria-hidden="true" />已过期
+        </span>
+      );
+    case "relogin":
+      return (
+        <span
+          className="slot-badge slot-badge--danger"
+          title="该账号的登录凭据已完全失效且无法自动续期；需在 WorkBuddy 客户端重新登录后重新保存"
+        >
+          <i className="slot-badge__dot" aria-hidden="true" />需重登
+        </span>
+      );
+    case "pending":
+      return (
+        <span
+          className="slot-badge slot-badge--warn"
+          title="该账号的凭据有效期未知；建议用「刷新登录凭据」确认状态"
+        >
+          <i className="slot-badge__dot slot-badge__dot--warn" aria-hidden="true" />待确认
+        </span>
+      );
+    default:
+      return (
+        <span className="slot-badge slot-badge--idle" title="该账号尚未保存登录凭据">
+          <i className="slot-badge__dot slot-badge__dot--hollow" aria-hidden="true" />未登录
+        </span>
+      );
+  }
 }

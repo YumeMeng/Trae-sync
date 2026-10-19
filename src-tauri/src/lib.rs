@@ -1283,6 +1283,8 @@ pub fn run() {
             workbuddy_commands::get_current_product,
             workbuddy_commands::set_current_product,
             workbuddy_commands::get_workbuddy_session_health,
+            // P18-B3：深度健康检测（文件面 + wbipc 实时面，只读）。
+            workbuddy_commands::check_workbuddy_login_health,
             workbuddy_commands::list_workbuddy_accounts,
             workbuddy_commands::workbuddy_checkin_status,
             workbuddy_commands::workbuddy_checkin_claim,
