@@ -1604,3 +1604,32 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 
 #### A7 工程自查（主理人）
 - [ ] 代码质量/技术债/遗留项盘点，产出清单后逐项处理
+
+
+### P18 WorkBuddy 第二轮（2026-10-19 grilling 定稿——三线并行）
+
+**来源**：用户五点指令（切号纳入下一轮/对话库认知修正/开放讨论/UI 一致性确认/grill 定下一步）+ 10-17 转移会话报告（`%TEMP%\handoff-workbuddy-session-transfer-20261017.md`）。
+**认知修正**：WorkBuddy 会话 = 本地 SQLite 索引（workbuddy.db sessions 表按 user_id 隔离）+ 本地 jsonl 正文；切号后 local 会话不可见需过户——与 Trae"归属随行"同问题域；此前"云端跟号走"判断作废。
+**UI 对齐原则**：共通功能保持一致性；不为一侧没有的功能造 UI。
+
+#### B1 会话过户产品化（wb_transfer.py → Rust）
+- [ ] 协议/发现层：数据根 ~/.workbuddy、安装路径三级探测（注册表/常见路径/进程命令行，注意 userData 与数据根区分）
+- [ ] 读取层：workbuddy.db 只读（WAL 安全）；账号分布/会话归属/当前 uid（日志解析 AuthenticationManager userId changed）
+- [ ] 过户事务：BEGIN IMMEDIATE → UPDATE user_id（AND transport='local'，含 deleted_at 行）→ cloud 残留防御检查 → COMMIT → wal_checkpoint(TRUNCATE)
+- [ ] 进程安全：完全退出复用 P14-2 边界（Unknown 拒写）；重启后进程数确认
+- [ ] 验证：正文 jsonl 抽验（cwd 转义规则）；输出更新行数/残留/缺失
+- [ ] UI：「转移历史会话」（昵称+会话数+时间表达，不展示 uid）；单次确认
+- [ ] 单测（.scratch db 副本做 fixture）+ 真机一轮
+
+#### B2 切号实验与实现（关-写-开）
+- [ ] 实验：客户端关闭 → .info token 改写（明文/工具加密信封两形态）→ 冷启动接受度（风险知情：失败可重登，重捕链已有）
+- [ ] 实验通过 → 切号编排实现（关客户端→写 .info→开客户端→健康复核）；与 B1 过户串联（切号后自动过户选项）
+- [ ] spec 8.4 修订（原前提推翻的正式记录）
+
+#### B3 UI 全套对齐（共通功能一致性）
+- [ ] 账号卡形态对齐：徽章体系（登录状态徽章沿用 Trae 规格）/积分入账号卡/信息密度
+- [ ] 健康检测按钮（WB 侧等价：登录四态深度检测）
+- [ ] 视觉规格统一（替换 workbuddy-* 自定义 class 为统一设计系统）
+- [ ] 签到卡对齐（状态/领取/自动签到设置与 Trae CheckinPage 规格一致）
+- [ ] 空态/错误态完整设计
+- [ ] 范围红线：不为一侧没有的功能造 UI（实例启停/主库管理不造）；代码注释修正（WorkBuddyPanel L180 "对话存云端"错误注释随 B1 修正）
