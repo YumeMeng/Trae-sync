@@ -62,3 +62,48 @@ export function refreshWorkBuddyAccount(): Promise<WorkBuddyRefreshStatusDto> {
 export function switchWorkBuddyAccount(profileId: string): Promise<WorkBuddySwitchDto> {
   return invoke<WorkBuddySwitchDto>("switch_workbuddy_account", { profileId });
 }
+
+// ===== P17-A5 WorkBuddy 自动签到调度 =====
+
+/** WorkBuddy 自动签到状态（设置 + 今日台账 + 账号参与清单）。 */
+export interface WorkBuddyAutoCheckinStatusDto {
+  readonly enabled: boolean;
+  readonly daily_time_hhmm: string;
+  readonly ledger: {
+    readonly date: string;
+    readonly running: boolean;
+    readonly total: number;
+    readonly completed: number;
+    readonly failed: number;
+    readonly skipped: number;
+  } | null;
+  readonly accounts: readonly {
+    readonly profile_id: string;
+    readonly screen_name: string;
+    readonly enabled: boolean;
+  }[];
+}
+
+/** 读取 WorkBuddy 自动签到状态。 */
+export function fetchWorkBuddyAutoCheckinStatus(): Promise<WorkBuddyAutoCheckinStatusDto> {
+  return invoke<WorkBuddyAutoCheckinStatusDto>("get_workbuddy_auto_checkin_status");
+}
+
+/** 保存 WorkBuddy 自动签到设置（总开关 + 每日触发时间）。 */
+export function setWorkBuddyAutoCheckinSettings(
+  enabled: boolean,
+  dailyTimeHhmm: string,
+): Promise<void> {
+  return invoke("set_workbuddy_auto_checkin_settings", {
+    enabled,
+    dailyTimeHhmm,
+  });
+}
+
+/** 设置单个账号的自动签到参与状态。 */
+export function setWorkBuddyAccountAutoCheckin(
+  profileId: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke("set_workbuddy_account_auto_checkin", { profileId, enabled });
+}

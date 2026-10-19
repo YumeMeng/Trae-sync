@@ -426,7 +426,8 @@ pub(crate) async fn switch_workbuddy_account(
 // ===== 内部 helper =====
 
 /// WorkBuddy 域真实模式门禁（独立错误码；fixture 模式无 WorkBuddy 基建）。
-fn ensure_login_real_mode_workbuddy(state: &AppState) -> Result<(), String> {
+/// pub(crate)：P17-A5 调度命令（workbuddy_schedule）共用同一门禁。
+pub(crate) fn ensure_login_real_mode_workbuddy(state: &AppState) -> Result<(), String> {
     if state.runtime_mode != crate::RuntimeMode::RealReadPreview {
         return Err("workbuddy_real_mode_required".to_string());
     }

@@ -901,14 +901,15 @@ pub(crate) struct AutoCheckinStatusWireDto {
 }
 
 /// 今日台账 DTO（running=true 表示错峰执行中或中断未完成）。
+/// pub(crate)：P17-A5 WorkBuddy 调度状态回执复用同形（workbuddy_schedule）。
 #[derive(Debug, Clone, Serialize)]
-struct AutoCheckinLedgerWireDto {
-    date: String,
-    running: bool,
-    total: usize,
-    completed: usize,
-    failed: usize,
-    skipped: usize,
+pub(crate) struct AutoCheckinLedgerWireDto {
+    pub(crate) date: String,
+    pub(crate) running: bool,
+    pub(crate) total: usize,
+    pub(crate) completed: usize,
+    pub(crate) failed: usize,
+    pub(crate) skipped: usize,
 }
 
 /// 真实批量签到：注册表取档案 -> 阈值续期（refresh 模式）-> status/claim/status 直连。

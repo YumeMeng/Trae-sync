@@ -30,7 +30,7 @@ use serde::Deserialize;
 use crate::workbuddy_credential::{
     decrypt_session_tokens, WorkBuddySessionSnapshot,
 };
-use crate::workbuddy_login_credential::WorkBuddyLoginStore;
+use crate::workbuddy_login_credential::{WorkBuddyLoginRecord, WorkBuddyLoginStore};
 
 /// 签到凭据上下文（明文 token 只在内存流转，调用方禁止落盘/写日志）。
 #[derive(Debug, Clone)]
@@ -443,7 +443,43 @@ pub fn renew_pool_record(
     let mut record = store
         .load(&summary.profile_id, &summary.account_id)
         .map_err(|_| WorkBuddyPoolError::RecordMissing)?;
+    renew_record(http, store, &mut record, now_unix)
+}
 
+/// 按指定账号续期（P17-A5 自动调度：多账号池逐账号 claim 前的断连兜底）。
+/// 语义与 [`renew_pool_record`] 一致，只是目标账号由 profile_id 指定。
+pub fn renew_pool_profile(
+    http: &reqwest::blocking::Client,
+    store: &WorkBuddyLoginStore,
+    profile_id: &str,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+    let mut record = load_pool_record(store, profile_id)?;
+    renew_record(http, store, &mut record, now_unix)
+}
+
+/// 按容器清单定位并加载指定账号（不存在 → RecordMissing）。
+fn load_pool_record(
+    store: &WorkBuddyLoginStore,
+    profile_id: &str,
+) -> Result<WorkBuddyLoginRecord, WorkBuddyPoolError> {
+    let summaries = store.list().map_err(|_| WorkBuddyPoolError::StoreIo)?;
+    let summary = summaries
+        .iter()
+        .find(|summary| summary.profile_id == profile_id)
+        .ok_or(WorkBuddyPoolError::RecordMissing)?;
+    store
+        .load(&summary.profile_id, &summary.account_id)
+        .map_err(|_| WorkBuddyPoolError::RecordMissing)
+}
+
+/// 续期内核（按记录；access 充裕跳过不轮换，临近过期刷新 + 原子写回）。
+fn renew_record(
+    http: &reqwest::blocking::Client,
+    store: &WorkBuddyLoginStore,
+    record: &mut WorkBuddyLoginRecord,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
     let access_expires_in = record
         .access_token_expires_at_unix_seconds
         .saturating_sub(now_unix);
@@ -502,17 +538,36 @@ pub fn open_session_from_pool(
     let record = store
         .load(&summary.profile_id, &summary.account_id)
         .map_err(|_| WorkBuddyPoolError::RecordMissing)?;
-    Ok((
-        WorkBuddyCheckinSession {
-            credentials: WorkBuddyCheckinCredentials {
-                access_token: record.access_token,
-                uid: record.account_id,
-                domain: record.domain,
-            },
-            http,
+    Ok((session_from_record(http, &record), renewal))
+}
+
+/// 按指定账号打开签到会话（P17-A5 自动调度：先续期该账号（断连兜底），
+/// 再用其最新代次装配会话）。
+pub fn open_session_for_profile(
+    login_root: &Path,
+    profile_id: &str,
+    now_unix: u64,
+) -> Result<(WorkBuddyCheckinSession, WorkBuddyRenewalOutcome), WorkBuddyPoolError> {
+    let http = pool_http();
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    let renewal = renew_pool_profile(&http, &store, profile_id, now_unix)?;
+    let record = load_pool_record(&store, profile_id)?;
+    Ok((session_from_record(http, &record), renewal))
+}
+
+/// 会话装配（按池记录；access/uid/domain 三元组）。
+fn session_from_record(
+    http: reqwest::blocking::Client,
+    record: &WorkBuddyLoginRecord,
+) -> WorkBuddyCheckinSession {
+    WorkBuddyCheckinSession {
+        credentials: WorkBuddyCheckinCredentials {
+            access_token: record.access_token.clone(),
+            uid: record.account_id.clone(),
+            domain: record.domain.clone(),
         },
-        renewal,
-    ))
+        http,
+    }
 }
 
 fn pool_http() -> reqwest::blocking::Client {

@@ -115,6 +115,7 @@ pub mod credential_handover;
 mod credential_handover;
 // P17-T5 并列骨架：WorkBuddy 产品域命令 + 产品注册表/切换命令。
 mod workbuddy_commands;
+mod workbuddy_schedule;
 // P16-T4：新账号「从客户端捕获」入池编排（spec docs/specs/p16-account-capture.md）。
 mod account_capture;
 // P12-R3：插件域（P5-8b 插件 tab：ADR-0023 环境插件清单 + ADR-0026 实时同步）
@@ -131,6 +132,8 @@ mod test_support;
 // credential_handover（进度事件契约与串行运行器经该模块引用）；
 // get_relay_ledger / 账号列表 / oauth_login 沿用同一签到材料根约定。
 use checkin_schedule::{checkin_material_root, spawn_auto_checkin_scheduler};
+// P17-A5：WorkBuddy 域门禁经 crate root 转发（workbuddy_schedule 命令共用）。
+pub(crate) use workbuddy_commands::ensure_login_real_mode_workbuddy;
 // P12-R3：启动恢复扫描（run()）调用凭据域的凭证恢复原语。
 use credential_handover::{recover_managed_account_runtime_from_disk, recovery_error_runtime};
 // P12-R2a：映射函数随迁专用模块；转发导入保持 lib.rs 调用面零改动。
@@ -1257,7 +1260,13 @@ pub fn run() {
                 let _removed = traesync_infrastructure::sqlcipher::cleanup_stale_readonly_copies();
                 if scheduler_mode == RuntimeMode::RealReadPreview {
                     let lock = app.state::<AppState>().checkin_execution_lock.clone();
-                    spawn_auto_checkin_scheduler(app.handle().clone(), scheduler_root, lock);
+                    spawn_auto_checkin_scheduler(app.handle().clone(), scheduler_root.clone(), lock);
+                    // P17-A5：WorkBuddy 自动签到调度器（并列实现，独立台账；
+                    // 与 Trae 调度器同策略：每日 claim + 断连续期兜底）。
+                    workbuddy_schedule::spawn_workbuddy_auto_checkin_scheduler(
+                        app.handle().clone(),
+                        scheduler_root.clone(),
+                    );
                 }
                 // P6-3：OAuth 临时档案周期清理——与运行模式无关，只按
                 // 目录年龄回收，超龄目录不可能是进行中的登录。
@@ -1398,6 +1407,9 @@ pub fn run() {
             checkin_schedule::get_auto_checkin_settings,
             checkin_schedule::set_auto_checkin_settings,
             checkin_schedule::set_account_auto_checkin,
+            workbuddy_schedule::get_workbuddy_auto_checkin_status,
+            workbuddy_schedule::set_workbuddy_auto_checkin_settings,
+            workbuddy_schedule::set_workbuddy_account_auto_checkin,
             // U-1 数据层：本地备注名（脱敏手机号为登录/补采自动写入，无独立命令）。
             // G11 手机号补录：完整手机号写凭据包（DPAPI 加密，与令牌同级）。
             // U-6 W4：资产库三态筛选——归档开关 / 占用统计 / 彻底删除记录。

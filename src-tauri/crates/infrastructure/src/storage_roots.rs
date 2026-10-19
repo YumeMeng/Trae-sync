@@ -32,6 +32,13 @@ pub fn fused_login_root_from(storage_root: &Path) -> PathBuf {
     storage_root.join("fused-login")
 }
 
+/// WorkBuddy 自动签到调度根（P17-A5）：`{storage_root}/workbuddy-schedule`。
+/// 与 Trae 侧（checkin 材料根内）同构的设置/台账/参与集存储位——产品并列
+/// 纪律：WB 调度状态独立成根，不混入 Trae 签到材料。
+pub fn workbuddy_schedule_root_from(storage_root: &Path) -> PathBuf {
+    storage_root.join("workbuddy-schedule")
+}
+
 /// WorkBuddy 登录代次容器根：`{storage_root}/workbuddy-login`（P17-T4c）。
 /// 与 Trae 融合版容器（fused-login）独立目录——跨产品凭据隔离（ADR-0029
 /// 产品分层：产品凭据分开建模，跨产品复制禁令继续有效）。
@@ -65,6 +72,10 @@ mod tests {
         assert_eq!(
             workbuddy_login_root_from(root),
             PathBuf::from("S").join("workbuddy-login")
+        );
+        assert_eq!(
+            workbuddy_schedule_root_from(root),
+            PathBuf::from("S").join("workbuddy-schedule")
         );
     }
 }
