@@ -35,7 +35,7 @@ use traesync_infrastructure::workbuddy_credential::{
 };
 use traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginStore;
 use traesync_infrastructure::workbuddy_wbipc::{
-    parse_endpoint, switch_workbuddy_account_via_rpc, PipeTransport, WbipcTransport,
+    parse_endpoint, verify_client_session_via_rpc, PipeTransport, WbipcTransport,
 };
 
 use crate::{ensure_login_real_mode, run_blocking, AppState};
@@ -335,24 +335,22 @@ pub struct WorkBuddySwitchDto {
     pub renewed: bool,
 }
 
-/// WorkBuddy 切号（**单次确认入口**：UI 弹窗确认后调用；真机切号验证
-/// 需用户在场，由主理人协调）。
+/// WorkBuddy 切号（**单次确认入口**；P17-A4 真机调试后暂不可用）。
 ///
-/// 编排（spec 8.4 写路径约束 + 8.8 多副本协同）：
-/// 1. 客户端必须运行中（wbipc broker 随主进程持有）；
-/// 2. 池凭据先续期（access 充裕自动跳过）——saveOauthToken 写给客户端的
-///    是工具侧最新代次，客户端始终拿到最新对；
-/// 3. wbipc 三态握手 → `auth:logout` → `auth:saveOauthToken` →
-///    `auth:getAccount` 回读 uid 交叉校验（宁可不报成功，不可错登）。
-/// 对话跟号走：对话存 CodeBuddy 云端按账号隔离，切号=换登录态自动跟随，
-/// 编排内不做对话同步（真机验证记录留证据）。
+/// **A4 真机调试定案（asar 实读）**：wbipc broker 只注册 `wb.request`
+/// （HTTP 代理）/entitlement/wecom-a2a 三根管道；`auth:login/logout/
+/// saveOauthToken` 是 Electron IPC 通道（app 内部），**不在 wbipc 协议面**
+/// ——spec 8.4 的切号写路径前提被真机推翻，切号机制需重设计（主理人决策）。
+/// 本命令现执行**只读会话验证**（握手 → ListPipes → GetPipe → http.fetch
+/// 签到状态，零写操作）作为真机证据链，随后返回稳定错误码
+/// `workbuddy_switch_pipe_unavailable`；UI 文案由该错误码呈现。
 #[tauri::command]
 pub(crate) async fn switch_workbuddy_account(
-    profile_id: String,
+    _profile_id: String,
     state: State<'_, AppState>,
 ) -> Result<WorkBuddySwitchDto, String> {
     ensure_login_real_mode_workbuddy(&state)?;
-    let login_root = workbuddy_login_root(&state)?;
+    let _login_root = workbuddy_login_root(&state)?;
     run_blocking("workbuddy_switch_join_failed", move || {
         // 1) 客户端运行中（探针端口组；未运行 = wbipc 通道不存在）。
         traesync_infrastructure::workbuddy_instance::probe_local_api_default()
@@ -364,61 +362,26 @@ pub(crate) async fn switch_workbuddy_account(
                     code
                 }
             })?;
-
-        // 2) 池凭据先续期（写回最新代次；access 充裕跳过不轮换）。
-        let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
-        let renewed = match traesync_infrastructure::workbuddy_checkin::renew_pool_credentials(
-            &login_root,
-            now,
-        ) {
-            Ok(outcome) => matches!(
-                outcome,
-                traesync_infrastructure::workbuddy_checkin::WorkBuddyRenewalOutcome::Renewed { .. }
-            ),
-            Err(error) => {
-                return Err(match error {
-                    traesync_infrastructure::workbuddy_checkin::WorkBuddyPoolError::PoolEmpty
-                    | traesync_infrastructure::workbuddy_checkin::WorkBuddyPoolError::RecordMissing => {
-                        "workbuddy_switch_account_missing".to_string()
-                    }
-                    traesync_infrastructure::workbuddy_checkin::WorkBuddyPoolError::RefreshRejected => {
-                        "workbuddy_switch_refresh_rejected".to_string()
-                    }
-                    _ => "workbuddy_switch_refresh_failed".to_string(),
-                })
-            }
-        };
-
-        // 3) 目标账号在池（容器读取 + 绑定校验）。
-        let store = WorkBuddyLoginStore::new(&login_root);
-        let summaries = store.list().map_err(|_| "workbuddy_pool_invalid".to_string())?;
-        let summary = summaries
-            .iter()
-            .find(|summary| summary.profile_id == profile_id)
-            .ok_or("workbuddy_switch_account_missing")?;
-        let record = store
-            .load(&summary.profile_id, &summary.account_id)
-            .map_err(|_| "workbuddy_switch_account_missing".to_string())?;
-
-        // 4) wbipc 端点（ticket 随客户端启动轮换；不可读 = 客户端未运行）。
+        // 2) wbipc 端点（ticket 随客户端启动轮换；不可读 = 客户端未运行）。
         let endpoint_path =
             traesync_infrastructure::workbuddy_wbipc::default_endpoint_path()
                 .ok_or("workbuddy_switch_endpoint_missing".to_string())?;
         let endpoint_raw = std::fs::read_to_string(&endpoint_path)
             .map_err(|_| "workbuddy_switch_endpoint_missing".to_string())?;
-        let endpoint = parse_endpoint(&endpoint_raw)
-            .map_err(|error| error.code())?;
-
-        // 5) RPC 切号 + 回读校验。
-        let outcome = switch_workbuddy_account_via_rpc(&endpoint, &record, renewed, now, &|| {
-            traesync_infrastructure::workbuddy_wbipc::PipeTransport::connect(&endpoint.pipe_path)
+        let endpoint =
+            parse_endpoint(&endpoint_raw).map_err(|error| error.code())?;
+        // 3) 只读会话验证（真机证据链；零写操作——不做凭据轮换）。
+        let _evidence =
+            verify_client_session_via_rpc(&endpoint, &|| {
+                traesync_infrastructure::workbuddy_wbipc::PipeTransport::connect(
+                    &endpoint.pipe_path,
+                )
                 .map(|transport| Box::new(transport) as Box<dyn WbipcTransport>)
-        })
-        .map_err(|error| error.code())?;
-        Ok(WorkBuddySwitchDto {
-            screen_name: outcome.screen_name,
-            renewed: outcome.renewed,
-        })
+            })
+            .map_err(|error| error.code())?;
+        // 4) 切号写路径在 wbipc 面不存在（A4 定案）——稳定错误码交由
+        //    UI 呈现；机制重设计后此处接入新编排。
+        Err("workbuddy_switch_pipe_unavailable".to_string())
     })
     .await
 }

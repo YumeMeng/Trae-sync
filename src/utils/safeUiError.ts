@@ -701,6 +701,10 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     "WorkBuddy 客户端拒绝了切号请求，客户端可能停在登出状态；请在客户端重新登录或重试切换。",
   ],
   [
+    /workbuddy_switch_pipe_unavailable/i,
+    "当前 WorkBuddy 客户端版本未开放切号通道（wbipc 协议面无 auth 写方法），账号切换机制需要重新设计；客户端登录态未被改动。",
+  ],
+  [
     /workbuddy_switch_verify_failed/i,
     "切号后校验未通过（客户端登录账号与目标不符），请重试；反复失败请反馈。",
   ],

@@ -14,12 +14,25 @@
 //! - **RPC**：JSON-RPC 2.0（响应帧 `replyResult`/`replyError`；兼容标准
 //!   `{result}`/`{error}` 形态——脱敏解析按形态自适应）。
 //!
-//! 切号编排（spec 8.4 写路径约束 + 8.8 多副本协同定案）：客户端**运行中**
-//! 经 wbipc 依次 `auth:logout`（清当前会话）→ `auth:saveOauthToken`
-//! （写池内最新代次——工具刷新后的最新对，客户端始终拿到最新凭据）→
-//! `auth:getAccount`（回读 uid 交叉校验）。**对话跟号走天然成立**：
-//! WorkBuddy 对话存 CodeBuddy 云端按账号隔离，切号=换登录态自动跟随，
-//! 编排内不做任何对话同步（真机验证记录留证据）。
+//! **P17-A4 真机调试定案（asar 实读修正，2026-10-19）**：
+//! 1. **transcript 形态**：`encodeTranscript(role, t)` 五段 LP4BE 全部为
+//!    **UTF-8 字符串**——`[roleTag, String(protocol), endpoint, clientNonce,
+//!    serverNonce]`；clientNonce/serverNonce 是 **base64url 串本身**（非
+//!    解码字节——初版实现误用解码字节，真机 auth_failed 根因之一）；
+//! 2. **challenge**：`{type:"session_challenge", protocol:1, server_nonce,
+//!    server_proof}`（server 侧角色串 "wbipc-s"）；
+//! 3. **RPC 路由**：标准 JSON-RPC（`{jsonrpc,id,result|error}`）；三类方法：
+//!    `broker/ListPipes` → `{pipes:[名]}`；`broker/GetPipe`（params.pipe）
+//!    → 建通道 `c:{pipe}` 回 `{channel,methods}`；其余方法必须是
+//!    **`c:{pipe}/{method}` 形态 + 请求顶层 `mode:"call"`**（handleChannelCall
+//!    按首个 `/` 切通道，mode 缺失/不匹配 = BAD_REQUEST/METHOD_KIND_MISMATCH）；
+//! 4. **切号写路径不存在**：wbipc broker 只注册三根管道——`wb.request`
+//!    （唯一方法 `http.fetch`：经客户端后端会话的 HTTP 代理，自动注入
+//!    Bearer/x-user-id）、entitlement、wecom-a2a。**auth:login/logout/
+//!    saveOauthToken 是 Electron IPC 通道（app 内部 ipcRenderer），不在
+//!    wbipc 面**——spec 8.4 的写路径前提被真机推翻，切号机制需重设计
+//!    （主理人决策）；本模块现提供只读会话验证（handshake → ListPipes →
+//!    GetPipe("wb.request") → http.fetch 签到状态）作为 A4 的真机证据链。
 //!
 //! 单次确认纪律：命令层由 UI 弹窗确认后调用（与捕获同构）；本模块不做
 //! 二次确认，fail-closed 于任何协议/校验异常。
@@ -50,13 +63,15 @@ pub enum WbipcSwitchError {
     /// 握手失败（携带协议错误码或阶段标记）。
     HandshakeFailed(String),
     /// RPC 被服务端拒绝（携带方法与错误码）。
-    RpcRejected { method: &'static str, code: String },
+    RpcRejected { method: String, code: String },
     /// 切号后回读账号与目标不符（宁可不报成功，不可错登）。
     VerifyFailed,
     /// 帧超限（protocol violation）。
     FrameTooLarge,
     /// 目标账号不在工具池（未捕获/已清理）。
     AccountMissing,
+    /// 所需管道在 wbipc 面不可用（auth 写方法不在该协议面——A4 调试定案）。
+    PipeUnavailable,
     /// 管道 IO 失败（读半途 EOF 等）。
     Io,
 }
@@ -75,6 +90,7 @@ impl WbipcSwitchError {
             Self::VerifyFailed => "workbuddy_switch_verify_failed".to_string(),
             Self::FrameTooLarge => "workbuddy_switch_frame_too_large".to_string(),
             Self::AccountMissing => "workbuddy_switch_account_missing".to_string(),
+            Self::PipeUnavailable => "workbuddy_switch_pipe_unavailable".to_string(),
             Self::Io => "workbuddy_switch_io".to_string(),
         }
     }
@@ -84,7 +100,7 @@ impl WbipcSwitchError {
 /// ticket 随客户端每次启动轮换，值永不打印/落日志。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WbipcEndpoint {
-    /// 命名管道路径（Windows `\\.\pipe\…`）。
+    /// 命名管道路径（Windows `\.\pipe\…`）。
     pub pipe_path: String,
     /// 32B base64url ticket。
     pub ticket: String,
@@ -189,20 +205,22 @@ pub fn lp4be(segments: &[&[u8]]) -> Vec<u8> {
 }
 
 /// client_proof = base64url(HMAC-SHA256(key=ticket utf8, encodeTranscript))；
-/// encodeTranscript = concat(LP4BE ["wbipc-c", "1", <管道路径>, clientNonce,
-/// serverNonce])——nonce 段为解码后原始字节（spec 8.6 实读定案）。
+/// encodeTranscript = concat(LP4BE 五段 **UTF-8 字符串** ["wbipc-c", "1",
+/// <管道路径>, clientNonce, serverNonce])——nonce 段是 base64url 串本身
+/// （asar `encodeTranscript` 实读：`Buffer.from(e,"utf8")` 逐段，P17-A4
+/// 真机调试定案修正——初版误用解码后原始字节导致 auth_failed）。
 pub fn client_proof(
     ticket: &str,
     pipe_path: &str,
-    client_nonce: &[u8],
-    server_nonce: &[u8],
+    client_nonce_b64: &str,
+    server_nonce_b64: &str,
 ) -> String {
     let transcript = lp4be(&[
         b"wbipc-c",
         b"1",
         pipe_path.as_bytes(),
-        client_nonce,
-        server_nonce,
+        client_nonce_b64.as_bytes(),
+        server_nonce_b64.as_bytes(),
     ]);
     b64url_encode(&hmac_sha256(ticket.as_bytes(), &transcript))
 }
@@ -231,7 +249,7 @@ pub trait WbipcTransport {
     fn read_frame(&mut self) -> Result<serde_json::Value, WbipcSwitchError>;
 }
 
-/// 生产传输：Windows 命名管道（`\\.\pipe\…` 经 std fs 直接打开，与探针
+/// 生产传输：Windows 命名管道（`\.\pipe\…` 经 std fs 直接打开，与探针
 /// 同口径）。
 pub struct PipeTransport {
     stream: fs::File,
@@ -351,16 +369,23 @@ pub fn handshake(
             "unexpected_frame:{challenge_type}"
         )));
     }
-    let Some(server_nonce) = nonce_from(&challenge, "server_nonce", "serverNonce") else {
+    let Some(server_nonce_b64) = nonce_from(&challenge, "server_nonce", "serverNonce") else {
         return Err(WbipcSwitchError::HandshakeFailed("missing_nonce".to_string()));
     };
+    // nonce_from 返回解码字节——此处需要 base64url 串本身（transcript 形态
+    // 是字符串段），从 challenge 原文取回串值。
+    let server_nonce_str = challenge
+        .get("server_nonce")
+        .or_else(|| challenge.get("serverNonce"))
+        .and_then(|v| v.as_str())
+        .ok_or(WbipcSwitchError::HandshakeFailed("missing_nonce".to_string()))?;
     let prove = serde_json::json!({
         "type": "session_prove",
         "client_proof": client_proof(
             &endpoint.ticket,
             &endpoint.pipe_path,
-            &client_nonce,
-            &server_nonce,
+            &b64url_encode(&client_nonce),
+            server_nonce_str,
         ),
     });
     transport.send_frame(&prove)?;
@@ -393,15 +418,62 @@ pub fn handshake(
 pub fn call_rpc(
     transport: &mut dyn WbipcTransport,
     id: u64,
-    method: &'static str,
+    method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, WbipcSwitchError> {
-    transport.send_frame(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    }))?;
+    call_method(
+        transport,
+        id,
+        method,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )
+}
+
+/// 通道调用：wbipc 的方法路由要求非 broker 方法以 `c:{pipe}/{method}`
+/// 形态发起，且请求**顶层**携带 `mode:"call"`（handleChannelCall 按首个
+/// `/` 切通道名；mode 缺失 = BAD_REQUEST，kind 不匹配 =
+/// METHOD_KIND_MISMATCH）。
+pub fn call_channel(
+    transport: &mut dyn WbipcTransport,
+    id: u64,
+    pipe: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, WbipcSwitchError> {
+    call_method(
+        transport,
+        id,
+        &format!("c:{pipe}/{method}"),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": format!("c:{pipe}/{method}"),
+            "params": params,
+            "mode": "call",
+        }),
+    )
+    .map_err(|error| match error {
+        WbipcSwitchError::RpcRejected { code, .. } if code == "PIPE_UNKNOWN" => {
+            WbipcSwitchError::PipeUnavailable
+        }
+        other => other,
+    })
+}
+
+/// 帧发送 + 响应解析核心（call_rpc/call_channel 共用）。
+fn call_method(
+    transport: &mut dyn WbipcTransport,
+    id: u64,
+    method: &str,
+    frame: serde_json::Value,
+) -> Result<serde_json::Value, WbipcSwitchError> {
+    let _ = id;
+    transport.send_frame(&frame)?;
     loop {
         let frame = transport.read_frame()?;
         let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -412,7 +484,7 @@ pub fn call_rpc(
                     .get("error")
                     .and_then(extract_error_code)
                     .unwrap_or_else(|| "unknown".to_string());
-                return Err(WbipcSwitchError::RpcRejected { method, code });
+                return Err(WbipcSwitchError::RpcRejected { method: method.to_string(), code });
             }
             "session_hello_error" => {
                 let code = frame
@@ -430,7 +502,7 @@ pub fn call_rpc(
                         .get("error")
                         .and_then(extract_error_code)
                         .unwrap_or_else(|| "unknown".to_string());
-                    return Err(WbipcSwitchError::RpcRejected { method, code });
+                    return Err(WbipcSwitchError::RpcRejected { method: method.to_string(), code });
                 }
                 // 通知/未知帧：继续读下一帧（不猜测语义）。
             }
@@ -438,103 +510,79 @@ pub fn call_rpc(
     }
 }
 
-// ===== 切号编排 =====
+/// 内置 HTTP 代理管道名（asar 实读：broker 唯一通用管道）。
+pub const WB_REQUEST_PIPE: &str = "wb.request";
+/// 内置 HTTP 代理方法名。
+pub const HTTP_FETCH_METHOD: &str = "http.fetch";
+/// 只读验证用的后端端点（签到活动状态，spec 8.5 定案的已知端点）。
+pub const CHECKIN_STATUS_PATH: &str = "/v2/billing/meter/checkin-activity-status";
 
-/// 切号回执（脱敏；不含令牌材料）。
+/// 只读会话验证回执（真机证据链；不含任何令牌材料）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkBuddySwitchOutcome {
-    /// 目标账号 uid（本地 UUID；等于池记录 account_id）。
-    pub account_id: String,
-    /// 目标账号展示名（池记录）。
-    pub screen_name: String,
-    /// 本次是否先做了池凭据续期（false = access 充裕，未轮换）。
-    pub renewed: bool,
+pub struct WorkBuddySessionEvidence {
+    /// session_hello_ack 携带的可见管道清单（升序）。
+    pub pipes: Vec<String>,
+    /// wb.request/http.fetch 只读往返的 HTTP 状态码（0 = 通道未返回）。
+    pub http_status: u16,
+    /// 响应体字节数（base64 解码后口径）。
+    pub body_len: usize,
 }
 
-/// 从池记录构造 saveOauthToken 的 auth 对象（.info 元数据 camelCase 同形；
-/// expiresIn/refreshExpiresIn 用剩余秒数，lastRefreshTime 用当前毫秒）。
-/// **真机验证检查点**：确切键形以真机 saveOauthToken 结果为准（单测锁定
-/// 当前形态，偏差在真机验证时修正）。
-fn auth_object_from_record(record: &WorkBuddyLoginRecord, now_unix: u64) -> serde_json::Value {
-    let access_remaining = record
-        .access_token_expires_at_unix_seconds
-        .saturating_sub(now_unix);
-    let refresh_remaining = record
-        .refresh_token_expires_at_unix_seconds
-        .saturating_sub(now_unix);
-    serde_json::json!({
-        "accessToken": record.access_token,
-        "refreshToken": record.refresh_token,
-        "scope": "",
-        "domain": record.domain,
-        "sessionState": record.session_state,
-        "expiresIn": access_remaining,
-        "refreshExpiresIn": refresh_remaining,
-        "lastRefreshTime": now_unix.saturating_mul(1000),
-    })
-}
-
-/// 从 getAccount 响应提取 uid（响应形态防御：result.data.uid / result.uid /
-/// result.user.uid / result.account.uid 逐层尝试——真机验证检查点）。
-fn uid_from_account_response(response: &serde_json::Value) -> Option<String> {
-    let result = response.get("data").unwrap_or(response);
-    for path in [
-        &["uid"][..],
-        &["user", "uid"][..],
-        &["account", "uid"][..],
-        &["data", "uid"][..],
-    ] {
-        let mut cursor = result;
-        let mut ok = true;
-        for key in path {
-            match cursor.get(key) {
-                Some(next) => cursor = next,
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            if let Some(uid) = cursor.as_str() {
-                if !uid.is_empty() {
-                    return Some(uid.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 切号编排（泛型连接工厂，离线单测注入脚本化对端）：
-/// 握手 → `auth:logout` → `auth:saveOauthToken`（池内最新代次）→
-/// `auth:getAccount` 回读 uid 交叉校验。任何一步失败即中止（fail-closed），
-/// 客户端侧可能停在登出态——UI 提示用户在客户端重登或重试切号。
-pub fn switch_workbuddy_account_via_rpc(
+/// 只读会话验证（P17-A4 真机证据链；零写操作）：
+/// 握手 → `broker/ListPipes`（wb.request 必须可见，防管道名漂移）→
+/// `broker/GetPipe`（建通道）→ `c:wb.request/http.fetch` POST 签到状态
+/// （客户端自动注入 Bearer/x-user-id——200 = 客户端会话有效且代理可达）。
+pub fn verify_client_session_via_rpc(
     endpoint: &WbipcEndpoint,
-    record: &WorkBuddyLoginRecord,
-    renewed: bool,
-    now_unix: u64,
     connect: &dyn Fn() -> Result<Box<dyn WbipcTransport>, WbipcSwitchError>,
-) -> Result<WorkBuddySwitchOutcome, WbipcSwitchError> {
+) -> Result<WorkBuddySessionEvidence, WbipcSwitchError> {
     let mut transport = connect()?;
     handshake(transport.as_mut(), endpoint, "workbuddy-switch")?;
-    call_rpc(transport.as_mut(), 1, "auth:logout", serde_json::json!({}))?;
-    call_rpc(
+    let listed = call_rpc(transport.as_mut(), 1, "broker/ListPipes", serde_json::json!({}))?;
+    let pipes: Vec<String> = listed
+        .get("pipes")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !pipes.iter().any(|pipe| pipe == WB_REQUEST_PIPE) {
+        return Err(WbipcSwitchError::PipeUnavailable);
+    }
+    let got = call_rpc(
         transport.as_mut(),
         2,
-        "auth:saveOauthToken",
-        serde_json::json!({ "auth": auth_object_from_record(record, now_unix) }),
+        "broker/GetPipe",
+        serde_json::json!({ "pipe": WB_REQUEST_PIPE }),
     )?;
-    let account = call_rpc(transport.as_mut(), 3, "auth:getAccount", serde_json::json!({}))?;
-    match uid_from_account_response(&account) {
-        Some(uid) if uid == record.account_id => Ok(WorkBuddySwitchOutcome {
-            account_id: record.account_id.clone(),
-            screen_name: record.screen_name.clone(),
-            renewed,
-        }),
-        _ => Err(WbipcSwitchError::VerifyFailed),
+    if got.get("channel").and_then(|value| value.as_str()).is_none() {
+        return Err(WbipcSwitchError::Io);
     }
+    let response = call_channel(
+        transport.as_mut(),
+        3,
+        WB_REQUEST_PIPE,
+        HTTP_FETCH_METHOD,
+        serde_json::json!({
+            "method": "POST",
+            "path": CHECKIN_STATUS_PATH,
+            "headers": { "content-type": "application/json" },
+        }),
+    )?;
+    let http_status = response.get("status").and_then(|value| value.as_u64()).unwrap_or(0) as u16;
+    let body_b64 = response
+        .get("body_b64")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let body_len = b64url_decode(body_b64).map(|bytes| bytes.len()).unwrap_or(0);
+    Ok(WorkBuddySessionEvidence {
+        pipes,
+        http_status,
+        body_len,
+    })
 }
 
 #[cfg(test)]
@@ -588,7 +636,7 @@ mod tests {
         );
     }
 
-    /// ticket_id：sha256 前 16 hex（已知向量 abc → 6ca… 的前 16 位）。
+    /// ticket_id：sha256 前 16 hex（已知向量 abc → ba78… 的前 16 位）。
     #[test]
     fn ticket_id_is_sha256_prefix16() {
         assert_eq!(ticket_id("abc"), "ba7816bf8f01cfea");
@@ -605,24 +653,38 @@ mod tests {
         );
     }
 
-    /// client_proof 形态：base64url 无填充、确定性、输入敏感。
+    /// P17-A4 定案已知答案：transcript 五段为 UTF-8 字符串（nonce 段 =
+    /// base64url 串本身），与 python 独立实现交叉锁定。
     #[test]
-    fn client_proof_is_deterministic_base64url() {
-        let proof = client_proof("ticket-1", r"\\.\pipe\wb", &[1_u8; 16], &[2_u8; 16]);
-        assert!(!proof.contains('+') && !proof.contains('/') && !proof.contains('='));
-        assert_eq!(
-            proof,
-            client_proof("ticket-1", r"\\.\pipe\wb", &[1_u8; 16], &[2_u8; 16])
+    fn client_proof_matches_transcript_known_answer() {
+        let proof = client_proof(
+            "ticket-utf8",
+            r"\.\pipe\wb",
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "BBBBBBBBBBBBBBBBBBBBBB",
         );
+        assert_eq!(proof, "l5sMEQwmLGuGuHCYbU_tVnrtqAu6IVi-HOmSUELVPr8");
+        // server 角色（wbipc-s）侧证明形态不同。
+        let server = {
+            let transcript = lp4be(&[
+                b"wbipc-s",
+                b"1",
+                r"\.\pipe\wb".as_bytes(),
+                b"AAAAAAAAAAAAAAAAAAAAAA",
+                b"BBBBBBBBBBBBBBBBBBBBBB",
+            ]);
+            b64url_encode(&hmac_sha256("ticket-utf8".as_bytes(), &transcript))
+        };
+        assert_eq!(server, "Hkvu68Vm_qMxwdRRW9awOjjOnV3liMtXuhTT_z0Ggpw");
+        // 输入敏感：serverNonce 变化即变化。
         assert_ne!(
             proof,
-            client_proof("ticket-1", r"\\.\pipe\wb", &[1_u8; 16], &[3_u8; 16]),
-            "serverNonce 参与转录"
-        );
-        assert_ne!(
-            proof,
-            client_proof("ticket-2", r"\\.\pipe\wb", &[1_u8; 16], &[2_u8; 16]),
-            "ticket 参与 HMAC key"
+            client_proof(
+                "ticket-utf8",
+                r"\.\pipe\wb",
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                "CCCCCCCCCCCCCCCCCCCCCC",
+            )
         );
     }
 
@@ -638,11 +700,12 @@ mod tests {
     /// 端点解析：合法形态 + 缺字段拒绝。
     #[test]
     fn parse_endpoint_validates_shape() {
-        let endpoint = parse_endpoint(r#"{"endpoint":"\\\\.\\pipe\\wb-1","ticket":"tkt"}"#).unwrap();
+        let endpoint =
+            parse_endpoint(r#"{"endpoint":"\\\\.\\pipe\\wb-1","ticket":"tkt"}"#).unwrap();
         assert_eq!(endpoint.pipe_path, r"\\.\pipe\wb-1");
         assert_eq!(endpoint.ticket, "tkt");
         assert_eq!(
-            parse_endpoint(r#"{"endpoint":"\\\\.\\pipe\\wb"}"#).unwrap_err(),
+            parse_endpoint(r#"{"endpoint":"\.\pipe\wb"}"#).unwrap_err(),
             WbipcSwitchError::EndpointMissing
         );
         assert_eq!(
@@ -652,27 +715,31 @@ mod tests {
     }
 
     /// 握手成功路径：hello 内容（protocol/ticket_id/client_nonce）与 prove
-    /// 的 client_proof 逐段符合 spec 8.6；ack 携带 pipes。
+    /// 的 client_proof 逐段符合 asar 定案；ack 携带 pipes。
     #[test]
     fn handshake_completes_three_steps() {
         let endpoint = WbipcEndpoint {
-            pipe_path: r"\\.\pipe\wb-broker".to_string(),
+            pipe_path: r"\.\pipe\wb-broker".to_string(),
             ticket: "ticket-utf8".to_string(),
         };
         let server_nonce = b64url_encode(&[7_u8; 16]);
         let mut transport = MockTransport::scripted(&[
-            serde_json::json!({"type": "session_challenge", "server_nonce": server_nonce}),
+            serde_json::json!({
+                "type": "session_challenge",
+                "protocol": 1,
+                "server_nonce": server_nonce,
+                "server_proof": "srv-proof",
+            }),
             serde_json::json!({
                 "type": "session_hello_ack",
                 "protocol": 1,
-                "connection_epoch": 42,
+                "connection_epoch": "ce-41414141",
                 "max_inflight": 8,
-                "pipes": ["auth-pipe", "misc-pipe"],
+                "pipes": ["wb.request"],
             }),
         ]);
         let ack = handshake(&mut transport, &endpoint, "workbuddy-switch").unwrap();
-        assert_eq!(ack.connection_epoch, Some(42));
-        assert_eq!(ack.pipes, vec!["auth-pipe", "misc-pipe"]);
+        assert_eq!(ack.pipes, vec!["wb.request"]);
         // 帧序：hello → prove。
         assert_eq!(transport.sent.len(), 2);
         let hello = &transport.sent[0];
@@ -682,15 +749,14 @@ mod tests {
         assert_eq!(hello["ticket_id"], ticket_id("ticket-utf8"));
         assert_eq!(hello["client"]["kind"], "tool");
         assert_eq!(hello["client"]["id"], "workbuddy-switch");
-        // prove 的 proof 与纯函数一致（同 nonce/ticket/管道路径）。
+        // prove 的 proof 与纯函数一致（nonce 段 = base64url 串本身）。
         let prove = &transport.sent[1];
         assert_eq!(prove["type"], "session_prove");
-        let client_nonce = b64url_decode(hello["client_nonce"].as_str().unwrap()).unwrap();
         let expected = client_proof(
             "ticket-utf8",
-            r"\\.\pipe\wb-broker",
-            &client_nonce,
-            &[7_u8; 16],
+            r"\.\pipe\wb-broker",
+            hello["client_nonce"].as_str().unwrap(),
+            server_nonce.as_str(),
         );
         assert_eq!(prove["client_proof"], expected);
     }
@@ -699,7 +765,7 @@ mod tests {
     #[test]
     fn handshake_surfaces_hello_error_code() {
         let endpoint = WbipcEndpoint {
-            pipe_path: r"\\.\pipe\wb".to_string(),
+            pipe_path: r"\.\pipe\wb".to_string(),
             ticket: "t".to_string(),
         };
         let mut transport = MockTransport::scripted(&[serde_json::json!({
@@ -714,141 +780,115 @@ mod tests {
         assert!(error.code().starts_with("workbuddy_switch_handshake_failed:"));
     }
 
-    /// RPC：replyResult 取 result；replyError 携带方法与错误码；
-    /// session_hello_error 视为会话丢失。
+    /// RPC：标准 jsonrpc result/error 解析；session_hello_error 视为会话丢失。
     #[test]
     fn call_rpc_parses_reply_frames() {
-        let mut ok = MockTransport::scripted(&[serde_json::json!({"type": "replyResult", "result": {"uid": "u1"}})]);
-        let result = call_rpc(&mut ok, 1, "auth:getAccount", serde_json::json!({})).unwrap();
-        assert_eq!(result["uid"], "u1");
-        assert_eq!(ok.sent[0]["method"], "auth:getAccount");
+        let mut ok = MockTransport::scripted(&[serde_json::json!(
+            {"jsonrpc": "2.0", "id": 1, "result": {"pipes": ["wb.request"]}}
+        )]);
+        let result = call_rpc(&mut ok, 1, "broker/ListPipes", serde_json::json!({})).unwrap();
+        assert_eq!(result["pipes"][0], "wb.request");
+        assert_eq!(ok.sent[0]["method"], "broker/ListPipes");
         assert_eq!(ok.sent[0]["jsonrpc"], "2.0");
 
-        let mut rejected = MockTransport::scripted(&[serde_json::json!({
-            "type": "replyError",
-            "error": {"code": "invalid_session", "message": "no session"},
-        })]);
-        let error = call_rpc(&mut rejected, 2, "auth:logout", serde_json::json!({})).unwrap_err();
+        let mut rejected = MockTransport::scripted(&[serde_json::json!(
+            {"jsonrpc": "2.0", "id": 2, "error": {"code": "PIPE_UNKNOWN", "message": "unknown pipe"}}
+        )]);
+        let error =
+            call_rpc(&mut rejected, 2, "broker/GetPipe", serde_json::json!({})).unwrap_err();
         assert_eq!(
             error,
             WbipcSwitchError::RpcRejected {
-                method: "auth:logout",
-                code: "invalid_session".to_string(),
+                method: "broker/GetPipe".to_string(),
+                code: "PIPE_UNKNOWN".to_string(),
             }
         );
 
-        let mut lost = MockTransport::scripted(&[serde_json::json!({"type": "session_hello_error", "code": "bad_request"})]);
-        let error = call_rpc(&mut lost, 3, "auth:getAccount", serde_json::json!({})).unwrap_err();
+        let mut lost = MockTransport::scripted(&[serde_json::json!(
+            {"type": "session_hello_error", "code": "bad_request"}
+        )]);
+        let error =
+            call_rpc(&mut lost, 3, "broker/ListPipes", serde_json::json!({})).unwrap_err();
         assert!(matches!(error, WbipcSwitchError::HandshakeFailed(_)));
     }
 
-    /// 切号编排成功路径：logout → saveOauthToken（auth 对象来自池记录）→
-    /// getAccount 回读 uid 与目标一致；回执带池记录展示名。
+    /// 通道调用（P17-A4 定案）：方法 = `c:{pipe}/{method}` + 顶层 mode:"call"。
     #[test]
-    fn switch_orchestration_happy_path_verifies_uid() {
-        let endpoint = WbipcEndpoint {
-            pipe_path: r"\\.\pipe\wb".to_string(),
-            ticket: "t".to_string(),
-        };
-        let record = fixture_record();
-        let now = 1_800_000_000_u64;
-        let frames = [
-            serde_json::json!({"type": "session_challenge", "server_nonce": b64url_encode(&[9; 16])}),
-            serde_json::json!({"type": "session_hello_ack", "protocol": 1, "pipes": []}),
-            serde_json::json!({"type": "replyResult", "result": {}}),
-            serde_json::json!({"type": "replyResult", "result": {}}),
-            serde_json::json!({"type": "replyResult", "result": {"uid": record.account_id}}),
-        ];
-        let connect = move || -> Result<Box<dyn WbipcTransport>, WbipcSwitchError> {
-            Ok(Box::new(MockTransport::scripted(&frames)) as Box<dyn WbipcTransport>)
-        };
-        let outcome =
-            switch_workbuddy_account_via_rpc(&endpoint, &record, true, now, &connect).unwrap();
-        assert_eq!(outcome.account_id, "fixture-uid");
-        assert_eq!(outcome.screen_name, "测试账号");
-        assert!(outcome.renewed);
-    }
-
-    /// 切号编排：uid 回读不符 → VerifyFailed（宁可不报成功，不可错登）。
-    #[test]
-    fn switch_orchestration_rejects_uid_mismatch() {
-        let endpoint = WbipcEndpoint {
-            pipe_path: r"\\.\pipe\wb".to_string(),
-            ticket: "t".to_string(),
-        };
-        let record = fixture_record();
-        let frames = [
-            serde_json::json!({"type": "session_challenge", "server_nonce": b64url_encode(&[9; 16])}),
-            serde_json::json!({"type": "session_hello_ack", "protocol": 1, "pipes": []}),
-            serde_json::json!({"type": "replyResult", "result": {}}),
-            serde_json::json!({"type": "replyResult", "result": {}}),
-            serde_json::json!({"type": "replyResult", "result": {"uid": "other-uid"}}),
-        ];
-        let connect = move || -> Result<Box<dyn WbipcTransport>, WbipcSwitchError> {
-            Ok(Box::new(MockTransport::scripted(&frames)) as Box<dyn WbipcTransport>)
-        };
-        let error = switch_workbuddy_account_via_rpc(&endpoint, &record, false, 0, &connect)
-            .unwrap_err();
-        assert_eq!(error, WbipcSwitchError::VerifyFailed);
-    }
-
-    /// 切号编排：logout 被拒 → RpcRejected 原样上抛（fail-closed 中止）。
-    #[test]
-    fn switch_orchestration_aborts_when_logout_rejected() {
-        let endpoint = WbipcEndpoint {
-            pipe_path: r"\\.\pipe\wb".to_string(),
-            ticket: "t".to_string(),
-        };
-        let record = fixture_record();
-        let frames = [
-            serde_json::json!({"type": "session_challenge", "server_nonce": b64url_encode(&[9; 16])}),
-            serde_json::json!({"type": "session_hello_ack", "protocol": 1, "pipes": []}),
-            serde_json::json!({"type": "replyError", "error": {"code": "busy"}}),
-        ];
-        let connect = move || -> Result<Box<dyn WbipcTransport>, WbipcSwitchError> {
-            Ok(Box::new(MockTransport::scripted(&frames)) as Box<dyn WbipcTransport>)
-        };
-        let error = switch_workbuddy_account_via_rpc(&endpoint, &record, false, 0, &connect)
-            .unwrap_err();
+    fn call_channel_frames_channel_method_and_mode() {
+        let mut transport = MockTransport::scripted(&[serde_json::json!(
+            {"jsonrpc": "2.0", "id": 1, "result": {"status": 200, "body_b64": ""}}
+        )]);
+        let result = call_channel(
+            &mut transport,
+            1,
+            WB_REQUEST_PIPE,
+            HTTP_FETCH_METHOD,
+            serde_json::json!({"method": "POST", "path": "/x"}),
+        )
+        .unwrap();
+        assert_eq!(result["status"], 200);
         assert_eq!(
-            error,
-            WbipcSwitchError::RpcRejected {
-                method: "auth:logout",
-                code: "busy".to_string(),
-            }
+            transport.sent[0]["method"],
+            "c:wb.request/http.fetch",
+            "通道方法形态：c:wb.request/http.fetch"
         );
+        assert_eq!(transport.sent[0]["mode"], "call", "顶层 mode 必须为 call");
+        assert_eq!(transport.sent[0]["params"]["method"], "POST");
     }
 
-    /// auth 对象形态锁定：令牌/域名/会话标识来自池记录，有效期用剩余秒。
+    /// 只读会话验证编排：握手 → ListPipes → GetPipe → http.fetch 签到状态
+    /// → 回执（pipes/status/body_len）；wb.request 不可见 = PipeUnavailable。
     #[test]
-    fn auth_object_shapes_from_record() {
-        let record = fixture_record();
-        let object = auth_object_from_record(&record, 1_800_000_000);
-        assert_eq!(object["accessToken"], record.access_token);
-        assert_eq!(object["refreshToken"], record.refresh_token);
-        assert_eq!(object["domain"], record.domain);
-        assert_eq!(object["sessionState"], record.session_state);
-        assert_eq!(
-            object["expiresIn"],
-            record.access_token_expires_at_unix_seconds - 1_800_000_000
-        );
+    fn verify_session_orchestration_roundtrip() {
+        let endpoint = WbipcEndpoint {
+            pipe_path: r"\.\pipe\wb".to_string(),
+            ticket: "t".to_string(),
+        };
+        let body = b64url_encode(br#"{"code":0,"data":{"today_checked_in":false}}"#);
+        let frames = [
+            serde_json::json!({
+                "type": "session_challenge",
+                "protocol": 1,
+                "server_nonce": b64url_encode(&[9; 16]),
+                "server_proof": "srv",
+            }),
+            serde_json::json!({"type": "session_hello_ack", "protocol": 1, "pipes": ["wb.request"]}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"pipes": ["wb.request"]}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {"channel": "c:wb.request", "methods": ["http.fetch"]}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": {"status": 200, "headers": {}, "body_b64": body}}),
+        ];
+        let connect = move || -> Result<Box<dyn WbipcTransport>, WbipcSwitchError> {
+            Ok(Box::new(MockTransport::scripted(&frames)) as Box<dyn WbipcTransport>)
+        };
+        let evidence = verify_client_session_via_rpc(&endpoint, &connect).unwrap();
+        assert_eq!(evidence.pipes, vec!["wb.request"]);
+        assert_eq!(evidence.http_status, 200);
+        assert!(evidence.body_len > 0);
     }
 
-    fn fixture_record() -> WorkBuddyLoginRecord {
-        WorkBuddyLoginRecord {
-            profile_id: "wb-fixture".to_string(),
-            account_id: "fixture-uid".to_string(),
-            screen_name: "测试账号".to_string(),
-            masked_mobile: String::new(),
-            access_token: "at".to_string(),
-            refresh_token: "rt".to_string(),
-            access_token_expires_at_unix_seconds: 1_800_000_000 + 100,
-            refresh_token_expires_at_unix_seconds: 1_800_000_000 + 200,
-            domain: "www.workbuddy.cn".to_string(),
-            session_state: "ss".to_string(),
-            device_id: "dev".to_string(),
-            minted_at_unix_seconds: 1_799_000_000,
-            last_updated_at_unix_seconds: 1_799_000_000,
-        }
+    /// 只读会话验证：wb.request 不在可见清单 → PipeUnavailable（fail-closed）。
+    #[test]
+    fn verify_session_rejects_missing_request_pipe() {
+        let endpoint = WbipcEndpoint {
+            pipe_path: r"\.\pipe\wb".to_string(),
+            ticket: "t".to_string(),
+        };
+        let frames = [
+            serde_json::json!({
+                "type": "session_challenge",
+                "protocol": 1,
+                "server_nonce": b64url_encode(&[9; 16]),
+                "server_proof": "srv",
+            }),
+            serde_json::json!({"type": "session_hello_ack", "protocol": 1, "pipes": ["other"]}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"pipes": ["other"]}}),
+        ];
+        let connect = move || -> Result<Box<dyn WbipcTransport>, WbipcSwitchError> {
+            Ok(Box::new(MockTransport::scripted(&frames)) as Box<dyn WbipcTransport>)
+        };
+        assert_eq!(
+            verify_client_session_via_rpc(&endpoint, &connect).unwrap_err(),
+            WbipcSwitchError::PipeUnavailable
+        );
     }
 }
