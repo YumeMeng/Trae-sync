@@ -90,7 +90,8 @@ const TRAE_CN_OPERATIONS: &[ProductOperationStateDto] = &[
         "account.health_check",
         OperationReadiness::Ready,
         "Trae CN 账号健康检测已完成现有验收。",
-        Some(".scratch/checkin-http/reports/trae-cn-health-probe-1790684645.json#trae-cn-health-probe"),
+        // P17-A7：证据锚点持久化到 tickets（原 .scratch 探针报告被清理）。
+        Some("tickets.new.md#P2-4"),
     ),
     operation(
         "account.tool_selection",
@@ -108,7 +109,7 @@ const TRAE_CN_OPERATIONS: &[ProductOperationStateDto] = &[
         "checkin.status",
         OperationReadiness::Ready,
         "签到状态查询已通过只读探针验证。",
-        Some(".scratch/checkin-http/reports/trae-cn-checkin-probe-20260928.json#trae-cn-checkin-status-probe"),
+        Some("tickets.new.md#P1-3"), // P17-A7：探针证据持久化（原 .scratch 报告被清理）
     ),
     // P15-10：checkin.claim 惰性条目清理（原 Pending「真实领取尚待验收」；
     // 融合版身份下的真实 claim 验收由签到域真机关口承载，注册表不再登记）。
@@ -122,7 +123,7 @@ const TRAE_CN_OPERATIONS: &[ProductOperationStateDto] = &[
         "library.read",
         OperationReadiness::Ready,
         "Trae CN 数据根只读浏览已实现。",
-        Some(".scratch/checkin-http/reports/trae-cn-library-read-probe-1790681305.json#trae-cn-library-read-probe"),
+        Some("tickets.new.md#P5-3"), // P17-A7：探针证据持久化
     ),
     operation(
         "library.archive",
@@ -799,7 +800,10 @@ mod tests {
             (
                 "trae_cn",
                 "account.health_check",
-                ".scratch/checkin-http/reports/trae-cn-health-probe-1790684645.json#trae-cn-health-probe",
+                // P17-A7：原 .scratch 探针报告被空间治理清理，证据锚点改持久化
+                // 到 tickets（P2-4 含"健康检测"+"Rust 单测 11 项"双标记，与
+                // work_cn 侧同源语义）。
+                "tickets.new.md#P2-4",
             ),
             (
                 "trae_cn",
@@ -809,12 +813,12 @@ mod tests {
             (
                 "trae_cn",
                 "checkin.status",
-                ".scratch/checkin-http/reports/trae-cn-checkin-probe-20260928.json#trae-cn-checkin-status-probe",
+                "tickets.new.md#P1-3",
             ),
             (
                 "trae_cn",
                 "library.read",
-                ".scratch/checkin-http/reports/trae-cn-library-read-probe-1790681305.json#trae-cn-library-read-probe",
+                "tickets.new.md#P5-3",
             ),
         ];
         let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
