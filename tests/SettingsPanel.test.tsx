@@ -168,12 +168,13 @@ describe("设置面板", () => {
     freshRefresh.resolve({ enabled: false, keep: 3 });
     await waitFor(() => {
       expect(screen.getByTestId("backup-retention-enabled-select")).toHaveValue("off");
-      expect(screen.getByTestId("backup-retention-keep-input")).toHaveValue(3);
+      // P17-A3：保留份数输入已退役，滚动单份说明随开关状态切换。
+      expect(screen.getByTestId("backup-retention-hint")).toHaveTextContent(/不会被自动删除/);
     });
     delayedInitial.resolve({ enabled: true, keep: 9 });
     await waitFor(() => {
       expect(screen.getByTestId("backup-retention-enabled-select")).toHaveValue("off");
-      expect(screen.getByTestId("backup-retention-keep-input")).toHaveValue(3);
+      expect(screen.getByTestId("backup-retention-hint")).toHaveTextContent(/不会被自动删除/);
     });
   });
 
@@ -503,9 +504,9 @@ describe("设置面板", () => {
 
     render(<SettingsPanel active={true} />);
     const settings = await screen.findByTestId("backup-retention-settings");
-    // 开启态：hint 说明超出保留份数自动删除。
-    expect(screen.getByTestId("backup-retention-hint")).toHaveTextContent(/自动删除/);
-    expect(screen.getByTestId("backup-retention-keep-input")).toHaveValue(5);
+    // P17-A3 滚动单份：开启态说明只保留最新一份。
+    expect(screen.getByTestId("backup-retention-hint")).toHaveTextContent(/只保留最新一份/);
+    expect(screen.queryByTestId("backup-retention-keep-input")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByTestId("backup-retention-enabled-select"), { target: { value: "off" } });
     await waitFor(() => {
@@ -514,43 +515,66 @@ describe("设置面板", () => {
     await waitFor(() => {
       expect(notifyMock.success).toHaveBeenCalledWith("备份自动清理已关闭，旧备份不会再被自动删除。");
     });
-    // 关闭后保留份数输入禁用。
-    expect(screen.getByTestId("backup-retention-keep-input")).toBeDisabled();
     expect(settings).toBeInTheDocument();
   });
 
-  it("P5-9：修改保留份数立即保存，越界值不提交", async () => {
-    let retention = { enabled: true, keep: 5 };
-    const calls: Array<{ enabled: boolean; keep: number }> = [];
+  it("P17-A2：从备份还原需单次确认，确认后调用还原并重读备份链", async () => {
+    const stamp = 1756000000;
     mockRoute("get_master_backup_chain", () => ({
-      backups: [],
-      backup_dir: "D:\\bak",
-      keep_policy: 5,
+      backups: [{ stamp_unix_seconds: stamp, total_bytes: 1024, has_wal: false, has_credentials: false }],
+      backup_dir: "D:////bak",
+      keep_policy: 1,
     }));
-    mockRoute("get_backup_retention", () => ({ ...retention }));
-    mockRoute("set_backup_retention", (args) => {
-      const payload = args as { enabled: boolean; keep: number };
-      calls.push(payload);
-      retention = { ...payload };
-      return undefined;
-    });
+    mockRoute("restore_master_backup", () => ({
+      stamp_unix_seconds: stamp,
+      checkup_status: "ready",
+      relaunch_outcome: "launched",
+    }));
 
     render(<SettingsPanel active={true} />);
-    await screen.findByTestId("backup-retention-settings");
+    await screen.findByTestId("master-backup-section");
 
-    fireEvent.change(screen.getByTestId("backup-retention-keep-input"), { target: { value: "12" } });
+    // 点还原 → 弹单次确认；取消时不调用后端。
+    fireEvent.click(screen.getByTestId(`master-backup-restore-${stamp}`));
+    expect(await screen.findByTestId("master-restore-dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("master-restore-dialog-cancel"));
+    expect(mockInvoke).not.toHaveBeenCalledWith("restore_master_backup", expect.anything());
+
+    // 确认后调用还原（stamp 参数化）并成功提示体检通过。
+    fireEvent.click(screen.getByTestId(`master-backup-restore-${stamp}`));
+    await screen.findByTestId("master-restore-dialog");
+    fireEvent.click(screen.getByTestId("master-restore-dialog-confirm"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("set_backup_retention", { enabled: true, keep: 12 });
+      expect(mockInvoke).toHaveBeenCalledWith("restore_master_backup", { stamp });
     });
     await waitFor(() => {
       expect(notifyMock.success).toHaveBeenCalledWith(
-        "备份自动清理已开启，超出 12 份的旧备份会在新备份生成后自动删除。",
+        "主库已从备份还原，体检复核通过，TRAE 已重新启动。",
       );
     });
+  });
 
-    // 越界值（51）不提交，避免后端拒绝后设置与界面不一致。
-    const before = calls.length;
-    fireEvent.change(screen.getByTestId("backup-retention-keep-input"), { target: { value: "51" } });
-    expect(calls).toHaveLength(before);
+  it("P17-A2：还原校验失败给出稳定提示且原数据未受影响语义", async () => {
+    const stamp = 1756000001;
+    mockRoute("get_master_backup_chain", () => ({
+      backups: [{ stamp_unix_seconds: stamp, total_bytes: 1024, has_wal: false, has_credentials: false }],
+      backup_dir: "D:////bak",
+      keep_policy: 1,
+    }));
+    mockRoute("restore_master_backup", () => {
+      throw new Error("master_restore_backup_invalid");
+    });
+
+    render(<SettingsPanel active={true} />);
+    await screen.findByTestId("master-backup-section");
+
+    fireEvent.click(screen.getByTestId(`master-backup-restore-${stamp}`));
+    await screen.findByTestId("master-restore-dialog");
+    fireEvent.click(screen.getByTestId("master-restore-dialog-confirm"));
+    await waitFor(() => {
+      expect(notifyMock.error).toHaveBeenCalledWith(
+        expect.stringMatching(/备份校验未通过/),
+      );
+    });
   });
 });

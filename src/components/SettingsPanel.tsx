@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CalendarClock, DatabaseBackup, FolderSymlink } from "lucide-react";
+import { ArchiveRestore, CalendarClock, DatabaseBackup, FolderSymlink } from "lucide-react";
 import type { AutoCheckinStatusDto } from "../types/account_switch";
 import type {
   BackupMigrationDto,
   BackupRetentionDto,
   MasterBackupChainDto,
+  MasterRestoreResultDto,
 } from "../types/masterLibrary";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { EmptyState } from "./EmptyState";
 
 interface SettingsPanelProps {
@@ -34,9 +36,13 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
   const [locationInput, setLocationInput] = useState("");
   const [migrateExisting, setMigrateExisting] = useState(true);
   const [locationBusy, setLocationBusy] = useState(false);
-  // P5-9 备份保留设置：自动清理开关 + 保留份数（与备份链同分区展示）。
+  // P5-9 备份保留设置（P17-A3 滚动单份语义）：自动清理开关保留为开关；
+  // 保留份数已退役（同目录同时刻只有一份备份）。
   const [retention, setRetention] = useState<BackupRetentionDto | null>(null);
   const [retentionBusy, setRetentionBusy] = useState(false);
+  // P17-A2 从备份还原主库：单次确认弹层（覆盖性操作）→ 执行 → 刷新备份链。
+  const [restoreTarget, setRestoreTarget] = useState<number | null>(null);
+  const [restoreBusy, setRestoreBusy] = useState(false);
 
   // 页面失活期间的界面回写守卫：只以活动状态区分「本页操作」与「后台收尾」。
   const currentActive = useRef(active);
@@ -177,25 +183,53 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       .finally(() => setLocationBusy(false));
   }, [locationBusy, locationInput, migrateExisting, loadBackupChain]);
 
-  // P5-9 保存备份保留设置：开关与保留份数一起提交（后端范围校验 1-50）。
-  const handleSaveRetention = useCallback((enabled: boolean, keep: number) => {
-    if (retentionBusy) return;
+  // P5-9/P17-A3 保存备份保留设置：开关即滚动清理开关（keep 字段保留传值
+  // 兼容后端契约，语义已退役为滚动单份）。
+  const handleSaveRetention = useCallback((enabled: boolean) => {
+    if (retentionBusy || !retention) return;
     setRetentionBusy(true);
-    void invoke("set_backup_retention", { enabled, keep })
+    void invoke("set_backup_retention", { enabled, keep: retention.keep })
       .then(() => {
-        setRetention({ enabled, keep });
+        setRetention({ ...retention, enabled });
         return loadRetention().catch(() => undefined);
       })
       .then(() => {
         notify.success(enabled
-          ? `备份自动清理已开启，超出 ${keep} 份的旧备份会在新备份生成后自动删除。`
+          ? "备份自动清理已开启：同目录只保留最新一份备份，更早的会在新备份生成后删除。"
           : "备份自动清理已关闭，旧备份不会再被自动删除。");
       })
       .catch((reason: unknown) => notify.error(
         safeUiErrorMessage(reason, "备份清理设置保存失败。"),
       ))
       .finally(() => setRetentionBusy(false));
-  }, [loadRetention, retentionBusy]);
+  }, [loadRetention, retention, retentionBusy]);
+
+  // P17-A2 从备份还原主库：关闭 TRAE → 校验备份 → 覆盖还原 → 体检复核
+  // → 重启实例。失败时原数据未动（校验先于一切写动作）。
+  const handleRestoreBackup = useCallback(() => {
+    if (restoreBusy || restoreTarget === null) return;
+    setRestoreBusy(true);
+    void invoke<MasterRestoreResultDto>("restore_master_backup", { stamp: restoreTarget })
+      .then((receipt) => {
+        if (receipt.checkup_status === "ready") {
+          notify.success("主库已从备份还原，体检复核通过，TRAE 已重新启动。");
+        } else {
+          notify.summary(
+            "主库已还原，但恢复后体检未通过，请到库详情页复核",
+            [{ displayName: "恢复后体检", reason: receipt.checkup_status === "read_failed"
+              ? "数据库无法读取（密钥或文件异常）"
+              : "未检出主库数据" }],
+            0,
+          );
+        }
+        setRestoreTarget(null);
+        return loadBackupChain();
+      })
+      .catch((reason: unknown) => notify.error(
+        safeUiErrorMessage(reason, "主库还原未完成，原数据未受影响。"),
+      ))
+      .finally(() => setRestoreBusy(false));
+  }, [loadBackupChain, restoreBusy, restoreTarget]);
 
   // 保存自动签到设置：开关与时间一起提交（后端原子写保留台账 + 格式校验）。
   const handleSaveAutoCheckin = useCallback((enabled: boolean, dailyTime: string) => {
@@ -293,34 +327,16 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
                   <select
                     value={retention.enabled ? "on" : "off"}
                     disabled={retentionBusy}
-                    onChange={(event) => handleSaveRetention(event.target.value === "on", retention.keep)}
+                    onChange={(event) => handleSaveRetention(event.target.value === "on")}
                     data-testid="backup-retention-enabled-select"
                   >
-                    <option value="on">开启（超出保留数自动删除）</option>
-                    <option value="off">关闭（永不自动删除）</option>
+                    <option value="on">开启（只保留最新一份）</option>
+                    <option value="off">关闭（旧备份不自动删除）</option>
                   </select>
-                </label>
-                <label className="account-center__target-field">
-                  <span>保留份数（1-50）</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={50}
-                    value={retention.keep}
-                    disabled={retentionBusy || !retention.enabled}
-                    onChange={(event) => {
-                      const next = Number(event.target.value);
-                      // 空输入或越界值不保存；1-50 内立即提交。
-                      if (Number.isFinite(next) && next >= 1 && next <= 50) {
-                        handleSaveRetention(retention.enabled, Math.floor(next));
-                      }
-                    }}
-                    data-testid="backup-retention-keep-input"
-                  />
                 </label>
                 <span className="account-center__meta" data-testid="backup-retention-hint">
                   {retention.enabled
-                    ? "超出保留份数的旧备份，会在新备份生成后自动删除"
+                    ? "同一时刻只保留最新一份备份；新备份生成后，更早的会自动删除"
                     : "当前未开启自动清理，备份不会被自动删除"}
                 </span>
               </div>
@@ -343,6 +359,18 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
                         含凭据
                       </span>
                     )}
+                    {/* P17-A2 从备份还原：覆盖性操作，先弹单次确认。 */}
+                    <button
+                      className="btn btn--quiet settings-backup__restore"
+                      type="button"
+                      onClick={() => setRestoreTarget(entry.stamp_unix_seconds)}
+                      disabled={restoreBusy}
+                      data-testid={`master-backup-restore-${entry.stamp_unix_seconds}`}
+                      title="用这份备份覆盖当前主库数据（需先关闭 TRAE，系统会自动关闭）"
+                    >
+                      <ArchiveRestore size={14} aria-hidden="true" />
+                      还原
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -465,6 +493,26 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
               </div>
             </div>
           )}
+        {/* P17-A2 还原主库：单次确认弹层（覆盖性操作——用备份内容替换当前
+            主库数据，备份之后的对话/账号变化会丢失）。 */}
+        {restoreTarget !== null && (
+          <ConfirmDialog
+            title="从备份还原主库"
+            lines={[
+              "将用所选备份覆盖当前主库数据：备份之后的对话、账号变化会丢失。",
+              "系统会先自动关闭 TRAE，校验备份完整后再覆盖；校验不通过则原数据不受影响。",
+              "还原完成后会自动做一次数据库体检并重新启动 TRAE。",
+            ]}
+            confirmLabel="确认还原"
+            busyLabel="还原中…"
+            busy={restoreBusy}
+            onCancel={() => {
+              if (!restoreBusy) setRestoreTarget(null);
+            }}
+            onConfirm={() => void handleRestoreBackup()}
+            testId="master-restore-dialog"
+          />
+        )}
         </>
       )}
     </section>

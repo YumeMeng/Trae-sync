@@ -72,8 +72,21 @@ export interface MasterBackupChainDto {
 export interface BackupRetentionDto {
   /** 自动清理开关；false = 永不自动删除。 */
   readonly enabled: boolean;
-  /** 保留最近 N 份（含刚生成的最新备份；范围 1-50）。 */
+  /** P17-A3：保留份数语义已退役（滚动单份定案），字段仅为后端契约兼容。 */
   readonly keep: number;
+}
+
+/**
+ * P17-A2 主库还原回执（restore_master_backup 返回）。
+ * 字段与 src-tauri/src/library_archive.rs 的 MasterRestoreResultDto 一致。
+ */
+export interface MasterRestoreResultDto {
+  /** 还原的备份时间戳。 */
+  readonly stamp_unix_seconds: number;
+  /** 恢复后体检结论：ready / no_master_data / read_failed。 */
+  readonly checkup_status: string;
+  /** 主库实例重启结果（launched / failed）。 */
+  readonly relaunch_outcome: string;
 }
 
 /**

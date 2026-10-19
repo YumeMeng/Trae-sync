@@ -1876,6 +1876,248 @@ pub(crate) fn resolve_library_backup_dir(
     db_path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
+// ===== P17-A2 手动恢复主库入口 =====
+
+/// 手动恢复主库回执（restore_master_backup 返回）。
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MasterRestoreResultDto {
+    /// 还原的备份时间戳。
+    stamp_unix_seconds: u64,
+    /// 恢复后体检结论：ready / no_master_data / read_failed（体检自动触发，
+    /// P17-A2——恢复完成后立即复核库可读性与账号归属）。
+    checkup_status: String,
+    /// 主库实例重启结果（launched / failed；fail-soft，与归档提交同口径）。
+    relaunch_outcome: String,
+}
+
+/// P17-A2 可测内核：实例生命周期动作注入（离线单测同归档编排模式）。
+///
+/// 编排（spec 10.2 手动恢复入口）：
+/// 1. 备份存在性：请求 stamp 必须在活动备份目录链内（命名异常散件不认）；
+/// 2. 三件套完整性 + 格式合法性校验（**不动主库**）：db 成员解压到隔离
+///    临时目录，用真实密钥开库体检（打不开/密钥不符/结构缺失 = 拒绝）；
+/// 3. 关闭主库实例（trae_instance 编排幂等；关闭失败 = 未关实例拒绝，
+///    不动任何数据）；
+/// 4. 覆盖还原：先彻底删除现有 db/wal/shm，再按备份实际拥有的成员写出
+///    （tmp + rename 原子落位；备份无 wal/shm 时不残留旧附属件）；
+/// 5. 体检自动触发（P15-11 缓存作废 + 实测体检）+ 重启实例（fail-soft）。
+#[allow(clippy::too_many_arguments)]
+fn restore_master_backup_with_lifecycle(
+    master_dir: &Path,
+    backup_dir: &Path,
+    raw_key: &str,
+    stamp: u64,
+    close_client: &dyn Fn(&Path) -> Result<(), String>,
+    relaunch_client: &dyn Fn(&Path, &str) -> Result<(), String>,
+    window_title: &str,
+) -> Result<MasterRestoreResultDto, String> {
+    use traesync_infrastructure::master_checkup::{read_master_checkup, MasterCheckupStatus};
+    use traesync_infrastructure::master_handover::{
+        backup_member_file_names, decompress_backup_member, list_master_backups_in,
+    };
+
+    let db_path = master_database_path(master_dir);
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "master_restore_failed".to_string())?
+        .to_string();
+
+    // 1) 备份存在性。
+    let in_chain = list_master_backups_in(backup_dir, &db_name)
+        .iter()
+        .any(|entry| entry.stamp_unix_seconds == stamp);
+    if !in_chain {
+        return Err("master_restore_backup_missing".to_string());
+    }
+    let names = backup_member_file_names(&db_name, stamp);
+    let (plain_db, zst_db) = (backup_dir.join(&names[0]), backup_dir.join(&names[1]));
+    if !plain_db.is_file() && !zst_db.is_file() {
+        return Err("master_restore_backup_missing".to_string());
+    }
+
+    // 2) 完整性 + 格式合法性校验（隔离临时目录开库；密钥不符在此暴露）。
+    let validation_dir = std::env::temp_dir().join(format!(
+        "trae-sync-restore-validate-{stamp}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&validation_dir);
+    std::fs::create_dir_all(&validation_dir).map_err(|_| "master_restore_failed".to_string())?;
+    let validate_result = (|| -> Result<(), String> {
+        // read_master_checkup 按 master_database_path（ModularData/ai-agent/
+        // database.db 嵌套布局）寻库——临时目录需镜像该结构。
+        let staged = master_database_path(&validation_dir);
+        std::fs::create_dir_all(staged.parent().unwrap())
+            .map_err(|_| "master_restore_failed".to_string())?;
+        if zst_db.is_file() {
+            decompress_backup_member(&zst_db, &staged)
+        } else {
+            std::fs::copy(&plain_db, &staged)
+                .map(|_| ())
+                .map_err(|_| MasterHandoverError::Io)
+        }
+        .map_err(|_| "master_restore_backup_invalid".to_string())?;
+        // 体检口径校验：真实密钥开库 + 结构可读（校验通过 = 三件套主件合法）。
+        if !matches!(
+            read_master_checkup(&validation_dir, raw_key),
+            MasterCheckupStatus::Ready(_)
+        ) {
+            return Err("master_restore_backup_invalid".to_string());
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&validation_dir);
+    validate_result?;
+
+    // 3) 关闭主库实例（幂等编排；关闭失败 = 未关实例拒绝，零副作用）。
+    close_client(master_dir).map_err(|error| {
+        if error == "master_restore_close_failed" {
+            error
+        } else {
+            "master_restore_close_failed".to_string()
+        }
+    })?;
+
+    // 4) 覆盖还原：先彻底删除现有三件套（备份属可再生数据，spec 10.4
+    //    删除纪律——直删不走回收站），再按备份实际成员 tmp+rename 原子落位。
+    let atomic_write = |source: &Path, target: &Path| -> Result<(), String> {
+        let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+        tmp_name.push(".restore-tmp");
+        let temporary = target.with_file_name(tmp_name);
+        let _ = std::fs::remove_file(&temporary);
+        if zst_variant_of(source).is_some() {
+            decompress_backup_member(source, &temporary)
+        } else {
+            std::fs::copy(source, &temporary)
+                .map(|_| ())
+                .map_err(|_| MasterHandoverError::Io)
+        }
+        .map_err(|_| "master_restore_failed".to_string())?;
+        std::fs::rename(&temporary, target).map_err(|_| "master_restore_failed".to_string())
+    };
+    let _ = std::fs::remove_file(&db_path);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(db_path.with_file_name(format!("{db_name}{suffix}")));
+    }
+    if zst_db.is_file() {
+        atomic_write(&zst_db, &db_path)?;
+    } else {
+        atomic_write(&plain_db, &db_path)?;
+    }
+    // wal/shm：备份有则原样写回，无则保持删除（不残留旧运行附属件）。
+    for suffix in ["-wal", "-shm"] {
+        let (plain, zst) = (
+            backup_dir.join(&format!("{db_name}.switch-bak-{stamp}{suffix}")),
+            backup_dir.join(&format!("{db_name}.switch-bak-{stamp}{suffix}.zst")),
+        );
+        if zst.is_file() {
+            atomic_write(&zst, &db_path.with_file_name(format!("{db_name}{suffix}")))?;
+        } else if plain.is_file() {
+            atomic_write(&plain, &db_path.with_file_name(format!("{db_name}{suffix}")))?;
+        }
+    }
+
+    // 5) 体检自动触发（缓存作废 + 实测）+ 重启实例（fail-soft）。
+    traesync_infrastructure::master_checkup::invalidate_master_checkup_cache();
+    let checkup_status = match read_master_checkup(master_dir, raw_key) {
+        MasterCheckupStatus::Ready(_) => "ready",
+        MasterCheckupStatus::NoMasterData => "no_master_data",
+        MasterCheckupStatus::ReadFailed => "read_failed",
+    };
+    let relaunch_outcome = match relaunch_client(master_dir, window_title) {
+        Ok(()) => "launched".to_string(),
+        Err(_) => "failed".to_string(),
+    };
+    Ok(MasterRestoreResultDto {
+        stamp_unix_seconds: stamp,
+        checkup_status: checkup_status.to_string(),
+        relaunch_outcome,
+    })
+}
+
+/// 成员源是否为压缩形态（恢复 tmp 写出选解压或复制；文件名 .zst 后缀判定）。
+fn zst_variant_of(source: &Path) -> Option<&Path> {
+    source
+        .to_str()
+        .filter(|name| name.ends_with(".zst"))
+        .map(|_| source)
+}
+
+/// P17-A2：从备份还原主库（设置页「从备份还原」入口，覆盖性操作）。
+///
+/// 前置：主库实例由 trae_instance 编排幂等关闭（运行中先关闭；关闭失败
+/// 拒绝 = `master_restore_close_failed`）。校验（三件套完整/格式合法）
+/// 通过后才动主库数据；完成后体检自动触发并重启实例。
+#[tauri::command]
+pub(crate) async fn restore_master_backup(
+    stamp: u64,
+    state: tauri::State<'_, AppState>,
+) -> Result<MasterRestoreResultDto, String> {
+    ensure_real_preview(&state)?;
+    if state.source_raw_key.is_empty() {
+        return Err("source_key_unavailable".to_string());
+    }
+    let storage_root = PathBuf::from(&state.storage_root);
+    let recovery_root = PathBuf::from(&state.recovery_root);
+    let raw_key = state.source_raw_key.clone();
+    let material_root = checkin_material_root(&state)?;
+    run_blocking("master_restore_join_failed", move || {
+        let master_dir =
+            master_data_dir().map_err(|_| "environment_registry_invalid".to_string())?;
+        let _lease = OperationLease::acquire_shared_for_path(&recovery_root, &master_dir)
+            .map_err(|error| format!("operation_lease_unavailable:{error}"))?;
+        let backup_dir = resolve_master_backup_dir(&storage_root, &master_database_path(&master_dir));
+        // 重启窗口标题：主库 = 当前账号名（P5-5 口径；解析失败回退产品名）。
+        let window_title = library_account::resolve_library_account(
+            &material_root,
+            &storage_root,
+            &resolve_library_context(None, &storage_root)?,
+        )
+        .ok()
+        .flatten()
+        .and_then(LibraryAccountResolution::into_account)
+        .map(|record| {
+            record
+                .display_name
+                .clone()
+                .unwrap_or_else(|| record.screen_name.clone())
+        })
+        .unwrap_or_else(|| "TRAE".to_string());
+        // trae_instance 编排注入：幂等关闭 + 重启（与切号/归档同源）。
+        let close_client = |dir: &Path| -> Result<(), String> {
+            close_instance(TraeProduct::TraeCn, dir)
+                .map(|_| ())
+                .map_err(|error| {
+                    let _ = crate::process_guard::close_failure_code(error, "master_restore_close_failed");
+                    "master_restore_close_failed".to_string()
+                })
+        };
+        let relaunch_client = |dir: &Path, title: &str| -> Result<(), String> {
+            launch_instance_common(TraeProduct::TraeCn, dir, title, None)
+                .map(|_| ())
+                .map_err(|error| {
+                    let _ = error;
+                    "master_restore_relaunch_failed".to_string()
+                })
+        };
+        restore_master_backup_with_lifecycle(
+            &master_dir,
+            &backup_dir,
+            &raw_key,
+            stamp,
+            &close_client,
+            &relaunch_client,
+            &window_title,
+        )
+    })
+    .await
+}
+
+
 /// P11-4① 备份位置校验（set/migrate 命令同口径）：绝对路径、长度上限、
 /// 可创建（目录或其父级）、不落入签到材料根（防凭据材料与备份互混）。
 /// 返回可直接使用的路径；None = 恢复默认位置。
@@ -7833,5 +8075,285 @@ pub mod acceptance_probe {
             "source_dir": source_dir.display().to_string(),
             "target_dir": target_dir.display().to_string(),
         }))
+    }
+}
+
+// ============================================================================
+// P17-A2 手动恢复主库（restore_master_backup_with_lifecycle）单测
+// ============================================================================
+
+#[cfg(test)]
+mod restore_master_tests {
+    use super::*;
+    use rusqlite::{Connection, OpenFlags};
+    use tempfile::TempDir;
+
+    /// 还原测试夹具：主库（合法 SQLCipher fixture，与体检读面同 schema）
+    /// + 活动备份目录。
+    struct RestoreFixture {
+        _root: TempDir,
+        master_dir: PathBuf,
+        backup_dir: PathBuf,
+        raw_key: String,
+    }
+
+    impl RestoreFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let master_dir = root.path().join("master");
+            let backup_dir = root.path().join("backups");
+            std::fs::create_dir_all(&backup_dir).unwrap();
+            let raw_key = "cd".repeat(32);
+            Self::seed_db(&master_dir, &raw_key);
+            Self {
+                _root: root,
+                master_dir,
+                backup_dir,
+                raw_key,
+            }
+        }
+
+        /// 建库：schema 与体检读面一致（read_master_checkup 校验通过的前提）。
+        fn seed_db(master_dir: &Path, raw_key: &str) {
+            let db_path = master_database_path(master_dir);
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let conn = Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{raw_key}'\";"))
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (
+                    project_id TEXT PRIMARY KEY, user_id TEXT,
+                    biz_project_id TEXT, name TEXT, deleted_at INTEGER);
+                 CREATE TABLE chat_session (
+                    session_id TEXT PRIMARY KEY, project_id TEXT, session_title TEXT,
+                    updated_at INTEGER, deleted_at INTEGER, hidden_status TEXT);
+                 CREATE TABLE chat_message (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE,
+                    session_id TEXT, message_role TEXT, message_index INTEGER,
+                    reply_to_message_id TEXT, response_message_id TEXT, deleted_at INTEGER);
+                 CREATE TABLE chat_message_general (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE,
+                    content TEXT, created_at TEXT);
+                 CREATE TABLE chat_message_task (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE,
+                    content TEXT, created_at TEXT);
+                 CREATE TABLE chat_turn (turn_id TEXT PRIMARY KEY, session_id TEXT, deleted_at INTEGER);
+                 CREATE TABLE task (task_id TEXT PRIMARY KEY, session_id TEXT, deleted_at INTEGER);
+                 CREATE TABLE history_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, history_v2_id TEXT UNIQUE,
+                    session_id TEXT, messages TEXT, created_at TEXT);
+                 CREATE TABLE agent_run (agent_run_id TEXT PRIMARY KEY, session_id TEXT);
+                 CREATE TABLE session_project (session_id TEXT PRIMARY KEY, project_id TEXT);
+                 CREATE TABLE server_history_info (
+                    id INTEGER PRIMARY KEY, session_id TEXT, conversation_id TEXT,
+                    source TEXT, user_id TEXT);
+                 INSERT INTO project VALUES ('project-1', 'account-1', 'biz-1', '项目一', NULL);",
+            )
+            .unwrap();
+        }
+
+        fn open_conn(&self) -> Connection {
+            let conn = Connection::open_with_flags(
+                master_database_path(&self.master_dir),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", self.raw_key))
+                .unwrap();
+            conn
+        }
+
+        fn project_count(&self) -> i64 {
+            self.open_conn()
+                .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+                .unwrap()
+        }
+
+        /// 拍一份滚动备份（压缩形态，覆盖解压还原路径），返回 stamp。
+        fn take_backup(&self) -> u64 {
+            let backup = traesync_infrastructure::master_handover::backup_master_trio_rolling(
+                &master_database_path(&self.master_dir),
+                &self.backup_dir,
+            )
+            .unwrap();
+            let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+            name.trim_start_matches("database.db.switch-bak-")
+                .trim_end_matches(".zst")
+                .parse()
+                .unwrap()
+        }
+    }
+
+    fn ok_close(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ok_relaunch(_: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 还原成功：备份后写入的漂移被覆盖回备份时点；体检自动触发 ready；
+    /// 实例重启回执 launched。
+    #[test]
+    fn restore_overwrites_master_with_backup_content() {
+        let fixture = RestoreFixture::new();
+        let stamp = fixture.take_backup();
+        // 漂移：备份后新增一行项目。
+        fixture
+            .open_conn()
+            .execute(
+                "INSERT INTO project VALUES ('project-2', 'account-1', 'biz-2', '漂移', NULL)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(fixture.project_count(), 2);
+
+        let receipt = restore_master_backup_with_lifecycle(
+            &fixture.master_dir,
+            &fixture.backup_dir,
+            &fixture.raw_key,
+            stamp,
+            &ok_close,
+            &ok_relaunch,
+            "测试账号",
+        )
+        .unwrap();
+        assert_eq!(receipt.stamp_unix_seconds, stamp);
+        assert_eq!(receipt.checkup_status, "ready", "恢复后体检自动触发且通过");
+        assert_eq!(receipt.relaunch_outcome, "launched");
+        // 漂移被覆盖：库内容回到备份时点。
+        assert_eq!(fixture.project_count(), 1);
+    }
+
+    /// 文件校验失败拒绝：备份 db 成员损坏（非法 zst）→ 拒绝还原，
+    /// 主库原数据不受影响（漂移行保留）。
+    #[test]
+    fn restore_rejects_invalid_backup_without_touching_master() {
+        let fixture = RestoreFixture::new();
+        let stamp = fixture.take_backup();
+        fixture
+            .open_conn()
+            .execute(
+                "INSERT INTO project VALUES ('project-2', 'account-1', 'biz-2', '漂移', NULL)",
+                [],
+            )
+            .unwrap();
+        // 损坏备份 db 成员（覆盖为垃圾字节，仍带 .zst 名）。
+        std::fs::write(
+            fixture
+                .backup_dir
+                .join(format!("database.db.switch-bak-{stamp}.zst")),
+            b"corrupt-not-a-zst-frame",
+        )
+        .unwrap();
+
+        let error = restore_master_backup_with_lifecycle(
+            &fixture.master_dir,
+            &fixture.backup_dir,
+            &fixture.raw_key,
+            stamp,
+            &ok_close,
+            &ok_relaunch,
+            "测试账号",
+        )
+        .unwrap_err();
+        assert_eq!(error, "master_restore_backup_invalid");
+        // 主库原数据不受影响（漂移行还在 = 未被覆盖）。
+        assert_eq!(fixture.project_count(), 2);
+    }
+
+    /// 密钥不符拒绝：用另一密钥造的备份（格式合法但打不开）→ 校验拒绝，
+    /// 主库零改动。
+    #[test]
+    fn restore_rejects_backup_encrypted_with_other_key() {
+        let fixture = RestoreFixture::new();
+        let stamp = fixture.take_backup();
+        fixture
+            .open_conn()
+            .execute(
+                "INSERT INTO project VALUES ('project-2', 'account-1', 'biz-2', '漂移', NULL)",
+                [],
+            )
+            .unwrap();
+        // 用其他密钥造一份形态合法的备份（独立时间戳，避免滚动互删）。
+        let other_stamp = stamp + 1;
+        let other_dir = fixture._root.path().join("other-master");
+        RestoreFixture::seed_db(&other_dir, &"ef".repeat(32));
+        traesync_infrastructure::master_handover::backup_master_trio_stamped(
+            &master_database_path(&other_dir),
+            Some(&fixture.backup_dir),
+            other_stamp,
+        )
+        .unwrap();
+
+        let error = restore_master_backup_with_lifecycle(
+            &fixture.master_dir,
+            &fixture.backup_dir,
+            &fixture.raw_key,
+            other_stamp,
+            &ok_close,
+            &ok_relaunch,
+            "测试账号",
+        )
+        .unwrap_err();
+        assert_eq!(error, "master_restore_backup_invalid");
+        // 主库零改动。
+        assert_eq!(fixture.project_count(), 2);
+        let _ = stamp;
+    }
+
+    /// 未关实例拒绝：关闭编排失败 → 拒绝还原，主库零改动，且不重启实例。
+    #[test]
+    fn restore_rejects_when_instance_close_fails() {
+        let fixture = RestoreFixture::new();
+        let stamp = fixture.take_backup();
+        fixture
+            .open_conn()
+            .execute(
+                "INSERT INTO project VALUES ('project-2', 'account-1', 'biz-2', '漂移', NULL)",
+                [],
+            )
+            .unwrap();
+        let relaunch_calls = std::cell::Cell::new(0);
+        let relaunch = |_: &Path, _: &str| -> Result<(), String> {
+            relaunch_calls.set(relaunch_calls.get() + 1);
+            Ok(())
+        };
+        let error = restore_master_backup_with_lifecycle(
+            &fixture.master_dir,
+            &fixture.backup_dir,
+            &fixture.raw_key,
+            stamp,
+            &|_| Err("master_restore_close_failed".to_string()),
+            &relaunch,
+            "测试账号",
+        )
+        .unwrap_err();
+        assert_eq!(error, "master_restore_close_failed");
+        // 零副作用：数据未覆盖、实例未重启。
+        assert_eq!(fixture.project_count(), 2);
+        assert_eq!(relaunch_calls.get(), 0);
+    }
+
+    /// 备份缺失拒绝：链外 stamp → 拒绝（命名异常散件/过期 stamp 不认）。
+    #[test]
+    fn restore_rejects_missing_stamp() {
+        let fixture = RestoreFixture::new();
+        let _ = fixture.take_backup();
+        let error = restore_master_backup_with_lifecycle(
+            &fixture.master_dir,
+            &fixture.backup_dir,
+            &fixture.raw_key,
+            1,
+            &ok_close,
+            &ok_relaunch,
+            "测试账号",
+        )
+        .unwrap_err();
+        assert_eq!(error, "master_restore_backup_missing");
     }
 }
