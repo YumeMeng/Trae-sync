@@ -15,6 +15,13 @@
 //! 凭据来源：[`crate::workbuddy_credential::decrypt_session_tokens`]（客户端
 //! 运行时取钥解密）+ 会话快照的 uid/domain。本模块不落盘任何凭据。
 //!
+//! **P19-B7 直连语义定稿（b7-findings §3.3）**：5.8.3 官方客户端签到请求
+//! 已追加 `X-Device-Token`（Turing 设备风控 SDK 原生模块生成，工具侧无法
+//! 复刻）。本模块维持**缺头直连**（客户端失败时仍带 `X-Device-Token-Error`
+//! 发请求，服务端存在降级容忍路径；P17 探针无此头即 200），401/403 归类
+//! [`WorkBuddyCheckinOutcome::AuthMismatch`] 报因——前端文案含「客户端
+//! 风控升级可能」（safeUiError），若服务端按此头收紧风控属预期演进风险。
+//!
 //! P17-T4c⑤ 凭据自持（spec 8.8 真机定稿）：refreshToken 一次性轮换、
 //! 刷新端点零设备绑定（X-Domain/X-Refresh-Token/X-Auth-Refresh-Source 三
 //! 头，空 body）。[`open_session_from_pool`] 优先用工具账号池（WBSESSN1

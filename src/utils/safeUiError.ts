@@ -660,7 +660,9 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
   ],
   [
     /workbuddy_checkin_auth_mismatch/i,
-    "WorkBuddy 登录会话与本机客户端身份不一致，请在 WorkBuddy 中重新登录后再试。",
+    // P19-B4/B7：签到直连不带新版客户端的 X-Device-Token 设备风控头；
+    // 401/403 报因需含「客户端风控升级可能」（探查报告 b7-findings §3.3）。
+    "WorkBuddy 登录会话与本机客户端身份不一致，请在 WorkBuddy 中重新登录后再试；重新登录后仍失败的话，存在客户端风控升级可能（新版客户端签到请求已加入设备风控校验）。",
   ],
   [
     /workbuddy_session_file_missing/i,
