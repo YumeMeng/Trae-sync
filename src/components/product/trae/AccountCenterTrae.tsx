@@ -10,37 +10,37 @@ import type {
   ManagedAccountsViewDto,
   TraeInstanceLoginState,
   TraeInstanceStateDto,
-} from "../types/account_switch";
-import type { BatchProgressEvent, BatchProgressKind } from "../types/batchProgress";
-import { useTauriEvents } from "../hooks/useTauriEvents";
-import type { EnvironmentStateDto } from "../types/environment";
-import { safeUiErrorMessage } from "../utils/safeUiError";
-import { displayMobile, effectiveDisplayName } from "../utils/accountDisplay";
+} from "../../../types/account_switch";
+import type { BatchProgressEvent, BatchProgressKind } from "../../../types/batchProgress";
+import { useTauriEvents } from "../../../hooks/useTauriEvents";
+import type { EnvironmentStateDto } from "../../../types/environment";
+import { safeUiErrorMessage } from "../../../utils/safeUiError";
+import { displayMobile, effectiveDisplayName } from "../../../utils/accountDisplay";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
-import { notify, type NotifyIssue } from "../platform/notify";
-import { AccountDetail } from "./AccountDetail";
-import { AdapterAccountDetail } from "./AdapterAccountDetail";
+import { notify, type NotifyIssue } from "../../../platform/notify";
+import { AccountDetail } from "../../AccountDetail";
+import { AdapterAccountDetail } from "../../AdapterAccountDetail";
 import {
   CheckinSlotBadge,
   LoginArchiveSlotBadge,
   deriveCheckinSlotState,
   deriveLoginSlotState,
   type LoginSlotState,
-} from "./StatusBadges";
-import { MasterSwitchDialog, type MasterSwitchTarget } from "./MasterSwitchDialog";
-import { ConfirmDialog } from "./shared/ConfirmDialog";
-import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "./shared/account/AccountRow";
-import { ACCOUNT_SORT_OPTIONS, type AccountFilter, type AccountSort } from "./shared/account/AccountListControls";
-import { AccountPageSkeleton } from "./shared/account/AccountPageSkeleton";
-import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
-import { productUi } from "../platform/productUiRegistry";
+} from "../../StatusBadges";
+import { MasterSwitchDialog, type MasterSwitchTarget } from "../../MasterSwitchDialog";
+import { ConfirmDialog } from "../../shared/ConfirmDialog";
+import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "../../shared/account/AccountRow";
+import { ACCOUNT_SORT_OPTIONS, type AccountFilter, type AccountSort } from "../../shared/account/AccountListControls";
+import { AccountPageSkeleton } from "../../shared/account/AccountPageSkeleton";
+import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "../../shared/account/preferences";
+import { productUi } from "../../../platform/productUiRegistry";
 import type {
   AccountAction,
   AccountActionResult,
   AccountAdapter,
   AccountSnapshot,
   AccountView as AdapterAccountView,
-} from "../platform/accountAdapter";
+} from "../../../platform/accountAdapter";
 
 interface AccountCenterProps {
   /** 页面可见时才发起账号状态读取，避免后台 IPC。 */

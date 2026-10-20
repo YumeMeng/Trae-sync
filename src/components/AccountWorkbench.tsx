@@ -1,4 +1,4 @@
-import { AccountCenter } from "./AccountCenter";
+import { AccountCenter } from "./product/trae/AccountCenterTrae";
 
 interface AccountWorkbenchProps {
   /** 页面可见时才读取账号状态。 */

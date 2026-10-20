@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { AccountCenter } from "../src/components/AccountCenter";
+import { AccountCenter } from "../src/components/product/trae/AccountCenterTrae";
 import { createTraeCnAccountAdapter } from "../src/platform/accountAdapter";
 import type {
   AccountProfileDto,

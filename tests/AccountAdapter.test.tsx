@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
-import { AccountCenter } from "../src/components/AccountCenter";
+import { AccountCenter } from "../src/components/product/trae/AccountCenterTrae";
 import { accountAdapterFor, createTraeCnAccountAdapter } from "../src/platform/accountAdapter";
 import { CURRENT_PRODUCT_ID } from "../src/types/product";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
