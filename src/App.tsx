@@ -10,10 +10,10 @@ import { EnvironmentPage } from "./components/EnvironmentPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { WorkBuddyOverviewPage } from "./pages/WorkBuddyOverviewPage";
 import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
+import { WorkBuddyLibraryPage } from "./pages/WorkBuddyLibraryPage";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
 import { WorkBuddyCheckinPage, WorkBuddyPanel } from "./components/WorkBuddyPanel";
 import { WorkBuddyEnvironmentPage } from "./components/WorkBuddyEnvironmentPage";
-import { CapabilitySection } from "./components/CapabilitySection";
 import type { LibraryRef } from "./components/LibrarySessionsPanel";
 import {
   detailLibraryRefFor,
@@ -23,7 +23,6 @@ import {
 } from "./platform/productRegistry";
 import { CURRENT_PRODUCT_ID, WORKBUDDY_PRODUCT_ID } from "./types/product";
 import type { CurrentProductDto, ProductEntryDto } from "./types/product";
-import type { SectionKey } from "./platform/productRegistry";
 import { notify, Toaster } from "./platform/notify";
 import { safeUiErrorMessage } from "./utils/safeUiError";
 
@@ -32,28 +31,6 @@ import { safeUiErrorMessage } from "./utils/safeUiError";
 // 切页/组件重建不重播；刷新随模块重载而重置，恢复"刷新即重放"合同语义。
 const STAGGER_LISTS = ["account-list", "account-card-grid", "checkin-flow"];
 const playedStaggerLists = new Set<string>();
-
-/**
- * 未适配区块的诚实占位页（P17-T5 并列骨架一期）：页头保持与常规页一致的
- * region/标题/焦点管理结构，正文渲染 pending 说明卡（CapabilitySection）。
- */
-function ProductPendingPage({ section, title, note }: { section: SectionKey; title: string; note: string }) {
-  return (
-    <section className="workbuddy-page" role="region" aria-label={title}>
-      <header className="page-header">
-        <div className="page-header__copy">
-          <h1 data-page-title={section} tabIndex={-1}>{title}</h1>
-        </div>
-      </header>
-      <CapabilitySection
-        state="pending"
-        product={WORKBUDDY_PRODUCT_ID}
-        title={`${title}能力适配中`}
-        note={note}
-      />
-    </section>
-  );
-}
 
 /** 自动签到批次完成事件（auto-checkin-finished）载荷（与后端 DTO 同口径）。 */
 interface AutoCheckinFinishedEvent {
@@ -324,11 +301,7 @@ export default function App() {
           </div>
           <div className="app-page" hidden={activePage !== "master-library"}>
             {isWorkBuddy ? (
-              <ProductPendingPage
-                section="master-library"
-                title="主库详情"
-                note="WorkBuddy 的对话库浏览将随对话库适配开放。"
-              />
+              <WorkBuddyLibraryPage active={activePage === "master-library"} />
             ) : (
               <MasterLibraryDetail
                 active={activePage === "master-library"}
