@@ -1633,3 +1633,14 @@ TRAE 官方将 TraeWork CN 升级为融合版 TRAE（3.4.2），Work 客户端 2
 - [x] 签到卡对齐（今日状态走 CheckinSlotBadge 统一签到槽；自动签到状态行对齐 CheckinPage meta 规格）
 - [x] 空态/错误态：共享 EmptyState + workbench__error 词汇沿用（既有）；深度检测失败态经 notify 全局通知
 - [x] 范围红线：实例启停/主库管理不造 UI（未触碰）；代码注释修正已完成（随 B1）
+
+
+### P19 跨产品对齐（2026-10-20 定稿——ADR-0036/0037 + docs/specs/p19-plan.md 为执行依据，14 决策点已拍板）
+
+- [ ] P19-B1 骨架抽取（M）：五步迁移①②③（纯移动→控件→AccountPageSkeleton）+ productUiRegistry 能力声明
+- [ ] P19-B2 WB 消费迁移（M，依赖 B1）：签到骨架 + WB 全页消费 + 参与集默认全参与修复
+- [ ] P19-B3 主库移植（L，与 B1 并行）：archive_tx 状态机提取 + WB 库会话浏览/消息/软删除+彻底删除/过户核验（首任务）/体检/统计/cwd 归并 + 备份范围落地
+- [ ] P19-B4 登录编排（M）：探查票（asar OAuth 参数）先行 → OAuthLoginProtocol trait → begin/complete_workbuddy_login
+- [ ] P19-B5 签到深化（S，依赖 B2）：逐账号行/额度列 total_credits/一键签/补签/checkin_dates 日历
+- [ ] P19-B6 总览/环境/备份（M，依赖 B3）：WB 工作台统计 + 环境轻量版 + WB 备份 UI + Trae 手动删除备份
+- [ ] P19-B7 探查票组（S×4）：CodeBuddy 设备管理 / WB 插件绑定 / 签到明细端点 / 多实例实验（B3 后）

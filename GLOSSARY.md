@@ -43,3 +43,17 @@
 **真实模式（RealReadPreview）**：工具操作真实客户端数据根的运行模式（与 fixture 测试模式相对）。所有写操作仅在此模式放行。
 
 **单次确认（Single Confirmation，ADR-0018）**：破坏性真实操作执行前必须获得用户的显式一次性确认；自动化护航（备份/守卫/回执）围绕该确认构建。
+
+
+## 跨产品概念映射（ADR-0037——扩展新平台的锚定依据）
+
+| 锚定概念 | TRAE 实现 | WB 实现 | 扩展判定问题清单 |
+|----------|-----------|---------|------------------|
+| 对话库 | 主库 database.db（SQLCipher）+ 归属随行 | workbuddy.db（SQLite WAL，sessions.user_id 隔离）+ projects jsonl 正文 | 会话存储在哪？本地还是云？账号隔离字段？正文与索引是否分离？ |
+| 环境 | --user-data-dir 隔离目录多实例，对话库跟随目录 | userData 与数据根分离，多实例隔离性待实验 | 客户端支持多实例参数吗？数据目录跟随哪个参数？ |
+| 额度 | 模型积分（checkin 概览） | total_credits + daily_credit + checkin_dates | 签到/积分接口有哪些字段？逐字段核对过吗？ |
+| 添加账号 | 隔离浏览器 OAuth 编排 | 网页 OAuth 授权码流（CodeBuddy 参数）+ 捕获入池 | 登录是网页流还是仅客户端？协议参数在哪？ |
+| 签到登录态 | begin/complete/cancel_login 会话编排 | 直连（池凭据）无登录会话 | 该平台签到是否需要独立登录会话？ |
+| 主库/副库 | 原生库 vs 副环境实例 | 单库，多实例实验后再定 | 存在几个库？如何区分原生与创建？ |
+| 收编/过户 | incorporate_master_records | transfer sessions.user_id（P18-B1） | 客户端游离记录如何纳入管理？归属字段是什么？ |
+| 归并 | merge_master_projects（主库内项目合并） | cwd 项目归并（sessions 批量 UPDATE + 目录迁移） | 项目维度是什么？如何合并？ |
