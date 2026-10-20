@@ -36,6 +36,8 @@ pub mod checkin_http;
 pub mod checkin_login;
 // P19-B4：OAuth 登录编排协议端口（四差异点参数化 + 共用编排骨架）。
 pub mod oauth_login_protocol;
+// P19-B4：WorkBuddy 登录编排实现（state 轮询流；authUrl+state 下发 + 1s 轮询）。
+pub mod workbuddy_login;
 // P13-1：Trae CN 签到协议实装（status/claim，探针形状为唯一权威来源）。
 pub mod trae_cn_checkin;
 // P11-6：Trae CN 签到只读探针（ADR-0032 决策 4 门禁；status 类查询先行）。
@@ -183,6 +185,15 @@ pub use checkin_login::{
 };
 // P19-B4：OAuth 登录编排协议端口与共用编排骨架。
 pub use oauth_login_protocol::{run_login_flow, LoginFlowError, OAuthLoginProtocol};
+// P19-B4：WorkBuddy 登录编排公开 API（state 轮询流实现 + 请求形状/信封解析）。
+pub use workbuddy_login::{
+    build_account_request, build_snapshot_request, build_state_request, build_token_poll_request,
+    classify_account_poll, classify_token_poll, parse_account_snapshot, wb_exemption_headers,
+    ReqwestWorkBuddyLoginHttp, TokenPollOutcome, WbLoginHttpRequest, WbLoginHttpResponse,
+    WB_ACCOUNT_AUTH_RETRIES, WB_AUTH_API_ORIGIN, WB_CODE_ACCOUNT_PENDING, WB_CODE_TOKEN_PENDING,
+    WB_POLL_INTERVAL, WB_POLL_TIMEOUT, WB_TRUSTED_AUTH_ORIGINS, WorkBuddyLoginError,
+    WorkBuddyLoginHttp, WorkBuddyLoginProtocol,
+};
 // P13-1：Trae CN 签到协议端口与 Real 实现（命令层经此引用）。
 pub use trae_cn_checkin::{
     claim_request, parse_claim_envelope, parse_status_envelope, status_request,
