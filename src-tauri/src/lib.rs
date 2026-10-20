@@ -1428,6 +1428,12 @@ pub fn run() {
             workbuddy_schedule::get_workbuddy_auto_checkin_status,
             workbuddy_schedule::set_workbuddy_auto_checkin_settings,
             workbuddy_schedule::set_workbuddy_account_auto_checkin,
+            // P19-B5 逐账号签到命令面（矩阵 #43/#46/#48/#51/#56 WB 适配器；
+            // fail-soft 批查 + per-account claim + 参与集 + opt-out 持久化）。
+            workbuddy_schedule::get_workbuddy_checkin_overview,
+            workbuddy_schedule::list_workbuddy_checkin_accounts,
+            workbuddy_schedule::workbuddy_checkin_claim_profile,
+            workbuddy_schedule::workbuddy_checkin_claim_batch,
             // U-1 数据层：本地备注名（脱敏手机号为登录/补采自动写入，无独立命令）。
             // G11 手机号补录：完整手机号写凭据包（DPAPI 加密，与令牌同级）。
             // U-6 W4：资产库三态筛选——归档开关 / 占用统计 / 彻底删除记录。

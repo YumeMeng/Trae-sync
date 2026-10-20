@@ -1086,3 +1086,234 @@ mod workbuddy_schedule_tests {
         assert_eq!(error, "workbuddy_auto_checkin_account_missing");
     }
 }
+// ============================================================================
+// P19-B5 后端单测（逐账号命令面 + opt-out 持久化）
+// ============================================================================
+
+#[cfg(test)]
+mod workbuddy_b5_tests {
+    use super::*;
+    use tempfile::tempdir;
+    use traesync_infrastructure::workbuddy_login_credential::{
+        WorkBuddyLoginRecord, WorkBuddyLoginStore,
+    };
+
+    /// 建池夹具：两个池内账号（wb-uid-1/账号一、wb-uid-2/账号二）。
+    fn make_pool(login_root: &Path) {
+        std::fs::create_dir_all(login_root).unwrap();
+        let store = WorkBuddyLoginStore::new(login_root);
+        for (uid, name) in [("uid-1", "账号一"), ("uid-2", "账号二")] {
+            store
+                .save(&WorkBuddyLoginRecord {
+                    profile_id: format!("wb-{uid}"),
+                    account_id: uid.to_string(),
+                    screen_name: name.to_string(),
+                    masked_mobile: String::new(),
+                    access_token: "at".to_string(),
+                    refresh_token: "rt".to_string(),
+                    access_token_expires_at_unix_seconds: 1_800_000_000,
+                    refresh_token_expires_at_unix_seconds: 1_800_000_000,
+                    domain: "d".to_string(),
+                    session_state: "s".to_string(),
+                    device_id: "dev".to_string(),
+                    minted_at_unix_seconds: 1,
+                    last_updated_at_unix_seconds: 1,
+                })
+                .unwrap();
+        }
+    }
+
+    /// 有效参与语义：未 touched 默认参与；显式关闭永远 false；显式开启 true。
+    #[test]
+    fn effective_participation_default_on_and_opt_out_respected() {
+        let root = tempdir().unwrap();
+        let schedule_root = root.path().join("schedule");
+        let login_root = root.path().join("login");
+        make_pool(&login_root);
+
+        // 未 touched：两账号默认参与（八域对齐 #3）。
+        let status = workbuddy_auto_checkin_status(&schedule_root, &login_root);
+        assert!(status.accounts.iter().all(|account| account.enabled));
+        assert_eq!(workbuddy_eligible_ids(&schedule_root, &login_root).len(), 2);
+
+        // 显式关闭 wb-uid-1：touched + 移出 enabled → effective false，
+        // 且默认参与语义不再作用于它（opt-out 永久尊重）。
+        set_workbuddy_account_participation(&schedule_root, &login_root, "wb-uid-1", false)
+            .unwrap();
+        let status = workbuddy_auto_checkin_status(&schedule_root, &login_root);
+        let first = status.accounts.iter().find(|a| a.profile_id == "wb-uid-1").unwrap();
+        let second = status.accounts.iter().find(|a| a.profile_id == "wb-uid-2").unwrap();
+        assert!(!first.enabled, "显式关闭永远尊重");
+        assert!(second.enabled, "未 touched 账号不受他账号设置影响");
+        assert_eq!(
+            workbuddy_eligible_ids(&schedule_root, &login_root),
+            vec!["wb-uid-2".to_string()],
+            "调度 eligible 同口径：显式关闭排除、默认参与保留"
+        );
+
+        // 再显式开启：touched + enabled → true。
+        set_workbuddy_account_participation(&schedule_root, &login_root, "wb-uid-1", true)
+            .unwrap();
+        assert!(workbuddy_auto_checkin_status(&schedule_root, &login_root)
+            .accounts
+            .iter()
+            .all(|account| account.enabled));
+    }
+
+    /// v1 → v2 迁移：v1 enabled_profiles = touched（显式开启意图保留）；
+    /// v1 未列入账号转为「未 touched」→ 默认参与（一次性语义切换）。
+    #[test]
+    fn participation_v1_migrates_to_touched_semantics() {
+        let root = tempdir().unwrap();
+        let schedule_root = root.path().join("schedule");
+        let login_root = root.path().join("login");
+        make_pool(&login_root);
+        // 手写 v1 文件：仅 wb-uid-1 显式开启。
+        std::fs::create_dir_all(&schedule_root).unwrap();
+        let v1 = r#"{"format_version":1,"enabled_profiles":["wb-uid-1"]}"#;
+        std::fs::write(schedule_root.join(PARTICIPATION_FILE), v1).unwrap();
+        let state = WorkBuddyParticipationStore::new(&schedule_root)
+            .load_state()
+            .unwrap();
+        assert!(state.touched_profiles.iter().any(|id| id == "wb-uid-1"));
+        assert!(state.effective_enabled("wb-uid-1"));
+        // v1 未列入的 wb-uid-2 → 未 touched → 新语义默认参与。
+        assert!(state.effective_enabled("wb-uid-2"));
+        // 重新读取稳定（迁移语义幂等）。
+        assert!(WorkBuddyParticipationStore::new(&schedule_root)
+            .load_state()
+            .is_ok());
+    }
+
+    /// overview 编排内核 fail-soft：账号一成功、账号二失败——失败只落
+    /// 本条 error 字段，不阻塞他账号。
+    #[test]
+    fn overview_is_fail_soft_per_account() {
+        let targets = vec![
+            ("wb-uid-1".to_string(), "账号一".to_string()),
+            ("wb-uid-2".to_string(), "账号二".to_string()),
+        ];
+        let results: std::collections::HashMap<
+            String,
+            Result<(bool, u32, u32, u32, Vec<String>), String>,
+        > = [
+            (
+                "wb-uid-1",
+                Ok((true, 6, 100, 600, vec!["2026-10-20".to_string()])),
+            ),
+            (
+                "wb-uid-2",
+                Err("workbuddy_checkin_refresh_rejected".to_string()),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, outcome)| (id.to_string(), outcome))
+        .collect();
+        let status_fn = |pid: &str| results[pid].clone();
+        let overview = workbuddy_checkin_overview_inner(targets, &status_fn);
+        assert_eq!(overview.len(), 2, "失败账号不缩短批查结果");
+        let first = &overview[0];
+        assert!(first.error.is_none());
+        assert_eq!(first.today_checked_in, Some(true));
+        assert_eq!(first.total_credits, Some(600));
+        assert_eq!(first.checkin_dates, vec!["2026-10-20".to_string()]);
+        let second = &overview[1];
+        assert_eq!(
+            second.error.as_deref(),
+            Some("workbuddy_checkin_refresh_rejected")
+        );
+        assert_eq!(second.today_checked_in, None, "失败账号状态字段为 None");
+        assert!(second.checkin_dates.is_empty());
+    }
+
+    /// claim 单账号命令编排：池内缺失账号 → 稳定错误码（复用调度口径）。
+    #[test]
+    fn claim_profile_missing_pool_account_maps_error() {
+        let root = tempdir().unwrap();
+        let error = claim_workbuddy_profile_detailed(&root.path().join("nope"), "wb-x")
+            .unwrap_err();
+        assert_eq!(error, "workbuddy_auto_checkin_account_missing");
+    }
+
+    /// batch 编排内核 fail-soft：成功/已签/失败逐条落；池外 id 的 Err
+    /// 兜底（claim 闭包注入；命令层去重，内核不假设唯一）。
+    #[test]
+    fn claim_batch_is_fail_soft_per_account() {
+        let targets = vec![
+            ("wb-uid-1".to_string(), "账号一".to_string()),
+            ("wb-uid-1".to_string(), "账号一".to_string()),
+            ("wb-uid-2".to_string(), "账号二".to_string()),
+            ("wb-gone".to_string(), String::new()),
+        ];
+        let claims: std::collections::HashMap<
+            String,
+            Result<WorkBuddyProfileClaimReceipt, String>,
+        > = [
+            (
+                "wb-uid-1",
+                Ok(WorkBuddyProfileClaimReceipt {
+                    outcome: CheckinOutcome::Claimed,
+                    detail_code: None,
+                    credit: 100,
+                }),
+            ),
+            (
+                "wb-uid-2",
+                Ok(WorkBuddyProfileClaimReceipt {
+                    outcome: CheckinOutcome::AlreadyCheckedIn,
+                    detail_code: None,
+                    credit: 0,
+                }),
+            ),
+            (
+                "wb-gone",
+                Err("workbuddy_auto_checkin_account_missing".to_string()),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, outcome)| (id.to_string(), outcome))
+        .collect();
+        let claim = |pid: &str| claims[pid].clone();
+        let items = workbuddy_checkin_claim_batch_inner(targets, &claim);
+        assert_eq!(items.len(), 4, "逐条回执：失败/重复不缩短结果");
+        assert_eq!(items[0].outcome, CheckinOutcome::Claimed);
+        assert_eq!(items[0].credit, 100);
+        // 重复条目原样透传（去重是命令层职责，内核不假设唯一）。
+        assert_eq!(items[1].outcome, CheckinOutcome::Claimed);
+        assert_eq!(items[2].outcome, CheckinOutcome::AlreadyCheckedIn);
+        assert_eq!(items[2].credit, 0);
+        assert_eq!(items[3].outcome, CheckinOutcome::RuntimeError);
+        assert_eq!(
+            items[3].detail_code.as_deref(),
+            Some("workbuddy_auto_checkin_account_missing")
+        );
+    }
+
+    /// 参与集命令内核：list 语义 = 全池行 + 有效参与标志（显式关闭 false、
+    /// 未 touched true）。
+    #[test]
+    fn list_accounts_reports_effective_participation() {
+        let root = tempdir().unwrap();
+        let schedule_root = root.path().join("schedule");
+        let login_root = root.path().join("login");
+        make_pool(&login_root);
+        set_workbuddy_account_participation(&schedule_root, &login_root, "wb-uid-1", false)
+            .unwrap();
+        let participation = WorkBuddyParticipationStore::new(&schedule_root)
+            .load_state()
+            .unwrap_or_default();
+        let rows: Vec<(String, bool)> = pool_summaries(&login_root)
+            .into_iter()
+            .map(|(profile_id, _)| {
+                (profile_id.clone(), participation.effective_enabled(&profile_id))
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("wb-uid-1".to_string(), false),
+                ("wb-uid-2".to_string(), true)
+            ]
+        );
+    }
+}
