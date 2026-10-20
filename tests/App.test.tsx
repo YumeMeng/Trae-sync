@@ -429,11 +429,20 @@ describe("应用工作区入口", () => {
       captured_in_pool: false,
     }));
     mockRoute("list_workbuddy_accounts", () => []);
+    // 账号页健康卡的积分行（workbuddy_checkin_status 任选会话语义）。
     mockRoute("workbuddy_checkin_status", () => ({
       today_checked_in: false,
       streak_days: 6,
       daily_credit: 100,
       total_credits: 700,
+    }));
+    // P19-B5 签到页逐账号行：per-account 状态查询（池空则不发）。
+    mockRoute("workbuddy_checkin_status_for", () => ({
+      today_checked_in: false,
+      streak_days: 6,
+      daily_credit: 100,
+      total_credits: 700,
+      checkin_dates: ["2026-10-20", "2026-10-19"],
     }));
 
     render(<App />);
@@ -453,9 +462,12 @@ describe("应用工作区入口", () => {
     // P18-B3 后登录态由 G10 slot-badge 承载（WorkBuddyLoginSlotBadge，无独立 testid）。
     expect(screen.getByTestId("workbuddy-health-card")).toHaveTextContent("已登录");
 
-    // checkin = ready：WorkBuddy 签到卡。
+    // checkin = ready：WorkBuddy 签到页（P19-B5 逐账号行形态，池空时历史条不渲染，
+    // 但调度设置卡与页头骨架在册——断言骨架区块承载）。
     fireEvent.click(screen.getByTestId("navigation-checkin"));
-    expect(await screen.findByTestId("workbuddy-checkin-card")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(within(screen.getByRole("region", { name: "签到" })).getByTestId("product-badge-workbuddy")).toBeInTheDocument();
+    });
 
     // environment = pending：未适配区块渲染诚实说明卡。
     // （overview/master-library 槽位同样持有 hidden 的 pending 卡，

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, ArrowRightLeft, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
+import { Activity, ArrowRightLeft, RefreshCw, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import type {
   WorkBuddySessionHealthDto,
@@ -11,9 +11,10 @@ import type {
 import {
   captureWorkBuddyAccount,
   checkWorkBuddyLoginHealth,
-  claimWorkBuddyCheckin,
+  claimWorkBuddyCheckinFor,
   fetchWorkBuddyAutoCheckinStatus,
   fetchWorkBuddyCheckinStatus,
+  fetchWorkBuddyCheckinStatusFor,
   listWorkBuddyAccounts,
   loadWorkBuddySessionHealth,
   planWorkBuddySessionTransfer,
@@ -38,6 +39,8 @@ import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "
 import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
 import { CheckinPageSkeleton } from "./shared/checkin/CheckinPageSkeleton";
 import { AutoCheckinSettingsCard } from "./shared/checkin/AutoCheckinSettingsCard";
+import { CheckinActionsRow } from "./shared/checkin/CheckinActionsRow";
+import { CheckinFlowRow } from "./shared/checkin/CheckinFlowRow";
 import { productUi } from "../platform/productUiRegistry";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
@@ -619,11 +622,79 @@ function saveTouchedParticipation(touched: Set<string>): void {
   } catch { /* 存储不可用时仅本次会话生效 */ }
 }
 
+/** 逐账号签到行状态（P19-B5）：status 为 null 且 errorCode 非空 = 行级读取失败（fail-soft）。 */
+interface WbCheckinRowState {
+  status: WorkBuddyCheckinStatusDto | null;
+  errorCode: string | null;
+}
+
+/** 近 N 天日期串（YYYY-MM-DD 本地时区；今天在前？否——升序，旧→今）。 */
+function lastDayKeys(n: number): string[] {
+  const out: string[] = [];
+  for (let i = n - 1; i >= 0; i -= 1) {
+    const day = new Date();
+    day.setDate(day.getDate() - i);
+    out.push(`${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`);
+  }
+  return out;
+}
+
+/** 签到历史条（IA 草案 §1.3 签到日历的近 N 天形态，P19-B5）：每账号一行近 14 天点阵。 */
+function WbCheckinHistoryStrip({ pool, rowStates }: {
+  pool: readonly { profile_id: string; screen_name: string }[];
+  rowStates: Record<string, WbCheckinRowState>;
+}) {
+  const days = lastDayKeys(14);
+  return (
+    <div className="workbuddy-card" data-testid="workbuddy-checkin-history">
+      <div className="workbuddy-card__title">签到历史（近 14 天）</div>
+      {pool.map((account) => {
+        const state = rowStates[account.profile_id];
+        const checked = new Set(state?.status?.checkin_dates ?? []);
+        return (
+          <div className="account-list__row" key={account.profile_id} data-testid={`workbuddy-history-${account.profile_id}`}>
+            <div className="account-item__main">
+              <span className="account-card__avatar" aria-hidden="true">
+                {(account.screen_name || "W").trim().charAt(0).toUpperCase()}
+              </span>
+              <div className="account-item__id">
+                <div className="account-item__name-row">
+                  <strong className="account-item__name">{account.screen_name || "WorkBuddy 账号"}</strong>
+                </div>
+              </div>
+            </div>
+            <div className="account-item__side">
+              <span
+                className="account-item__meta"
+                role="img"
+                aria-label={`近 14 天签到 ${days.filter((day) => checked.has(day)).length} 天（实心=已签）`}
+              >
+                {state?.errorCode
+                  ? "状态未知"
+                  : days.map((day) => (checked.has(day) ? "●" : "○")).join("")}
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
-  const [status, setStatus] = useState<WorkBuddyCheckinStatusDto | null>(null);
+  const [pool, setPool] = useState<readonly WorkBuddyLoginSummaryDto[]>([]);
+  // 逐账号签到状态（P19-B5）：profile_id → 状态/行级错误；读失败行 fail-soft 不阻塞他行。
+  const [rowStates, setRowStates] = useState<Record<string, WbCheckinRowState>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [claiming, setClaiming] = useState(false);
+  // 批量选择（默认全参与，八域对齐 #3）与前端串行批次执行。
+  const [selection, setSelection] = useState<readonly string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [runIds, setRunIds] = useState<readonly string[]>([]);
+  const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null);
+  // 逐行 claim 结果（outcome 与 CheckinResultDto 同口径，进 OutcomeLabels WB 通用档）。
+  const [rowResults, setRowResults] = useState<Record<string, { outcome: string; detail_code: string | null }>>({});
+  const stopRef = useRef(false);
   // P17-A5 每日自动签到：设置 + 账号参与清单（与 Trae 自动签到同策略）。
   const [autoStatus, setAutoStatus] = useState<WorkBuddyAutoCheckinStatusDto | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
@@ -640,9 +711,24 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
     try {
-      const next = await fetchWorkBuddyCheckinStatus();
-      setStatus(next);
+      const accounts = await listWorkBuddyAccounts();
+      setPool(accounts);
       setLoadError(null);
+      // 逐账号状态并发查询（P19-B5）：单行失败 fail-soft 标注，不阻塞他行。
+      await Promise.all(accounts.map(async (account) => {
+        try {
+          const status = await fetchWorkBuddyCheckinStatusFor(account.profile_id);
+          setRowStates((current) => ({ ...current, [account.profile_id]: { status, errorCode: null } }));
+        } catch (reason: unknown) {
+          setRowStates((current) => ({
+            ...current,
+            [account.profile_id]: {
+              status: current[account.profile_id]?.status ?? null,
+              errorCode: safeUiErrorMessage(reason, "该账号签到状态不可读取"),
+            },
+          }));
+        }
+      }));
     } catch (reason: unknown) {
       setLoadError(safeUiErrorMessage(reason, "签到状态暂时不可读取，请稍后重试。"));
     } finally {
@@ -663,6 +749,14 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
     void refresh(true);
     void refreshAuto();
   }, [active, refresh, refreshAuto]);
+
+  // 选择默认全选；池变化时剔除失效项并保留既有选择（与 TRAE 签到页同口径）。
+  useEffect(() => {
+    setSelection((current) => {
+      const filtered = current.filter((id) => pool.some((account) => account.profile_id === id));
+      return filtered.length > 0 ? filtered : pool.map((account) => account.profile_id);
+    });
+  }, [pool]);
 
   // P19-B2 参与集默认全参与：池加载后，从未显式设置过的账号自动批量置 true
   //（一次归一；显式关闭过的账号不动）。
@@ -735,25 +829,67 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
     })().finally(() => setAutoBusy(false));
   }, [autoBusy, autoStatus, refreshAuto, touch]);
 
-  const runClaim = useCallback(async () => {
-    setClaiming(true);
-    try {
-      const claim = await claimWorkBuddyCheckin();
-      notify.success(
-        `WorkBuddy：签到成功，获得 ${claim.credit} 积分，已连续签到 ${claim.streak_days} 天`,
-      );
-      await refresh(false);
-    } catch (reason: unknown) {
-      notify.error(
-        `WorkBuddy：签到未完成——${safeUiErrorMessage(reason, "签到未完成，请稍后重试。")}`,
-      );
-    } finally {
-      setClaiming(false);
-    }
-  }, [refresh]);
+  const toggle = useCallback((profileId: string) => {
+    setSelection((current) => current.includes(profileId)
+      ? current.filter((id) => id !== profileId)
+      : [...current, profileId]);
+  }, []);
 
-  // P19-B2⑤：页面编排（门控/页头/状态行）由 CheckinPageSkeleton 承担；
-  // WB 签到形态为 single（单账号卡 + 自动签到设置卡），批量行升级归 B5。
+  // U-3 通用执行入口（P19-B5 前端串行版）：逐账号 claim_for（幂等：已签
+  // verified=true 空操作，后端先查后领）；单行失败不中断批次（fail-soft）。
+  const handleRunIds = useCallback(async (ids: readonly string[]) => {
+    if (busy || ids.length === 0) return;
+    setBusy(true);
+    stopRef.current = false;
+    setRowResults({});
+    setProgress({ completed: 0, total: ids.length });
+    setRunIds([...ids]);
+    let failed = 0;
+    try {
+      for (const profileId of ids) {
+        if (stopRef.current) break;
+        try {
+          const claim = await claimWorkBuddyCheckinFor(profileId);
+          // 幂等口径：credit>0 = 新签；verified=true 且 credit=0 = 已签跳过。
+          setRowResults((current) => ({
+            ...current,
+            [profileId]: { outcome: claim.credit > 0 ? "claimed" : "already_checked_in", detail_code: null },
+          }));
+        } catch (reason: unknown) {
+          setRowResults((current) => ({
+            ...current,
+            [profileId]: { outcome: "failed", detail_code: null },
+          }));
+          failed += 1;
+          notify.error(`WorkBuddy：签到未完成——${safeUiErrorMessage(reason, "请稍后重试。")}`);
+        }
+        // 该行状态即时回读（徽章/额度同步），失败不影响批次继续。
+        await fetchWorkBuddyCheckinStatusFor(profileId)
+          .then((status) => setRowStates((current) => ({ ...current, [profileId]: { status, errorCode: null } })))
+          .catch(() => undefined);
+        setProgress((current) => (current ? { completed: current.completed + 1, total: current.total } : current));
+      }
+      if (stopRef.current) {
+        notify.info("WorkBuddy：签到批次已取消，未开始的账号保持原状。");
+      } else if (failed === 0) {
+        notify.success("WorkBuddy：签到批次完成（已签账号幂等跳过，结果见各行）。");
+      } else {
+        notify.warning(`WorkBuddy：部分签到未完成（${failed} 个失败），详见各行结果与通知。`);
+      }
+    } finally {
+      setBusy(false);
+      setRunIds([]);
+      setProgress(null);
+    }
+  }, [busy]);
+
+  const handleCancel = useCallback(() => {
+    if (!busy) return;
+    stopRef.current = true;
+  }, [busy]);
+
+  // P19-B5：WB 签到页升级逐账号行形态（IA 草案 §1.3；架构 §1.5 S5/B5）。
+  // 页面编排由 CheckinPageSkeleton 承担；调度设置卡走 content 后置插槽。
   const uiProduct = productUi("workbuddy");
   // 参与集 UI 生效态：显式设置过的账号按后端值；未设置过的默认参与。
   const participationAccounts = (autoStatus?.accounts ?? []).map((account) => ({
@@ -761,19 +897,24 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
     displayName: account.screen_name,
     participating: touchedRef.current.has(account.profile_id) ? account.enabled : true,
   }));
+  const pendingIds = pool
+    .filter((account) => rowStates[account.profile_id]?.status?.today_checked_in !== true)
+    .map((account) => account.profile_id);
+  const progressCompleted = progress?.completed ?? 0;
+  const cursorId = busy && runIds.length > 0 ? runIds[Math.min(progressCompleted, runIds.length - 1)] : null;
 
   return (
     <CheckinPageSkeleton
       product={uiProduct}
       active={active}
       loading={loading}
-      headerActions={status ? (
+      headerActions={pool.length > 0 || !loadError ? (
         <div className="page-header__actions">
           <button
             type="button"
             className="btn"
             onClick={() => void refresh(false)}
-            disabled={loading || claiming}
+            disabled={loading || busy}
             data-testid="workbuddy-checkin-refresh"
           >
             <RefreshCw size={15} className={loading ? "icon-spin" : undefined} aria-hidden="true" />
@@ -796,51 +937,71 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
           {autoStatus.enabled ? ` · ${wbAutoLedgerLabel(autoStatus)}` : ""}
         </p>
       ) : null}
-      content={status ? (
-        <>
-          <div className="workbuddy-card" data-testid="workbuddy-checkin-card">
-            <div className="workbuddy-card__title">每日签到</div>
-            <InfoRow label="今日状态">
-              {/* P18-B3：签到槽徽章统一走 G10 CheckinSlotBadge（与 Trae 签到页同义同色）。 */}
-              <CheckinSlotBadge state={deriveCheckinSlotState({ checked_in: status.today_checked_in })} />
-            </InfoRow>
-            <InfoRow label="已连续签到">{status.streak_days} 天</InfoRow>
-            <InfoRow label="今日可得">+{status.daily_credit} 积分</InfoRow>
-            <InfoRow label="积分余额">{status.total_credits} 积分</InfoRow>
-            <div className="workbuddy-card__actions">
-              <button
-                type="button"
-                className="btn btn--primary"
-                onClick={() => void runClaim()}
-                disabled={status.today_checked_in || claiming}
-                data-testid="workbuddy-checkin-button"
-              >
-                {claiming && <Loader2 size={15} className="icon-spin" aria-hidden="true" />}
-                {status.today_checked_in ? "今日已签到" : claiming ? "签到中…" : "立即签到"}
-              </button>
-            </div>
-          </div>
-
-          {/* P17-A5 每日自动签到：设置 + 账号参与（共享设置卡，P19-B2⑤ 抽取）。 */}
-          {autoStatus && (
-            <AutoCheckinSettingsCard
-              testIdPrefix="workbuddy"
-              enabled={autoStatus.enabled}
-              dailyTimeHhmm={autoStatus.daily_time_hhmm}
-              busy={autoBusy}
-              toggleSummary="开启后到点自动执行（断连自动续期兜底）"
-              ledgerNote={autoStatus.ledger
-                ? autoStatus.ledger.running
-                  ? `今日执行中（完成 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
-                  : `今日已完成（成功 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
+      entryCount={pool.length}
+      selectedCount={selection.length}
+      actions={(
+        <CheckinActionsRow
+          variant="batch"
+          enabled={pool.length > 0}
+          busy={busy}
+          poolCount={pool.length}
+          pendingCount={pendingIds.length}
+          selectionCount={selection.length}
+          onRunAll={() => void handleRunIds(pool.map((account) => account.profile_id))}
+          onRunPending={() => void handleRunIds(pendingIds)}
+          onRunSelected={() => void handleRunIds(selection)}
+          onCancel={handleCancel}
+        />
+      )}
+      progress={busy ? progress : null}
+      progressNote="逐账号直接领取（已签幂等跳过）"
+      rows={pool.map((account) => {
+        const state = rowStates[account.profile_id];
+        const status = state?.status ?? null;
+        const isCursor = busy && account.profile_id === cursorId;
+        const doneInRun = busy && rowResults[account.profile_id] !== undefined;
+        return (
+          <CheckinFlowRow
+            key={account.profile_id}
+            productId="workbuddy"
+            profileId={account.profile_id}
+            displayName={account.screen_name || "WorkBuddy 账号"}
+            badge={state?.errorCode
+              ? <span className="slot-badge slot-badge--idle" title={state.errorCode}>状态未知</span>
+              : status
+                ? <CheckinSlotBadge state={deriveCheckinSlotState({ checked_in: status.today_checked_in })} />
                 : null}
-              accounts={participationAccounts}
-              onSettingsChange={handleSaveAutoSettings}
-              onParticipationChange={handleToggleAccount}
-              onParticipateAll={handleParticipateAll}
-            />
-          )}
-        </>
+            meta={status ? `额度 ${status.total_credits} 积分 · 连签 ${status.streak_days} 天` : ""}
+            selected={selection.includes(account.profile_id)}
+            onToggle={() => toggle(account.profile_id)}
+            disabled={busy}
+            phase={busy ? (doneInRun ? "done" : isCursor ? "running" : "queued") : "idle"}
+            result={rowResults[account.profile_id] ?? null}
+            waitSecs={null}
+            onInlineCheckin={() => void handleRunIds([account.profile_id])}
+            inlineEnabled={status ? !status.today_checked_in : false}
+          />
+        );
+      })}
+      listVariant="flow"
+      footer={pool.length > 0 ? <WbCheckinHistoryStrip pool={pool} rowStates={rowStates} /> : undefined}
+      content={autoStatus ? (
+        <AutoCheckinSettingsCard
+          testIdPrefix="workbuddy"
+          enabled={autoStatus.enabled}
+          dailyTimeHhmm={autoStatus.daily_time_hhmm}
+          busy={autoBusy}
+          toggleSummary="开启后到点自动执行（断连自动续期兜底）"
+          ledgerNote={autoStatus.ledger
+            ? autoStatus.ledger.running
+              ? `今日执行中（完成 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
+              : `今日已完成（成功 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
+            : null}
+          accounts={participationAccounts}
+          onSettingsChange={handleSaveAutoSettings}
+          onParticipationChange={handleToggleAccount}
+          onParticipateAll={handleParticipateAll}
+        />
       ) : null}
     />
   );

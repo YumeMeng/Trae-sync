@@ -40,6 +40,8 @@ export interface CheckinPageSkeletonProps {
   actions?: ReactNode;
   /** 总进度条（串行批次 X/Y + 说明文案）。 */
   progress?: { completed: number; total: number } | null;
+  /** 进度条说明文案（缺省 = TRAE SOLO 通道错峰口径；无错峰产品自定义）。 */
+  progressNote?: string;
   /** 行节点列表（行组件来自 shared/checkin；key 由产品层设置）。 */
   rows?: readonly ReactNode[];
   /** 列表容器形态：flow=演进式单列（checkin-flow）；plain=简单选择列表。 */
@@ -64,6 +66,7 @@ export function CheckinPageSkeleton({
   selectionHeading = "签到账号",
   actions,
   progress,
+  progressNote,
   rows,
   listVariant = "flow",
   footer,
@@ -109,10 +112,11 @@ export function CheckinPageSkeleton({
         />
       )}
 
-      {/* 单账号内容形态（single）：产品层自带卡片；提供 content 即不走批量区块。 */}
+      {/* 单账号内容插槽（single 形态整页内容；batch 形态下作为主体后置插槽，
+          P19-B2④ 起支持 content + rows 共存——如 WB 批量行下方的调度设置卡）。 */}
       {!errorState && content}
 
-      {content === undefined && !errorState && hasEntries && rows !== undefined && (
+      {!errorState && hasEntries && rows !== undefined && (
         <section className="checkin-page__selection" aria-labelledby="checkin-selection-heading">
           <div className="account-center__section-heading">
             <h3 id="checkin-selection-heading"><CalendarCheck size={16} aria-hidden="true" />{selectionHeading}</h3>
@@ -123,7 +127,8 @@ export function CheckinPageSkeleton({
 
           {actions}
 
-          {/* U-3 总进度条：串行批次期间 X/Y + 已完成比例。 */}
+          {/* U-3 总进度条：串行批次期间 X/Y + 已完成比例。文案为 TRAE SOLO 通道
+              专属口径；其他产品（无错峰间隔）经 progressNote 覆盖。 */}
           {progress && progress.total > 0 && (
             <div className="checkin-progress" role="status" data-testid="checkin-progress">
               <div className="checkin-progress__track">
@@ -133,7 +138,7 @@ export function CheckinPageSkeleton({
                 />
               </div>
               <span className="checkin-progress__label">
-                {progress.completed}/{progress.total} · 每账号走 状态 → 领取 → 复核，账号间自动间隔 3-8 秒
+                {progress.completed}/{progress.total} · {progressNote ?? "每账号走 状态 → 领取 → 复核，账号间自动间隔 3-8 秒"}
               </span>
             </div>
           )}

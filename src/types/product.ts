@@ -65,6 +65,8 @@ export interface WorkBuddyCheckinStatusDto {
   readonly streak_days: number;
   readonly daily_credit: number;
   readonly total_credits: number;
+  /** 签到日期（YYYY-MM-DD，倒序）；per-account 命令（P19-B5）返回，单账号旧命令可缺省。 */
+  readonly checkin_dates?: readonly string[];
 }
 
 /** WorkBuddy 签到领取回执（verified = 复核翻转确认真实入账）。 */

@@ -64,10 +64,19 @@ const defaultPool = [
 function installWorkbuddyRoutes(options?: {
   pool?: typeof defaultPool;
   accounts?: readonly { profile_id: string; screen_name: string; enabled: boolean }[];
+  /** profile_id → 状态（缺省全未签）；null = 模拟该行查询失败（fail-soft）。 */
+  statusFor?: Record<string, Record<string, unknown> | null>;
 }) {
   mockRoute("get_workbuddy_session_health", () => health);
   mockRoute("list_workbuddy_accounts", () => options?.pool ?? defaultPool);
   mockRoute("workbuddy_checkin_status", () => checkinStatus);
+  mockRoute("workbuddy_checkin_status_for", (args: { profileId: string }) => {
+    const table = options?.statusFor;
+    const status = table ? table[args.profileId] : { ...checkinStatus, checkin_dates: ["2026-10-20", "2026-10-19"] };
+    if (status === null || status === undefined) return Promise.reject(new Error("row_unavailable"));
+    return status;
+  });
+  mockRoute("workbuddy_checkin_claim_for", () => ({ credit: 10, streak_days: 7, verified: true }));
   mockRoute("get_workbuddy_auto_checkin_status", () =>
     autoStatus(options?.accounts ?? [
       { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
@@ -169,22 +178,92 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
   });
 });
 
-describe("WorkBuddyCheckinPage（P19-B2⑤ 签到页骨架消费 + 参与集默认全参与）", () => {
-  it("骨架渲染：单账号卡 + 自动签到状态行 + 立即签到可用", async () => {
+describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 参与集默认全参与）", () => {
+  it("骨架渲染：逐账号行（复选+昵称+额度/连签 meta）+ 批量按钮组 + 历史条 + 自动签到状态行", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
 
-    expect(await screen.findByTestId("workbuddy-checkin-card")).toBeInTheDocument();
-    expect(screen.getByTestId("workbuddy-checkin-button")).toHaveTextContent("立即签到");
+    // 批量区块承载逐账号行（checkin-flow stagger 类名冻结）。
+    await screen.findByTestId("checkin-run-all");
+    expect(screen.getByTestId("checkin-run-all")).toHaveTextContent("一键全签（2）");
+    const flow = document.querySelector("ul.checkin-flow");
+    expect(flow).not.toBeNull();
+    expect(flow!.querySelectorAll(".checkin-flow__row")).toHaveLength(2);
+    // 行内 meta：额度列 + 连签（IA 草案 §1.3 签到账号行字段）。
+    expect(flow!.textContent).toContain("额度 700 积分 · 连签 6 天");
+    // 历史条（checkin_dates 近 14 天点阵）在册。
+    expect(screen.getByTestId("workbuddy-checkin-history")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-history-wb-uid-1")).toBeInTheDocument();
     expect(screen.getByTestId("workbuddy-auto-checkin-meta")).toHaveTextContent("每日 09:30 触发");
     expect(screen.getByTestId("product-badge-workbuddy")).toBeInTheDocument();
+  });
+
+  it("行内单签：签到按钮触发 per-account claim 并落行内结果", async () => {
+    installWorkbuddyRoutes();
+    render(<WorkBuddyCheckinPage active={true} />);
+
+    const inline = await screen.findByTestId("checkin-inline-wb-uid-1");
+    expect(inline).toBeEnabled();
+    fireEvent.click(inline);
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["workbuddy_checkin_claim_for", { profileId: "wb-uid-1" }],
+      );
+    });
+    // 行内结果徽章（WB 通用档文案：签到成功）。
+    await screen.findByText("签到成功");
+  });
+
+  it("一键全签：对全部池账号逐个 claim（幂等，已签跳过由后端保证）", async () => {
+    installWorkbuddyRoutes();
+    render(<WorkBuddyCheckinPage active={true} />);
+
+    fireEvent.click(await screen.findByTestId("checkin-run-all"));
+    await waitFor(() => {
+      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "workbuddy_checkin_claim_for");
+      expect(calls).toHaveLength(2);
+      expect(calls).toContainEqual(["workbuddy_checkin_claim_for", { profileId: "wb-uid-1" }]);
+      expect(calls).toContainEqual(["workbuddy_checkin_claim_for", { profileId: "wb-uid-2" }]);
+    });
+  });
+
+  it("一键补签：只对今日未签账号执行", async () => {
+    installWorkbuddyRoutes({ statusFor: {
+      "wb-uid-1": { ...checkinStatus, today_checked_in: true },
+      "wb-uid-2": { ...checkinStatus, today_checked_in: false },
+    } });
+    render(<WorkBuddyCheckinPage active={true} />);
+
+    const pendingButton = await screen.findByTestId("checkin-run-pending");
+    expect(pendingButton).toHaveTextContent("一键补签（1）");
+    fireEvent.click(pendingButton);
+    await waitFor(() => {
+      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "workbuddy_checkin_claim_for");
+      expect(calls).toEqual([["workbuddy_checkin_claim_for", { profileId: "wb-uid-2" }]]);
+    });
+  });
+
+  it("行级 fail-soft：单账号状态查询失败标注「状态未知」，不阻塞他行", async () => {
+    installWorkbuddyRoutes({ statusFor: {
+      "wb-uid-1": null,
+      "wb-uid-2": { ...checkinStatus, checkin_dates: ["2026-10-20"] },
+    } });
+    render(<WorkBuddyCheckinPage active={true} />);
+
+    await screen.findByTestId("checkin-run-all");
+    // 行徽章与历史条双处 fail-soft 标注。
+    expect(screen.getAllByText("状态未知")).toHaveLength(2);
+    // 他行正常渲染额度 meta。
+    expect(document.querySelector("ul.checkin-flow")!.textContent).toContain("额度 700 积分");
+    // 历史条同步标注。
+    expect(screen.getByTestId("workbuddy-history-wb-uid-1")).toHaveTextContent("状态未知");
   });
 
   it("参与集默认全参与：从未显式设置的账号池加载后自动批量置 true 并记录 touched", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
 
-    await screen.findByTestId("workbuddy-checkin-card");
+    await screen.findByTestId("checkin-run-all");
     // wb-uid-2 enabled=false 且从未显式设置：归一为参与（一次置 true）。
     await waitFor(() => {
       const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
@@ -202,7 +281,7 @@ describe("WorkBuddyCheckinPage（P19-B2⑤ 签到页骨架消费 + 参与集默�
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
 
-    await screen.findByTestId("workbuddy-checkin-card");
+    await screen.findByTestId("checkin-run-all");
     const checkbox = await screen.findByTestId("workbuddy-auto-checkin-account-wb-uid-2") as HTMLInputElement;
     expect(checkbox.checked).toBe(false);
     const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
@@ -229,14 +308,15 @@ describe("WorkBuddyCheckinPage（P19-B2⑤ 签到页骨架消费 + 参与集默�
     });
   });
 
-  it("今日已签到：按钮翻转禁用态", async () => {
-    mockRoute("get_workbuddy_session_health", () => health);
-    mockRoute("workbuddy_checkin_status", () => ({ ...checkinStatus, today_checked_in: true }));
-    mockRoute("get_workbuddy_auto_checkin_status", () => autoStatus([]));
+  it("今日已签到：行内单签禁用 + 签到槽徽章翻转", async () => {
+    installWorkbuddyRoutes({ statusFor: {
+      "wb-uid-1": { ...checkinStatus, today_checked_in: true },
+      "wb-uid-2": { ...checkinStatus, today_checked_in: false },
+    } });
     render(<WorkBuddyCheckinPage active={true} />);
 
-    const button = await screen.findByTestId("workbuddy-checkin-button");
-    expect(button).toHaveTextContent("今日已签到");
-    expect(button).toBeDisabled();
+    const inline = await screen.findByTestId("checkin-inline-wb-uid-1");
+    expect(inline).toBeDisabled();
+    expect(screen.getByTestId("checkin-inline-wb-uid-2")).toBeEnabled();
   });
 });

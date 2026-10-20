@@ -42,9 +42,22 @@ export function fetchWorkBuddyCheckinStatus(): Promise<WorkBuddyCheckinStatusDto
   return invoke<WorkBuddyCheckinStatusDto>("workbuddy_checkin_status");
 }
 
+/**
+ * 按账号查询直连签到状态（P19-B5 逐账号行）：借该账号容器凭据解密。
+ * 后端命令由 B5 后端批次提供；未落地前真实模式 fail-fast，行级 fail-soft 标注。
+ */
+export function fetchWorkBuddyCheckinStatusFor(profileId: string): Promise<WorkBuddyCheckinStatusDto> {
+  return invoke<WorkBuddyCheckinStatusDto>("workbuddy_checkin_status_for", { profileId });
+}
+
 /** 领取今日签到（幂等：已签返回 verified=true 且 credit=0）。 */
 export function claimWorkBuddyCheckin(): Promise<WorkBuddyCheckinClaimDto> {
   return invoke<WorkBuddyCheckinClaimDto>("workbuddy_checkin_claim");
+}
+
+/** 按账号领取今日签到（P19-B5；幂等纪律与单账号命令一致：已签 verified=true 空操作）。 */
+export function claimWorkBuddyCheckinFor(profileId: string): Promise<WorkBuddyCheckinClaimDto> {
+  return invoke<WorkBuddyCheckinClaimDto>("workbuddy_checkin_claim_for", { profileId });
 }
 
 /**
