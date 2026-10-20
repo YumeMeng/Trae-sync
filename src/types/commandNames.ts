@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（118 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（122 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -57,6 +57,7 @@ export type CommandName =
   | "get_storage_root_state"
   | "get_trae_instance_states"
   | "get_workbuddy_auto_checkin_status"
+  | "get_workbuddy_checkin_overview"
   | "get_workbuddy_library_checkup"
   | "get_workbuddy_library_history"
   | "get_workbuddy_library_stats"
@@ -75,6 +76,7 @@ export type CommandName =
   | "list_trae_cn_accounts"
   | "list_trae_cn_foreign_projects"
   | "list_workbuddy_accounts"
+  | "list_workbuddy_checkin_accounts"
   | "login_environment"
   | "merge_master_projects"
   | "merge_trae_cn_project"
@@ -121,5 +123,7 @@ export type CommandName =
   | "transfer_workbuddy_sessions"
   | "uninstall_plugin_everywhere"
   | "workbuddy_checkin_claim"
+  | "workbuddy_checkin_claim_batch"
+  | "workbuddy_checkin_claim_profile"
   | "workbuddy_checkin_status"
 ;
