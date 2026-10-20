@@ -40,6 +40,7 @@ pub(crate) fn make_real_mode_state(storage_root: &Path) -> AppState {
         managed_account_runtime: Arc::new(Mutex::new(ManagedAccountRuntimeSlot::default())),
         checkin_cancellation: Arc::new(AtomicBool::new(false)),
         active_login_attempt: Arc::new(Mutex::new(None)),
+        active_workbuddy_login: Arc::new(Mutex::new(None)),
         checkin_execution_lock: Arc::new(Mutex::new(())),
     }
 }

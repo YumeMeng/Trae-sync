@@ -115,6 +115,8 @@ pub mod credential_handover;
 mod credential_handover;
 // P17-T5 并列骨架：WorkBuddy 产品域命令 + 产品注册表/切换命令。
 mod workbuddy_commands;
+// P19-B4：WorkBuddy 登录编排命令面（state 轮询流 begin/complete/cancel）。
+mod workbuddy_login_commands;
 // P19-B3：WorkBuddy 主库域命令（库页 WB 适配器：浏览/消息/软删/彻底删除/
 // 体检/统计/cwd 归并；破坏性写带进程纪律与备份前置）。
 mod workbuddy_library_commands;
@@ -289,6 +291,10 @@ pub(crate) struct AppState {
     /// 单个 OAuth attempt 连同产品、会话、取消阶段与浏览器资源一起持有；
     /// 完成或取消收尾前拒绝新的 begin，避免跨产品取消及迟到清理误伤。
     active_login_attempt: Arc<Mutex<Option<oauth_login::ActiveLoginAttempt>>>,
+    /// P19-B4：WorkBuddy 登录活动 attempt（state 轮询流；单槽占用语义与
+    /// active_login_attempt 一致，产品不同不共用槽）。
+    pub(crate) active_workbuddy_login:
+        Arc<Mutex<Option<workbuddy_login_commands::WorkBuddyLoginAttempt>>>,
     /// 签到执行互斥：手动批次整批持有（阻塞等待，最多等自动单账号几秒）；
     /// 自动批次逐账号短持有（try_lock 失败即跳过该账号，grill 2026-08-23 决策 5）。
     checkin_execution_lock: Arc<Mutex<()>>,
@@ -1254,6 +1260,7 @@ pub fn run() {
             managed_account_runtime: Arc::new(Mutex::new(initial_managed_account_runtime)),
             checkin_cancellation: Arc::new(AtomicBool::new(false)),
             active_login_attempt: Arc::new(Mutex::new(None)),
+            active_workbuddy_login: Arc::new(Mutex::new(None)),
             checkin_execution_lock: Arc::new(Mutex::new(())),
         })
         .setup({
@@ -1315,6 +1322,11 @@ pub fn run() {
             workbuddy_backup_commands::restore_workbuddy_backup,
             workbuddy_backup_commands::delete_workbuddy_backups,
             workbuddy_backup_commands::get_workbuddy_probe_info,
+            // P19-B4 登录编排（state 轮询流；begin 下发 authUrl、complete
+            // 轮询取凭据入池、cancel 停轮询；与捕获编排并存不替换）。
+            workbuddy_login_commands::begin_workbuddy_login,
+            workbuddy_login_commands::complete_workbuddy_login,
+            workbuddy_login_commands::cancel_workbuddy_login,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,
             read_work_cn_state,
@@ -1509,6 +1521,7 @@ mod command_shell_tests {
             managed_account_runtime: Arc::new(Mutex::new(ManagedAccountRuntimeSlot::default())),
             checkin_cancellation: Arc::new(AtomicBool::new(false)),
             active_login_attempt: Arc::new(Mutex::new(None)),
+            active_workbuddy_login: Arc::new(Mutex::new(None)),
             checkin_execution_lock: Arc::new(Mutex::new(())),
         }
     }
