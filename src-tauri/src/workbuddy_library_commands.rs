@@ -132,7 +132,7 @@ pub(crate) fn get_workbuddy_library_checkup(
 
 /// 写前进程检查 + 写后重启补偿（P19 §4.4 纪律；注入式原语为真实进程，
 /// 离线单测不覆盖本路径——单测口径见 workbuddy_transfer 19 单测）。
-fn run_with_client_stopped<T>(
+pub(crate) fn run_with_client_stopped<T>(
     write: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, WorkBuddyLibraryWriteTail), String> {
     // 1) 写前进程检查：Unknown 拒绝一切写副作用（P14-2 边界）。
@@ -290,7 +290,7 @@ fn state_backup_root() -> Result<PathBuf, String> {
 }
 
 /// 组装备份源（P19 决策 1 全纳入范围；app 根缺数据时报错——备份锚点纪律）。
-fn backup_sources_for_data_root(
+pub(crate) fn backup_sources_for_data_root(
     data_root: &std::path::Path,
     login_root: Option<&std::path::Path>,
 ) -> Result<traesync_infrastructure::workbuddy_backup::WorkBuddyBackupSources, String> {

@@ -309,11 +309,32 @@ pub fn backup_workbuddy_scope_to(
 }
 
 /// 显式时间戳版本（编排层可统一发号；测试确定性构造现场）。
-/// 语义与 [`backup_workbuddy_scope_to`] 完全一致。
+/// 语义与 [`backup_workbuddy_scope_to`] 完全一致（滚动单份）。
 pub fn backup_workbuddy_scope_stamped(
     sources: &WorkBuddyBackupSources,
     target_dir: &Path,
     stamp: u64,
+) -> Result<WorkBuddyBackupOutcome, WorkBuddyBackupError> {
+    backup_workbuddy_scope_stamped_inner(sources, target_dir, stamp, true)
+}
+
+/// P19-B8：非滚动发布变体（**保留既有链条**）——恢复前置「再备份当前态
+/// 一次」专用：滚动语义会清掉全部旧份（含即将恢复的目标份），恢复前置
+/// 必须保链。其余语义（暂存压缩/manifest/原子发布）与滚动版一致。
+pub fn backup_workbuddy_scope_stamped_keep_chain(
+    sources: &WorkBuddyBackupSources,
+    target_dir: &Path,
+    stamp: u64,
+) -> Result<WorkBuddyBackupOutcome, WorkBuddyBackupError> {
+    backup_workbuddy_scope_stamped_inner(sources, target_dir, stamp, false)
+}
+
+/// 发布内核（rollover = 是否发布成功后滚动清旧）。
+fn backup_workbuddy_scope_stamped_inner(
+    sources: &WorkBuddyBackupSources,
+    target_dir: &Path,
+    stamp: u64,
+    rollover: bool,
 ) -> Result<WorkBuddyBackupOutcome, WorkBuddyBackupError> {
     if !sources.app_config_root.is_dir() {
         return Err(WorkBuddyBackupError::SourceUnavailable);
@@ -394,10 +415,14 @@ pub fn backup_workbuddy_scope_stamped(
     }
 
     // P17-A3 滚动单份：发布成功后彻底删除其余旧份（直删不走回收站）。
+    // P19-B8：keep_chain 变体（rollover=false）跳过滚动——恢复前置再备份
+    // 不能清掉即将恢复的目标份。
     let mut rolled_over = 0_usize;
-    for other in list_workbuddy_backup_stamps(target_dir) {
-        if other != stamp && hard_delete_workbuddy_backup(target_dir, other) {
-            rolled_over += 1;
+    if rollover {
+        for other in list_workbuddy_backup_stamps(target_dir) {
+            if other != stamp && hard_delete_workbuddy_backup(target_dir, other) {
+                rolled_over += 1;
+            }
         }
     }
 
@@ -802,6 +827,26 @@ mod tests {
             WorkBuddyBackupError::TargetExists
         );
         assert!(first.backup_dir.join("manifest.json").is_file());
+    }
+
+    /// P19-B8 keep_chain 变体：发布不滚动——两次备份并存，既有链条
+    /// 不被清理（恢复前置再备份的语义基础）。
+    #[test]
+    fn keep_chain_backup_publishes_without_rollover() {
+        let root = tempdir().unwrap();
+        let sources = make_sources(root.path());
+        let target = root.path().join("backups");
+        backup_workbuddy_scope_stamped(&sources, &target, 1000).unwrap();
+        let second =
+            backup_workbuddy_scope_stamped_keep_chain(&sources, &target, 2000).unwrap();
+        assert_eq!(second.rolled_over, 0, "keep_chain 不触发滚动");
+        // 两条并存（对照滚动版：rolling_backup_keeps_single_copy 只留一份）。
+        assert_eq!(list_workbuddy_backup_stamps(&target), vec![1000, 2000]);
+        // keep_chain 目标已存在同样拒绝（永不覆盖既有备份纪律不变）。
+        assert_eq!(
+            backup_workbuddy_scope_stamped_keep_chain(&sources, &target, 2000).unwrap_err(),
+            WorkBuddyBackupError::TargetExists
+        );
     }
 
     /// P17-A3 滚动单份：第二次备份后旧份整目录彻底删除（直删不进回收站

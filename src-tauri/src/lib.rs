@@ -118,6 +118,9 @@ mod workbuddy_commands;
 // P19-B3：WorkBuddy 主库域命令（库页 WB 适配器：浏览/消息/软删/彻底删除/
 // 体检/统计/cwd 归并；破坏性写带进程纪律与备份前置）。
 mod workbuddy_library_commands;
+// P19-B8：WorkBuddy 备份链管理命令（list/create/restore/delete，对齐
+// Trae 备份域深度）+ 探针数据面命令（环境页连接卡）。
+mod workbuddy_backup_commands;
 mod workbuddy_schedule;
 // P16-T4：新账号「从客户端捕获」入池编排（spec docs/specs/p16-account-capture.md）。
 mod account_capture;
@@ -1305,6 +1308,13 @@ pub fn run() {
             workbuddy_library_commands::delete_workbuddy_sessions,
             workbuddy_library_commands::purge_workbuddy_sessions,
             workbuddy_library_commands::merge_workbuddy_cwd_projects,
+            // P19-B8 备份链管理面（fe 设置页管理面 UI 数据源）+ 探针数据面
+            // （环境页连接卡：版本/安装路径/进程状态，全 fail-soft）。
+            workbuddy_backup_commands::list_workbuddy_backups,
+            workbuddy_backup_commands::create_workbuddy_backup,
+            workbuddy_backup_commands::restore_workbuddy_backup,
+            workbuddy_backup_commands::delete_workbuddy_backups,
+            workbuddy_backup_commands::get_workbuddy_probe_info,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,
             read_work_cn_state,
