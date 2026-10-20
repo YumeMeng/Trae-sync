@@ -13,6 +13,8 @@
 
 pub mod account_evidence;
 pub mod account_registry;
+// P19-B3：归档事务纪律状态机（master_archive 参数化提取，Trae 与 WB 共用）。
+pub mod archive_tx;
 #[cfg(feature = "sqlcipher")]
 pub mod account_session_content;
 #[cfg(feature = "sqlcipher")]
@@ -100,6 +102,10 @@ pub mod workbuddy_wbipc;
 // 只碰 transport='local'、云会话红线、进程 Unknown 拒写——模块头红线清单）。
 #[cfg(feature = "sqlcipher")]
 pub mod workbuddy_transfer;
+// P19-B3：WorkBuddy 主库域移植（workbuddy.db 索引 + projects jsonl 正文；
+// 软删除/彻底删除/体检/统计/cwd 归并；cloud 红线与写前进程纪律见模块头）。
+#[cfg(feature = "sqlcipher")]
+pub mod workbuddy_library;
 // P18-B2：WorkBuddy 切号实验执行器（骨架完整实现、真机执行入口锁定待
 // 统一验收——组合根无命令注册，示例执行器双重确认门禁）。
 pub mod workbuddy_switch_experiment;

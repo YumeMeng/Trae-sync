@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
+use crate::archive_tx::{placeholders, run_archive_transaction};
 use crate::master_handover::{backup_master_trio_to, backup_master_trio_rolling, master_database_path};
 
 /// 借用的原生隐藏枚举（会话列表排除式白名单成员）。
@@ -67,12 +68,6 @@ impl std::fmt::Display for MasterArchiveError {
 }
 
 impl std::error::Error for MasterArchiveError {}
-
-/// 统一标记提交错误，避免把未知持久状态误报为已回滚。
-fn commit_archive_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), MasterArchiveError> {
-    tx.commit()
-        .map_err(|_| MasterArchiveError::CommitOutcomeUnknown)
-}
 
 /// 统计当前账号下处于指定归档状态的目标会话，提交前后使用同一条件核对。
 fn count_owned_sessions_with_status(
@@ -184,11 +179,6 @@ pub(crate) fn verify_key_readable(conn: &Connection) -> Result<(), MasterArchive
     .map_err(|_| MasterArchiveError::DbOpenFailed)
 }
 
-/// 构造 `?, ?, ...` 占位符串（批量 IN 子句用）。
-fn placeholders(count: usize) -> String {
-    vec!["?"; count].join(", ")
-}
-
 /// 只保留当前主库登录账号名下的会话；调用方给出的 ID 可能来自过期界面，
 /// 所有写操作都必须在数据库层重新确认项目归属。
 fn authorized_session_ids(
@@ -262,99 +252,102 @@ pub fn apply_master_archive_changes(
         return Err(MasterArchiveError::ArchiveUnsupported);
     }
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|_| MasterArchiveError::WriteFailed)?;
-    let result = (|| -> Result<(usize, usize, usize, usize), MasterArchiveError> {
-        let archived_before = count_owned_sessions_with_status(
-            &tx,
-            archive_session_ids,
-            current_user_id,
-            Some(ARCHIVE_HIDDEN_STATUS),
-        )?;
-        let restored_before =
-            count_owned_sessions_with_status(&tx, restore_session_ids, current_user_id, None)?;
-        let archived_sessions = if archive_session_ids.is_empty() {
-            0
-        } else {
-            let session_clause = placeholders(archive_session_ids.len());
-            let owner_param = archive_session_ids.len() + 1;
-            let sql = format!(
-                "UPDATE chat_session SET hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
-                 WHERE hidden_status IS NULL AND session_id IN ({session_clause}) \
-                 AND EXISTS (SELECT 1 FROM project p \
-                    WHERE p.project_id = chat_session.project_id AND p.user_id = ?{owner_param})"
-            );
-            let mut params: Vec<&str> = archive_session_ids.iter().map(String::as_str).collect();
-            params.push(current_user_id);
-            tx.execute(&sql, rusqlite::params_from_iter(params))
+    // P19-B3：事务纪律状态机迁移至 archive_tx::run_archive_transaction
+    // （归属重校验在 body 内、CommitOutcomeUnknown / 提交后读回校验语义不变）。
+    let (archived_sessions, restored_sessions, _expected_archived, _expected_restored): (
+        usize,
+        usize,
+        usize,
+        usize,
+    ) = run_archive_transaction(
+        &conn,
+        || MasterArchiveError::WriteFailed,
+        |tx| -> Result<(usize, usize, usize, usize), MasterArchiveError> {
+            let archived_before = count_owned_sessions_with_status(
+                tx,
+                archive_session_ids,
+                current_user_id,
+                Some(ARCHIVE_HIDDEN_STATUS),
+            )?;
+            let restored_before =
+                count_owned_sessions_with_status(tx, restore_session_ids, current_user_id, None)?;
+            let archived_sessions = if archive_session_ids.is_empty() {
+                0
+            } else {
+                let session_clause = placeholders(archive_session_ids.len());
+                let owner_param = archive_session_ids.len() + 1;
+                let sql = format!(
+                    "UPDATE chat_session SET hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
+                     WHERE hidden_status IS NULL AND session_id IN ({session_clause}) \
+                     AND EXISTS (SELECT 1 FROM project p \
+                        WHERE p.project_id = chat_session.project_id AND p.user_id = ?{owner_param})"
+                );
+                let mut params: Vec<&str> =
+                    archive_session_ids.iter().map(String::as_str).collect();
+                params.push(current_user_id);
+                tx.execute(&sql, rusqlite::params_from_iter(params))
+                    .map_err(|_| MasterArchiveError::WriteFailed)?
+            };
+
+            if !restore_session_ids.is_empty() {
+                let session_clause = placeholders(restore_session_ids.len());
+                let mut params: Vec<&str> = vec![current_user_id];
+                params.extend(restore_session_ids.iter().map(String::as_str));
+                // 恢复选中的归档会话前，先让其项目归属当前账号；项目级恢复
+                // 与会话级恢复共用这一个批次，不让 UI 出现“恢复了但找不到”。
+                let move_projects_sql = format!(
+                    "UPDATE project SET user_id = ?1 WHERE project_id IN (\
+                     SELECT DISTINCT project_id FROM chat_session \
+                     WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
+                       AND session_id IN ({session_clause}))"
+                );
+                tx.execute(
+                    &move_projects_sql,
+                    rusqlite::params_from_iter(params.iter().copied()),
+                )
+                .map_err(|_| MasterArchiveError::WriteFailed)?;
+            }
+
+            let restored_sessions = if restore_session_ids.is_empty() {
+                0
+            } else {
+                let session_clause = placeholders(restore_session_ids.len());
+                let sql = format!(
+                    "UPDATE chat_session SET hidden_status = NULL \
+                     WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
+                       AND session_id IN ({session_clause})"
+                );
+                tx.execute(
+                    &sql,
+                    rusqlite::params_from_iter(restore_session_ids.iter().map(String::as_str)),
+                )
                 .map_err(|_| MasterArchiveError::WriteFailed)?
-        };
+            };
 
-        if !restore_session_ids.is_empty() {
-            let session_clause = placeholders(restore_session_ids.len());
-            let mut params: Vec<&str> = vec![current_user_id];
-            params.extend(restore_session_ids.iter().map(String::as_str));
-            // 恢复选中的归档会话前，先让其项目归属当前账号；项目级恢复
-            // 与会话级恢复共用这一个批次，不让 UI 出现“恢复了但找不到”。
-            let move_projects_sql = format!(
-                "UPDATE project SET user_id = ?1 WHERE project_id IN (\
-                 SELECT DISTINCT project_id FROM chat_session \
-                 WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
-                   AND session_id IN ({session_clause}))"
-            );
-            tx.execute(
-                &move_projects_sql,
-                rusqlite::params_from_iter(params.iter().copied()),
-            )
-            .map_err(|_| MasterArchiveError::WriteFailed)?;
-        }
-
-        let restored_sessions = if restore_session_ids.is_empty() {
-            0
-        } else {
-            let session_clause = placeholders(restore_session_ids.len());
-            let sql = format!(
-                "UPDATE chat_session SET hidden_status = NULL \
-                 WHERE hidden_status = '{ARCHIVE_HIDDEN_STATUS}' \
-                   AND session_id IN ({session_clause})"
-            );
-            tx.execute(
-                &sql,
-                rusqlite::params_from_iter(restore_session_ids.iter().map(String::as_str)),
-            )
-            .map_err(|_| MasterArchiveError::WriteFailed)?
-        };
-
-        Ok((
-            archived_sessions,
-            restored_sessions,
-            archived_before + archived_sessions,
-            restored_before + restored_sessions,
-        ))
-    })();
-
-    match result {
-        Ok((archived_sessions, restored_sessions, expected_archived, expected_restored)) => {
-            commit_archive_transaction(tx)?;
+            Ok((
+                archived_sessions,
+                restored_sessions,
+                archived_before + archived_sessions,
+                restored_before + restored_sessions,
+            ))
+        },
+        // 统一标记提交错误，避免把未知持久状态误报为已回滚。
+        || MasterArchiveError::CommitOutcomeUnknown,
+        |conn, (_, _, expected_archived, expected_restored)| {
             verify_archive_after_commit(
-                &conn,
+                conn,
                 archive_session_ids,
                 restore_session_ids,
                 current_user_id,
-                expected_archived,
-                expected_restored,
-            )?;
-            Ok(MasterArchiveApplyOutcome {
-                archived_sessions,
-                restored_sessions,
-            })
-        }
-        Err(error) => {
-            let _ = tx.rollback();
-            Err(error)
-        }
-    }
+                *expected_archived,
+                *expected_restored,
+            )
+        },
+    )?;
+    Ok(MasterArchiveApplyOutcome {
+        archived_sessions,
+        restored_sessions,
+    })
 }
 
 /// 真实删除会话（破坏性，单事务）：备份 → 内容三表 → chat_message →
@@ -446,79 +439,75 @@ pub fn delete_master_sessions_with_backup_dir(
         rows
     };
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|_| MasterArchiveError::WriteFailed)?;
-    let result = (|| -> Result<(usize, usize, usize), MasterArchiveError> {
-        // 1. 消息内容三表（存在则删；关联键 message_id，随消息元数据行删除）。
-        let mut deleted_messages = 0usize;
-        for table in [
-            "chat_message_general",
-            "chat_message_task",
-            "chat_message_chat",
-        ] {
-            let table_exists: bool = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|count| count > 0)
-                .map_err(|_| MasterArchiveError::WriteFailed)?;
-            if !table_exists {
-                continue;
+    // P19-B3：事务纪律状态机迁移至 archive_tx::run_archive_transaction
+    // （删除路径无提交后读回校验，verify 为直通；其余语义不变）。
+    let (deleted_sessions, deleted_messages, removed_projects) = run_archive_transaction(
+        &conn,
+        || MasterArchiveError::WriteFailed,
+        |tx| -> Result<(usize, usize, usize), MasterArchiveError> {
+            // 1. 消息内容三表（存在则删；关联键 message_id，随消息元数据行删除）。
+            let mut deleted_messages = 0usize;
+            for table in [
+                "chat_message_general",
+                "chat_message_task",
+                "chat_message_chat",
+            ] {
+                let table_exists: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|count| count > 0)
+                    .map_err(|_| MasterArchiveError::WriteFailed)?;
+                if !table_exists {
+                    continue;
+                }
+                let sql = format!(
+                    "DELETE FROM {table} WHERE message_id IN (\
+                     SELECT message_id FROM chat_message WHERE session_id IN ({in_clause}))"
+                );
+                deleted_messages += tx
+                    .execute(&sql, rusqlite::params_from_iter(params.iter()))
+                    .map_err(|_| MasterArchiveError::WriteFailed)?;
             }
-            let sql = format!(
-                "DELETE FROM {table} WHERE message_id IN (\
-                 SELECT message_id FROM chat_message WHERE session_id IN ({in_clause}))"
-            );
+            // 2. 消息元数据行。
+            let sql = format!("DELETE FROM chat_message WHERE session_id IN ({in_clause})");
             deleted_messages += tx
                 .execute(&sql, rusqlite::params_from_iter(params.iter()))
                 .map_err(|_| MasterArchiveError::WriteFailed)?;
-        }
-        // 2. 消息元数据行。
-        let sql = format!("DELETE FROM chat_message WHERE session_id IN ({in_clause})");
-        deleted_messages += tx
-            .execute(&sql, rusqlite::params_from_iter(params.iter()))
-            .map_err(|_| MasterArchiveError::WriteFailed)?;
-        // 3. 会话行。
-        let sql = format!("DELETE FROM chat_session WHERE session_id IN ({in_clause})");
-        let deleted_sessions = tx
-            .execute(&sql, rusqlite::params_from_iter(params.iter()))
-            .map_err(|_| MasterArchiveError::WriteFailed)?;
-        // 4. 空壳项目行：受影响项目中已无任何会话挂接的行。
-        let project_params: Vec<&str> = affected_projects.iter().map(String::as_str).collect();
-        let project_clause = placeholders(affected_projects.len());
-        let sql = format!(
-            "DELETE FROM project WHERE project_id IN ({project_clause}) \
-             AND NOT EXISTS (SELECT 1 FROM chat_session \
-             WHERE chat_session.project_id = project.project_id)"
-        );
-        let removed_projects = if affected_projects.is_empty() {
-            0
-        } else {
-            tx.execute(&sql, rusqlite::params_from_iter(project_params))
-                .map_err(|_| MasterArchiveError::WriteFailed)?
-        };
-        Ok((deleted_sessions, deleted_messages, removed_projects))
-    })();
+            // 3. 会话行。
+            let sql = format!("DELETE FROM chat_session WHERE session_id IN ({in_clause})");
+            let deleted_sessions = tx
+                .execute(&sql, rusqlite::params_from_iter(params.iter()))
+                .map_err(|_| MasterArchiveError::WriteFailed)?;
+            // 4. 空壳项目行：受影响项目中已无任何会话挂接的行。
+            let project_params: Vec<&str> = affected_projects.iter().map(String::as_str).collect();
+            let project_clause = placeholders(affected_projects.len());
+            let sql = format!(
+                "DELETE FROM project WHERE project_id IN ({project_clause}) \
+                 AND NOT EXISTS (SELECT 1 FROM chat_session \
+                 WHERE chat_session.project_id = project.project_id)"
+            );
+            let removed_projects = if affected_projects.is_empty() {
+                0
+            } else {
+                tx.execute(&sql, rusqlite::params_from_iter(project_params))
+                    .map_err(|_| MasterArchiveError::WriteFailed)?
+            };
+            Ok((deleted_sessions, deleted_messages, removed_projects))
+        },
+        // 统一标记提交错误，避免把未知持久状态误报为已回滚。
+        || MasterArchiveError::CommitOutcomeUnknown,
+        |_, _| Ok(()),
+    )?;
 
-    match result {
-        Ok((deleted_sessions, deleted_messages, removed_projects)) => {
-            commit_archive_transaction(tx)?;
-            Ok(MasterDeleteOutcome {
-                deleted_sessions,
-                deleted_messages,
-                removed_projects,
-                backup_path: backup.display().to_string(),
-            })
-        }
-        Err(error) => {
-            // 回滚失败也只能放弃：库由 SQLite 事务原子性保证（连接关闭时回滚）。
-            let _ = tx.rollback();
-            Err(error)
-        }
-    }
+    Ok(MasterDeleteOutcome {
+        deleted_sessions,
+        deleted_messages,
+        removed_projects,
+        backup_path: backup.display().to_string(),
+    })
 }
 
 /// 分组合并回执（P5-8c）：规模供 UI 展示。
@@ -616,47 +605,43 @@ fn merge_master_projects_inner(
     let conn = open_with_key_readwrite(&db_path, raw_key)?;
     verify_key_readable(&conn)?;
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|_| MasterArchiveError::WriteFailed)?;
-    let result = (|| -> Result<(usize, usize), MasterArchiveError> {
-        // 1. 全部会话改挂目标分组（含归档/软删行——归位语义保持一致）。
-        let sql = format!(
-            "UPDATE chat_session SET project_id = ?1 WHERE project_id IN ({source_clause})"
-        );
-        let mut params: Vec<&str> = vec![target_project_id];
-        params.extend(source_params.iter().copied());
-        let moved_sessions = tx
-            .execute(&sql, rusqlite::params_from_iter(params))
-            .map_err(|_| MasterArchiveError::WriteFailed)?;
-        // 2. 空壳源分组行清理（NOT EXISTS 守卫：与删除路径同款防御）。
-        let sql = format!(
-            "DELETE FROM project WHERE project_id IN ({source_clause}) \
-             AND NOT EXISTS (SELECT 1 FROM chat_session \
-             WHERE chat_session.project_id = project.project_id)"
-        );
-        let removed_projects = tx
-            .execute(&sql, rusqlite::params_from_iter(source_params))
-            .map_err(|_| MasterArchiveError::WriteFailed)?;
-        Ok((moved_sessions, removed_projects))
-    })();
+    // P19-B3：事务纪律状态机迁移至 archive_tx::run_archive_transaction
+    // （归并路径无提交后读回校验，verify 为直通；其余语义不变）。
+    let (moved_sessions, removed_projects) = run_archive_transaction(
+        &conn,
+        || MasterArchiveError::WriteFailed,
+        |tx| -> Result<(usize, usize), MasterArchiveError> {
+            // 1. 全部会话改挂目标分组（含归档/软删行——归位语义保持一致）。
+            let sql = format!(
+                "UPDATE chat_session SET project_id = ?1 WHERE project_id IN ({source_clause})"
+            );
+            let mut params: Vec<&str> = vec![target_project_id];
+            params.extend(source_params.iter().copied());
+            let moved_sessions = tx
+                .execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(|_| MasterArchiveError::WriteFailed)?;
+            // 2. 空壳源分组行清理（NOT EXISTS 守卫：与删除路径同款防御）。
+            let sql = format!(
+                "DELETE FROM project WHERE project_id IN ({source_clause}) \
+                 AND NOT EXISTS (SELECT 1 FROM chat_session \
+                 WHERE chat_session.project_id = project.project_id)"
+            );
+            let removed_projects = tx
+                .execute(&sql, rusqlite::params_from_iter(source_params))
+                .map_err(|_| MasterArchiveError::WriteFailed)?;
+            Ok((moved_sessions, removed_projects))
+        },
+        // 统一标记提交错误，避免把未知持久状态误报为已回滚。
+        || MasterArchiveError::CommitOutcomeUnknown,
+        |_, _| Ok(()),
+    )?;
 
-    match result {
-        Ok((moved_sessions, removed_projects)) => {
-            commit_archive_transaction(tx)?;
-            Ok(MasterMergeOutcome {
-                moved_sessions,
-                removed_projects,
-                // P17-A3：归并不再自动备份；字段保留为前端契约兼容，恒空串。
-                backup_path: String::new(),
-            })
-        }
-        Err(error) => {
-            // 回滚失败也只能放弃：库由 SQLite 事务原子性保证（连接关闭时回滚）。
-            let _ = tx.rollback();
-            Err(error)
-        }
-    }
+    Ok(MasterMergeOutcome {
+        moved_sessions,
+        removed_projects,
+        // P17-A3：归并不再自动备份；字段保留为前端契约兼容，恒空串。
+        backup_path: String::new(),
+    })
 }
 
 #[cfg(test)]
@@ -726,17 +711,18 @@ mod tests {
     }
 
     /// 用延迟外键制造真实 COMMIT 错误，并确认事务释放后写入没有残留。
+    /// （P19-B3：改经 archive_tx::run_archive_transaction 验证同一语义。）
     #[test]
     fn failed_archive_commit_is_unknown_and_rolls_back_fixture_transaction() {
         let conn = Connection::open_in_memory().unwrap();
-        let raw_key = "aa".repeat(32);
         conn.execute_batch(&format!(
-            "PRAGMA key = \"x'{raw_key}'\";
+            "PRAGMA key = \"x'{}'\";
              PRAGMA foreign_keys = ON;
              CREATE TABLE parent (id INTEGER PRIMARY KEY);
              CREATE TABLE child (
                 parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
              );",
+            "aa".repeat(32),
         ))
         .unwrap();
         let foreign_keys_enabled: i64 = conn
@@ -744,10 +730,18 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_keys_enabled, 1);
 
-        let tx = conn.unchecked_transaction().unwrap();
-        tx.execute("INSERT INTO child VALUES (1)", []).unwrap();
+        let result: Result<usize, MasterArchiveError> = run_archive_transaction(
+            &conn,
+            || MasterArchiveError::WriteFailed,
+            |tx| {
+                tx.execute("INSERT INTO child VALUES (1)", [])
+                    .map_err(|_| MasterArchiveError::WriteFailed)
+            },
+            || MasterArchiveError::CommitOutcomeUnknown,
+            |_, _| Ok(()),
+        );
         assert_eq!(
-            commit_archive_transaction(tx),
+            result,
             Err(MasterArchiveError::CommitOutcomeUnknown)
         );
         let child_count: i64 = conn
