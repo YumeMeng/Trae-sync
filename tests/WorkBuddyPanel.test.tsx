@@ -61,24 +61,50 @@ const defaultPool = [
   poolEntry("wb-uid-2", "uid-2", "乙账号"),
 ];
 
+/** P19-B5 后端契约（be-engineer 9609f9a）：overview 条目构造器。 */
+const overviewRow = (
+  profileId: string,
+  screenName: string,
+  over: Partial<Record<string, unknown>> = {},
+) => ({
+  profile_id: profileId,
+  screen_name: screenName,
+  today_checked_in: false,
+  streak_days: 6,
+  daily_credit: 100,
+  total_credits: 700,
+  checkin_dates: ["2026-10-20", "2026-10-19"],
+  error: null,
+  ...over,
+});
+
 function installWorkbuddyRoutes(options?: {
   pool?: typeof defaultPool;
   accounts?: readonly { profile_id: string; screen_name: string; enabled: boolean }[];
-  /** profile_id → 状态（缺省全未签）；null = 模拟该行查询失败（fail-soft）。 */
-  statusFor?: Record<string, Record<string, unknown> | null>;
+  /** get_workbuddy_checkin_overview 回执（缺省两账号 ok 行）。 */
+  overview?: readonly Record<string, unknown>[];
 }) {
   mockRoute("get_workbuddy_session_health", () => health);
   mockRoute("list_workbuddy_accounts", () => options?.pool ?? defaultPool);
   mockRoute("workbuddy_checkin_status", () => checkinStatus);
-  // 联调期（P19-B5）：per-account 命令契约已冻结、后端落地中（be-engineer B5），
-  // CommandName 联合暂未包含——显式 cast，命令入册后摘除。
-  mockRoute("workbuddy_checkin_status_for" as Parameters<typeof mockRoute>[0], (args: { profileId: string }) => {
-    const table = options?.statusFor;
-    const status = table ? table[args.profileId] : { ...checkinStatus, checkin_dates: ["2026-10-20", "2026-10-19"] };
-    if (status === null || status === undefined) return Promise.reject(new Error("row_unavailable"));
-    return status;
-  });
-  mockRoute("workbuddy_checkin_claim_for" as Parameters<typeof mockRoute>[0], () => ({ credit: 10, streak_days: 7, verified: true }));
+  mockRoute("get_workbuddy_checkin_overview", () =>
+    options?.overview ?? [
+      overviewRow("wb-uid-1", "甲账号"),
+      overviewRow("wb-uid-2", "乙账号"),
+    ]);
+  mockRoute("workbuddy_checkin_claim_profile", () => ({ credit: 10, streak_days: 7, verified: true }));
+  mockRoute("workbuddy_checkin_claim_batch", (args: { profileIds: string[] }) =>
+    args.profileIds.map((profileId) => ({
+      profile_id: profileId,
+      screen_name: profileId === "wb-uid-1" ? "甲账号" : "乙账号",
+      outcome: "claimed",
+      credit: 10,
+      detail_code: null,
+    })));
+  mockRoute("list_workbuddy_checkin_accounts", () => [
+    { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
+    { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
+  ]);
   mockRoute("get_workbuddy_auto_checkin_status", () =>
     autoStatus(options?.accounts ?? [
       { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
@@ -180,7 +206,7 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
   });
 });
 
-describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 参与集默认全参与）", () => {
+describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消费）", () => {
   it("骨架渲染：逐账号行（复选+昵称+额度/连签 meta）+ 批量按钮组 + 历史条 + 自动签到状态行", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
@@ -200,7 +226,7 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 参与集默认�
     expect(screen.getByTestId("product-badge-workbuddy")).toBeInTheDocument();
   });
 
-  it("行内单签：签到按钮触发 per-account claim 并落行内结果", async () => {
+  it("行内单签：签到按钮触发 claim_profile 并落行内结果", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
 
@@ -209,90 +235,88 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 参与集默认�
     fireEvent.click(inline);
     await waitFor(() => {
       expect(mockCoreInvoke.mock.calls).toContainEqual(
-        ["workbuddy_checkin_claim_for", { profileId: "wb-uid-1" }],
+        ["workbuddy_checkin_claim_profile", { profileId: "wb-uid-1" }],
       );
     });
     // 行内结果徽章（WB 通用档文案：签到成功）。
     await screen.findByText("签到成功");
   });
 
-  it("一键全签：对全部池账号逐个 claim（幂等，已签跳过由后端保证）", async () => {
+  it("一键全签：后端批量逐条回执（workbuddy_checkin_claim_batch）", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
 
     fireEvent.click(await screen.findByTestId("checkin-run-all"));
     await waitFor(() => {
-      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "workbuddy_checkin_claim_for");
-      expect(calls).toHaveLength(2);
-      expect(calls).toContainEqual(["workbuddy_checkin_claim_for", { profileId: "wb-uid-1" }]);
-      expect(calls).toContainEqual(["workbuddy_checkin_claim_for", { profileId: "wb-uid-2" }]);
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["workbuddy_checkin_claim_batch", { profileIds: ["wb-uid-1", "wb-uid-2"] }],
+      );
     });
+    // 逐行结果落位（claimed → 签到成功，两行都有）。
+    expect((await screen.findAllByText("签到成功"))).toHaveLength(2);
   });
 
   it("一键补签：只对今日未签账号执行", async () => {
-    installWorkbuddyRoutes({ statusFor: {
-      "wb-uid-1": { ...checkinStatus, today_checked_in: true },
-      "wb-uid-2": { ...checkinStatus, today_checked_in: false },
-    } });
+    installWorkbuddyRoutes({ overview: [
+      overviewRow("wb-uid-1", "甲账号", { today_checked_in: true }),
+      overviewRow("wb-uid-2", "乙账号"),
+    ] });
     render(<WorkBuddyCheckinPage active={true} />);
 
     const pendingButton = await screen.findByTestId("checkin-run-pending");
     expect(pendingButton).toHaveTextContent("一键补签（1）");
     fireEvent.click(pendingButton);
     await waitFor(() => {
-      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "workbuddy_checkin_claim_for");
-      expect(calls).toEqual([["workbuddy_checkin_claim_for", { profileId: "wb-uid-2" }]]);
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["workbuddy_checkin_claim_batch", { profileIds: ["wb-uid-2"] }],
+      );
     });
   });
 
-  it("行级 fail-soft：单账号状态查询失败标注「状态未知」，不阻塞他行", async () => {
-    installWorkbuddyRoutes({ statusFor: {
-      "wb-uid-1": null,
-      "wb-uid-2": { ...checkinStatus, checkin_dates: ["2026-10-20"] },
-    } });
+  it("行级 fail-soft：单账号 error 落条目标注「状态未知」，不阻塞他行", async () => {
+    installWorkbuddyRoutes({ overview: [
+      overviewRow("wb-uid-1", "甲账号", {
+        error: "workbuddy_checkin_auth_mismatch",
+        today_checked_in: null, streak_days: null, daily_credit: null, total_credits: null, checkin_dates: [],
+      }),
+      overviewRow("wb-uid-2", "乙账号"),
+    ] });
     render(<WorkBuddyCheckinPage active={true} />);
 
     await screen.findByTestId("checkin-run-all");
     // 行徽章与历史条双处 fail-soft 标注。
     expect(screen.getAllByText("状态未知")).toHaveLength(2);
-    // 他行正常渲染额度 meta。
+    // 他行正常渲染额度 meta；失败行不可单签。
     expect(document.querySelector("ul.checkin-flow")!.textContent).toContain("额度 700 积分");
-    // 历史条同步标注。
-    expect(screen.getByTestId("workbuddy-history-wb-uid-1")).toHaveTextContent("状态未知");
+    expect(screen.getByTestId("checkin-inline-wb-uid-1")).toBeDisabled();
   });
 
-  it("参与集默认全参与：从未显式设置的账号池加载后自动批量置 true 并记录 touched", async () => {
+  it("批量不可中断：不渲染取消按钮（后端整体批次语义，诚实 UI）", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
 
     await screen.findByTestId("checkin-run-all");
-    // wb-uid-2 enabled=false 且从未显式设置：归一为参与（一次置 true）。
-    await waitFor(() => {
-      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
-      expect(calls).toContainEqual(["set_workbuddy_account_auto_checkin", { profileId: "wb-uid-2", enabled: true }]);
-    });
-    const touched = JSON.parse(window.localStorage.getItem("auto-checkin.workbuddy.touched") ?? "[]");
-    expect(touched).toContain("wb-uid-2");
-    // 归一只跑一轮：不会把已参与的 wb-uid-1 再写一遍。
-    const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
-    expect(calls.filter(([, args]) => (args as { profileId: string }).profileId === "wb-uid-1")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "取消未开始任务" })).not.toBeInTheDocument();
   });
 
-  it("显式关闭尊重：touched 账号保持关闭，不被归一改写", async () => {
-    window.localStorage.setItem("auto-checkin.workbuddy.touched", JSON.stringify(["wb-uid-2"]));
-    installWorkbuddyRoutes();
+  it("参与集（后端有效参与）：未显式设置默认参与，显式关闭被尊重且不触发归一", async () => {
+    installWorkbuddyRoutes({ accounts: [
+      { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
+      { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
+    ] });
     render(<WorkBuddyCheckinPage active={true} />);
 
     await screen.findByTestId("checkin-run-all");
     const checkbox = await screen.findByTestId("workbuddy-auto-checkin-account-wb-uid-2") as HTMLInputElement;
+    // enabled = 后端有效参与语义（opt-out 后端化，前端 touched 集退役）。
     expect(checkbox.checked).toBe(false);
+    expect((screen.getByTestId("workbuddy-auto-checkin-account-wb-uid-1") as HTMLInputElement).checked).toBe(true);
+    // 无前端归一化写操作。
     const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
     expect(calls).toHaveLength(0);
   });
 
-  it("全部参与入口：一键把未参与账号批量置 true", async () => {
-    // 两账号都已显式关闭（touched）：归一不动它们，按钮保持可用（未参与 2）。
-    window.localStorage.setItem("auto-checkin.workbuddy.touched", JSON.stringify(["wb-uid-1", "wb-uid-2"]));
+  it("全部参与入口：一键把显式关闭的账号批量重新置为参与", async () => {
     installWorkbuddyRoutes({ accounts: [
       { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: false },
       { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
@@ -311,10 +335,10 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 参与集默认�
   });
 
   it("今日已签到：行内单签禁用 + 签到槽徽章翻转", async () => {
-    installWorkbuddyRoutes({ statusFor: {
-      "wb-uid-1": { ...checkinStatus, today_checked_in: true },
-      "wb-uid-2": { ...checkinStatus, today_checked_in: false },
-    } });
+    installWorkbuddyRoutes({ overview: [
+      overviewRow("wb-uid-1", "甲账号", { today_checked_in: true }),
+      overviewRow("wb-uid-2", "乙账号"),
+    ] });
     render(<WorkBuddyCheckinPage active={true} />);
 
     const inline = await screen.findByTestId("checkin-inline-wb-uid-1");

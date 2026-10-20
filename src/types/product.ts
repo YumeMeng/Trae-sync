@@ -69,6 +69,52 @@ export interface WorkBuddyCheckinStatusDto {
   readonly checkin_dates?: readonly string[];
 }
 
+/**
+ * WB 逐账号签到状态条目（P19-B5 get_workbuddy_checkin_overview 回执；矩阵 #43/#48）。
+ * fail-soft 语义：error 非空时状态字段全 null（行级标注，不阻塞他账号）。
+ */
+export interface WorkBuddyCheckinAccountStatusDto {
+  readonly profile_id: string;
+  readonly screen_name: string;
+  readonly today_checked_in: boolean | null;
+  readonly streak_days: number | null;
+  readonly daily_credit: number | null;
+  readonly total_credits: number | null;
+  /** YYYY-MM-DD，签到日历数据源。 */
+  readonly checkin_dates: readonly string[];
+  /** 稳定错误码；null = ok。 */
+  readonly error: string | null;
+}
+
+/** WB 签到结果口径（CheckinOutcome snake_case；进 OutcomeLabels 通用档）。 */
+export type WorkBuddyCheckinOutcome =
+  | "claimed"
+  | "already_checked_in"
+  | "not_eligible"
+  | "auth_mismatch"
+  | "credential_refresh_failed"
+  | "profile_busy"
+  | "network_error"
+  | "runtime_error"
+  | "verification_failed";
+
+/** WB 批量签到逐条回执（P19-B5 workbuddy_checkin_claim_batch；矩阵 #51）。 */
+export interface WorkBuddyCheckinBatchItemDto {
+  readonly profile_id: string;
+  readonly screen_name: string;
+  readonly outcome: WorkBuddyCheckinOutcome;
+  readonly credit: number;
+  readonly detail_code: string | null;
+}
+
+/** WB 自动签到参与集行（P19-B5 list_workbuddy_checkin_accounts；矩阵 #46）。
+ *  enabled = 有效参与：未显式设置默认 true（八域对齐 #3），显式关闭永远 false（后端 touched 权威）。 */
+export interface WorkBuddyCheckinParticipationDto {
+  readonly profile_id: string;
+  readonly screen_name: string;
+  readonly enabled: boolean;
+}
+
 /** WorkBuddy 签到领取回执（verified = 复核翻转确认真实入账）。 */
 export interface WorkBuddyCheckinClaimDto {
   readonly credit: number;

@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  WorkBuddyCheckinAccountStatusDto,
+  WorkBuddyCheckinBatchItemDto,
   WorkBuddyCheckinClaimDto,
+  WorkBuddyCheckinParticipationDto,
   WorkBuddyCheckinStatusDto,
   WorkBuddyDeepHealthDto,
   WorkBuddyLoginSummaryDto,
@@ -43,21 +46,38 @@ export function fetchWorkBuddyCheckinStatus(): Promise<WorkBuddyCheckinStatusDto
 }
 
 /**
- * 按账号查询直连签到状态（P19-B5 逐账号行）：借该账号容器凭据解密。
- * 后端命令由 B5 后端批次提供；未落地前真实模式 fail-fast，行级 fail-soft 标注。
+ * 逐账号签到状态批查（P19-B5；矩阵 #43 聚合 + #48 单账号刷新）。
+ * profileId=null = 全池批查（后端 fail-soft：单账号失败落条目 error，不阻塞他账号）；
+ * 具体 id = 单账号刷新；不在池内 → 整体 Err workbuddy_auto_checkin_account_missing。
  */
-export function fetchWorkBuddyCheckinStatusFor(profileId: string): Promise<WorkBuddyCheckinStatusDto> {
-  return invoke<WorkBuddyCheckinStatusDto>("workbuddy_checkin_status_for", { profileId });
+export function fetchWorkBuddyCheckinOverview(
+  profileId: string | null,
+): Promise<readonly WorkBuddyCheckinAccountStatusDto[]> {
+  return invoke<readonly WorkBuddyCheckinAccountStatusDto[]>("get_workbuddy_checkin_overview", {
+    profileId,
+  });
 }
 
-/** 领取今日签到（幂等：已签返回 verified=true 且 credit=0）。 */
-export function claimWorkBuddyCheckin(): Promise<WorkBuddyCheckinClaimDto> {
-  return invoke<WorkBuddyCheckinClaimDto>("workbuddy_checkin_claim");
+/** 参与集清单（矩阵 #46）：enabled = 有效参与（未显式设置默认 true；opt-out 永久尊重）。 */
+export function listWorkBuddyCheckinAccounts(): Promise<readonly WorkBuddyCheckinParticipationDto[]> {
+  return invoke<readonly WorkBuddyCheckinParticipationDto[]>("list_workbuddy_checkin_accounts");
 }
 
-/** 按账号领取今日签到（P19-B5；幂等纪律与单账号命令一致：已签 verified=true 空操作）。 */
-export function claimWorkBuddyCheckinFor(profileId: string): Promise<WorkBuddyCheckinClaimDto> {
-  return invoke<WorkBuddyCheckinClaimDto>("workbuddy_checkin_claim_for", { profileId });
+/** 按账号领取今日签到（矩阵 #56；幂等：AlreadyCheckedIn → credit=0 verified=true）。 */
+export function claimWorkBuddyCheckinProfile(profileId: string): Promise<WorkBuddyCheckinClaimDto> {
+  return invoke<WorkBuddyCheckinClaimDto>("workbuddy_checkin_claim_profile", { profileId });
+}
+
+/**
+ * 批量签到（矩阵 #51 一键签到）：后端顺序执行、fail-soft 逐条回执
+ * （池外 id 落条目报错不整体拒绝）。批量不可中断，前端不提供取消。
+ */
+export function claimWorkBuddyCheckinBatch(
+  profileIds: readonly string[],
+): Promise<readonly WorkBuddyCheckinBatchItemDto[]> {
+  return invoke<readonly WorkBuddyCheckinBatchItemDto[]>("workbuddy_checkin_claim_batch", {
+    profileIds: [...profileIds],
+  });
 }
 
 /**

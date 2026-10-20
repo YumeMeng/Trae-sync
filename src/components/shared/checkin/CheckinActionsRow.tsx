@@ -25,7 +25,8 @@ export interface CheckinActionsRowProps {
   onRunPending(): void;
   /** batch：对勾选子集执行（「签到所选」按钮）。 */
   onRunSelected(): void;
-  onCancel(): void;
+  /** 取消未开始任务（可选：后端整体批次不可中断的产品不传即不渲染取消按钮）。 */
+  onCancel?(): void;
 }
 
 export function CheckinActionsRow({
@@ -76,7 +77,9 @@ export function CheckinActionsRow({
             <CalendarCheck size={15} aria-hidden="true" />签到所选（{selectionCount}）
           </button>
         )}
-        <button className="btn btn--quiet" type="button" onClick={onCancel} disabled={!busy}>取消未开始任务</button>
+        {onCancel && (
+          <button className="btn btn--quiet" type="button" onClick={onCancel} disabled={!busy}>取消未开始任务</button>
+        )}
       </div>
     );
   }
@@ -86,7 +89,9 @@ export function CheckinActionsRow({
       <button className="btn btn--primary" type="button" onClick={onRunAll} disabled={!enabled || selectionCount === 0 || busy}>
         <CalendarCheck size={15} aria-hidden="true" />{busy ? "签到执行中…" : `全部签到（${selectionCount}）`}
       </button>
-      <button className="btn btn--quiet" type="button" onClick={onCancel} disabled={!busy}>取消未开始任务</button>
+      {onCancel && (
+        <button className="btn btn--quiet" type="button" onClick={onCancel} disabled={!busy}>取消未开始任务</button>
+      )}
     </div>
   );
 }
