@@ -463,12 +463,16 @@ describe("应用工作区入口", () => {
       expect(within(screen.getByRole("region", { name: "签到" })).getByTestId("product-badge-workbuddy")).toBeInTheDocument();
     });
 
-    // environment = pending：未适配区块渲染诚实说明卡。
-    // （overview/master-library 槽位同样持有 hidden 的 pending 卡，
-    //   必须收在当前 region 内断言，避免多元素命中。）
+    // environment = ready：轻量版只读状态卡（P19-B6；决策 10 不含启停动作）。
+    // 需深度健康命令 mock（进页自动检测一次）。
+    mockRoute("check_workbuddy_login_health", () => ({
+      status: "Active",
+      live_status: "client_offline",
+    }));
     fireEvent.click(screen.getByTestId("navigation-environment"));
     const workbuddyEnvRegion = await screen.findByRole("region", { name: "环境" });
-    expect(within(workbuddyEnvRegion).getByTestId("capability-pending")).toBeInTheDocument();
+    expect(within(workbuddyEnvRegion).getByTestId("workbuddy-env-client-card")).toBeInTheDocument();
+    expect(within(workbuddyEnvRegion).getByTestId("workbuddy-env-health-card")).toBeInTheDocument();
 
     // 切回 TRAE：账号页恢复完整账号工作台（重挂载重拉数据）。
     fireEvent.change(screen.getByRole("combobox", { name: "当前产品" }), {

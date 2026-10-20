@@ -12,6 +12,7 @@ import { WorkBuddyOverviewPage } from "./pages/WorkBuddyOverviewPage";
 import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
 import { WorkBuddyCheckinPage, WorkBuddyPanel } from "./components/WorkBuddyPanel";
+import { WorkBuddyEnvironmentPage } from "./components/WorkBuddyEnvironmentPage";
 import { CapabilitySection } from "./components/CapabilitySection";
 import type { LibraryRef } from "./components/LibrarySessionsPanel";
 import {
@@ -312,11 +313,7 @@ export default function App() {
           </div>
           <div className="app-page" hidden={activePage !== "environment"}>
             {isWorkBuddy ? (
-              <ProductPendingPage
-                section="environment"
-                title="环境"
-                note="WorkBuddy 的环境管理将随客户端适配扩展开放。"
-              />
+              <WorkBuddyEnvironmentPage active={activePage === "environment"} />
             ) : (
               <EnvironmentPage
                 active={activePage === "environment"}

@@ -85,7 +85,8 @@ const WORKBUDDY_UI: ProductUiContext = {
     overview: "ready",
     accounts: "ready",
     checkin: "ready",
-    environment: "pending",
+    // P19-B6：环境页轻量版（只读状态卡；多实例行 pending）。
+    environment: "ready",
     "master-library": "pending",
     settings: "ready",
   },

@@ -88,8 +88,8 @@ function liveHealthLabel(liveStatus: WorkBuddyDeepHealthDto["live_status"]): str
   }
 }
 
-/** 信息行：label + value 的两列展示（卡内统一行结构）。 */
-function InfoRow({ label, children }: { label: string; children: ReactNode }) {
+/** 信息行：label + value 的两列展示（卡内统一行结构；WB 域各页共用）。 */
+export function InfoRow({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="workbuddy-row">
       <span className="workbuddy-row__label">{label}</span>
