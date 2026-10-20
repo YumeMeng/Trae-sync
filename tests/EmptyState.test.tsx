@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { Layers } from "lucide-react";
-import { EmptyState } from "../src/components/EmptyState";
+import { EmptyState } from "../src/components/shared/EmptyState";
 
 // ============================================================================
 // EmptyState（P11-6 任务 4）：各页自持空态的统一轻量组件。

@@ -31,9 +31,9 @@ import {
   deriveCheckinSlotState,
   deriveWorkBuddyPoolLoginState,
 } from "./StatusBadges";
-import { ProductBadge } from "./ProductBadge";
-import { ConfirmDialog } from "./ConfirmDialog";
-import { EmptyState } from "./EmptyState";
+import { ProductBadge } from "./shared/ProductBadge";
+import { ConfirmDialog } from "./shared/ConfirmDialog";
+import { EmptyState } from "./shared/EmptyState";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 

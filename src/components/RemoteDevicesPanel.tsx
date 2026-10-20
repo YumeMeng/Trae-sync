@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, LogOut, MonitorSmartphone, RefreshCw } from "lucide-react";
-import { ConfirmDialog } from "./ConfirmDialog";
-import { EmptyState } from "./EmptyState";
+import { ConfirmDialog } from "./shared/ConfirmDialog";
+import { EmptyState } from "./shared/EmptyState";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import type { RemoteDeviceEntry, RemoteDeviceSnapshot } from "../types/product";

@@ -11,8 +11,8 @@ import type {
 import { safeUiErrorMessage } from "../utils/safeUiError";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
-import { ConfirmDialog } from "./ConfirmDialog";
-import { EmptyState } from "./EmptyState";
+import { ConfirmDialog } from "./shared/ConfirmDialog";
+import { EmptyState } from "./shared/EmptyState";
 
 interface SettingsPanelProps {
   /** 页面可见时才读取设置，避免后台 IPC。 */

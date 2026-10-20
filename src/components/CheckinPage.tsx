@@ -1,9 +1,9 @@
-﻿import { ProductBadge } from "./ProductBadge";
+﻿import { ProductBadge } from "./shared/ProductBadge";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { CalendarCheck, Loader2, RefreshCw, Timer, UserPlus } from "lucide-react";
+import { CalendarCheck, Loader2, RefreshCw, UserPlus } from "lucide-react";
 import type {
   AutoCheckinStatusDto,
   CheckinBatchSummaryDto,
@@ -13,13 +13,14 @@ import type {
   ManagedAccountsViewDto,
 } from "../types/account_switch";
 import type { AppPage } from "./NavigationRail";
-import { EmptyState } from "./EmptyState";
+import { EmptyState } from "./shared/EmptyState";
 import { PRODUCT_DISPLAY_NAME, sectionStateOf } from "../platform/productRegistry";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
 import { CheckinSlotBadge, deriveCheckinSlotState } from "./StatusBadges";
+import { InterWaitCountdown } from "./shared/checkin/InterWaitCountdown";
 
 /** 后端逐账号进度事件（checkin-progress）载荷；outcome 与 CheckinResultDto 同口径。 */
 interface CheckinProgressEvent {
@@ -629,41 +630,8 @@ function CheckinRow({ name, meta, badge, selected, onToggle, disabled, result }:
   );
 }
 
-/**
- * 本地秒级倒计时（后端只在阶段开始时推送一次总时长，前端自行递减）。
- */
-function useCountdownSeconds(initial: number) {
-  const [remaining, setRemaining] = useState(initial);
-  useEffect(() => {
-    setRemaining(initial);
-  }, [initial]);
-  useEffect(() => {
-    if (remaining <= 0) return;
-    const timer = window.setTimeout(() => setRemaining((value) => Math.max(0, value - 1)), 1000);
-    return () => window.clearTimeout(timer);
-  }, [remaining]);
-  return remaining;
-}
-
-/**
- * 账号间错峰等待倒计时：批量执行时下一账号前的 3~8 秒随机间隔
- * 显示"N 秒后开始"；归零后显示"开始中…"（由 running 阶段接管）。
- */
-function InterWaitCountdown({ seconds }: { seconds: number }) {
-  const remaining = useCountdownSeconds(seconds);
-  if (remaining <= 0) {
-    return (
-      <>
-        <Loader2 size={13} className="checkin-flow__spinner" aria-hidden="true" />开始中…
-      </>
-    );
-  }
-  return (
-    <>
-      <Timer size={13} aria-hidden="true" />{remaining} 秒后开始
-    </>
-  );
-}
+// useCountdownSeconds / InterWaitCountdown 已纯移动到
+// shared/checkin/InterWaitCountdown.tsx（P19-B1 步骤①：产品无关组件归位共享层）。
 
 /** 行内元信息：模型额度（含时间标注）+ 最近验证。
  * 注：签到活动 credits 为静态池值（实证恒 200），不展示。 */

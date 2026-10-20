@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, Waypoints, X } from "lucide-react";
 import type { PlatformContextDto } from "../types/workspace";
 import type { CurrentProductDto, ProductEntryDto } from "../types/product";
-import { ProductBadge } from "./ProductBadge";
+import { ProductBadge } from "./shared/ProductBadge";
 
 interface TitleBarProps {
   platform: PlatformContextDto;

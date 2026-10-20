@@ -1,7 +1,7 @@
 import { CircleSlash, Hourglass } from "lucide-react";
 import type { ReactNode } from "react";
 import type { CapabilityState } from "../platform/productRegistry";
-import { EmptyState } from "./EmptyState";
+import { EmptyState } from "./shared/EmptyState";
 
 // ============================================================================
 // 区块能力三态渲染（P11-6，ADR-0032 决策 2）：

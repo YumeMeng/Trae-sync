@@ -23,7 +23,7 @@ import { effectiveDisplayName } from "../utils/accountDisplay";
 import { LoginArchiveSlotBadge, deriveLoginSlotState } from "./StatusBadges";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { RemoteDevicesPanel } from "./RemoteDevicesPanel";
 
 interface AccountDetailProps {

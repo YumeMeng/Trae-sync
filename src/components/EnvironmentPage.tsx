@@ -35,7 +35,7 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 import { notify } from "../platform/notify";
 import { InstanceSlotBadge } from "./StatusBadges";
 import { sectionStateOf } from "../platform/productRegistry";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { ConfirmDialog } from "./shared/ConfirmDialog";
 
 interface EnvironmentPageProps {
   /** 页面可见时才读取环境状态，避免后台 IPC；隐藏时停止轮询。 */

@@ -41,8 +41,8 @@ import { masterArchiveCommitFailure, safeUiErrorMessage } from "../utils/safeUiE
 import { notify } from "../platform/notify";
 // 归档草稿状态机（P12-R2c 自本组件收敛为 hook；迁移语义见 hook 注释）。
 import { useArchiveDraft } from "../hooks/useArchiveDraft";
-import { ConfirmDialog } from "./ConfirmDialog";
-import { EmptyState } from "./EmptyState";
+import { ConfirmDialog } from "./shared/ConfirmDialog";
+import { EmptyState } from "./shared/EmptyState";
 
 // ============================================================================
 // 库对话面板（G21 两栏式 + G22 统一选择模式，ADR-0025 Library 抽象）
