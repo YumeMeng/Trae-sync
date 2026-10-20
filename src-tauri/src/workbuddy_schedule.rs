@@ -16,9 +16,11 @@
 //! - **诊断日志**：与 Trae 同口径——进度事件（workbuddy-auto-checkin-
 //!   progress/finished）+ 失败 detail_code 携带稳定错误码；令牌零外显。
 //!
-//! 账号参与集：WorkBuddy 池记录无 per-account 开关字段，参与自动签到的
-//! 账号集合存调度根 `workbuddy-auto-checkin-accounts.json`（tmp+rename
-//! 原子写）；参与集与池容器求交——已从池清理的账号自动失效。
+//! 账号参与集（P19-B5 opt-out 持久化）：调度根
+//! `workbuddy-auto-checkin-accounts.json`（tmp+rename 原子写）存显式设置
+//! 记录（enabled/touched 双集合）——**默认全参与**（八域对齐 #3）：未
+//! 显式设置过的账号视为参与；显式关闭永远尊重。参与集与池容器求交——
+//! 已从池清理的账号自动失效。
 
 use std::path::{Path, PathBuf};
 
@@ -46,8 +48,33 @@ const MAX_PARTICIPATION_BYTES: u64 = 64 * 1024;
 
 /// 账号参与集存储（调度根内单 JSON；损坏时报错不静默重建——配置文件是
 /// 用户决策的证据，与 Trae 设置同纪律）。
+///
+/// P19-B5 持久 opt-out 语义（架构草案 §1.2E / 八域对齐 #3「默认全参与」）：
+/// - `enabled_profiles`：显式开启参与的账号；
+/// - `touched_profiles`：**曾被用户显式设置过的账号**（开启或关闭都算
+///   touched）——默认参与语义只作用于「从未设置过」的账号；
+/// - **有效参与 = 未 touched → true（默认参与）**；touched → enabled。
+///   显式关闭永远尊重（默认全参与的归一化不会复活已关闭账号）；
+/// - v1 迁移：v1 仅有 enabled_profiles（不在列 = 默认不参与）。迁移映射
+///   `touched = enabled_profiles`（保留显式开启意图），未列入账号转为
+///   「未 touched」→ 按新产品决策默认参与（一次性语义切换，用户拍板）。
 struct WorkBuddyParticipationStore {
     path: PathBuf,
+}
+
+/// 参与集状态（enabled / touched 双集合；有效参与 = 未 touched || enabled）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParticipationState {
+    enabled_profiles: Vec<String>,
+    touched_profiles: Vec<String>,
+}
+
+impl ParticipationState {
+    /// 有效参与判定（默认全参与语义的唯一口径）。
+    fn effective_enabled(&self, profile_id: &str) -> bool {
+        !self.touched_profiles.iter().any(|id| id == profile_id)
+            || self.enabled_profiles.iter().any(|id| id == profile_id)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -55,6 +82,8 @@ struct ParticipationFile {
     format_version: u32,
     #[serde(default)]
     enabled_profiles: Vec<String>,
+    #[serde(default)]
+    touched_profiles: Vec<String>,
 }
 
 impl WorkBuddyParticipationStore {
@@ -64,28 +93,46 @@ impl WorkBuddyParticipationStore {
         }
     }
 
-    /// 读取参与集；文件不存在返回空集（首次使用）。
-    fn load(&self) -> Result<Vec<String>, ()> {
+    /// 读取参与集（v1 自动迁移到 v2 语义）；文件不存在返回缺省空集。
+    /// 迁移映射：v1 `enabled_profiles` → v2 `touched = enabled`
+    /// （显式开启意图保留）；v1 未列入账号 → 未 touched → 默认参与
+    /// （八域对齐 #3 一次性语义切换）。损坏/版本不符返回 Err（调用方
+    /// 按各自纪律处理——设置页报错，调度 fail-soft 跳过）。
+    fn load_state(&self) -> Result<ParticipationState, ()> {
         let content = match std::fs::read_to_string(&self.path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Vec::new());
+                return Ok(ParticipationState::default());
             }
             Err(_) => return Err(()),
         };
-        let file: ParticipationFile =
-            serde_json::from_str(&content).map_err(|_| ())?;
-        if file.format_version != 1 {
-            return Err(());
+        let file: ParticipationFile = serde_json::from_str(&content).map_err(|_| ())?;
+        match file.format_version {
+            1 => Ok(ParticipationState {
+                // v1 迁移：显式开启 = touched；未列入 → 默认参与。
+                enabled_profiles: file.enabled_profiles.clone(),
+                touched_profiles: file.enabled_profiles,
+            }),
+            2 => Ok(ParticipationState {
+                enabled_profiles: file.enabled_profiles,
+                touched_profiles: file.touched_profiles,
+            }),
+            _ => Err(()),
         }
-        Ok(file.enabled_profiles)
     }
 
-    /// 原子保存（tmp + rename；失败保留原文件）。
-    fn save(&self, enabled_profiles: &[String]) -> Result<(), ()> {
+    /// 兼容旧读取口（显式开启集合；B5 起调用方应改用
+    /// [`Self::load_state`] + `ParticipationState::effective_enabled`）。
+    fn load(&self) -> Result<Vec<String>, ()> {
+        self.load_state().map(|state| state.enabled_profiles)
+    }
+
+    /// 保存参与集（tmp + rename 原子写；v2 格式，失败保留原文件）。
+    fn save_state(&self, state: &ParticipationState) -> Result<(), ()> {
         let file = ParticipationFile {
-            format_version: 1,
-            enabled_profiles: enabled_profiles.to_vec(),
+            format_version: 2,
+            enabled_profiles: state.enabled_profiles.clone(),
+            touched_profiles: state.touched_profiles.clone(),
         };
         let content = serde_json::to_string_pretty(&file).map_err(|_| ())?;
         if let Some(parent) = self.path.parent() {
@@ -101,6 +148,15 @@ impl WorkBuddyParticipationStore {
         std::fs::write(&temporary, content).map_err(|_| ())?;
         std::fs::rename(&temporary, &self.path).map_err(|_| ())
     }
+
+    /// v1 兼容保存口（既有调用方/旧测试；内部转 v2：enabled 即 touched，
+    /// 保持「显式设置过」语义）。
+    fn save(&self, enabled_profiles: &[String]) -> Result<(), ()> {
+        self.save_state(&ParticipationState {
+            enabled_profiles: enabled_profiles.to_vec(),
+            touched_profiles: enabled_profiles.to_vec(),
+        })
+    }
 }
 
 /// 调度根下的设置/台账存储（与 Trae 同一 store 类型，独立实例独立文件）。
@@ -114,7 +170,7 @@ pub(crate) struct WorkBuddyAutoCheckinStatusDto {
     pub enabled: bool,
     pub daily_time_hhmm: String,
     pub ledger: Option<AutoCheckinLedgerWireDto>,
-    /// 池内账号与其参与状态（默认不参与；UI 逐账号开关）。
+    /// 池内账号与其参与状态（P19-B5：有效参与——未 touched 默认参与）。
     pub accounts: Vec<WorkBuddyAutoAccountDto>,
 }
 
@@ -175,6 +231,11 @@ fn workbuddy_roots(
 }
 
 /// 读取状态（fail-soft：调度数据读失败按默认值返回，不阻塞 UI）。
+///
+/// P19-B5：`accounts[].enabled` 语义升级为**有效参与**（未 touched →
+/// 默认参与 true；touched → 显式值）。参与集文件损坏时按缺省态处理
+/// （全部视为未 touched → 默认参与——产品默认语义即「全参与」，claim
+/// 幂等风险可控；文件修复后显式设置恢复权威）。
 pub(crate) fn workbuddy_auto_checkin_status(
     schedule_root: &Path,
     login_root: &Path,
@@ -182,12 +243,12 @@ pub(crate) fn workbuddy_auto_checkin_status(
     let store = schedule_store(schedule_root);
     let (settings, ledger) = store.load().unwrap_or_default();
     let participation = WorkBuddyParticipationStore::new(schedule_root)
-        .load()
+        .load_state()
         .unwrap_or_default();
     let accounts = pool_summaries(login_root)
         .into_iter()
         .map(|(profile_id, screen_name)| WorkBuddyAutoAccountDto {
-            enabled: participation.iter().any(|id| id == &profile_id),
+            enabled: participation.effective_enabled(&profile_id),
             profile_id,
             screen_name,
         })
@@ -229,6 +290,10 @@ pub(crate) fn save_workbuddy_auto_checkin_settings(
 }
 
 /// 设置单个账号的参与状态（账号必须仍在池内——防残留 id 复活）。
+///
+/// P19-B5 opt-out 语义：任何显式设置都写入 touched（开启/关闭均算），
+/// 此后默认全参与的归一化不再作用于该账号；关闭 = touched + 移出
+/// enabled（显式关闭永远尊重）。
 pub(crate) fn set_workbuddy_account_participation(
     schedule_root: &Path,
     login_root: &Path,
@@ -236,22 +301,26 @@ pub(crate) fn set_workbuddy_account_participation(
     enabled: bool,
 ) -> Result<(), String> {
     let store = WorkBuddyParticipationStore::new(schedule_root);
-    let mut participation = store.load().map_err(|_| "workbuddy_schedule_invalid".to_string())?;
+    let mut state = store.load_state().map_err(|_| "workbuddy_schedule_invalid".to_string())?;
     let in_pool = pool_summaries(login_root)
         .iter()
         .any(|(id, _)| id == profile_id);
     if !in_pool {
         return Err("workbuddy_auto_checkin_account_missing".to_string());
     }
+    // 显式设置 = touched（无论开/关——默认参与语义自此对该账号失效）。
+    if !state.touched_profiles.iter().any(|id| id == profile_id) {
+        state.touched_profiles.push(profile_id.to_string());
+    }
     if enabled {
-        if !participation.iter().any(|id| id == profile_id) {
-            participation.push(profile_id.to_string());
+        if !state.enabled_profiles.iter().any(|id| id == profile_id) {
+            state.enabled_profiles.push(profile_id.to_string());
         }
     } else {
-        participation.retain(|id| id != profile_id);
+        state.enabled_profiles.retain(|id| id != profile_id);
     }
     store
-        .save(&participation)
+        .save_state(&state)
         .map_err(|_| "workbuddy_schedule_save_failed".to_string())
 }
 
@@ -266,14 +335,271 @@ fn pool_summaries(login_root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// 筛选参与自动签到的账号（参与集 ∩ 池内现存账号；池清理自动失效）。
+// ===== P19-B5 逐账号签到命令面（矩阵 #43/#46/#48/#51/#56 WB 适配器） =====
+
+/// 逐账号签到状态 DTO（fail-soft：某账号失败不阻塞他账号——error 单独
+/// 外显，状态字段在 error 非空时为缺省值）。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WorkBuddyCheckinAccountStatusDto {
+    pub profile_id: String,
+    pub screen_name: String,
+    /// 查询成功时为 Some；失败（error 非空）为 None。
+    pub today_checked_in: Option<bool>,
+    pub streak_days: Option<u32>,
+    pub daily_credit: Option<u32>,
+    pub total_credits: Option<u32>,
+    /// 已签日期列表（YYYY-MM-DD；签到日历数据源，矩阵 #57）。
+    pub checkin_dates: Vec<String>,
+    /// 失败时的稳定错误码（None = 查询成功）。
+    pub error: Option<String>,
+}
+
+/// 单账号 status 查询（生产闭包：先续期该账号〔断连兜底〕再 status）。
+/// 返回 (today_checked_in, streak, daily, total, dates)。
+pub(crate) fn query_profile_status(
+    login_root: &Path,
+    profile_id: &str,
+) -> Result<(bool, u32, u32, u32, Vec<String>), String> {
+    let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
+    let (session, _renewal) = open_session_for_profile(login_root, profile_id, now)
+        .map_err(|error| map_pool_error(&error))?;
+    match session.status() {
+        Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok((
+            status.today_checked_in,
+            status.streak_days,
+            status.daily_credit,
+            status.total_credits,
+            status.checkin_dates,
+        )),
+        Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
+            Err("workbuddy_checkin_auth_mismatch".to_string())
+        }
+        Ok(other) => Err(format!("workbuddy_checkin_unexpected_response:{other:?}")),
+        Err(error) => Err(error.code().to_string()),
+    }
+}
+
+/// 聚合编排内核（注入 status 闭包，离线单测 fail-soft 语义）：
+/// 逐账号查询，单账号任何失败只落到该账号的 error 字段。
+fn workbuddy_checkin_overview_inner(
+    targets: Vec<(String, String)>,
+    status_fn: &dyn Fn(&str) -> Result<(bool, u32, u32, u32, Vec<String>), String>,
+) -> Vec<WorkBuddyCheckinAccountStatusDto> {
+    targets
+        .into_iter()
+        .map(|(profile_id, screen_name)| match status_fn(&profile_id) {
+            Ok((today_checked_in, streak_days, daily_credit, total_credits, checkin_dates)) => {
+                WorkBuddyCheckinAccountStatusDto {
+                    profile_id,
+                    screen_name,
+                    today_checked_in: Some(today_checked_in),
+                    streak_days: Some(streak_days),
+                    daily_credit: Some(daily_credit),
+                    total_credits: Some(total_credits),
+                    checkin_dates,
+                    error: None,
+                }
+            }
+            Err(code) => WorkBuddyCheckinAccountStatusDto {
+                profile_id,
+                screen_name,
+                today_checked_in: None,
+                streak_days: None,
+                daily_credit: None,
+                total_credits: None,
+                checkin_dates: Vec::new(),
+                error: Some(code),
+            },
+        })
+        .collect()
+}
+
+/// WB 签到聚合视图（矩阵 #43 get_checkin_overview WB 适配器 + #48
+/// refresh_checkin_credits 单账号模式）：逐账号 status 汇总（total_credits/
+/// streak/daily_credit/checkin_dates）。profile_id=Some → 单账号（不在池内
+/// 报稳定错误码）；None → 全池批查（fail-soft）。
+#[tauri::command]
+pub(crate) async fn get_workbuddy_checkin_overview(
+    profile_id: Option<String>,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<WorkBuddyCheckinAccountStatusDto>, String> {
+    crate::ensure_login_real_mode_workbuddy(&state)?;
+    let (_schedule_root, login_root) = workbuddy_roots(&state)?;
+    crate::run_blocking("workbuddy_checkin_overview_join_failed", move || {
+        let summaries = pool_summaries(&login_root);
+        let targets = match profile_id.as_deref() {
+            Some(id) => {
+                let found = summaries
+                    .iter()
+                    .find(|(pid, _)| pid == id)
+                    .ok_or("workbuddy_auto_checkin_account_missing".to_string())?;
+                vec![(found.0.clone(), found.1.clone())]
+            }
+            None => summaries,
+        };
+        let login_root_for_query = login_root.clone();
+        let status_fn =
+            |pid: &str| query_profile_status(&login_root_for_query, pid);
+        Ok(workbuddy_checkin_overview_inner(targets, &status_fn))
+    })
+    .await
+}
+
+/// WB 参与集（矩阵 #46 list_checkin_accounts WB 版）：池内账号逐条带
+/// **有效参与**标志（未 touched 默认参与；显式关闭永远 false）——fe 过滤
+/// enabled 构造参与集，后端不替前端裁剪（保留全部行供开关渲染）。
+#[tauri::command]
+pub(crate) fn list_workbuddy_checkin_accounts(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<WorkBuddyAutoAccountDto>, String> {
+    crate::ensure_login_real_mode_workbuddy(&state)?;
+    let (schedule_root, login_root) = workbuddy_roots(&state)?;
+    let participation = WorkBuddyParticipationStore::new(&schedule_root)
+        .load_state()
+        .unwrap_or_default();
+    Ok(pool_summaries(&login_root)
+        .into_iter()
+        .map(|(profile_id, screen_name)| WorkBuddyAutoAccountDto {
+            enabled: participation.effective_enabled(&profile_id),
+            profile_id,
+            screen_name,
+        })
+        .collect())
+}
+
+/// WB 单账号手动签到（矩阵 #56 per-account 形态；**单次确认入口**——
+/// UI 逐账号行独立签到按钮；与当前账号版 workbuddy_checkin_claim 同纪律：
+/// 先查后领 + 复核翻转，credit 外显）。
+#[tauri::command]
+pub(crate) async fn workbuddy_checkin_claim_profile(
+    profile_id: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<crate::workbuddy_commands::WorkBuddyCheckinClaimDto, String> {
+    crate::ensure_login_real_mode_workbuddy(&state)?;
+    let (_schedule_root, login_root) = workbuddy_roots(&state)?;
+    crate::run_blocking("workbuddy_checkin_claim_profile_join_failed", move || {
+        let receipt = claim_workbuddy_profile_detailed(&login_root, &profile_id)?;
+        // WB 直连链只产出 Claimed/AlreadyCheckedIn/RuntimeError 三态；
+        // 其余领域变体（AuthMismatch/ProfileBusy 等来自 TRAE 虚拟设备链）
+        // 按防御性兜底归 Err（detail 优先，缺省给稳定码）。
+        match receipt.outcome {
+            CheckinOutcome::Claimed => Ok(crate::workbuddy_commands::WorkBuddyCheckinClaimDto {
+                credit: receipt.credit,
+                streak_days: claim_streak_after(&login_root, &profile_id),
+                verified: true,
+            }),
+            // 已签 = 幂等空操作，复核口径 verified=true（与当前账号版一致）。
+            CheckinOutcome::AlreadyCheckedIn => {
+                Ok(crate::workbuddy_commands::WorkBuddyCheckinClaimDto {
+                    credit: 0,
+                    streak_days: claim_streak_after(&login_root, &profile_id),
+                    verified: true,
+                })
+            }
+            CheckinOutcome::NotEligible => Err(
+                receipt
+                    .detail_code
+                    .unwrap_or_else(|| "workbuddy_checkin_not_eligible".to_string()),
+            ),
+            _ => Err(
+                receipt
+                    .detail_code
+                    .unwrap_or_else(|| "workbuddy_checkin_request_failed".to_string()),
+            ),
+        }
+    })
+    .await
+}
+
+/// 领取后的连签天数（best-effort 回读：status 失败按 0，不阻塞回执）。
+fn claim_streak_after(login_root: &Path, profile_id: &str) -> u32 {
+    query_profile_status(login_root, profile_id)
+        .map(|(_, streak, _, _, _)| streak)
+        .unwrap_or(0)
+}
+
+/// 批量签到逐账号条目（fail-soft：单账号失败只落本条）。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WorkBuddyCheckinBatchItemDto {
+    pub profile_id: String,
+    pub screen_name: String,
+    /// Claimed / AlreadyCheckedIn / NotEligible / RuntimeError（领域枚举
+    /// 线格式，与自动签到进度事件同口径）。
+    pub outcome: CheckinOutcome,
+    /// 本次入账积分（仅 Claimed 时 > 0）。
+    pub credit: u32,
+    pub detail_code: Option<String>,
+}
+
+/// 批量编排内核（注入 claim 闭包，离线单测 fail-soft 语义）：顺序执行，
+/// 单账号任何失败只落到本条 outcome=RuntimeError + detail_code。
+fn workbuddy_checkin_claim_batch_inner(
+    targets: Vec<(String, String)>,
+    claim: &dyn Fn(&str) -> Result<WorkBuddyProfileClaimReceipt, String>,
+) -> Vec<WorkBuddyCheckinBatchItemDto> {
+    targets
+        .into_iter()
+        .map(|(profile_id, screen_name)| {
+            let (outcome, detail_code, credit) = match claim(&profile_id) {
+                Ok(receipt) => (receipt.outcome, receipt.detail_code, receipt.credit),
+                // 池账号缺失等 Err：统一 RuntimeError（与自动批次同口径）。
+                Err(code) => (CheckinOutcome::RuntimeError, Some(code), 0),
+            };
+            WorkBuddyCheckinBatchItemDto {
+                profile_id,
+                screen_name,
+                outcome,
+                credit,
+                detail_code,
+            }
+        })
+        .collect()
+}
+
+/// WB 批量签到（矩阵 #51 run_checkin WB 适配器；**单次确认入口**：UI
+/// 「一键签到(N)」——参与集默认全选）。逐账号顺序执行（claim 纯 HTTP
+/// 幂等，无调度错峰需求）；fail-soft：某账号失败不阻塞他账号，逐条回执。
+#[tauri::command]
+pub(crate) async fn workbuddy_checkin_claim_batch(
+    profile_ids: Vec<String>,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<WorkBuddyCheckinBatchItemDto>, String> {
+    crate::ensure_login_real_mode_workbuddy(&state)?;
+    let (_schedule_root, login_root) = workbuddy_roots(&state)?;
+    crate::run_blocking("workbuddy_checkin_claim_batch_join_failed", move || {
+        let summaries = pool_summaries(&login_root);
+        // 参与集裁剪在后端兜底：入参去重并限定池内账号（池外 id 落条目
+        // 报错——fail-soft，不整体拒绝）。
+        let mut seen = std::collections::HashSet::new();
+        let targets: Vec<(String, String)> = profile_ids
+            .into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .map(|id| {
+                let screen_name = summaries
+                    .iter()
+                    .find(|(pid, _)| pid == &id)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_default();
+                (id, screen_name)
+            })
+            .collect();
+        let login_root_for_claim = login_root.clone();
+        let claim =
+            |pid: &str| claim_workbuddy_profile_detailed(&login_root_for_claim, pid);
+        Ok(workbuddy_checkin_claim_batch_inner(targets, &claim))
+    })
+    .await
+}
+
+/// 筛选参与自动签到的账号（**有效参与** ∩ 池内现存账号：未 touched 的
+/// 池账号默认参与〔八域对齐 #3〕；显式关闭永远排除；池清理自动失效）。
 fn workbuddy_eligible_ids(schedule_root: &Path, login_root: &Path) -> Vec<String> {
     let participation = WorkBuddyParticipationStore::new(schedule_root)
-        .load()
+        .load_state()
         .unwrap_or_default();
     pool_summaries(login_root)
         .into_iter()
-        .filter(|(profile_id, _)| participation.iter().any(|id| id == profile_id))
+        .filter(|(profile_id, _)| participation.effective_enabled(profile_id))
         .map(|(profile_id, _)| profile_id)
         .collect()
 }
@@ -393,13 +719,23 @@ fn production_claimer(
     move |profile_id| claim_workbuddy_profile(&login_root, profile_id)
 }
 
-/// 逐账号自动签到（P17-A5 核心）：`open_session_for_profile` 内建断连
-/// 兜底（access 充裕跳过/临近过期刷新写回），随后 status → claim →
-/// status 复核翻转（与手动 claim 命令同语义）。返回 (结果, detail_code)。
-pub(crate) fn claim_workbuddy_profile(
+/// 逐账号签到回执（B5：手动单签命令需要 credit 外显——调度口径仍走
+/// [`claim_workbuddy_profile`] 的 (outcome, detail) 二元组）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkBuddyProfileClaimReceipt {
+    pub outcome: CheckinOutcome,
+    pub detail_code: Option<String>,
+    /// 本次入账积分（仅 outcome=Claimed 时有效；其余为 0）。
+    pub credit: u32,
+}
+
+/// 逐账号签到核心（B5 拆分自 claim_workbuddy_profile）：`open_session_for_profile`
+/// 内建断连兜底（access 充裕跳过/临近过期刷新写回），随后 status → claim →
+/// status 复核翻转。复核不过 = RuntimeError（credit 不外显）。
+pub(crate) fn claim_workbuddy_profile_detailed(
     login_root: &Path,
     profile_id: &str,
-) -> Result<(CheckinOutcome, Option<String>), String> {
+) -> Result<WorkBuddyProfileClaimReceipt, String> {
     let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
     let (session, _renewal) = open_session_for_profile(login_root, profile_id, now)
         .map_err(|error| map_pool_error(&error))?;
@@ -407,29 +743,65 @@ pub(crate) fn claim_workbuddy_profile(
     let before = match session.status() {
         Ok(WorkBuddyCheckinOutcome::Status(status)) => status,
         Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-            return Ok((CheckinOutcome::RuntimeError, Some("workbuddy_checkin_auth_mismatch".to_string())))
+            return Ok(WorkBuddyProfileClaimReceipt {
+                outcome: CheckinOutcome::RuntimeError,
+                detail_code: Some("workbuddy_checkin_auth_mismatch".to_string()),
+                credit: 0,
+            })
         }
         Ok(other) => {
-            return Ok((CheckinOutcome::RuntimeError, Some(format!("workbuddy_checkin_unexpected_response:{other:?}"))))
+            return Ok(WorkBuddyProfileClaimReceipt {
+                outcome: CheckinOutcome::RuntimeError,
+                detail_code: Some(format!("workbuddy_checkin_unexpected_response:{other:?}")),
+                credit: 0,
+            })
         }
-        Err(error) => return Ok((CheckinOutcome::RuntimeError, Some(error.code().to_string()))),
+        Err(error) => {
+            return Ok(WorkBuddyProfileClaimReceipt {
+                outcome: CheckinOutcome::RuntimeError,
+                detail_code: Some(error.code().to_string()),
+                credit: 0,
+            })
+        }
     };
     if before.today_checked_in {
-        return Ok((CheckinOutcome::AlreadyCheckedIn, None));
+        return Ok(WorkBuddyProfileClaimReceipt {
+            outcome: CheckinOutcome::AlreadyCheckedIn,
+            detail_code: None,
+            credit: 0,
+        });
     }
     let claim = match session.claim() {
         Ok(WorkBuddyCheckinOutcome::Claimed(claim)) => claim,
         Ok(WorkBuddyCheckinOutcome::AlreadyCheckedIn) => {
             // 并发窗口（查询后他端已签）：幂等空操作。
-            return Ok((CheckinOutcome::AlreadyCheckedIn, None));
+            return Ok(WorkBuddyProfileClaimReceipt {
+                outcome: CheckinOutcome::AlreadyCheckedIn,
+                detail_code: None,
+                credit: 0,
+            });
         }
         Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-            return Ok((CheckinOutcome::RuntimeError, Some("workbuddy_checkin_auth_mismatch".to_string())))
+            return Ok(WorkBuddyProfileClaimReceipt {
+                outcome: CheckinOutcome::RuntimeError,
+                detail_code: Some("workbuddy_checkin_auth_mismatch".to_string()),
+                credit: 0,
+            })
         }
         Ok(other) => {
-            return Ok((CheckinOutcome::RuntimeError, Some(format!("workbuddy_checkin_rejected:{other:?}"))))
+            return Ok(WorkBuddyProfileClaimReceipt {
+                outcome: CheckinOutcome::RuntimeError,
+                detail_code: Some(format!("workbuddy_checkin_rejected:{other:?}")),
+                credit: 0,
+            })
         }
-        Err(error) => return Ok((CheckinOutcome::RuntimeError, Some(error.code().to_string()))),
+        Err(error) => {
+            return Ok(WorkBuddyProfileClaimReceipt {
+                outcome: CheckinOutcome::RuntimeError,
+                detail_code: Some(error.code().to_string()),
+                credit: 0,
+            })
+        }
     };
     // 复核翻转才算真实入账（与手动 claim 同纪律）。
     let verified = matches!(
@@ -437,10 +809,26 @@ pub(crate) fn claim_workbuddy_profile(
         Ok(WorkBuddyCheckinOutcome::Status(status)) if status.today_checked_in
     );
     if !verified {
-        return Ok((CheckinOutcome::RuntimeError, Some("workbuddy_checkin_unverified".to_string())));
+        return Ok(WorkBuddyProfileClaimReceipt {
+            outcome: CheckinOutcome::RuntimeError,
+            detail_code: Some("workbuddy_checkin_unverified".to_string()),
+            credit: 0,
+        });
     }
-    let _ = claim;
-    Ok((CheckinOutcome::Claimed, None))
+    Ok(WorkBuddyProfileClaimReceipt {
+        outcome: CheckinOutcome::Claimed,
+        detail_code: None,
+        credit: claim.credit,
+    })
+}
+
+/// 逐账号自动签到（P17-A5 核心，调度口径薄封装）。
+pub(crate) fn claim_workbuddy_profile(
+    login_root: &Path,
+    profile_id: &str,
+) -> Result<(CheckinOutcome, Option<String>), String> {
+    claim_workbuddy_profile_detailed(login_root, profile_id)
+        .map(|receipt| (receipt.outcome, receipt.detail_code))
 }
 
 /// 池错误 → 稳定 detail 码（续期拒绝引导重新捕获，与命令层口径一致）。
