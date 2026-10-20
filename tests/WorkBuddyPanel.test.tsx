@@ -101,10 +101,11 @@ function installWorkbuddyRoutes(options?: {
       credit: 10,
       detail_code: null,
     })));
-  mockRoute("list_workbuddy_checkin_accounts", () => [
-    { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
-    { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
-  ]);
+  mockRoute("list_workbuddy_checkin_accounts", () =>
+    options?.accounts ?? [
+      { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
+      { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
+    ]);
   mockRoute("get_workbuddy_auto_checkin_status", () =>
     autoStatus(options?.accounts ?? [
       { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },

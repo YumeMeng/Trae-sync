@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type {
   WorkBuddySessionHealthDto,
   WorkBuddyCheckinAccountStatusDto,
+  WorkBuddyCheckinParticipationDto,
   WorkBuddyCheckinStatusDto,
   WorkBuddyLoginSummaryDto,
   WorkBuddyTransferDto,
@@ -672,26 +673,17 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   const [rowResults, setRowResults] = useState<Record<string, { outcome: string; detail_code: string | null }>>({});
   // 参与集已加载标记：默认选择用参与集；未加载（命令失败）回退全选。
   const participationLoadedRef = useRef(false);
-  // P17-A5 每日自动签到：设置 + 账号参与清单（enabled = 后端有效参与）。
+  // P17-A5 每日自动签到：设置（status 命令）+ 参与集行（list 命令，有效参与）。
   const [autoStatus, setAutoStatus] = useState<WorkBuddyAutoCheckinStatusDto | null>(null);
+  const [participation, setParticipation] = useState<readonly WorkBuddyCheckinParticipationDto[]>([]);
   const [autoBusy, setAutoBusy] = useState(false);
 
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
     try {
-      // 参与集（矩阵 #46 list_workbuddy_checkin_accounts）：enabled = 后端有效参与
-      //（未显式设置默认 true，opt-out 永久尊重）——批量选择默认选中参与集；
-      // 读取失败回退全选（选择只是批次范围，不阻塞页面）。
-      const [next, participation] = await Promise.all([
-        fetchWorkBuddyCheckinOverview(null),
-        listWorkBuddyCheckinAccounts().catch(() => null),
-      ]);
+      const next = await fetchWorkBuddyCheckinOverview(null);
       setRows(next);
       setLoadError(null);
-      if (participation) {
-        participationLoadedRef.current = true;
-        setSelection(participation.filter((account) => account.enabled).map((account) => account.profile_id));
-      }
     } catch (reason: unknown) {
       setLoadError(safeUiErrorMessage(reason, "签到状态暂时不可读取，请稍后重试。"));
     } finally {
@@ -700,10 +692,16 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   }, []);
 
   const refreshAuto = useCallback(async () => {
-    try {
-      setAutoStatus(await fetchWorkBuddyAutoCheckinStatus());
-    } catch {
-      setAutoStatus(null); // 调度数据读失败静默（分区可插拔语义）。
+    const [statusResult, participationResult] = await Promise.allSettled([
+      fetchWorkBuddyAutoCheckinStatus(),
+      listWorkBuddyCheckinAccounts(),
+    ]);
+    setAutoStatus(statusResult.status === "fulfilled" ? statusResult.value : null);
+    if (participationResult.status === "fulfilled") {
+      participationLoadedRef.current = true;
+      setParticipation(participationResult.value);
+    } else {
+      setParticipation([]);
     }
   }, []);
 
@@ -713,15 +711,18 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
     void refreshAuto();
   }, [active, refresh, refreshAuto]);
 
-  // 选择默认 = 有效参与集（list_workbuddy_checkin_accounts）；行集变化时剔除
-  // 失效项并保留既有选择；参与集未加载（命令失败）回退全选（与 TRAE 同口径）。
+  // 批量选择默认 = 有效参与集（list 命令）；行集变化时剔除失效项并保留既有
+  // 选择；参与集未加载（命令失败）回退全选，加载但为空（全部显式关闭）保持空选。
   useEffect(() => {
     setSelection((current) => {
       const filtered = current.filter((id) => rows.some((row) => row.profile_id === id));
       if (filtered.length > 0) return filtered;
-      return participationLoadedRef.current ? [] : rows.map((row) => row.profile_id);
+      if (participationLoadedRef.current) {
+        return participation.filter((account) => account.enabled).map((account) => account.profile_id);
+      }
+      return rows.map((row) => row.profile_id);
     });
-  }, [rows]);
+  }, [rows, participation]);
 
   const handleSaveAutoSettings = useCallback(
     (enabled: boolean, dailyTimeHhmm: string) => {
@@ -759,8 +760,8 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
 
   // 批量置 true 入口：把显式关闭的账号全部重新参与（单次语义，后端持久）。
   const handleParticipateAll = useCallback(() => {
-    if (autoBusy || !autoStatus) return;
-    const targets = autoStatus.accounts.filter((account) => !account.enabled);
+    if (autoBusy) return;
+    const targets = participation.filter((account) => !account.enabled);
     if (targets.length === 0) return;
     setAutoBusy(true);
     void (async () => {
@@ -770,7 +771,7 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
       await refreshAuto();
       notify.success(`WorkBuddy：已把 ${targets.length} 个账号全部置为参与自动签到。`);
     })().finally(() => setAutoBusy(false));
-  }, [autoBusy, autoStatus, refreshAuto]);
+  }, [autoBusy, participation, refreshAuto]);
 
   const toggle = useCallback((profileId: string) => {
     setSelection((current) => current.includes(profileId)
@@ -912,10 +913,10 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
               ? `今日执行中（完成 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
               : `今日已完成（成功 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
             : null}
-          accounts={(autoStatus.accounts ?? []).map((account) => ({
+          accounts={participation.map((account) => ({
             profileId: account.profile_id,
             displayName: account.screen_name,
-            // enabled = 后端有效参与（未显式设置默认 true，opt-out 永久尊重）。
+            // enabled = 后端有效参与（list 命令，与批量选择同源；P19-B6 数据源统一）。
             participating: account.enabled,
           }))}
           onSettingsChange={handleSaveAutoSettings}
