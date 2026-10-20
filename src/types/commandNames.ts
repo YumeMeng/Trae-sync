@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（110 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（117 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -26,6 +26,7 @@ export type CommandName =
   | "create_master_backup"
   | "delete_environment"
   | "delete_master_sessions"
+  | "delete_workbuddy_sessions"
   | "export_recovery_package_command"
   | "force_reset_master_current_account"
   | "get_account_registry"
@@ -55,7 +56,11 @@ export type CommandName =
   | "get_storage_root_state"
   | "get_trae_instance_states"
   | "get_workbuddy_auto_checkin_status"
+  | "get_workbuddy_library_checkup"
+  | "get_workbuddy_library_history"
+  | "get_workbuddy_library_stats"
   | "get_workbuddy_session_health"
+  | "get_workbuddy_session_messages"
   | "get_workspace_state"
   | "import_recovery_package_command"
   | "incorporate_master_records"
@@ -72,6 +77,7 @@ export type CommandName =
   | "login_environment"
   | "merge_master_projects"
   | "merge_trae_cn_project"
+  | "merge_workbuddy_cwd_projects"
   | "migrate_master_backups"
   | "migrate_storage_root_command"
   | "open_device_management_docs"
@@ -81,6 +87,7 @@ export type CommandName =
   | "preview_master_switch_plugins"
   | "preview_trae_cn_project_merge"
   | "purge_account_records"
+  | "purge_workbuddy_sessions"
   | "read_work_cn_state"
   | "refresh_checkin_credentials"
   | "refresh_checkin_credits"
