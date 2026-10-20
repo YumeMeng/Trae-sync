@@ -127,6 +127,7 @@ describe("SettingsPanel WB 变体（P19-B6 备份区诚实呈现）", () => {
 
 // ===== P19-B8 备份链管理面 备份链管理面 + 探针信息消费 =====
 
+import { notify } from "../src/platform/notify";
 import { WorkBuddyBackupSection } from "../src/components/WorkBuddyBackupSection";
 import { WorkBuddyEnvironmentPage } from "../src/components/WorkBuddyEnvironmentPage";
 
@@ -207,6 +208,10 @@ describe("WorkBuddyBackupSection（P19-B8 备份链管理面）", () => {
     await waitFor(() => {
       expect(mockCoreInvoke.mock.calls).toContainEqual(["restore_workbuddy_backup", { stamp: 1760001200 }]);
     });
+    // safety_backup_stamp 回退点呈现（be 契约：UI 务必展示该字段）。
+    expect(vi.mocked(notify.success)).toHaveBeenCalledWith(
+      expect.stringContaining("恢复前状态已存为"),
+    );
   });
 
   it("删除：多选 + 单次确认调用 delete（confirmed=true 由适配器承载）", async () => {
@@ -241,3 +246,30 @@ describe("WorkBuddyEnvironmentPage 探针信息（P19-B8 数据面）", () => {
   });
 });
 
+
+describe("WorkBuddyEnvironmentPage 探针降级渲染（P19-B8 fail-soft）", () => {
+  beforeEach(() => {
+    resetRoutes();
+    installFakeInvoke();
+    installBackupRoutes();
+  });
+
+  it("探针降级渲染：客户端未运行（全维度 null）→ 版本/路径/数据根如实显示未知", async () => {
+    // 运行状态徽章由深度健康驱动（client_offline = 未运行）；探针只供版本/路径/数据根。
+    mockRoute("check_workbuddy_login_health", () => ({
+      status: "access_expired", live_status: "client_offline",
+    }));
+    mockRoute("get_workbuddy_probe_info", () => ({
+      running: false, process_count: null, app: null, version: null,
+      platform: null, install_path: null, install_source: null, data_root: null,
+    }));
+    render(<WorkBuddyEnvironmentPage active={true} />);
+
+    const card = await screen.findByTestId("workbuddy-env-client-card");
+    // 客户端未运行 = 探针正常返回（不是错误），连接卡恒可渲染。
+    await waitFor(() => {
+      expect(card.textContent).toContain("未运行");
+    });
+    expect(card.textContent).toContain("未知");
+  });
+});
