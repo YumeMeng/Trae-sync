@@ -55,3 +55,20 @@ export interface WorkBuddyProbeInfoDto {
   readonly install_source: "env_override" | "process_command_line" | "common_path" | "registry" | null;
   readonly data_root: string | null;
 }
+
+// ===== P19-B4 WB 登录编排（be-b4-impl 契约：begin/complete/cancel 三命令） =====
+
+/** 发起登录回执：auth_url 已由后端拉起系统浏览器打开，同时返回供展示与手动复制兜底。 */
+export interface WorkBuddyLoginBeginDto {
+  readonly auth_url: string;
+  readonly attempt_id: number;
+}
+
+/** 登录完成回执：acceptance 语义与 Trae 登录回执一致（failed 不回滚、不自动重试）。 */
+export interface WorkBuddyLoginCompleteDto {
+  readonly profile_id: string;
+  readonly account_id: string;
+  readonly screen_name: string;
+  readonly acceptance: "passed" | "failed";
+  readonly acceptance_error_code?: string;
+}

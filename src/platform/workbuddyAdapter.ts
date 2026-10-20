@@ -22,6 +22,8 @@ import type {
   WorkBuddyMergeCwdDto,
 } from "../types/workbuddyLibrary";
 import type {
+  WorkBuddyLoginBeginDto,
+  WorkBuddyLoginCompleteDto,
   WorkBuddyBackupChainDto,
   WorkBuddyBackupCreateDto,
   WorkBuddyBackupDeleteDto,
@@ -287,4 +289,24 @@ export function deleteWorkBuddyBackups(stamps: readonly number[]) {
 /** 客户端探针信息（只读 fail-soft；环境页连接卡数据源）。 */
 export function fetchWorkBuddyProbeInfo() {
   return invoke<WorkBuddyProbeInfoDto>("get_workbuddy_probe_info");
+}
+
+// ===== P19-B4 WB 登录编排（begin/complete/cancel；单槽 attempt） =====
+
+/** 发起登录：后端自动拉起系统浏览器打开授权页；auth_url 同时返回（手动复制兜底）。 */
+export function beginWorkBuddyLogin(): Promise<WorkBuddyLoginBeginDto> {
+  return invoke<WorkBuddyLoginBeginDto>("begin_workbuddy_login");
+}
+
+/**
+ * 等待授权完成（阻塞直到轮询命中，1s×5min）：acceptance 语义与 Trae 登录
+ * 回执一致——failed 不回滚、前端如实展示、不自动重试、不发起第二次授权。
+ */
+export function completeWorkBuddyLogin(attemptId: number): Promise<WorkBuddyLoginCompleteDto> {
+  return invoke<WorkBuddyLoginCompleteDto>("complete_workbuddy_login", { attemptId });
+}
+
+/** 取消等待（complete 会立即以 workbuddy_login_cancelled 返回）。 */
+export function cancelWorkBuddyLogin(attemptId: number): Promise<null> {
+  return invoke<null>("cancel_workbuddy_login", { attemptId });
 }

@@ -70,7 +70,9 @@ const WORKBUDDY_UI: ProductUiContext = {
   productId: "workbuddy",
   displayName: "WorkBuddy",
   capabilities: {
-    addAccount: "capture",
+    // P19-B4：添加账号点亮（OAuth 浏览器登录编排，消费 begin/complete/cancel 命令）；
+    // capture（保存当前客户端登录）保留为并存动作。
+    addAccount: "oauth-browser",
     // P19-B5：签到页升级逐账号行形态（对齐 TRAE CheckinPage 规格）。
     checkin: "batch-rows",
     // P19-B2⑤：积分列开启（IA 草案 §1.2）——当前客户端登录账号的池行显示积分块。

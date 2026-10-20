@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, ArrowRightLeft, RefreshCw, ShieldCheck } from "lucide-react";
+import { Activity, ArrowRightLeft, RefreshCw, ShieldCheck, UserPlus } from "lucide-react";
 import type { ReactNode } from "react";
 import type {
   WorkBuddySessionHealthDto,
@@ -11,10 +11,13 @@ import type {
   WorkBuddyDeepHealthDto,
 } from "../types/product";
 import {
+  beginWorkBuddyLogin,
+  cancelWorkBuddyLogin,
   captureWorkBuddyAccount,
   checkWorkBuddyLoginHealth,
   claimWorkBuddyCheckinBatch,
   claimWorkBuddyCheckinProfile,
+  completeWorkBuddyLogin,
   fetchWorkBuddyAutoCheckinStatus,
   fetchWorkBuddyCheckinOverview,
   fetchWorkBuddyCheckinStatus,
@@ -86,6 +89,20 @@ function liveHealthLabel(liveStatus: WorkBuddyDeepHealthDto["live_status"]): str
     default:
       return "状态未知";
   }
+}
+
+/** B4 登录错误码 → 人话（未知码回落 safeUiError 兜底）。 */
+function workbuddyLoginErrorText(reason: unknown): string {
+  if (typeof reason === "string") {
+    switch (reason) {
+      case "workbuddy_login_already_in_progress": return "WorkBuddy：已有登录正在进行（同一时间仅允许一个），请稍候再试。";
+      case "workbuddy_login_poll_timeout": return "WorkBuddy：等待授权超时（5 分钟），请重新发起登录。";
+      case "workbuddy_login_auth_url_untrusted": return "WorkBuddy：授权地址校验未通过，已中止（请检查网络环境）。";
+      case "workbuddy_real_mode_required": return "WorkBuddy：当前为演示模式，登录不可用。";
+      default: break;
+    }
+  }
+  return `WorkBuddy：登录未完成——${safeUiErrorMessage(reason, "请重新发起登录。")}`;
 }
 
 /** 信息行：label + value 的两列展示（卡内统一行结构；WB 域各页共用）。 */
@@ -162,6 +179,9 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   // P17-T6/A4 切号：单次确认弹窗（目标 profile_id）→ 执行 → 刷新健康与池。
   const [switchTarget, setSwitchTarget] = useState<string | null>(null);
   const [switching, setSwitching] = useState(false);
+  // P19-B4 添加账号（OAuth 浏览器登录编排）：attempt 非空 = 等待授权中
+  //（与 TRAE 添加账号同形态：无弹窗等待，按钮态翻转 + 通知收尾）。
+  const [loginAttemptId, setLoginAttemptId] = useState<number | null>(null);
   // U-2 双视图与排序（P19-B2⑤ 对齐账号页模板；key 按产品分前缀）。
   const [accountView, setAccountView] = useState<AccountView>(() =>
     readStoredPreference(accountPreferenceKey("workbuddy", "view"), "list", ["list", "card"] as const));
@@ -242,6 +262,41 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       setCapturing(false);
     }
   }, [refresh]);
+
+  // P19-B4 添加账号：begin（自动拉起浏览器）→ complete（阻塞等待授权）→
+  // 成功入池刷新。acceptance 语义与 TRAE 一致：failed 不回滚、如实警告、
+  // 不自动重试也不发起第二次授权。
+  const runAddAccount = useCallback(async () => {
+    if (loginAttemptId !== null) return;
+    try {
+      const begin = await beginWorkBuddyLogin();
+      setLoginAttemptId(begin.attempt_id);
+      const receipt = await completeWorkBuddyLogin(begin.attempt_id);
+      notify.success(`WorkBuddy：账号「${receipt.screen_name}」登录成功，已保存到账号池。`);
+      await refresh(false);
+      if (receipt.acceptance === "failed") {
+        notify.warning(
+          `账号已保存，但可持续性验收未通过（${receipt.acceptance_error_code ?? "未知原因"}）。`,
+          "可稍后重新发起登录获取新凭据。",
+        );
+      }
+    } catch (reason: unknown) {
+      // 取消不是错误：以中性提示收尾（complete 会以 workbuddy_login_cancelled 返回）。
+      if (typeof reason === "string" && reason === "workbuddy_login_cancelled") {
+        notify.info("登录已取消；若浏览器未完成授权，可重新发起登录。");
+      } else {
+        notify.error(workbuddyLoginErrorText(reason));
+      }
+    } finally {
+      setLoginAttemptId(null);
+    }
+  }, [loginAttemptId, refresh]);
+
+  // 取消等待：cancel 令阻塞中的 complete 立即以 workbuddy_login_cancelled 返回。
+  const handleCancelLogin = useCallback(() => {
+    if (loginAttemptId === null) return;
+    void cancelWorkBuddyLogin(loginAttemptId).catch(() => undefined);
+  }, [loginAttemptId]);
 
   // 客户端未登录时捕获必然失败（后端第一步就是会话 Active 校验），UI 提前禁用。
   const captureDisabled = health !== null && health.status !== "active";
@@ -455,15 +510,38 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           </button>
           <button
             type="button"
-            className="btn btn--primary"
+            className="btn"
             onClick={() => setCaptureDialogOpen(true)}
-            disabled={captureDisabled || capturing || loading}
+            disabled={captureDisabled || capturing || loading || loginAttemptId !== null}
             data-testid="workbuddy-capture-button"
-            title={captureDisabled ? "WorkBuddy 客户端当前未登录，请先在客户端中登录" : undefined}
+            title={captureDisabled ? "WorkBuddy 客户端当前未登录，请先在客户端中登录" : "把客户端当前登录的账号保存到账号池"}
           >
             <ShieldCheck size={15} aria-hidden="true" />
             保存当前登录账号
           </button>
+          {uiProduct.capabilities.addAccount === "oauth-browser" && (
+            <button
+              type="button"
+              className="btn btn--primary"
+              onClick={() => void runAddAccount()}
+              disabled={loginAttemptId !== null || capturing || loading}
+              data-testid="workbuddy-add-account-button"
+              title="打开浏览器完成 WorkBuddy 授权登录，账号自动保存到账号池"
+            >
+              <UserPlus size={15} aria-hidden="true" />
+              {loginAttemptId !== null ? "等待浏览器登录完成…" : "添加账号"}
+            </button>
+          )}
+          {loginAttemptId !== null && (
+            <button
+              type="button"
+              className="btn btn--quiet"
+              onClick={handleCancelLogin}
+              data-testid="workbuddy-login-cancel"
+            >
+              取消等待
+            </button>
+          )}
         </>
       )}
       errorState={loadError ? {
@@ -529,7 +607,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       renderRow={(record) => renderPoolRow(record)}
       emptyState={{
         className: "workbuddy-page__empty",
-        description: "还没有保存 WorkBuddy 账号。在 WorkBuddy 客户端登录后，点击右上角「保存当前登录账号」。",
+        description: "还没有保存 WorkBuddy 账号。点击右上角「添加账号」通过浏览器登录，或在客户端登录后点「保存当前登录账号」。",
       }}
       detailView={() => null}
       dialogs={(

@@ -18,6 +18,7 @@ vi.mock("../src/platform/notify", () => ({
   },
 }));
 
+import { notify } from "../src/platform/notify";
 import { WorkBuddyCheckinPage, WorkBuddyPanel } from "../src/components/WorkBuddyPanel";
 
 // WorkBuddy 域命令回执（脱敏形态，与真实 DTO 同构）。
@@ -113,6 +114,11 @@ function installWorkbuddyRoutes(options?: {
     ]));
   mockRoute("set_workbuddy_account_auto_checkin", () => undefined);
   mockRoute("set_workbuddy_auto_checkin_settings", () => undefined);
+  mockRoute("begin_workbuddy_login", () => ({ auth_url: "https://auth.example/xyz", attempt_id: 7 }));
+  mockRoute("complete_workbuddy_login", () => ({
+    profile_id: "wb-uid-9", account_id: "uid-9", screen_name: "新账号", acceptance: "passed",
+  }));
+  mockRoute("cancel_workbuddy_login", () => null);
 }
 
 beforeEach(() => {
@@ -347,5 +353,112 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     const inline = await screen.findByTestId("checkin-inline-wb-uid-1");
     expect(inline).toBeDisabled();
     expect(screen.getByTestId("checkin-inline-wb-uid-2")).toBeEnabled();
+  });
+});
+
+
+describe("WorkBuddyPanel 添加账号（P19-B4 登录编排消费）", () => {
+  beforeEach(() => {
+    resetRoutes();
+    installFakeInvoke();
+    window.localStorage.clear();
+    installWorkbuddyRoutes();
+  });
+
+  it("页头主操作：添加账号按钮在册（oauth-browser 能力开关），capture 并存降为普通按钮", async () => {
+    render(<WorkBuddyPanel active={true} />);
+
+    const add = await screen.findByTestId("workbuddy-add-account-button");
+    expect(add).toHaveTextContent("添加账号");
+    expect(add.className).toContain("btn--primary");
+    expect(screen.getByTestId("workbuddy-capture-button")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-capture-button").className).not.toContain("btn--primary");
+  });
+
+  it("登录成功流：begin→complete→入池刷新；按钮翻转为等待态", async () => {
+    // complete 受控：等待态可被断言（真实命令为 1s×5min 阻塞轮询）。
+    let resolveComplete: ((receipt: unknown) => void) = () => undefined;
+    mockRoute("complete_workbuddy_login", () => new Promise((resolve) => {
+      resolveComplete = resolve;
+    }));
+    render(<WorkBuddyPanel active={true} />);
+
+    const add = await screen.findByTestId("workbuddy-add-account-button");
+    fireEvent.click(add);
+    expect(await screen.findByTestId("workbuddy-add-account-button")).toHaveTextContent("等待浏览器登录完成…");
+    expect(screen.getByTestId("workbuddy-login-cancel")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls.some(([cmd]) => cmd === "begin_workbuddy_login")).toBe(true);
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["complete_workbuddy_login", { attemptId: 7 }],
+      );
+    });
+    resolveComplete({
+      profile_id: "wb-uid-9", account_id: "uid-9", screen_name: "新账号", acceptance: "passed",
+    });
+    await waitFor(() => {
+      expect(vi.mocked(notify.success)).toHaveBeenCalledWith(
+        expect.stringContaining("新账号"),
+      );
+    });
+    // 成功后按钮复位 + 池刷新（list 二次调用）。
+    await waitFor(() => {
+      expect(screen.getByTestId("workbuddy-add-account-button")).toHaveTextContent("添加账号");
+    });
+    const listCalls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "list_workbuddy_accounts");
+    expect(listCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("acceptance failed：账号已保存但如实警告，不自动重试", async () => {
+    mockRoute("complete_workbuddy_login", () => ({
+      profile_id: "wb-uid-9", account_id: "uid-9", screen_name: "新账号",
+      acceptance: "failed", acceptance_error_code: "device_refresh_rejected",
+    }));
+    render(<WorkBuddyPanel active={true} />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-add-account-button"));
+    await waitFor(() => {
+      expect(vi.mocked(notify.warning)).toHaveBeenCalledWith(
+        expect.stringContaining("device_refresh_rejected"),
+        expect.any(String),
+      );
+    });
+  });
+
+  it("取消等待：cancel 令 complete 以 cancelled 返回，中性提示收尾", async () => {
+    let rejectComplete: ((reason: unknown) => void) | null = null;
+    mockRoute("complete_workbuddy_login", () => new Promise((_resolve, reject) => {
+      rejectComplete = reject;
+    }));
+    mockRoute("cancel_workbuddy_login", () => {
+      rejectComplete?.("workbuddy_login_cancelled");
+      return null;
+    });
+    render(<WorkBuddyPanel active={true} />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-add-account-button"));
+    fireEvent.click(await screen.findByTestId("workbuddy-login-cancel"));
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["cancel_workbuddy_login", { attemptId: 7 }],
+      );
+    });
+    await waitFor(() => {
+      expect(vi.mocked(notify.info)).toHaveBeenCalledWith(
+        expect.stringContaining("登录已取消"),
+      );
+    });
+  });
+
+  it("重复发起保护：already_in_progress 错误码映射人话", async () => {
+    mockRoute("begin_workbuddy_login", () => Promise.reject("workbuddy_login_already_in_progress"));
+    render(<WorkBuddyPanel active={true} />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-add-account-button"));
+    await waitFor(() => {
+      expect(vi.mocked(notify.error)).toHaveBeenCalledWith(
+        expect.stringContaining("已有登录正在进行"),
+      );
+    });
   });
 });
