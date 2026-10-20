@@ -115,6 +115,9 @@ pub mod credential_handover;
 mod credential_handover;
 // P17-T5 并列骨架：WorkBuddy 产品域命令 + 产品注册表/切换命令。
 mod workbuddy_commands;
+// P19-B3：WorkBuddy 主库域命令（库页 WB 适配器：浏览/消息/软删/彻底删除/
+// 体检/统计/cwd 归并；破坏性写带进程纪律与备份前置）。
+mod workbuddy_library_commands;
 mod workbuddy_schedule;
 // P16-T4：新账号「从客户端捕获」入池编排（spec docs/specs/p16-account-capture.md）。
 mod account_capture;
@@ -1293,6 +1296,15 @@ pub fn run() {
             workbuddy_commands::switch_workbuddy_account,
             // P18-B1 会话过户（单次确认入口；dry_run=true 只出计划不动库）。
             workbuddy_commands::transfer_workbuddy_sessions,
+            // P19-B3 主库移植：WB 库域命令（只读在线浏览/体检/统计 +
+            // 破坏性写：软删/彻底删除〔备份前置〕/cwd 归并，进程纪律同 B1）。
+            workbuddy_library_commands::get_workbuddy_library_stats,
+            workbuddy_library_commands::get_workbuddy_library_history,
+            workbuddy_library_commands::get_workbuddy_session_messages,
+            workbuddy_library_commands::get_workbuddy_library_checkup,
+            workbuddy_library_commands::delete_workbuddy_sessions,
+            workbuddy_library_commands::purge_workbuddy_sessions,
+            workbuddy_library_commands::merge_workbuddy_cwd_projects,
             // 产品身份发现随凭据域迁 credential_handover（P12-R3）。
             credential_handover::get_product_identity_state,
             read_work_cn_state,

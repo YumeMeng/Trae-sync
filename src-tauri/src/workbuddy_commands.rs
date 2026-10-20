@@ -662,7 +662,8 @@ fn current_product_id(state: &AppState) -> Result<String, String> {
 }
 
 /// WorkBuddy 登录容器根。
-fn workbuddy_login_root(state: &AppState) -> Result<PathBuf, String> {
+/// pub(crate)：P19-B3 库域命令（workbuddy_library_commands）共用。
+pub(crate) fn workbuddy_login_root(state: &AppState) -> Result<PathBuf, String> {
     if state.storage_root.is_empty() {
         return Err("workbuddy_storage_unavailable".to_string());
     }
