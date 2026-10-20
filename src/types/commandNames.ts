@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（117 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（118 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -25,6 +25,7 @@ export type CommandName =
   | "create_environment"
   | "create_master_backup"
   | "delete_environment"
+  | "delete_master_backups"
   | "delete_master_sessions"
   | "delete_workbuddy_sessions"
   | "export_recovery_package_command"
