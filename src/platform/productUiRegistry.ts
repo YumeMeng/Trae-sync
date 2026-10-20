@@ -72,7 +72,8 @@ const WORKBUDDY_UI: ProductUiContext = {
   capabilities: {
     addAccount: "capture",
     checkin: "single",
-    creditsColumn: false,
+    // P19-B2⑤：积分列开启（IA 草案 §1.2）——当前客户端登录账号的池行显示积分块。
+    creditsColumn: true,
     health: "deep",
     attentionFilter: false,
     detailView: "pool-only",

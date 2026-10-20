@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, ArrowRightLeft, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import type {
@@ -31,13 +31,13 @@ import {
   deriveCheckinSlotState,
   deriveWorkBuddyPoolLoginState,
 } from "./StatusBadges";
-import { ProductBadge } from "./shared/ProductBadge";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
-import { EmptyState } from "./shared/EmptyState";
 import { AccountPageSkeleton } from "./shared/account/AccountPageSkeleton";
 import { ACCOUNT_SORT_OPTIONS, type AccountSort } from "./shared/account/AccountListControls";
 import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "./shared/account/AccountRow";
 import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
+import { CheckinPageSkeleton } from "./shared/checkin/CheckinPageSkeleton";
+import { AutoCheckinSettingsCard } from "./shared/checkin/AutoCheckinSettingsCard";
 import { productUi } from "../platform/productUiRegistry";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
@@ -593,6 +593,32 @@ interface WorkBuddyCheckinPageProps {
   active: boolean;
 }
 
+/**
+ * 参与集「显式设置过」的本机记录（P19-B2 参与集默认全参与修复，前端侧）：
+ * 用户在 UI 显式拨动过参与开关的账号 id。未记录的账号视为「从未显式设置」，
+ * UI 默认视为参与，且池加载后自动批量置 true 落到后端（八域对齐方案第 3 条：
+ * 默认全参与）；显式关闭（touched 且 false）永远尊重。
+ * 注：本机存储丢失会导致一次重新归一（把未显式关闭的账号重新置为参与），
+ * 可接受；持久的 opt-out 语义归后端 auto_checkin_store（架构草案 §1.2E）。
+ */
+const WB_AUTO_CHECKIN_TOUCHED_KEY = "auto-checkin.workbuddy.touched";
+
+function loadTouchedParticipation(): Set<string> {
+  try {
+    const raw = window.localStorage.getItem(WB_AUTO_CHECKIN_TOUCHED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? new Set(parsed.filter((id): id is string => typeof id === "string")) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveTouchedParticipation(touched: Set<string>): void {
+  try {
+    window.localStorage.setItem(WB_AUTO_CHECKIN_TOUCHED_KEY, JSON.stringify([...touched]));
+  } catch { /* 存储不可用时仅本次会话生效 */ }
+}
+
 export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   const [status, setStatus] = useState<WorkBuddyCheckinStatusDto | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -601,6 +627,15 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   // P17-A5 每日自动签到：设置 + 账号参与清单（与 Trae 自动签到同策略）。
   const [autoStatus, setAutoStatus] = useState<WorkBuddyAutoCheckinStatusDto | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
+  // 参与集显式设置记录（localStorage；见上方注释）。
+  const touchedRef = useRef<Set<string>>(loadTouchedParticipation());
+  // 参与集归一守卫：每次 autoStatus 到达最多跑一轮，防止失败循环重试。
+  const normalizedRef = useRef(false);
+
+  const touch = useCallback((profileId: string) => {
+    touchedRef.current.add(profileId);
+    saveTouchedParticipation(touchedRef.current);
+  }, []);
 
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
@@ -629,6 +664,24 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
     void refreshAuto();
   }, [active, refresh, refreshAuto]);
 
+  // P19-B2 参与集默认全参与：池加载后，从未显式设置过的账号自动批量置 true
+  //（一次归一；显式关闭过的账号不动）。
+  useEffect(() => {
+    if (!autoStatus || normalizedRef.current) return;
+    normalizedRef.current = true;
+    const unset = autoStatus.accounts.filter(
+      (account) => !touchedRef.current.has(account.profile_id) && !account.enabled,
+    );
+    if (unset.length === 0) return;
+    void (async () => {
+      for (const account of unset) {
+        await setWorkBuddyAccountAutoCheckin(account.profile_id, true).catch(() => undefined);
+        touch(account.profile_id);
+      }
+      await refreshAuto();
+    })();
+  }, [autoStatus, refreshAuto, touch]);
+
   const handleSaveAutoSettings = useCallback(
     (enabled: boolean, dailyTimeHhmm: string) => {
       if (autoBusy) return;
@@ -651,6 +704,7 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   const handleToggleAccount = useCallback(
     (profileId: string, enabled: boolean) => {
       if (autoBusy) return;
+      touch(profileId); // 显式设置即记录，此后尊重用户选择。
       setAutoBusy(true);
       void setWorkBuddyAccountAutoCheckin(profileId, enabled)
         .then(refreshAuto)
@@ -659,8 +713,27 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
         ))
         .finally(() => setAutoBusy(false));
     },
-    [autoBusy, refreshAuto],
+    [autoBusy, refreshAuto, touch],
   );
+
+  // 批量置 true 入口：把未参与账号全部置为参与（显式记录，防归一回翻）。
+  const handleParticipateAll = useCallback(() => {
+    if (autoBusy || !autoStatus) return;
+    const targets = autoStatus.accounts.filter(
+      (account) => !account.enabled
+        || (!touchedRef.current.has(account.profile_id) && !account.enabled),
+    );
+    if (targets.length === 0) return;
+    setAutoBusy(true);
+    void (async () => {
+      for (const account of targets) {
+        await setWorkBuddyAccountAutoCheckin(account.profile_id, true).catch(() => undefined);
+        touch(account.profile_id);
+      }
+      await refreshAuto();
+      notify.success(`WorkBuddy：已把 ${targets.length} 个账号全部置为参与自动签到。`);
+    })().finally(() => setAutoBusy(false));
+  }, [autoBusy, autoStatus, refreshAuto, touch]);
 
   const runClaim = useCallback(async () => {
     setClaiming(true);
@@ -679,160 +752,96 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
     }
   }, [refresh]);
 
-  return (
-    <section className="checkin-page" role="region" aria-label="签到">
-      <header className="page-header">
-        <div className="page-header__copy">
-          <h1 data-page-title="checkin" tabIndex={-1}>
-            签到 <ProductBadge productId="workbuddy" />
-          </h1>
-        </div>
-        {status && (
-          <div className="page-header__actions">
-            <button
-              type="button"
-              className="btn"
-              onClick={() => void refresh(false)}
-              disabled={loading || claiming}
-              data-testid="workbuddy-checkin-refresh"
-            >
-              <RefreshCw size={15} className={loading ? "icon-spin" : undefined} aria-hidden="true" />
-              刷新
-            </button>
-          </div>
-        )}
-      </header>
+  // P19-B2⑤：页面编排（门控/页头/状态行）由 CheckinPageSkeleton 承担；
+  // WB 签到形态为 single（单账号卡 + 自动签到设置卡），批量行升级归 B5。
+  const uiProduct = productUi("workbuddy");
+  // 参与集 UI 生效态：显式设置过的账号按后端值；未设置过的默认参与。
+  const participationAccounts = (autoStatus?.accounts ?? []).map((account) => ({
+    profileId: account.profile_id,
+    displayName: account.screen_name,
+    participating: touchedRef.current.has(account.profile_id) ? account.enabled : true,
+  }));
 
-      {/* P18-B3 对齐 CheckinPage 规格的常驻自动签到状态行。 */}
-      {autoStatus && (
+  return (
+    <CheckinPageSkeleton
+      product={uiProduct}
+      active={active}
+      loading={loading}
+      headerActions={status ? (
+        <div className="page-header__actions">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void refresh(false)}
+            disabled={loading || claiming}
+            data-testid="workbuddy-checkin-refresh"
+          >
+            <RefreshCw size={15} className={loading ? "icon-spin" : undefined} aria-hidden="true" />
+            刷新
+          </button>
+        </div>
+      ) : undefined}
+      errorState={loadError ? {
+        title: "无法读取签到状态",
+        description: loadError,
+        action: (
+          <button type="button" className="btn btn--primary" onClick={() => void refresh(true)}>
+            重新读取
+          </button>
+        ),
+      } : undefined}
+      statusRegion={autoStatus ? (
         <p className="checkin-page__meta" role="status" data-testid="workbuddy-auto-checkin-meta">
           自动签到：{autoStatus.enabled ? `每日 ${autoStatus.daily_time_hhmm} 触发` : "已关闭"}
           {autoStatus.enabled ? ` · ${wbAutoLedgerLabel(autoStatus)}` : ""}
         </p>
-      )}
-
-      {loading ? (
-        <EmptyState role="status" className="workbuddy-page__empty" description="正在读取签到状态…" />
-      ) : loadError ? (
-        <EmptyState
-          role="alert"
-          className="workbuddy-page__empty"
-          title="无法读取签到状态"
-          description={loadError}
-          action={
-            <button type="button" className="btn btn--primary" onClick={() => void refresh(true)}>
-              重新读取
-            </button>
-          }
-        />
-      ) : status ? (
-        <div className="workbuddy-card" data-testid="workbuddy-checkin-card">
-          <div className="workbuddy-card__title">每日签到</div>
-          <InfoRow label="今日状态">
-            {/* P18-B3：签到槽徽章统一走 G10 CheckinSlotBadge（与 Trae 签到页同义同色）。 */}
-            <CheckinSlotBadge state={deriveCheckinSlotState({ checked_in: status.today_checked_in })} />
-          </InfoRow>
-          <InfoRow label="已连续签到">{status.streak_days} 天</InfoRow>
-          <InfoRow label="今日可得">+{status.daily_credit} 积分</InfoRow>
-          <InfoRow label="积分余额">{status.total_credits} 积分</InfoRow>
-          <div className="workbuddy-card__actions">
-            <button
-              type="button"
-              className="btn btn--primary"
-              onClick={() => void runClaim()}
-              disabled={status.today_checked_in || claiming}
-              data-testid="workbuddy-checkin-button"
-            >
-              {claiming && <Loader2 size={15} className="icon-spin" aria-hidden="true" />}
-              {status.today_checked_in ? "今日已签到" : claiming ? "签到中…" : "立即签到"}
-            </button>
-          </div>
-        </div>
       ) : null}
-
-      {/* P17-A5 每日自动签到：设置 + 账号参与（与 Trae 自动签到同策略）。 */}
-      {autoStatus && (
-        <div className="workbuddy-card" data-testid="workbuddy-auto-checkin-settings">
-          <div className="workbuddy-card__title">每日自动签到</div>
-          <div className="account-center__key-grid">
-            <label
-              className="settings-panel__toggle-row"
-              data-testid="workbuddy-auto-checkin-enabled-toggle"
-              title="到点后参与账号在 0-15 分钟内随机错峰自动执行。"
-            >
-              <input
-                type="checkbox"
-                checked={autoStatus.enabled}
-                disabled={autoBusy}
-                onChange={(event) =>
-                  handleSaveAutoSettings(event.target.checked, autoStatus.daily_time_hhmm)
-                }
-              />
-              <span className="account-center__profile-copy">
-                <strong>每日自动签到</strong>
-                <span>开启后到点自动执行（断连自动续期兜底）</span>
-              </span>
-            </label>
-            <label className="account-center__target-field">
-              <span>触发时间</span>
-              <input
-                type="time"
-                value={autoStatus.daily_time_hhmm}
-                disabled={autoBusy || !autoStatus.enabled}
-                onChange={(event) => {
-                  if (event.target.value) {
-                    handleSaveAutoSettings(autoStatus.enabled, event.target.value);
-                  }
-                }}
-                data-testid="workbuddy-auto-checkin-time-input"
-              />
-            </label>
-            {autoStatus.ledger && (
-              <span className="account-center__meta" data-testid="workbuddy-auto-checkin-ledger">
-                {autoStatus.ledger.running
-                  ? `今日执行中（完成 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
-                  : `今日已完成（成功 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`}
-              </span>
-            )}
+      content={status ? (
+        <>
+          <div className="workbuddy-card" data-testid="workbuddy-checkin-card">
+            <div className="workbuddy-card__title">每日签到</div>
+            <InfoRow label="今日状态">
+              {/* P18-B3：签到槽徽章统一走 G10 CheckinSlotBadge（与 Trae 签到页同义同色）。 */}
+              <CheckinSlotBadge state={deriveCheckinSlotState({ checked_in: status.today_checked_in })} />
+            </InfoRow>
+            <InfoRow label="已连续签到">{status.streak_days} 天</InfoRow>
+            <InfoRow label="今日可得">+{status.daily_credit} 积分</InfoRow>
+            <InfoRow label="积分余额">{status.total_credits} 积分</InfoRow>
+            <div className="workbuddy-card__actions">
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={() => void runClaim()}
+                disabled={status.today_checked_in || claiming}
+                data-testid="workbuddy-checkin-button"
+              >
+                {claiming && <Loader2 size={15} className="icon-spin" aria-hidden="true" />}
+                {status.today_checked_in ? "今日已签到" : claiming ? "签到中…" : "立即签到"}
+              </button>
+            </div>
           </div>
-          {autoStatus.accounts.length > 0 && (
-            <ul className="account-list" data-testid="workbuddy-auto-checkin-accounts">
-              {autoStatus.accounts.map((account) => (
-                <li key={account.profile_id}>
-                  <div className="account-list__row">
-                    <div className="account-item__main">
-                      <span className="account-card__avatar" aria-hidden="true">
-                        {(account.screen_name || "W").trim().charAt(0).toUpperCase()}
-                      </span>
-                      <div className="account-item__id">
-                        <div className="account-item__name-row">
-                          <strong className="account-item__name">
-                            {account.screen_name || "WorkBuddy 账号"}
-                          </strong>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="account-item__side">
-                      <label className="account-center__target-field">
-                        <span>参与自动签到</span>
-                        <input
-                          type="checkbox"
-                          checked={account.enabled}
-                          disabled={autoBusy}
-                          onChange={(event) =>
-                            handleToggleAccount(account.profile_id, event.target.checked)
-                          }
-                          data-testid={`workbuddy-auto-checkin-account-${account.profile_id}`}
-                        />
-                      </label>
-                    </div>
-                  </div>
-                </li>
-              ))}
-            </ul>
+
+          {/* P17-A5 每日自动签到：设置 + 账号参与（共享设置卡，P19-B2⑤ 抽取）。 */}
+          {autoStatus && (
+            <AutoCheckinSettingsCard
+              testIdPrefix="workbuddy"
+              enabled={autoStatus.enabled}
+              dailyTimeHhmm={autoStatus.daily_time_hhmm}
+              busy={autoBusy}
+              toggleSummary="开启后到点自动执行（断连自动续期兜底）"
+              ledgerNote={autoStatus.ledger
+                ? autoStatus.ledger.running
+                  ? `今日执行中（完成 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
+                  : `今日已完成（成功 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
+                : null}
+              accounts={participationAccounts}
+              onSettingsChange={handleSaveAutoSettings}
+              onParticipationChange={handleToggleAccount}
+              onParticipateAll={handleParticipateAll}
+            />
           )}
-        </div>
-      )}
-    </section>
+        </>
+      ) : null}
+    />
   );
 }

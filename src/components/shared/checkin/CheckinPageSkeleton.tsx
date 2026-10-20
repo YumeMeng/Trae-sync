@@ -23,6 +23,8 @@ export interface CheckinPageSkeletonProps {
   ariaLabel?: string;
   /** 页头动作区插槽（刷新等）。 */
   headerActions?: ReactNode;
+  /** 读取失败态（标题 + 说明 + 重试动作）：渲染于页头之下，替代主体。 */
+  errorState?: { title: string; description: string; action?: ReactNode };
   /** 页头与主体之间的状态区插槽（自动签到状态行/演示横幅/不可用提示）。 */
   statusRegion?: ReactNode;
   /** 无账号空态（缺省 = 不渲染主体）。 */
@@ -54,6 +56,7 @@ export function CheckinPageSkeleton({
   loading,
   ariaLabel = "签到",
   headerActions,
+  errorState,
   statusRegion,
   emptyState,
   entryCount = 0,
@@ -95,10 +98,21 @@ export function CheckinPageSkeleton({
 
       {statusRegion}
 
-      {/* 单账号内容形态（single）：产品层自带卡片；提供 content 即不走批量区块。 */}
-      {content}
+      {/* 读取失败态：诚实说明卡（重试动作由产品层注入）。 */}
+      {errorState && (
+        <EmptyState
+          role="alert"
+          className="checkin-page__empty"
+          title={errorState.title}
+          description={errorState.description}
+          action={errorState.action}
+        />
+      )}
 
-      {content === undefined && hasEntries && rows !== undefined && (
+      {/* 单账号内容形态（single）：产品层自带卡片；提供 content 即不走批量区块。 */}
+      {!errorState && content}
+
+      {content === undefined && !errorState && hasEntries && rows !== undefined && (
         <section className="checkin-page__selection" aria-labelledby="checkin-selection-heading">
           <div className="account-center__section-heading">
             <h3 id="checkin-selection-heading"><CalendarCheck size={16} aria-hidden="true" />{selectionHeading}</h3>
@@ -135,7 +149,7 @@ export function CheckinPageSkeleton({
         </section>
       )}
 
-      {content === undefined && !hasEntries && emptyState && (
+      {content === undefined && !errorState && !hasEntries && emptyState && (
         <EmptyState
           className={emptyState.className}
           description={emptyState.description}
