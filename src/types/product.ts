@@ -47,6 +47,10 @@ export interface WorkBuddyDeepHealthDto {
 /** WorkBuddy 会话健康（文件面只读；不含令牌材料）。 */
 export interface WorkBuddySessionHealthDto {
   readonly status: WorkBuddySessionStatus;
+  /** 当前客户端登录账号的平台 uid（后端 DTO 已有字段；uid 原文不进 UI 主视野，
+   *  仅用于与池行 account_id 同源匹配「使用中」标记与积分数据面归属）。 */
+  readonly uid: string;
+  readonly uin: string;
   /** 过期时间为 Unix 秒（0 = 未知）。 */
   readonly access_expires_at_unix_seconds: number;
   readonly refresh_expires_at_unix_seconds: number;

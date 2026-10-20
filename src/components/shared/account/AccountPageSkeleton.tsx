@@ -55,6 +55,10 @@ export interface AccountPageSkeletonProps {
   /** 选中态清理键（产品身份变化即清空详情选择）。产品层按自身产品指针
    *  语义传值（如 `adapter?.productId ?? "-"`，与迁移前 currentProductId 同源）。 */
   selectionResetKey: string;
+  /** 读取失败态（标题 + 说明 + 重试动作）：渲染于页头之下，替代主体。 */
+  errorState?: { title: string; description: string; action?: ReactNode };
+  /** 行列表容器 testid（如 WB 池清单 workbuddy-pool-list；缺省无）。 */
+  listTestId?: string;
 }
 
 export function AccountPageSkeleton({
@@ -74,6 +78,8 @@ export function AccountPageSkeleton({
   detailView,
   dialogs,
   selectionResetKey,
+  errorState,
+  listTestId,
 }: AccountPageSkeletonProps) {
   // 选中态由骨架管理：非空时进入独立详情视图（selectionResetKey 变化即清态，
   // 避免两个产品 profile_id 相同时展示旧产品详情）。
@@ -116,6 +122,29 @@ export function AccountPageSkeleton({
     );
   }
 
+  // 读取失败态：页头 + 诚实说明卡（重试动作由产品层注入）。
+  if (errorState) {
+    return (
+      <section className="account-center" role="region" aria-label={ariaLabel}>
+        <header className="page-header">
+          <div className="page-header__copy">
+            <h1 data-page-title="accounts" tabIndex={-1}>账号</h1>
+            <ProductBadge productId={product.productId} />
+          </div>
+          <div className="page-header__actions">{headerActions}</div>
+        </header>
+        <EmptyState
+          role="alert"
+          className="account-center__empty"
+          title={errorState.title}
+          description={errorState.description}
+          action={errorState.action}
+        />
+        {dialogs}
+      </section>
+    );
+  }
+
   return (
     <section className="account-center" role="region" aria-label={ariaLabel}>
       <header className="page-header">
@@ -142,7 +171,7 @@ export function AccountPageSkeleton({
         {listPrelude}
         {entries.length > 0 ? (
           // stagger 白名单类名（App.tsx 依赖 account-list / account-card-grid）。
-          <ul className={controls.view === "list" ? "account-list" : "account-card-grid"}>
+          <ul className={controls.view === "list" ? "account-list" : "account-card-grid"} data-testid={listTestId}>
             {entries.map((entry) => (
               <Fragment key={entry.id}>
                 {renderRow(entry, { onOpen: () => setSelectedProfileId(entry.id) })}

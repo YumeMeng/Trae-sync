@@ -34,6 +34,11 @@ import {
 import { ProductBadge } from "./shared/ProductBadge";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { EmptyState } from "./shared/EmptyState";
+import { AccountPageSkeleton } from "./shared/account/AccountPageSkeleton";
+import { ACCOUNT_SORT_OPTIONS, type AccountSort } from "./shared/account/AccountListControls";
+import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "./shared/account/AccountRow";
+import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
+import { productUi } from "../platform/productUiRegistry";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 
@@ -150,6 +155,19 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   // P17-T6/A4 切号：单次确认弹窗（目标 profile_id）→ 执行 → 刷新健康与池。
   const [switchTarget, setSwitchTarget] = useState<string | null>(null);
   const [switching, setSwitching] = useState(false);
+  // U-2 双视图与排序（P19-B2⑤ 对齐账号页模板；key 按产品分前缀）。
+  const [accountView, setAccountView] = useState<AccountView>(() =>
+    readStoredPreference(accountPreferenceKey("workbuddy", "view"), "list", ["list", "card"] as const));
+  const [accountSort, setAccountSort] = useState<AccountSort>(() =>
+    readStoredPreference<AccountSort>(accountPreferenceKey("workbuddy", "sort"), "added", ["added", "name"]));
+  const changeAccountView = useCallback((next: AccountView) => {
+    setAccountView(next);
+    writeStoredPreference(accountPreferenceKey("workbuddy", "view"), next);
+  }, []);
+  const changeAccountSort = useCallback((next: AccountSort) => {
+    setAccountSort(next);
+    writeStoredPreference(accountPreferenceKey("workbuddy", "sort"), next);
+  }, []);
 
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
@@ -313,15 +331,78 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     }
   }, [refresh, transferPlan]);
 
+  // P19-B2⑤：账号页编排（门控/页头/健康卡位/控件行/池行/空态）由
+  // AccountPageSkeleton 承担（ADR-0036 铁律），本组件退化为 WB 数据与插槽提供方。
+  const uiProduct = productUi("workbuddy");
+  const visiblePool = accountSort === "name"
+    ? [...pool].sort((a, b) => (a.screen_name || "").localeCompare(b.screen_name || "", "zh-Hans-CN"))
+    : pool;
+  const poolEntries = visiblePool.map((account) => ({
+    id: account.profile_id,
+    displayName: account.screen_name || "WorkBuddy 账号",
+    lastVerifiedAt: null,
+    // 「使用中」= 当前客户端登录账号（健康卡的 uid 与池账号 account_id 同源）。
+    isSelected: health?.uid === account.account_id,
+  }));
+  const renderPoolRow = (record: SharedAccountRecord) => {
+    const account = pool.find((item) => item.profile_id === record.id);
+    if (!account) return null;
+    const poolState = deriveWorkBuddyPoolLoginState({
+      access_expires_at_unix_seconds: account.access_token_expires_at_unix_seconds,
+      refresh_expires_at_unix_seconds: account.refresh_token_expires_at_unix_seconds,
+      now_unix_seconds: Math.floor(Date.now() / 1000),
+    });
+    // creditsColumn 能力开关（IA 草案 §1.2）：仅当前客户端登录账号有积分数据面。
+    const creditsMetric = uiProduct.capabilities.creditsColumn && record.isSelected && checkinStatus ? (
+      <div className="account-item__credits" title="WorkBuddy 当前登录账号的积分余额（签到数据面）">
+        <strong data-testid={`workbuddy-credits-${account.account_id}`}>{checkinStatus.total_credits}</strong>
+        <span className="account-item__credits-label">积分余额</span>
+      </div>
+    ) : null;
+    const cardCredits = uiProduct.capabilities.creditsColumn && record.isSelected && checkinStatus ? (
+      <div className="account-card__credits" title="WorkBuddy 当前登录账号的积分余额（签到数据面）">
+        <span className="account-card__credits-value" data-testid={`workbuddy-credits-${account.account_id}`}>
+          {checkinStatus.total_credits}
+        </span>
+        <span className="account-item__credits-label">积分余额</span>
+      </div>
+    ) : null;
+    const expiryMeta = (
+      <p className="account-item__meta">
+        登录有效期至 {formatUnixTime(account.access_token_expires_at_unix_seconds) ?? "未知"}
+        {" · "}
+        更新于 {formatUnixTime(account.last_updated_at_unix_seconds) ?? "未知"}
+      </p>
+    );
+    return (
+      <SharedAccountEntry
+        account={record}
+        variant={accountView}
+        testId={`workbuddy-pool-card-${account.profile_id}`}
+        actionTestId={`workbuddy-switch-${account.profile_id}`}
+        selectedTestId={`workbuddy-pool-current-${account.profile_id}`}
+        statusContent={<WorkBuddyPoolSlotBadge state={poolState} />}
+        listMeta={expiryMeta}
+        cardMeta={expiryMeta}
+        listMetric={creditsMetric}
+        cardMetric={cardCredits}
+        actionBusy={switching}
+        onAction={() => setSwitchTarget(account.profile_id)}
+        actionTitle="让 WorkBuddy 客户端切换登录到此账号（切换后如看不到历史会话，可用「转移历史会话」恢复可见）"
+        actionLabel="切换到此账号"
+      />
+    );
+  };
+
   return (
-    <section className="account-center" role="region" aria-label="账号">
-      <header className="page-header">
-        <div className="page-header__copy">
-          <h1 data-page-title="accounts" tabIndex={-1}>
-            账号 <ProductBadge productId="workbuddy" />
-          </h1>
-        </div>
-        <div className="page-header__actions">
+    <AccountPageSkeleton
+      product={uiProduct}
+      active={active}
+      loading={loading}
+      ariaLabel="账号"
+      selectionResetKey="workbuddy"
+      headerActions={(
+        <>
           <button
             type="button"
             className="btn"
@@ -376,179 +457,131 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
             <ShieldCheck size={15} aria-hidden="true" />
             保存当前登录账号
           </button>
-        </div>
-      </header>
-
-      {loading ? (
-        <EmptyState role="status" className="workbuddy-page__empty" description="正在读取 WorkBuddy 登录状态…" />
-      ) : loadError ? (
-        <EmptyState
-          role="alert"
-          className="workbuddy-page__empty"
-          title="无法读取 WorkBuddy 登录状态"
-          description={loadError}
-          action={
-            <button type="button" className="btn btn--primary" onClick={() => void refresh(true)}>
-              重新读取
-            </button>
-          }
-        />
-      ) : (
-        <>
-          {health && (
-            <div className="workbuddy-card" data-testid="workbuddy-health-card">
-              <div className="workbuddy-card__title">客户端登录状态</div>
-              <InfoRow label="登录状态">
-                {/* P18-B3：徽章统一走 G10 slot-badge 体系（与账号页/签到页同义同色）。 */}
-                <WorkBuddyLoginSlotBadge status={health.status} />
-              </InfoRow>
-              <InfoRow label="账号池">
-                {health.captured_in_pool
-                  ? "当前登录账号已保存到 Trae Sync 账号池"
-                  : "尚未保存到 Trae Sync 账号池"}
-              </InfoRow>
-              <InfoRow label="登录有效期至">
-                {formatUnixTime(health.access_expires_at_unix_seconds) ?? "未知"}
-              </InfoRow>
-              <InfoRow label="续期凭据有效期至">
-                {formatUnixTime(health.refresh_expires_at_unix_seconds) ?? "未知"}
-              </InfoRow>
-              {/* P18-B3：积分入账号卡（签到数据面已有；读取失败显示未知）。 */}
-              <InfoRow label="积分余额">
-                {checkinStatus ? `${checkinStatus.total_credits} 积分` : "未知"}
-              </InfoRow>
-              <InfoRow label="已连续签到">
-                {checkinStatus ? `${checkinStatus.streak_days} 天` : "未知"}
-              </InfoRow>
-              {deepHealth && (
-                <InfoRow label="健康检测">
-                  <span
-                    className={`slot-badge ${deepHealth.live_status === "verified" ? "slot-badge--ok" : deepHealth.live_status === "probe_failed" ? "slot-badge--danger" : "slot-badge--idle"}`}
-                    data-testid="workbuddy-deep-health-result"
-                  >
-                    <i className="slot-badge__dot" aria-hidden="true" />
-                    {liveHealthLabel(deepHealth.live_status)}
-                  </span>
-                </InfoRow>
-              )}
-            </div>
-          )}
-
-          <div className="workbuddy-card">
-            <div className="workbuddy-card__title">账号池（{pool.length}）</div>
-            {pool.length === 0 ? (
-              <EmptyState
-                className="workbuddy-page__empty"
-                description="还没有保存 WorkBuddy 账号。在 WorkBuddy 客户端登录后，点击右上角「保存当前登录账号」。"
-              />
-            ) : (
-              <ul className="account-list" data-testid="workbuddy-pool-list">
-                {pool.map((account) => {
-                  // P18-B3：账号池行对齐 AccountCenter 列表规格（account-item 结构
-                  // + G10 登录徽章）；凭据状态按双过期时刻推导。
-                  const poolState = deriveWorkBuddyPoolLoginState({
-                    access_expires_at_unix_seconds: account.access_token_expires_at_unix_seconds,
-                    refresh_expires_at_unix_seconds: account.refresh_token_expires_at_unix_seconds,
-                    now_unix_seconds: Math.floor(Date.now() / 1000),
-                  });
-                  return (
-                    <li key={account.profile_id}>
-                      <div className="account-list__row">
-                        <div className="account-item__main">
-                          <span className="account-card__avatar" aria-hidden="true">
-                            {(account.screen_name || "W").trim().charAt(0).toUpperCase()}
-                          </span>
-                          <div className="account-item__id">
-                            <div className="account-item__name-row">
-                              <strong className="account-item__name">
-                                {account.screen_name || "WorkBuddy 账号"}
-                              </strong>
-                              <WorkBuddyPoolSlotBadge state={poolState} />
-                            </div>
-                            <div className="account-meta-group">
-                              <p className="account-item__meta">
-                                登录有效期至 {formatUnixTime(account.access_token_expires_at_unix_seconds) ?? "未知"}
-                                {" · "}
-                                更新于 {formatUnixTime(account.last_updated_at_unix_seconds) ?? "未知"}
-                              </p>
-                            </div>
-                          </div>
-                        </div>
-                        <div className="account-item__side">
-                          <button
-                            type="button"
-                            className="btn btn--quiet"
-                            onClick={() => setSwitchTarget(account.profile_id)}
-                            disabled={switching}
-                            data-testid={`workbuddy-switch-${account.profile_id}`}
-                            title="让 WorkBuddy 客户端切换登录到此账号（切换后如看不到历史会话，可用「转移历史会话」恢复可见）"
-                          >
-                            切换到此账号
-                          </button>
-                        </div>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </div>
         </>
       )}
+      errorState={loadError ? {
+        title: "无法读取 WorkBuddy 登录状态",
+        description: loadError,
+        action: (
+          <button type="button" className="btn btn--primary" onClick={() => void refresh(true)}>
+            重新读取
+          </button>
+        ),
+      } : undefined}
+      statusRegion={health ? (
+        <div className="workbuddy-card" data-testid="workbuddy-health-card">
+          <div className="workbuddy-card__title">客户端登录状态</div>
+          <InfoRow label="登录状态">
+            {/* P18-B3：徽章统一走 G10 slot-badge 体系（与账号页/签到页同义同色）。 */}
+            <WorkBuddyLoginSlotBadge status={health.status} />
+          </InfoRow>
+          <InfoRow label="账号池">
+            {health.captured_in_pool
+              ? "当前登录账号已保存到 Trae Sync 账号池"
+              : "尚未保存到 Trae Sync 账号池"}
+          </InfoRow>
+          <InfoRow label="登录有效期至">
+            {formatUnixTime(health.access_expires_at_unix_seconds) ?? "未知"}
+          </InfoRow>
+          <InfoRow label="续期凭据有效期至">
+            {formatUnixTime(health.refresh_expires_at_unix_seconds) ?? "未知"}
+          </InfoRow>
+          {/* P18-B3：积分入账号卡（签到数据面已有；读取失败显示未知）。 */}
+          <InfoRow label="积分余额">
+            {checkinStatus ? `${checkinStatus.total_credits} 积分` : "未知"}
+          </InfoRow>
+          <InfoRow label="已连续签到">
+            {checkinStatus ? `${checkinStatus.streak_days} 天` : "未知"}
+          </InfoRow>
+          {deepHealth && (
+            <InfoRow label="健康检测">
+              <span
+                className={`slot-badge ${deepHealth.live_status === "verified" ? "slot-badge--ok" : deepHealth.live_status === "probe_failed" ? "slot-badge--danger" : "slot-badge--idle"}`}
+                data-testid="workbuddy-deep-health-result"
+              >
+                <i className="slot-badge__dot" aria-hidden="true" />
+                {liveHealthLabel(deepHealth.live_status)}
+              </span>
+            </InfoRow>
+          )}
+        </div>
+      ) : null}
+      entryCount={pool.length}
+      showControls={pool.length > 0}
+      controls={{
+        view: accountView,
+        onViewChange: changeAccountView,
+        sort: accountSort,
+        sortOptions: ACCOUNT_SORT_OPTIONS.filter((option) => option !== "checkin"),
+        onSortChange: changeAccountSort,
+        // attentionFilter=false（IA 草案）：WB 暂无凭据异常过滤口径，不渲染过滤器行。
+        filter: undefined,
+      }}
+      listTestId="workbuddy-pool-list"
+      entries={poolEntries}
+      renderRow={(record) => renderPoolRow(record)}
+      emptyState={{
+        className: "workbuddy-page__empty",
+        description: "还没有保存 WorkBuddy 账号。在 WorkBuddy 客户端登录后，点击右上角「保存当前登录账号」。",
+      }}
+      detailView={() => null}
+      dialogs={(
+        <>
+          {captureDialogOpen && (
+            <ConfirmDialog
+              title="保存当前 WorkBuddy 登录账号"
+              lines={[
+                "将从本机 WorkBuddy 客户端读取当前登录会话，加密保存到 Trae Sync 的账号池。",
+                "只读取登录凭据，不会修改 WorkBuddy 客户端的任何数据。",
+                "同一账号重复保存会用最新凭据覆盖旧记录。",
+              ]}
+              confirmLabel="保存账号"
+              busyLabel="保存中…"
+              busy={capturing}
+              onCancel={() => setCaptureDialogOpen(false)}
+              onConfirm={() => void runCapture()}
+              testId="workbuddy-capture-dialog"
+            />
+          )}
 
-      {captureDialogOpen && (
-        <ConfirmDialog
-          title="保存当前 WorkBuddy 登录账号"
-          lines={[
-            "将从本机 WorkBuddy 客户端读取当前登录会话，加密保存到 Trae Sync 的账号池。",
-            "只读取登录凭据，不会修改 WorkBuddy 客户端的任何数据。",
-            "同一账号重复保存会用最新凭据覆盖旧记录。",
-          ]}
-          confirmLabel="保存账号"
-          busyLabel="保存中…"
-          busy={capturing}
-          onCancel={() => setCaptureDialogOpen(false)}
-          onConfirm={() => void runCapture()}
-          testId="workbuddy-capture-dialog"
-        />
-      )}
+          {/* P17-T6/A4 切号单次确认（覆盖性操作：改写客户端登录态）。 */}
+          {switchTarget && (
+            <ConfirmDialog
+              title="切换 WorkBuddy 登录账号"
+              lines={[
+                "将让 WorkBuddy 客户端退出当前账号并登录到所选账号（写入客户端登录态）。",
+                "历史会话记录在本机并按账号隔离；切换后如看不到历史会话，可在本页使用「转移历史会话」恢复可见。",
+                "需要 WorkBuddy 客户端处于运行状态；切换完成后客户端即已登录新账号。",
+              ]}
+              confirmLabel="确认切换"
+              busyLabel="切换中…"
+              busy={switching}
+              onCancel={() => {
+                if (!switching) setSwitchTarget(null);
+              }}
+              onConfirm={() => void runSwitch()}
+              testId="workbuddy-switch-dialog"
+            />
+          )}
 
-      {/* P17-T6/A4 切号单次确认（覆盖性操作：改写客户端登录态）。 */}
-      {switchTarget && (
-        <ConfirmDialog
-          title="切换 WorkBuddy 登录账号"
-          lines={[
-            "将让 WorkBuddy 客户端退出当前账号并登录到所选账号（写入客户端登录态）。",
-            "历史会话记录在本机并按账号隔离；切换后如看不到历史会话，可在本页使用「转移历史会话」恢复可见。",
-            "需要 WorkBuddy 客户端处于运行状态；切换完成后客户端即已登录新账号。",
-          ]}
-          confirmLabel="确认切换"
-          busyLabel="切换中…"
-          busy={switching}
-          onCancel={() => {
-            if (!switching) setSwitchTarget(null);
-          }}
-          onConfirm={() => void runSwitch()}
-          testId="workbuddy-switch-dialog"
-        />
+          {/* P18-B1 会话过户单次确认（破坏性批量操作纪律；计划由后端 dry_run 生成）。 */}
+          {transferPlan && (
+            <ConfirmDialog
+              title="转移历史会话"
+              lines={transferDialogLines(transferPlan)}
+              confirmLabel="确认转移"
+              busyLabel="转移中…"
+              busy={transferring}
+              onCancel={() => {
+                if (!transferring) setTransferPlan(null);
+              }}
+              onConfirm={() => void runTransfer()}
+              testId="workbuddy-transfer-dialog"
+            />
+          )}
+        </>
       )}
-
-      {/* P18-B1 会话过户单次确认（破坏性批量操作纪律；计划由后端 dry_run 生成）。 */}
-      {transferPlan && (
-        <ConfirmDialog
-          title="转移历史会话"
-          lines={transferDialogLines(transferPlan)}
-          confirmLabel="确认转移"
-          busyLabel="转移中…"
-          busy={transferring}
-          onCancel={() => {
-            if (!transferring) setTransferPlan(null);
-          }}
-          onConfirm={() => void runTransfer()}
-          testId="workbuddy-transfer-dialog"
-        />
-      )}
-    </section>
+    />
   );
 }
 
