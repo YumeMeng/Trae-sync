@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, ArrowRightLeft, RefreshCw, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import type {
@@ -18,6 +18,7 @@ import {
   fetchWorkBuddyCheckinOverview,
   fetchWorkBuddyCheckinStatus,
   listWorkBuddyAccounts,
+  listWorkBuddyCheckinAccounts,
   loadWorkBuddySessionHealth,
   planWorkBuddySessionTransfer,
   refreshWorkBuddyAccount,
@@ -669,6 +670,8 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   const [busy, setBusy] = useState(false);
   // 逐行 claim 结果（outcome 与 CheckinResultDto 同口径，进 OutcomeLabels 通用档）。
   const [rowResults, setRowResults] = useState<Record<string, { outcome: string; detail_code: string | null }>>({});
+  // 参与集已加载标记：默认选择用参与集；未加载（命令失败）回退全选。
+  const participationLoadedRef = useRef(false);
   // P17-A5 每日自动签到：设置 + 账号参与清单（enabled = 后端有效参与）。
   const [autoStatus, setAutoStatus] = useState<WorkBuddyAutoCheckinStatusDto | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
@@ -676,9 +679,19 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
     try {
-      const next = await fetchWorkBuddyCheckinOverview(null);
+      // 参与集（矩阵 #46 list_workbuddy_checkin_accounts）：enabled = 后端有效参与
+      //（未显式设置默认 true，opt-out 永久尊重）——批量选择默认选中参与集；
+      // 读取失败回退全选（选择只是批次范围，不阻塞页面）。
+      const [next, participation] = await Promise.all([
+        fetchWorkBuddyCheckinOverview(null),
+        listWorkBuddyCheckinAccounts().catch(() => null),
+      ]);
       setRows(next);
       setLoadError(null);
+      if (participation) {
+        participationLoadedRef.current = true;
+        setSelection(participation.filter((account) => account.enabled).map((account) => account.profile_id));
+      }
     } catch (reason: unknown) {
       setLoadError(safeUiErrorMessage(reason, "签到状态暂时不可读取，请稍后重试。"));
     } finally {
@@ -700,11 +713,13 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
     void refreshAuto();
   }, [active, refresh, refreshAuto]);
 
-  // 选择默认全选；行集变化时剔除失效项并保留既有选择（与 TRAE 签到页同口径）。
+  // 选择默认 = 有效参与集（list_workbuddy_checkin_accounts）；行集变化时剔除
+  // 失效项并保留既有选择；参与集未加载（命令失败）回退全选（与 TRAE 同口径）。
   useEffect(() => {
     setSelection((current) => {
       const filtered = current.filter((id) => rows.some((row) => row.profile_id === id));
-      return filtered.length > 0 ? filtered : rows.map((row) => row.profile_id);
+      if (filtered.length > 0) return filtered;
+      return participationLoadedRef.current ? [] : rows.map((row) => row.profile_id);
     });
   }, [rows]);
 

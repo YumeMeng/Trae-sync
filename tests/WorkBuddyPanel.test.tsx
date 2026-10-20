@@ -311,6 +311,8 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     // enabled = 后端有效参与语义（opt-out 后端化，前端 touched 集退役）。
     expect(checkbox.checked).toBe(false);
     expect((screen.getByTestId("workbuddy-auto-checkin-account-wb-uid-1") as HTMLInputElement).checked).toBe(true);
+    // 批量选择默认选中参与集（IA §1.3：wb-uid-2 被显式关闭 → 不在默认选择内）。
+    expect(screen.getByText("已选 1/2")).toBeInTheDocument();
     // 无前端归一化写操作。
     const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
     expect(calls).toHaveLength(0);
