@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { Activity, RefreshCw } from "lucide-react";
 import type { WorkBuddyDeepHealthDto, WorkBuddySessionHealthDto } from "../types/product";
+import type { WorkBuddyProbeInfoDto } from "../types/workbuddyBackup";
 import {
   checkWorkBuddyLoginHealth,
+  fetchWorkBuddyProbeInfo,
   loadWorkBuddySessionHealth,
 } from "../platform/workbuddyAdapter";
 import { EmptyState } from "./shared/EmptyState";
@@ -20,6 +22,8 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 export function WorkBuddyEnvironmentPage({ active }: { active: boolean }) {
   const [health, setHealth] = useState<WorkBuddySessionHealthDto | null>(null);
   const [deepHealth, setDeepHealth] = useState<WorkBuddyDeepHealthDto | null>(null);
+  // 探针信息（P19-B8：版本/安装路径/数据根；fail-soft 全维度独立降级）。
+  const [probe, setProbe] = useState<WorkBuddyProbeInfoDto | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -32,6 +36,8 @@ export function WorkBuddyEnvironmentPage({ active }: { active: boolean }) {
       setLoadError(null);
       // 深度健康随刷新自动执行一次（只读；客户端未运行落 client_offline）。
       await runDeepHealthReadonly();
+      // 探针信息独立降级（失败仅隐藏版本/路径行，不阻塞页面）。
+      await fetchWorkBuddyProbeInfo().then(setProbe).catch(() => setProbe(null));
     } catch (reason: unknown) {
       setLoadError(safeUiErrorMessage(reason, "WorkBuddy 客户端状态暂时不可读取，请稍后重试。"));
     } finally {
@@ -134,6 +140,16 @@ export function WorkBuddyEnvironmentPage({ active }: { active: boolean }) {
             </InfoRow>
             <InfoRow label="工具账号池">
               {health.captured_in_pool ? "当前登录账号已保存到账号池" : "尚未保存到账号池"}
+            </InfoRow>
+            {/* P19-B8 探针数据面：版本/安装路径/数据根（全维度独立降级，未知如实显示）。 */}
+            <InfoRow label="客户端版本">
+              {probe?.version ?? "未知"}
+            </InfoRow>
+            <InfoRow label="安装路径">
+              {probe?.install_path ?? "未知"}
+            </InfoRow>
+            <InfoRow label="数据根目录">
+              {probe?.data_root ?? "未知"}
             </InfoRow>
           </div>
 

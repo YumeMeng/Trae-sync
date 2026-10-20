@@ -103,15 +103,19 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
 import { SettingsPanel } from "../src/components/SettingsPanel";
 
 describe("SettingsPanel WB 变体（P19-B6 备份区诚实呈现）", () => {
-  it("WB 产品：备份策略说明卡在册，TRAE 备份管理面不渲染且零 IPC", async () => {
+  it("WB 产品：备份链管理面在册，TRAE 备份管理面不渲染", async () => {
+    mockRoute("list_workbuddy_backups", () => ({
+      backup_dir: "C:" + String.fromCharCode(92) + "data",
+      backups: [],
+    }));
     render(<SettingsPanel active={true} productId="workbuddy" />);
 
-    expect(screen.getByTestId("workbuddy-backup-note")).toHaveTextContent("备份策略");
-    expect(screen.getByTestId("workbuddy-backup-note").textContent).toContain("自动滚动单份");
+    // B8 管理面（P19-B6 缺口闭环）：链/手动备份/删除入口在册。
+    expect(await screen.findByTestId("workbuddy-backup-section")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-backup-create")).toBeInTheDocument();
     expect(screen.getByText("WorkBuddy 的自动签到设置在「签到」页")).toBeInTheDocument();
-    // TRAE 备份管理面不渲染；数据面命令零调用。
+    // TRAE 备份管理面不渲染。
     expect(screen.queryByTestId("master-backup-section")).not.toBeInTheDocument();
-    expect(mockCoreInvoke).not.toHaveBeenCalled();
   });
 
   it("TRAE 产品：备份管理面照常（现有行为不变）", async () => {
@@ -120,3 +124,120 @@ describe("SettingsPanel WB 变体（P19-B6 备份区诚实呈现）", () => {
     expect(screen.queryByTestId("workbuddy-backup-note")).not.toBeInTheDocument();
   });
 });
+
+// ===== P19-B8 备份链管理面 备份链管理面 + 探针信息消费 =====
+
+import { WorkBuddyBackupSection } from "../src/components/WorkBuddyBackupSection";
+import { WorkBuddyEnvironmentPage } from "../src/components/WorkBuddyEnvironmentPage";
+
+const backupChain = {
+  backup_dir: "C:\\data\\workbuddy-backups",
+  backups: [
+    { stamp_unix_seconds: 1760001200, file_count: 12, source_bytes: 2048, compressed_bytes: 1024 },
+    { stamp_unix_seconds: 1759000000, file_count: null, source_bytes: null, compressed_bytes: 512 },
+  ],
+};
+
+function installBackupRoutes() {
+  mockRoute("list_workbuddy_backups", () => backupChain);
+  mockRoute("create_workbuddy_backup", () => ({
+    backup_dir: "C:\\data\\workbuddy-backups", stamp_unix_seconds: 1760002000,
+    file_count: 13, source_bytes: 2100, rolled_over: 1,
+  }));
+  mockRoute("restore_workbuddy_backup", (args: { stamp: number }) => ({
+    restored_files: 12, restored_bytes: 2048,
+    safety_backup_stamp: 1760001500, restored_stamp: args.stamp,
+  }));
+  mockRoute("delete_workbuddy_backups", (args: { stamps: number[] }) => ({
+    deleted_stamps: args.stamps, missing_stamps: [], remaining: 1,
+    backup_dir: "C:\\data\\workbuddy-backups",
+  }));
+  mockRoute("get_workbuddy_session_health", () => ({
+      status: "active", uid: "uid-1", uin: "uid-1", domain: "workbuddy.example",
+      access_expires_at_unix_seconds: 1799999999, refresh_expires_at_unix_seconds: 1799999999,
+      captured_in_pool: true,
+    }));
+  mockRoute("get_workbuddy_probe_info", () => ({
+    running: true, process_count: 1, app: "WorkBuddy", version: "3.2.0",
+    platform: "win32", install_path: "C:\\apps\\workbuddy",
+    install_source: "registry", data_root: "C:\\Users\\x\\.workbuddy",
+  }));
+  mockRoute("check_workbuddy_login_health", () => ({
+    status: "active", live_status: "verified",
+  }));
+}
+
+describe("WorkBuddyBackupSection（P19-B8 备份链管理面）", () => {
+  beforeEach(() => {
+    resetRoutes();
+    installFakeInvoke();
+    installBackupRoutes();
+  });
+
+  it("渲染：链列表（最新在前）+ 手动备份/删除/恢复入口 + 半成品条目如实标注", async () => {
+    render(<WorkBuddyBackupSection />);
+
+    const chain = await screen.findByTestId("workbuddy-backup-chain");
+    expect(chain.textContent).toContain("12 个文件");
+    // 半成品条目（manifest 不可读）如实标注。
+    expect(chain.textContent).toContain("清单缺失");
+    expect(screen.getByTestId("workbuddy-backup-create")).toBeEnabled();
+    expect(screen.getByTestId("workbuddy-backup-delete")).toBeDisabled();
+  });
+
+  it("手动备份：确认弹窗带客户端重启说明，回执滚动清理如实提示", async () => {
+    render(<WorkBuddyBackupSection />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-backup-create"));
+    const dialog = await screen.findByTestId("workbuddy-backup-create-confirm");
+    expect(dialog).toHaveTextContent("自动重启");
+    fireEvent.click(screen.getByTestId("workbuddy-backup-create-confirm-confirm"));
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls.some(([cmd]) => cmd === "create_workbuddy_backup")).toBe(true);
+    });
+  });
+
+  it("恢复：确认弹窗展示保链回退说明；恢复调用带链内 stamp", async () => {
+    render(<WorkBuddyBackupSection />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-backup-restore-1760001200"));
+    const dialog = await screen.findByTestId("workbuddy-backup-restore-confirm");
+    expect(dialog).toHaveTextContent("自动把当前状态备份一份");
+    fireEvent.click(screen.getByTestId("workbuddy-backup-restore-confirm-confirm"));
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(["restore_workbuddy_backup", { stamp: 1760001200 }]);
+    });
+  });
+
+  it("删除：多选 + 单次确认调用 delete（confirmed=true 由适配器承载）", async () => {
+    render(<WorkBuddyBackupSection />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-backup-select-1760001200"));
+    fireEvent.click(screen.getByTestId("workbuddy-backup-delete"));
+    fireEvent.click(await screen.findByTestId("workbuddy-backup-delete-confirm-confirm"));
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["delete_workbuddy_backups", { stamps: [1760001200], confirmed: true }],
+      );
+    });
+  });
+});
+
+describe("WorkBuddyEnvironmentPage 探针信息（P19-B8 数据面）", () => {
+  beforeEach(() => {
+    resetRoutes();
+    installFakeInvoke();
+    installBackupRoutes();
+  });
+
+  it("连接卡展示版本/安装路径/数据根（探针 fail-soft 数据面）", async () => {
+    render(<WorkBuddyEnvironmentPage active={true} />);
+
+    expect(await screen.findByTestId("workbuddy-env-client-card")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId("workbuddy-env-client-card").textContent).toContain("3.2.0");
+    });
+    expect(screen.getByTestId("workbuddy-env-client-card").textContent).toContain("C:\\apps\\workbuddy");
+  });
+});
+

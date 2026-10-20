@@ -13,7 +13,7 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 import { notify } from "../platform/notify";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { EmptyState } from "./shared/EmptyState";
-import { InfoRow } from "./WorkBuddyPanel";
+import { WorkBuddyBackupSection } from "./WorkBuddyBackupSection";
 
 interface SettingsPanelProps {
   /** 页面可见时才读取设置，避免后台 IPC。 */
@@ -284,21 +284,7 @@ export function SettingsPanel({ active, productId = "trae_cn" }: SettingsPanelPr
             <h3>对话库备份</h3>
           </div>
         </div>
-        <div className="workbuddy-card" data-testid="workbuddy-backup-note">
-          <div className="workbuddy-card__title">备份策略（自动滚动单份）</div>
-          <InfoRow label="备份时机">
-            彻底删除会话前自动创建（备份失败则整单拒绝，不会出现无备份的破坏性终点）。
-          </InfoRow>
-          <InfoRow label="备份范围">
-            workbuddy.db（含 wal/shm 附属件）+ projects 正文目录 + 登录凭据材料（P19 决策 1 全纳入）。
-          </InfoRow>
-          <InfoRow label="备份目录">
-            数据根下的 workbuddy-backups 目录（同一时刻只保留最新一份）。
-          </InfoRow>
-          <InfoRow label="恢复方式">
-            以最近一份备份覆盖 workbuddy.db 与 projects 目录；备份链的独立管理入口（查看/手动备份/恢复/删除）随后续批次开放。
-          </InfoRow>
-        </div>
+        <WorkBuddyBackupSection />
       </section>
     );
   }

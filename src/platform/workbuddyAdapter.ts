@@ -21,6 +21,13 @@ import type {
   WorkBuddyPurgeDto,
   WorkBuddyMergeCwdDto,
 } from "../types/workbuddyLibrary";
+import type {
+  WorkBuddyBackupChainDto,
+  WorkBuddyBackupCreateDto,
+  WorkBuddyBackupDeleteDto,
+  WorkBuddyBackupRestoreDto,
+  WorkBuddyProbeInfoDto,
+} from "../types/workbuddyBackup";
 
 /**
  * WorkBuddy 域命令的前端封装（P17-T5 并列骨架）。
@@ -250,4 +257,34 @@ export function mergeWorkBuddyCwdProjects(
     canonicalCwd,
     variantCwds: [...variantCwds],
   });
+}
+
+// ===== P19-B8 WB 备份链（be-engineer 契约：storage_root/workbuddy-backups 同域） =====
+
+/** 备份链枚举（只读；最新在前，manifest 不可读条目如实呈现）。 */
+export function fetchWorkBuddyBackupChain() {
+  return invoke<WorkBuddyBackupChainDto>("list_workbuddy_backups");
+}
+
+/** 手动备份（单次确认入口；进程纪律：完全退出 → 写 → 重启）。 */
+export function createWorkBuddyBackup() {
+  return invoke<WorkBuddyBackupCreateDto>("create_workbuddy_backup");
+}
+
+/** 从备份恢复（单次确认入口；恢复前自动保链备份当前态，safety_backup_stamp 为回退点）。 */
+export function restoreWorkBuddyBackup(stamp: number) {
+  return invoke<WorkBuddyBackupRestoreDto>("restore_workbuddy_backup", { stamp });
+}
+
+/** 删除备份条目（单次确认；confirmed 必传 true，链外 stamp 落 missing_stamps）。 */
+export function deleteWorkBuddyBackups(stamps: readonly number[]) {
+  return invoke<WorkBuddyBackupDeleteDto>("delete_workbuddy_backups", {
+    stamps: [...stamps],
+    confirmed: true,
+  });
+}
+
+/** 客户端探针信息（只读 fail-soft；环境页连接卡数据源）。 */
+export function fetchWorkBuddyProbeInfo() {
+  return invoke<WorkBuddyProbeInfoDto>("get_workbuddy_probe_info");
 }
