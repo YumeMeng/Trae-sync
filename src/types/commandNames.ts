@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（122 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（127 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -24,9 +24,11 @@ export type CommandName =
   | "complete_trae_cn_login"
   | "create_environment"
   | "create_master_backup"
+  | "create_workbuddy_backup"
   | "delete_environment"
   | "delete_master_backups"
   | "delete_master_sessions"
+  | "delete_workbuddy_backups"
   | "delete_workbuddy_sessions"
   | "export_recovery_package_command"
   | "force_reset_master_current_account"
@@ -61,6 +63,7 @@ export type CommandName =
   | "get_workbuddy_library_checkup"
   | "get_workbuddy_library_history"
   | "get_workbuddy_library_stats"
+  | "get_workbuddy_probe_info"
   | "get_workbuddy_session_health"
   | "get_workbuddy_session_messages"
   | "get_workspace_state"
@@ -76,6 +79,7 @@ export type CommandName =
   | "list_trae_cn_accounts"
   | "list_trae_cn_foreign_projects"
   | "list_workbuddy_accounts"
+  | "list_workbuddy_backups"
   | "list_workbuddy_checkin_accounts"
   | "login_environment"
   | "merge_master_projects"
@@ -102,6 +106,7 @@ export type CommandName =
   | "reset_checkin_device"
   | "restore_master_backup"
   | "restore_operation"
+  | "restore_workbuddy_backup"
   | "run_checkin"
   | "set_account_archived"
   | "set_account_auto_checkin"
