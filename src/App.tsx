@@ -8,6 +8,7 @@ import { AccountWorkbench } from "./components/AccountWorkbench";
 import { CheckinPage } from "./components/CheckinPage";
 import { EnvironmentPage } from "./components/EnvironmentPage";
 import { OverviewPage } from "./pages/OverviewPage";
+import { WorkBuddyOverviewPage } from "./pages/WorkBuddyOverviewPage";
 import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
 import { WorkBuddyCheckinPage, WorkBuddyPanel } from "./components/WorkBuddyPanel";
@@ -279,10 +280,9 @@ export default function App() {
           {state && (
             <div className="app-page" hidden={activePage !== "overview"}>
               {isWorkBuddy ? (
-                <ProductPendingPage
-                  section="overview"
-                  title="总览"
-                  note="WorkBuddy 的对话统计与使用概览将随对话库适配开放。"
+                <WorkBuddyOverviewPage
+                  active={activePage === "overview"}
+                  onNavigate={handlePageChange}
                 />
               ) : (
                 <OverviewPage

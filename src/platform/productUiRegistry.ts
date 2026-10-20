@@ -81,7 +81,8 @@ const WORKBUDDY_UI: ProductUiContext = {
     sortCheckin: false,
   },
   sectionStates: {
-    overview: "pending",
+    // P19-B6：总览工作台统计落地（签到/账号 + 会话统计卡）。
+    overview: "ready",
     accounts: "ready",
     checkin: "ready",
     environment: "pending",

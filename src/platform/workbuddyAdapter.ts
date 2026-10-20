@@ -12,6 +12,15 @@ import type {
   WorkBuddySwitchDto,
   WorkBuddyTransferDto,
 } from "../types/product";
+import type {
+  WorkBuddyCwdGroupDto,
+  WorkBuddyLibraryCheckupDto,
+  WorkBuddyLibraryStatsDto,
+  WorkBuddySessionMessagesDto,
+  WorkBuddySoftDeleteDto,
+  WorkBuddyPurgeDto,
+  WorkBuddyMergeCwdDto,
+} from "../types/workbuddyLibrary";
 
 /**
  * WorkBuddy 域命令的前端封装（P17-T5 并列骨架）。
@@ -168,4 +177,77 @@ export function setWorkBuddyAccountAutoCheckin(
   enabled: boolean,
 ): Promise<void> {
   return invoke("set_workbuddy_account_auto_checkin", { profileId, enabled });
+}
+
+// ===== P19-B3/B6 WB 对话库域（workbuddy_library 命令面；工具只读 + 单次确认写） =====
+
+/** WB 对话库聚合统计（矩阵 #64：总览库统计卡 + 库页统计卡）。 */
+export function fetchWorkBuddyLibraryStats(): Promise<WorkBuddyLibraryStatsDto> {
+  return invoke<WorkBuddyLibraryStatsDto>("get_workbuddy_library_stats");
+}
+
+/**
+ * 会话分组列表（矩阵 #63 视图面）：cwd 分组；userId=null 全库视图；
+ * includeDeleted 控制软删行（常规浏览隐藏，体检/恢复视图可见）。
+ */
+export function fetchWorkBuddyLibraryHistory(
+  userId: string | null,
+  includeDeleted: boolean,
+): Promise<readonly WorkBuddyCwdGroupDto[]> {
+  return invoke<readonly WorkBuddyCwdGroupDto[]>("get_workbuddy_library_history", {
+    userId,
+    includeDeleted,
+  });
+}
+
+/** 会话消息读取（矩阵 #66；jsonl 正文解析，正文缺失落 body_missing）。 */
+export function fetchWorkBuddySessionMessages(
+  sessionId: string,
+  userId: string | null,
+): Promise<WorkBuddySessionMessagesDto> {
+  return invoke<WorkBuddySessionMessagesDto>("get_workbuddy_session_messages", {
+    sessionId,
+    userId,
+  });
+}
+
+/** 库体检（矩阵 #62：孤儿正文/缺失正文/软删规模/外部目录/归并候选）。 */
+export function fetchWorkBuddyLibraryCheckup(): Promise<WorkBuddyLibraryCheckupDto> {
+  return invoke<WorkBuddyLibraryCheckupDto>("get_workbuddy_library_checkup");
+}
+
+/** 会话软删除（单次确认入口；UPDATE deleted_at 可逆；cloud/他人账号行自动跳过）。 */
+export function deleteWorkBuddySessions(
+  sessionIds: readonly string[],
+  userId: string,
+): Promise<WorkBuddySoftDeleteDto> {
+  return invoke<WorkBuddySoftDeleteDto>("delete_workbuddy_sessions", {
+    sessionIds: [...sessionIds],
+    userId,
+  });
+}
+
+/**
+ * 会话彻底删除（决策 7 单独确认；备份前置 = 滚动单份，失败整单拒绝——
+ * 不出现无备份的破坏性终点）。
+ */
+export function purgeWorkBuddySessions(
+  sessionIds: readonly string[],
+  userId: string,
+): Promise<WorkBuddyPurgeDto> {
+  return invoke<WorkBuddyPurgeDto>("purge_workbuddy_sessions", {
+    sessionIds: [...sessionIds],
+    userId,
+  });
+}
+
+/** cwd 归并（单次确认；canonical 吸收 variants，同一 cwd 多转义形态收敛）。 */
+export function mergeWorkBuddyCwdProjects(
+  canonicalCwd: string,
+  variantCwds: readonly string[],
+): Promise<WorkBuddyMergeCwdDto> {
+  return invoke<WorkBuddyMergeCwdDto>("merge_workbuddy_cwd_projects", {
+    canonicalCwd,
+    variantCwds: [...variantCwds],
+  });
 }
