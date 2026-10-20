@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowDownAZ, HeartPulse, LayoutGrid, List, RefreshCw, ShieldCheck, UserPlus, UserRound } from "lucide-react";
+import { HeartPulse, RefreshCw, ShieldCheck, UserPlus, UserRound } from "lucide-react";
 import type {
   CheckinCapabilityDto,
   CheckinLoginReceiptDto,
@@ -32,6 +32,8 @@ import { ProductBadge } from "./shared/ProductBadge";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { EmptyState } from "./shared/EmptyState";
 import { SharedAccountEntry, type AccountView } from "./shared/account/AccountRow";
+import { AccountListControls, ACCOUNT_SORT_OPTIONS, type AccountFilter, type AccountSort } from "./shared/account/AccountListControls";
+import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
 import type {
   AccountAction,
   AccountActionResult,
@@ -95,24 +97,9 @@ function acceptanceReasonText(errorCode: string | null | undefined): string {
 // 登录浏览器方式：isolated=隔离实例（默认，与本机登录态互不影响）；
 // system=本机浏览器默认 profile（复用系统已登录会话，一键授权当前账号）。
 type LoginBrowserMode = "isolated" | "system";
-// U-2 账号页双视图与排序类型由共享骨架承载（shared/account/AccountRow、preferences）。
-// U-2 排序：added=添加序（注册表顺序）；name=名称；checkin=签到状态（未签在前）。
-type AccountSort = "added" | "name" | "checkin";
-// G14 账号过滤：all=全部（默认）；attention=需处理（只显示异常账号）。会话内状态，不持久化。
-type AccountFilter = "all" | "attention";
-
-const VIEW_STORAGE_KEY = "accounts.view";
-const SORT_STORAGE_KEY = "accounts.sort";
-
-/** 读取本地偏好；非法值回退默认（list / added），保证 localStorage 脏数据不炸页面。 */
-function readStoredPreference<T extends string>(key: string, fallback: T, allowed: readonly T[]): T {
-  try {
-    const value = window.localStorage.getItem(key);
-    return allowed.includes(value as T) ? (value as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
+// U-2 双视图/排序/过滤类型与控件已抽取到 shared/account/（P19-B1 步骤②）：
+// AccountView ← AccountRow；AccountSort/AccountFilter + 控件 ← AccountListControls；
+// localStorage 偏好读写 ← preferences（key 按产品分前缀）。
 
 // 账号页只做一件事：账号档案。卡片矩阵（五要素）+ 独立详情视图（全量信息与操作）；
 // 每日签到在「签到」页，密钥工具在「设置」页；切号由 P5-2 弹层事务承担，
@@ -123,6 +110,8 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const snapshotReadGeneration = useRef(0);
   const environmentReadGeneration = useRef(0);
   const currentProductId = adapter?.productId ?? null;
+  // 视图/排序偏好的产品前缀：主路径（无适配器）即 TRAE 产品。
+  const preferenceProductId = adapter?.productId ?? "trae_cn";
   const progressProductId: string = adapter?.productId ?? WORK_ARCHIVE_PRODUCT_ID;
   const currentProductIdRef = useRef(currentProductId);
   const activeRef = useRef(active);
@@ -182,11 +171,11 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   const [localRefreshBusy, setLocalRefreshBusy] = useState(false);
   // 选中的账号：非空时进入独立详情视图。
   const [selectedProfileId, setSelectedProfileId] = useState("");
-  // U-2 双视图与排序：localStorage 记忆（脏值回退默认）。
+  // U-2 双视图与排序：localStorage 记忆（脏值回退默认；key 按产品分前缀）。
   const [accountView, setAccountView] = useState<AccountView>(() =>
-    readStoredPreference(VIEW_STORAGE_KEY, "list", ["list", "card"] as const));
+    readStoredPreference(accountPreferenceKey(preferenceProductId, "view"), "list", ["list", "card"] as const));
   const [accountSort, setAccountSort] = useState<AccountSort>(() =>
-    readStoredPreference(SORT_STORAGE_KEY, "added", ["added", "name", "checkin"] as const));
+    readStoredPreference(accountPreferenceKey(preferenceProductId, "sort"), "added", ACCOUNT_SORT_OPTIONS));
   // G14 需处理过滤：会话内状态（「需处理」是临时排查意图，不写偏好）。
   const [accountFilter, setAccountFilter] = useState<AccountFilter>("all");
   // 登录凭据健康度（profile_id → 条目，P7-5 凭据包实调判定）：
@@ -407,15 +396,15 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     ? adapter.capabilities.includes("login")
     : checkinCapability?.transport !== "fixture";
 
-  // U-2 视图/排序偏好持久化（每次变更即写，量小无需防抖）。
+  // U-2 视图/排序偏好持久化（每次变更即写，量小无需防抖；key 按产品分前缀）。
   const changeAccountView = useCallback((next: AccountView) => {
     setAccountView(next);
-    try { window.localStorage.setItem(VIEW_STORAGE_KEY, next); } catch { /* 存储不可用时仅本次会话生效 */ }
-  }, []);
+    writeStoredPreference(accountPreferenceKey(preferenceProductId, "view"), next);
+  }, [preferenceProductId]);
   const changeAccountSort = useCallback((next: AccountSort) => {
     setAccountSort(next);
-    try { window.localStorage.setItem(SORT_STORAGE_KEY, next); } catch { /* 同上 */ }
-  }, []);
+    writeStoredPreference(accountPreferenceKey(preferenceProductId, "sort"), next);
+  }, [preferenceProductId]);
 
   // U-2 排序视图：name 按展示名（备注优先）本地化比较；checkin 未签在前
   // （补签优先级），已签/未签内部再按名称稳定排序；added 保持注册表顺序。
@@ -1105,69 +1094,18 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
           <h3 id="account-mine-heading"><UserRound size={16} aria-hidden="true" />我的账号</h3>
           {hasAccountEntries && (
             <div className="account-center__list-controls">
-              {/* G14 过滤分段控件只属于 Work 的签到/凭据健康语义；CN 不显示无效入口。 */}
-              {realCheckinMode && (
-                <div className="seg-control" role="group" aria-label="账号过滤">
-                  <button
-                    type="button"
-                    className={`seg-control__item${accountFilter === "all" ? " seg-control__item--active" : ""}`}
-                    aria-pressed={accountFilter === "all"}
-                    onClick={() => setAccountFilter("all")}
-                    data-testid="account-filter-all"
-                    title="显示全部账号"
-                  >
-                    全部
-                  </button>
-                  <button
-                    type="button"
-                    className={`seg-control__item${accountFilter === "attention" ? " seg-control__item--active" : ""}`}
-                    aria-pressed={accountFilter === "attention"}
-                    onClick={() => setAccountFilter("attention")}
-                    data-testid="account-filter-attention"
-                    title="只显示需要处理的账号（需重登、已过期、待登录或签到失败）"
-                  >
-                    需处理
-                    {attentionCount > 0 && <span className="seg-control__count">{attentionCount}</span>}
-                  </button>
-                </div>
-              )}
-              {/* 排序：添加序 / 名称 / 签到状态（未签在前，补签场景优先）。 */}
-              <label className="account-center__sort-field">
-                <ArrowDownAZ size={14} aria-hidden="true" />
-                <span className="sr-only">排序方式</span>
-                <select
-                  value={realCheckinMode ? accountSort : accountSort === "checkin" ? "added" : accountSort}
-                  onChange={(event) => changeAccountSort(event.target.value as AccountSort)}
-                  data-testid="account-sort"
-                >
-                  <option value="added">添加顺序</option>
-                  <option value="name">名称</option>
-                  {realCheckinMode && <option value="checkin">签到状态</option>}
-                </select>
-              </label>
-              {/* 视图切换分段控件：列表 / 卡片（记忆 + 平滑过渡）。 */}
-              <div className="seg-control" role="group" aria-label="视图切换">
-                <button
-                  type="button"
-                  className={`seg-control__item${accountView === "list" ? " seg-control__item--active" : ""}`}
-                  aria-pressed={accountView === "list"}
-                  onClick={() => changeAccountView("list")}
-                  data-testid="account-view-list"
-                  title="列表视图：横向宽行，扫描对比最快"
-                >
-                  <List size={14} aria-hidden="true" />列表
-                </button>
-                <button
-                  type="button"
-                  className={`seg-control__item${accountView === "card" ? " seg-control__item--active" : ""}`}
-                  aria-pressed={accountView === "card"}
-                  onClick={() => changeAccountView("card")}
-                  data-testid="account-view-card"
-                  title="卡片视图：网格布局，信息分层展示"
-                >
-                  <LayoutGrid size={14} aria-hidden="true" />卡片
-                </button>
-              </div>
+              {/* 页头控件组（P19-B1② 抽取）：过滤/排序/视图切换走共享控件，
+                  产品差异经 sortOptions 与 filter 能力开关进入。 */}
+              <AccountListControls
+                view={accountView}
+                onViewChange={changeAccountView}
+                sort={accountSort}
+                sortOptions={realCheckinMode ? ACCOUNT_SORT_OPTIONS : ACCOUNT_SORT_OPTIONS.filter((option) => option !== "checkin")}
+                onSortChange={changeAccountSort}
+                filter={realCheckinMode
+                  ? { value: accountFilter, attentionCount, onChange: setAccountFilter }
+                  : undefined}
+              />
             </div>
           )}
           <span className="section-caption">{adapter ? adapterAccounts.length : realCheckinMode ? overview.length : savedAccounts.length} 个</span>

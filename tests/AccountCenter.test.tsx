@@ -252,7 +252,7 @@ describe("AccountCenter", () => {
   });
 
   it("卡片视图同样展示登录凭据剩余时间", async () => {
-    window.localStorage.setItem("accounts.view", "card");
+    window.localStorage.setItem("accounts.trae_cn.view", "card");
     mockRealMode([overviewEntry("profile-card", "卡片账号")]);
 
     render(<AccountCenter active={true} />);
@@ -1994,12 +1994,12 @@ describe("AccountCenter", () => {
     await waitFor(() => expect(document.querySelector(".account-list__row")).toBeNull());
     expect(document.querySelector(".account-card--clickable")).not.toBeNull();
     expect(screen.getByTestId("account-view-card")).toHaveClass("seg-control__item--active");
-    expect(window.localStorage.getItem("accounts.view")).toBe("card");
+    expect(window.localStorage.getItem("accounts.trae_cn.view")).toBe("card");
 
     // 切回列表：偏好更新。
     fireEvent.click(screen.getByTestId("account-view-list"));
     await waitFor(() => expect(document.querySelector(".account-list__row")).not.toBeNull());
-    expect(window.localStorage.getItem("accounts.view")).toBe("list");
+    expect(window.localStorage.getItem("accounts.trae_cn.view")).toBe("list");
   });
 
   it("U-2 排序：按签到状态（未签在前）与名称排序生效并记忆偏好", async () => {
@@ -2018,12 +2018,12 @@ describe("AccountCenter", () => {
     // 切签到状态排序：未签的甲升到首位。
     fireEvent.change(screen.getByTestId("account-sort"), { target: { value: "checkin" } });
     await waitFor(() => expect(list?.children[0]).toHaveTextContent("甲账号"));
-    expect(window.localStorage.getItem("accounts.sort")).toBe("checkin");
+    expect(window.localStorage.getItem("accounts.trae_cn.sort")).toBe("checkin");
 
     // 切名称排序：甲（拼音序）在前，与签到无关。
     fireEvent.change(screen.getByTestId("account-sort"), { target: { value: "name" } });
     await waitFor(() => expect(list?.children[0]).toHaveTextContent("甲账号"));
-    expect(window.localStorage.getItem("accounts.sort")).toBe("name");
+    expect(window.localStorage.getItem("accounts.trae_cn.sort")).toBe("name");
 
     // 回添加序：恢复注册表顺序。
     fireEvent.change(screen.getByTestId("account-sort"), { target: { value: "added" } });
