@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { HeartPulse, RefreshCw, ShieldCheck, UserPlus, UserRound } from "lucide-react";
+import { HeartPulse, RefreshCw, ShieldCheck, UserPlus } from "lucide-react";
 import type {
   CheckinCapabilityDto,
   CheckinLoginReceiptDto,
@@ -28,12 +28,12 @@ import {
   type LoginSlotState,
 } from "./StatusBadges";
 import { MasterSwitchDialog, type MasterSwitchTarget } from "./MasterSwitchDialog";
-import { ProductBadge } from "./shared/ProductBadge";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
-import { EmptyState } from "./shared/EmptyState";
-import { SharedAccountEntry, type AccountView } from "./shared/account/AccountRow";
-import { AccountListControls, ACCOUNT_SORT_OPTIONS, type AccountFilter, type AccountSort } from "./shared/account/AccountListControls";
+import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "./shared/account/AccountRow";
+import { ACCOUNT_SORT_OPTIONS, type AccountFilter, type AccountSort } from "./shared/account/AccountListControls";
+import { AccountPageSkeleton } from "./shared/account/AccountPageSkeleton";
 import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
+import { productUi } from "../platform/productUiRegistry";
 import type {
   AccountAction,
   AccountActionResult,
@@ -169,8 +169,7 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   }, [progressProductId]);
   // G15 纯本地刷新进行中（毫秒级本地读取，仅驱动按钮图标旋转）。
   const [localRefreshBusy, setLocalRefreshBusy] = useState(false);
-  // 选中的账号：非空时进入独立详情视图。
-  const [selectedProfileId, setSelectedProfileId] = useState("");
+  // 选中的账号（详情视图）由 AccountPageSkeleton 骨架管理（P19-B1 步骤③）。
   // U-2 双视图与排序：localStorage 记忆（脏值回退默认；key 按产品分前缀）。
   const [accountView, setAccountView] = useState<AccountView>(() =>
     readStoredPreference(accountPreferenceKey(preferenceProductId, "view"), "list", ["list", "card"] as const));
@@ -241,9 +240,8 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     };
   }, [active, load]);
 
-  // 产品变化时清空旧产品详情与快照，避免复用相同 profile_id 展示旧详情。
+  // 产品变化时清空旧产品快照与实测身份（详情选中态由骨架按 productId 清理）。
   useEffect(() => {
-    setSelectedProfileId("");
     setAdapterSnapshot(null);
     environmentReadGeneration.current += 1;
     setEnvObservedProfileId(null);
@@ -253,11 +251,6 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   useEffect(() => {
     setCredentialConfirmOpen(false);
   }, [currentProductId]);
-
-  useEffect(() => {
-    if (!active || loading) return;
-    document.querySelector<HTMLElement>('[data-page-title="accounts"]')?.focus({ preventScroll: true });
-  }, [active, loading]);
 
   useEffect(() => {
     if (!active) return;
@@ -877,80 +870,57 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
     </div>
   );
 
+  // —— P19-B1 步骤③：AccountCenter 退化为 TRAE 产品插槽提供方，页面编排
+  // （门控渲染/页头/控件行/列表/空态/详情切换）由 AccountPageSkeleton 承担
+  // （ADR-0036 铁律：禁止骨架外的产品分支布局）。—— 
+
   const adapterSnapshotStale = Boolean(
     adapter && adapterSnapshot && adapterSnapshot.productId !== adapter.productId,
   );
-  if (!active || loading || adapterSnapshotStale) {
-    return (
-      <section className="account-center" role="region" aria-label={adapter ? `${adapter.productName} 账号` : "账号"}>
-        {/* 加载中也保留页面标题，保证键盘导航与切页焦点一致 */}
-        <header className="page-header">
-          <div className="page-header__copy">
-            <h1 data-page-title="accounts" tabIndex={-1}>账号</h1>
-            <ProductBadge productId="trae_cn" />
-          </div>
-        </header>
-        <EmptyState role="status" className="account-center__empty" description="正在读取账号信息…" />
-      </section>
-    );
-  }
+  const uiProduct = productUi(adapter?.productId ?? "trae_cn");
+  const savedAccounts = view?.saved_accounts ?? [];
+  const adapterAccounts = adapterSnapshot?.accounts ?? [];
 
-  // 独立详情视图：总览里仍能找到该账号时展示（删除后 overview 刷新即回列表）。
-  const selectedEntry = !adapter && selectedProfileId
-    ? overview.find((entry) => entry.profile_id === selectedProfileId) ?? null
-    : null;
-  if (selectedEntry) {
-    return (
-      <>
-      <AccountDetail
-        entry={selectedEntry}
-        loginState={loginStates[selectedEntry.profile_id]}
-        currentAccountStatus={envObservedProfileId === null
-          ? "unknown"
-          : envObservedProfileId === selectedEntry.profile_id
-            ? "current"
-            : "other"}
-        onRelogin={() => handleLogin(false)}
+  // 详情视图插槽：真实模式与适配器模式各自命中（profile_id 空间按产品隔离）。
+  const renderDetailView = (profileId: string, ops: { onBack(): void }) => {
+    if (!adapter) {
+      const entry = overview.find((item) => item.profile_id === profileId) ?? null;
+      if (!entry) return null;
+      return (
+        <AccountDetail
+          entry={entry}
+          loginState={loginStates[entry.profile_id]}
+          currentAccountStatus={envObservedProfileId === null
+            ? "unknown"
+            : envObservedProfileId === entry.profile_id
+              ? "current"
+              : "other"}
+          onRelogin={() => handleLogin(false)}
           loginBusy={loginBusy}
           onDataChanged={async () => {
             await refreshOverview();
           }}
-          onSaveMobile={(mobile) => saveMobileBackfill(selectedEntry.profile_id, mobile)}
-          onBack={() => setSelectedProfileId("")}
+          onSaveMobile={(mobile) => saveMobileBackfill(entry.profile_id, mobile)}
+          onBack={ops.onBack}
         />
-        {mobilePromptDialog}
-        {duplicateMobileDialog}
-      </>
-    );
-  }
-
-  const savedAccounts = view?.saved_accounts ?? [];
-  const adapterAccounts = adapterSnapshot?.accounts ?? [];
-
-  // 适配器产品的独立详情视图（P10-5）：selectedProfileId 命中适配器快照中的
-  // 账号时展示。Work 与 adapter 分支共用 selectedProfileId 状态无冲突：
-  // 两分支互斥渲染，且 profile_id 空间按产品隔离。
-  const selectedAdapterAccount = adapter && selectedProfileId
-    ? adapterAccounts.find((account) => account.id === selectedProfileId) ?? null
-    : null;
-  if (selectedAdapterAccount && adapter) {
+      );
+    }
+    const account = adapterAccounts.find((item) => item.id === profileId) ?? null;
+    if (!account) return null;
     return (
       <AdapterAccountDetail
-        account={selectedAdapterAccount}
+        account={account}
         productId={adapter.productId}
         productName={adapter.productName}
         canSelectToolAccount={adapter.capabilities.includes("toolSelection")}
         toolSelectionBusy={toolAccountSelectionId !== null}
-        onSelectToolAccount={() => void handleToolAccountSelection(
-          selectedAdapterAccount.id,
-          selectedAdapterAccount.displayName,
-        )}
+        onSelectToolAccount={() => void handleToolAccountSelection(account.id, account.displayName)}
         // 退出登录设备后联动该账号健康检测（handleHealthCheck 自带忙碌守卫）。
-        onSignedOut={() => handleHealthCheck(selectedAdapterAccount.id)}
-        onBack={() => setSelectedProfileId("")}
+        onSignedOut={() => handleHealthCheck(account.id)}
+        onBack={ops.onBack}
       />
     );
-  }
+  };
 
   const visibleAdapterAccounts = accountSort === "name"
     ? [...adapterAccounts].sort((a, b) => a.displayName.localeCompare(b.displayName, "zh-Hans-CN"))
@@ -968,14 +938,119 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
   // 健康检测进度展示源：CN 路径事件优先，Work 网络步骤事件兜底（见渲染区注释）。
   const healthProgressShown = healthProgress ?? creditsProgress;
 
+  // 行插槽：产品层决定徽章组合与 meta（DTO→SharedAccountRecord 的映射留在产品层）。
+  const overviewById = new Map(overview.map((entry) => [entry.profile_id, entry]));
+  const savedById = new Map(savedAccounts.map((account) => [account.profile_id, account]));
+  const renderRow = (record: SharedAccountRecord, ops: { onOpen(): void }) => {
+    if (adapter) {
+      const account = adapterAccounts.find((item) => item.id === record.id);
+      if (!account) return null;
+      return (
+        <AdapterAccountCard
+          account={account}
+          variant={accountView}
+          toolSelectionBusy={toolAccountSelectionId !== null}
+          canSelectToolAccount={adapter.capabilities.includes("toolSelection")}
+          onOpen={ops.onOpen}
+          onSelectToolAccount={() => void handleToolAccountSelection(account.id, account.displayName)}
+        />
+      );
+    }
+    if (realCheckinMode) {
+      const entry = overviewById.get(record.id);
+      if (!entry) return null;
+      return (
+        <AccountCard
+          entry={entry}
+          variant={accountView}
+          loginState={effectiveCredentialState(entry, loginStates[entry.profile_id])}
+          archiveAvailable={loginStates[entry.profile_id]?.archive_available}
+          isCurrentAccount={envObservedProfileId === entry.profile_id}
+          switchBusy={switchTarget !== null}
+          onOpen={ops.onOpen}
+          onSwitch={() => setSwitchTarget({
+            profile_id: entry.profile_id,
+            display_name: effectiveDisplayName(entry),
+          })}
+        />
+      );
+    }
+    const saved = savedById.get(record.id);
+    if (!saved) return null;
+    return (
+      <SharedAccountEntry
+        account={record}
+        variant={accountView}
+        testId={`account-saved-card-${saved.profile_id}`}
+        actionTestId={`account-saved-switch-${saved.profile_id}`}
+        selectedTestId={`account-saved-current-${saved.profile_id}`}
+        statusContent={<span className="slot-badge slot-badge--idle">状态待验证</span>}
+        listMeta={<p className="account-item__meta">最近验证：{formatDateTime(saved.last_verified_at)}{saved.region ? ` · ${saved.region.toUpperCase()}` : ""}</p>}
+        cardMeta={<p className="account-card__meta">最近验证：{formatDateTime(saved.last_verified_at)}{saved.region ? ` · ${saved.region.toUpperCase()}` : ""}</p>}
+        actionBusy={false}
+        hasAction={false}
+      />
+    );
+  };
+
+  // 列表条目（已排序/过滤，产品层映射为 SharedAccountRecord）。
+  const entries: readonly SharedAccountRecord[] = adapter
+    ? visibleAdapterAccounts.map((account) => ({
+      id: account.id,
+      displayName: account.displayName,
+      lastVerifiedAt: account.lastVerifiedAt,
+      isSelected: account.isToolSelected,
+    }))
+    : realCheckinMode
+      ? visibleOverview.map((entry) => ({
+        id: entry.profile_id,
+        displayName: effectiveDisplayName(entry),
+        lastVerifiedAt: entry.last_verified_at,
+        isSelected: envObservedProfileId === entry.profile_id,
+      }))
+      : sortedSavedAccounts.map((account) => ({
+        id: account.profile_id,
+        displayName: account.display_name,
+        lastVerifiedAt: account.last_verified_at,
+        isSelected: account.profile_id === view?.current_account.profile_id,
+      }));
+
+  // 空态：产品层按数据形态给文案与动作（与迁移前逐字一致）。
+  const emptyState = adapter
+    ? {
+      className: "account-center__empty-actions",
+      description: "尚未保存账号。点击右上角“添加账号”通过浏览器登录。",
+      action: (
+        <button className="btn btn--primary" type="button" onClick={() => void handleLogin(true)} disabled={loginBusy}>
+          <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
+        </button>
+      ),
+    }
+    : realCheckinMode
+      ? (overview.length === 0
+        ? {
+          className: "account-center__empty-actions",
+          description: "还没有账号。通过浏览器登录添加第一个账号，登录成功后即可签到。",
+          action: (
+            <button className="btn btn--primary" type="button" onClick={() => void handleLogin(loginBrowserMode === "system")} disabled={loginBusy}>
+              <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
+            </button>
+          ),
+        }
+        : // G14 过滤空态：有账号但当前过滤无匹配，与「还没有账号」区分。
+        { className: "account-center__empty", description: "没有需要处理的账号。" })
+      : { className: "account-center__empty", description: "尚未保存账号。点击右上角“添加账号”通过浏览器登录。" };
+
   return (
-    <section className="account-center" role="region" aria-label={adapter ? `${adapter.productName} 账号` : "账号"}>
-      <header className="page-header">
-        <div className="page-header__copy">
-          <h1 data-page-title="accounts" tabIndex={-1}>账号</h1>
-            <ProductBadge productId="trae_cn" />
-        </div>
-        <div className="page-header__actions">
+    <AccountPageSkeleton
+      product={uiProduct}
+      active={active}
+      loading={loading || adapterSnapshotStale}
+      ariaLabel={adapter ? `${adapter.productName} 账号` : "账号"}
+      entries={entries}
+      renderRow={renderRow}
+      headerActions={(
+        <>
           <span className="status-badge status-badge--neutral"><ShieldCheck size={14} aria-hidden="true" />登录信息仅本机加密保存</span>
           {adapter && (
             <span className="badge badge--off" data-testid="product-credential-status">
@@ -1036,192 +1111,96 @@ export function AccountCenter({ active, adapter = null }: AccountCenterProps) {
               </button>
             </div>
           )}
-        </div>
-      </header>
-
-      {loginBusy && (
-        <div className="account-center__login-waiting" role="status">
-          <p className="account-center__meta">
-            {adapter
-              ? `已在本机浏览器打开 ${adapter.productName} 登录页（复用网页登录会话），完成授权后此处会自动继续；期间无需手动刷新。`
-              : loginBrowserMode === "system"
-              ? "已在本机浏览器打开 TRAE 登录页（复用系统登录态），完成授权后此处会自动继续；期间无需手动刷新。"
-              : "已在隔离浏览器打开 TRAE 登录页，完成登录后此处会自动继续；期间无需手动刷新。"}
-          </p>
-          {/* P7-4：等待不再只能干等 5 分钟——随时可取消（关闭隔离浏览器窗口同样会收尾） */}
-          <button
-            className="btn btn--quiet"
-            type="button"
-            onClick={() => void handleCancelLogin()}
-            disabled={loginAttemptId === null}
-            data-testid="account-cancel-login"
-          >
-            取消登录
-          </button>
-        </div>
+        </>
       )}
-      {creditsBusy && <p className="account-center__meta" role="status">
-        {creditsProgress
-          ? `正在处理 ${creditsProgress.completed}/${creditsProgress.total}：${creditsProgress.name}`
-          : creditsBusyForCurrentProduct
-            ? "正在查询最新额度…"
-            : "账号额度查询正在进行，完成后可继续。"}
-      </p>}
-      {/* P11-3：批量凭据刷新收到逐账号进度事件时升级为「正在处理 i/N：账号名」；
-          未收到事件（首批账号尚在处理）时保留原说明文案。 */}
-      {credentialRefreshBusy && <p className="account-center__meta" role="status">
-        {credentialProgress
-          ? `正在处理 ${credentialProgress.completed}/${credentialProgress.total}：${credentialProgress.name}`
-          : credentialRefreshBusyForCurrentProduct
-            ? adapter ? `正在刷新 ${adapter.productName} 登录凭据，不会打开新的 OAuth 登录…` : "正在刷新登录凭据，不会打开新的 OAuth 登录…"
-            : "账号凭据刷新正在进行，完成后可继续。"}
-      </p>}
-      {/* 健康检测进度：health-check-progress 由 CN 适配路径推送；Work 的网络
-          步骤（refresh_checkin_credits）复用 credits-refresh-progress——先看
-          CN 事件、再看网络步骤事件，均未到达（本地检测阶段）保留原回退文案。 */}
-      {healthBusy && <p className="account-center__meta" role="status">
-        {healthProgressShown
-          ? `正在处理 ${healthProgressShown.completed}/${healthProgressShown.total}：${healthProgressShown.name}`
-          : healthBusyForCurrentProduct
-            ? adapter ? `正在检测 ${adapter.productName} 账号健康度…` : "正在检测账号健康度（登录存档 + 签到会话探测）…"
-            : "账号健康检测正在进行，完成后可继续。"}
-      </p>}
-
-      {/* 我的账号：页面主体。真实模式双视图（U-2：列表宽行默认 / 卡片网格切换，
-          分段控件 + localStorage 记忆）；fixture 沿用已保存账号。 */}
-      <section className="account-center__profiles" aria-labelledby="account-mine-heading">
-        <div className="account-center__section-heading">
-          <h3 id="account-mine-heading"><UserRound size={16} aria-hidden="true" />我的账号</h3>
-          {hasAccountEntries && (
-            <div className="account-center__list-controls">
-              {/* 页头控件组（P19-B1② 抽取）：过滤/排序/视图切换走共享控件，
-                  产品差异经 sortOptions 与 filter 能力开关进入。 */}
-              <AccountListControls
-                view={accountView}
-                onViewChange={changeAccountView}
-                sort={accountSort}
-                sortOptions={realCheckinMode ? ACCOUNT_SORT_OPTIONS : ACCOUNT_SORT_OPTIONS.filter((option) => option !== "checkin")}
-                onSortChange={changeAccountSort}
-                filter={realCheckinMode
-                  ? { value: accountFilter, attentionCount, onChange: setAccountFilter }
-                  : undefined}
-              />
+      statusRegion={(
+        <>
+          {loginBusy && (
+            <div className="account-center__login-waiting" role="status">
+              <p className="account-center__meta">
+                {adapter
+                  ? `已在本机浏览器打开 ${adapter.productName} 登录页（复用网页登录会话），完成授权后此处会自动继续；期间无需手动刷新。`
+                  : loginBrowserMode === "system"
+                  ? "已在本机浏览器打开 TRAE 登录页（复用系统登录态），完成授权后此处会自动继续；期间无需手动刷新。"
+                  : "已在隔离浏览器打开 TRAE 登录页，完成登录后此处会自动继续；期间无需手动刷新。"}
+              </p>
+              {/* P7-4：等待不再只能干等 5 分钟——随时可取消（关闭隔离浏览器窗口同样会收尾） */}
+              <button
+                className="btn btn--quiet"
+                type="button"
+                onClick={() => void handleCancelLogin()}
+                disabled={loginAttemptId === null}
+                data-testid="account-cancel-login"
+              >
+                取消登录
+              </button>
             </div>
           )}
-          <span className="section-caption">{adapter ? adapterAccounts.length : realCheckinMode ? overview.length : savedAccounts.length} 个</span>
+          {creditsBusy && <p className="account-center__meta" role="status">
+            {creditsProgress
+              ? `正在处理 ${creditsProgress.completed}/${creditsProgress.total}：${creditsProgress.name}`
+              : creditsBusyForCurrentProduct
+                ? "正在查询最新额度…"
+                : "账号额度查询正在进行，完成后可继续。"}
+          </p>}
+          {/* P11-3：批量凭据刷新收到逐账号进度事件时升级为「正在处理 i/N：账号名」；
+              未收到事件（首批账号尚在处理）时保留原说明文案。 */}
+          {credentialRefreshBusy && <p className="account-center__meta" role="status">
+            {credentialProgress
+              ? `正在处理 ${credentialProgress.completed}/${credentialProgress.total}：${credentialProgress.name}`
+              : credentialRefreshBusyForCurrentProduct
+                ? adapter ? `正在刷新 ${adapter.productName} 登录凭据，不会打开新的 OAuth 登录…` : "正在刷新登录凭据，不会打开新的 OAuth 登录…"
+                : "账号凭据刷新正在进行，完成后可继续。"}
+          </p>}
+          {/* 健康检测进度：health-check-progress 由 CN 适配路径推送；Work 的网络
+              步骤（refresh_checkin_credits）复用 credits-refresh-progress——先看
+              CN 事件、再看网络步骤事件，均未到达（本地检测阶段）保留原回退文案。 */}
+          {healthBusy && <p className="account-center__meta" role="status">
+            {healthProgressShown
+              ? `正在处理 ${healthProgressShown.completed}/${healthProgressShown.total}：${healthProgressShown.name}`
+              : healthBusyForCurrentProduct
+                ? adapter ? `正在检测 ${adapter.productName} 账号健康度…` : "正在检测账号健康度（登录存档 + 签到会话探测）…"
+                : "账号健康检测正在进行，完成后可继续。"}
+          </p>}
+        </>
+      )}
+      entryCount={adapter ? adapterAccounts.length : realCheckinMode ? overview.length : savedAccounts.length}
+      showControls={hasAccountEntries}
+      controls={{
+        view: accountView,
+        onViewChange: changeAccountView,
+        sort: accountSort,
+        sortOptions: realCheckinMode ? ACCOUNT_SORT_OPTIONS : ACCOUNT_SORT_OPTIONS.filter((option) => option !== "checkin"),
+        onSortChange: changeAccountSort,
+        filter: realCheckinMode
+          ? { value: accountFilter, attentionCount, onChange: setAccountFilter }
+          : undefined,
+      }}
+      listPrelude={adapter && adapterSnapshot ? (
+        <div className="account-center__current" data-testid="account-adapter-identity">
+          <strong>{adapterSnapshot.officialIdentityLabel}</strong>
+          <span>{adapterSnapshot.officialIdentityMessage}</span>
         </div>
-        {adapter ? (
-          <>
-            {adapterSnapshot && (
-              <div className="account-center__current" data-testid="account-adapter-identity">
-                <strong>{adapterSnapshot.officialIdentityLabel}</strong>
-                <span>{adapterSnapshot.officialIdentityMessage}</span>
-              </div>
-            )}
-            {adapterAccounts.length > 0 ? (
-              <ul className={accountView === "list" ? "account-list" : "account-card-grid"}>
-                {visibleAdapterAccounts.map((account) => (
-                  <AdapterAccountCard
-                    key={account.id}
-                    account={account}
-                    variant={accountView}
-                    toolSelectionBusy={toolAccountSelectionId !== null}
-                    canSelectToolAccount={adapter.capabilities.includes("toolSelection")}
-                    onOpen={() => setSelectedProfileId(account.id)}
-                    onSelectToolAccount={() => void handleToolAccountSelection(account.id, account.displayName)}
-                  />
-                ))}
-              </ul>
-            ) : (
-              <EmptyState
-                className="account-center__empty-actions"
-                description="尚未保存账号。点击右上角“添加账号”通过浏览器登录。"
-                action={
-                  <button className="btn btn--primary" type="button" onClick={() => void handleLogin(true)} disabled={loginBusy}>
-                    <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
-                  </button>
-                }
-              />
-            )}
-          </>
-        ) : realCheckinMode ? (
-          overview.length > 0 ? (
-            visibleOverview.length > 0 ? (
-              <ul className={accountView === "list" ? "account-list" : "account-card-grid"}>
-                {visibleOverview.map((entry) => (
-                  <AccountCard
-                    key={entry.profile_id}
-                    entry={entry}
-                    variant={accountView}
-                    loginState={effectiveCredentialState(entry, loginStates[entry.profile_id])}
-                    archiveAvailable={loginStates[entry.profile_id]?.archive_available}
-                    isCurrentAccount={envObservedProfileId === entry.profile_id}
-                    switchBusy={switchTarget !== null}
-                    onOpen={() => setSelectedProfileId(entry.profile_id)}
-                    onSwitch={() => setSwitchTarget({
-                      profile_id: entry.profile_id,
-                      display_name: effectiveDisplayName(entry),
-                    })}
-                  />
-                ))}
-              </ul>
-            ) : (
-              // G14 过滤空态：有账号但当前过滤无匹配，与「还没有账号」区分。
-              <EmptyState className="account-center__empty" description="没有需要处理的账号。" />
-            )
-          ) : (
-            <EmptyState
-              className="account-center__empty-actions"
-              description="还没有账号。通过浏览器登录添加第一个账号，登录成功后即可签到。"
-              action={
-                <button className="btn btn--primary" type="button" onClick={() => void handleLogin(loginBrowserMode === "system")} disabled={loginBusy}>
-                  <UserPlus size={15} aria-hidden="true" />{loginBusy ? "等待浏览器登录完成…" : "添加账号"}
-                </button>
-              }
-            />
-          )
-        ) : savedAccounts.length > 0 ? (
-          <ul className={accountView === "list" ? "account-list" : "account-card-grid"}>
-            {sortedSavedAccounts.map((account) => (
-              <SharedAccountEntry
-                key={account.profile_id}
-                account={{
-                  id: account.profile_id,
-                  displayName: account.display_name,
-                  lastVerifiedAt: account.last_verified_at,
-                  isSelected: account.profile_id === view?.current_account.profile_id,
-                }}
-                variant={accountView}
-                testId={`account-saved-card-${account.profile_id}`}
-                actionTestId={`account-saved-switch-${account.profile_id}`}
-                selectedTestId={`account-saved-current-${account.profile_id}`}
-                statusContent={<span className="slot-badge slot-badge--idle">状态待验证</span>}
-                listMeta={<p className="account-item__meta">最近验证：{formatDateTime(account.last_verified_at)}{account.region ? ` · ${account.region.toUpperCase()}` : ""}</p>}
-                cardMeta={<p className="account-card__meta">最近验证：{formatDateTime(account.last_verified_at)}{account.region ? ` · ${account.region.toUpperCase()}` : ""}</p>}
-                actionBusy={false}
-                hasAction={false}
-              />
-            ))}
-          </ul>
-        ) : (
-          <EmptyState className="account-center__empty" description="尚未保存账号。点击右上角“添加账号”通过浏览器登录。" />
-        )}
-      </section>
-
-      {/* P5-2 切号进度弹层：target 非空即打开（五步事务由后端编排，见 MasterSwitchDialog）。 */}
-      <MasterSwitchDialog
-        target={switchTarget}
-        onFinished={handleSwitchFinished}
-        onClose={() => setSwitchTarget(null)}
-      />
-
-      {/* G11 登录后手机号补录弹层：共享变量（详情视图同样渲染）。 */}
-      {mobilePromptDialog}
-      {duplicateMobileDialog}
-
-      {/* 批量刷新凭据二次确认弹层（入口按钮在列表页头部）。 */}
-      {credentialConfirmDialog}
-    </section>
+      ) : null}
+      emptyState={emptyState}
+      detailView={renderDetailView}
+      selectionResetKey={adapter?.productId ?? "-"}
+      dialogs={(
+        <>
+          {/* P5-2 切号进度弹层：target 非空即打开（五步事务由后端编排，见 MasterSwitchDialog）。 */}
+          <MasterSwitchDialog
+            target={switchTarget}
+            onFinished={handleSwitchFinished}
+            onClose={() => setSwitchTarget(null)}
+          />
+          {/* G11 登录后手机号补录弹层与查重确认（详情视图同样渲染）。 */}
+          {mobilePromptDialog}
+          {duplicateMobileDialog}
+          {/* 批量刷新凭据二次确认弹层（入口按钮在列表页头部）。 */}
+          {credentialConfirmDialog}
+        </>
+      )}
+    />
   );
 }
 

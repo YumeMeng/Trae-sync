@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { LibraryRef } from "../components/LibrarySessionsPanel";
 import type { CurrentProductDto, ProductEntryDto } from "../types/product";
+import { PRODUCT_UI_REGISTRY } from "./productUiRegistry";
 
 /**
  * 当前产品展示名（单产品语境）：TRAE 账号域文案统一用此名称。
@@ -29,53 +30,30 @@ export type SectionKey =
  */
 export type CapabilityState = "ready" | "pending" | "absent";
 
-/** 单产品区块三态：融合版数据与操作均已就绪（P15-6 主库绑定迁移后全 ready）。 */
-export const PRODUCT_SECTION_STATES: Record<SectionKey, CapabilityState> = {
-  overview: "ready",
-  accounts: "ready",
-  checkin: "ready",
-  environment: "ready",
-  "master-library": "ready",
-  settings: "ready",
-};
+/**
+ * 单产品区块三态：融合版数据与操作均已就绪（P15-6 主库绑定迁移后全 ready）。
+ *
+ * P19-B1 步骤③ 并表：产品区块三态声明收口到 productUiRegistry（单一事实源，
+ * 避免第三处产品分支），此处保留别名与查询函数（既有调用面不变）。
+ */
+export const PRODUCT_SECTION_STATES: Record<SectionKey, CapabilityState> =
+  PRODUCT_UI_REGISTRY.trae_cn.sectionStates;
 
 /** 查询某区块的能力三态（TRAE 语境；跨产品语境用 sectionStatesFor）。 */
 export function sectionStateOf(section: SectionKey): CapabilityState {
   return PRODUCT_SECTION_STATES[section];
 }
 
-/**
- * WorkBuddy 的区块三态（P17-T5 并列骨架一期）：账号（健康/捕获/账号池）
- * 与签到（直连协议）已就绪；总览统计、环境、主库随二期对话库适配推进，
- * 先以 pending 说明卡诚实呈现。settings 是应用级设置（备份保留策略等），
- * 与产品无关，保持 ready。
- */
-const WORKBUDDY_SECTION_STATES: Record<SectionKey, CapabilityState> = {
-  overview: "pending",
-  accounts: "ready",
-  checkin: "ready",
-  environment: "pending",
-  "master-library": "pending",
-  settings: "ready",
-};
-
 /** 按产品查询区块三态（未注册产品 fail-closed 回退 pending）。 */
 export function sectionStatesFor(productId: string): Record<SectionKey, CapabilityState> {
-  switch (productId) {
-    case "workbuddy":
-      return WORKBUDDY_SECTION_STATES;
-    case "trae_cn":
-      return PRODUCT_SECTION_STATES;
-    default:
-      return {
-        overview: "pending",
-        accounts: "pending",
-        checkin: "pending",
-        environment: "pending",
-        "master-library": "pending",
-        settings: "ready",
-      };
-  }
+  return PRODUCT_UI_REGISTRY[productId]?.sectionStates ?? {
+    overview: "pending",
+    accounts: "pending",
+    checkin: "pending",
+    environment: "pending",
+    "master-library": "pending",
+    settings: "ready",
+  };
 }
 
 // ===== 产品上下文（P17-T5 并列骨架）：切换器与产品分支渲染的数据源 =====
