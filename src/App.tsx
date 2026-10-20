@@ -311,7 +311,7 @@ export default function App() {
             )}
           </div>
           <div className="app-page" hidden={activePage !== "settings"}>
-            <SettingsPanel active={activePage === "settings"} />
+            <SettingsPanel active={activePage === "settings"} productId={currentProduct?.product_id ?? CURRENT_PRODUCT_ID} />
           </div>
         </main>
       </div>

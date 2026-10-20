@@ -13,15 +13,18 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 import { notify } from "../platform/notify";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { EmptyState } from "./shared/EmptyState";
+import { InfoRow } from "./WorkBuddyPanel";
 
 interface SettingsPanelProps {
   /** 页面可见时才读取设置，避免后台 IPC。 */
   active: boolean;
+  /** 当前产品（P19-B6：WB 侧渲染设置变体；缺省 TRAE）。 */
+  productId?: string;
 }
 
 // 设置页：自动签到偏好 + 主库备份。P15-10 单产品塌缩：设置服务唯一产品，
 // 不再按产品条件读取，跨产品通知前缀机制随之移除。
-export function SettingsPanel({ active }: SettingsPanelProps) {
+export function SettingsPanel({ active, productId = "trae_cn" }: SettingsPanelProps) {
   // 自动签到设置（ADR-0019 决策 5 / 2026-08-23 grill）：总开关 + 每日时间点 + 今日台账。
   const [autoStatus, setAutoStatus] = useState<AutoCheckinStatusDto | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
@@ -104,22 +107,24 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
     );
   }, [readSnapshot]);
 
+  // P19-B6：WB 侧渲染设置变体（自动签到设置在签到页；WB 备份为彻底删除
+  // 自动滚动单份，无独立链命令）——TRAE 数据面命令不发起，避免跨产品误读。
   useEffect(() => {
-    if (!active) return;
+    if (!active || productId === "workbuddy") return;
     let cancelled = false;
     void loadRetention(() => !cancelled)
       .catch(() => undefined); // 读取失败不阻塞页面；保存时会再次报错
     return () => { cancelled = true; };
-  }, [active, loadRetention]);
+  }, [active, productId, loadRetention]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active || productId === "workbuddy") return;
     let cancelled = false;
     void loadAutoStatus(() => !cancelled)
       .catch(() => undefined); // 读取失败不阻塞页面；保存时会再次报错
     void loadBackupChain(() => !cancelled);
     return () => { cancelled = true; };
-  }, [active, loadAutoStatus, loadBackupChain]);
+  }, [active, productId, loadAutoStatus, loadBackupChain]);
 
   // 手动备份：主库三件套复制为 .switch-bak-{时间戳}（create_new 永不覆盖）。
   // 勾选凭据时后端把签到凭据白名单整拷到 credentials-{同时间戳}/ 子目录。
@@ -247,6 +252,56 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
       ))
       .finally(() => setAutoBusy(false));
   }, [autoBusy, loadAutoStatus]);
+
+  // WB 设置变体（IA §1.6 备份区诚实呈现）：自动签到设置入口在签到页；
+  // WB 备份 = 彻底删除前置自动滚动单份（无独立链命令 → 不渲染不可用按钮）。
+  if (productId === "workbuddy") {
+    return (
+      <section className="settings-panel" role="region" aria-label="设置">
+        <header className="page-header">
+          <div className="page-header__copy">
+            <span className="page-header__eyebrow">偏好与安全</span>
+            <h1 data-page-title="settings" tabIndex={-1}>设置</h1>
+          </div>
+        </header>
+
+        <div className="settings-panel__section-heading">
+          <div>
+            <span className="workbench__eyebrow">应用行为</span>
+            <h3>自动签到</h3>
+          </div>
+        </div>
+        <EmptyState
+          panel
+          className="workbuddy-page__empty"
+          title="WorkBuddy 的自动签到设置在「签到」页"
+          description="总开关、触发时间与账号参与清单由签到页底部的「每日自动签到」设置卡承载（与 TRAE 设置页同模板）。"
+        />
+
+        <div className="settings-panel__section-heading">
+          <div>
+            <span className="workbench__eyebrow">数据安全</span>
+            <h3>对话库备份</h3>
+          </div>
+        </div>
+        <div className="workbuddy-card" data-testid="workbuddy-backup-note">
+          <div className="workbuddy-card__title">备份策略（自动滚动单份）</div>
+          <InfoRow label="备份时机">
+            彻底删除会话前自动创建（备份失败则整单拒绝，不会出现无备份的破坏性终点）。
+          </InfoRow>
+          <InfoRow label="备份范围">
+            workbuddy.db（含 wal/shm 附属件）+ projects 正文目录 + 登录凭据材料（P19 决策 1 全纳入）。
+          </InfoRow>
+          <InfoRow label="备份目录">
+            数据根下的 workbuddy-backups 目录（同一时刻只保留最新一份）。
+          </InfoRow>
+          <InfoRow label="恢复方式">
+            以最近一份备份覆盖 workbuddy.db 与 projects 目录；备份链的独立管理入口（查看/手动备份/恢复/删除）随后续批次开放。
+          </InfoRow>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="settings-panel" role="region" aria-label="设置">

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
+import { installFakeInvoke, mockRoute, mockCoreInvoke, resetRoutes } from "./helpers/fakeInvoke";
 
 vi.mock("@tauri-apps/api/core", async () => {
   const fake = await import("./helpers/fakeInvoke");
@@ -95,5 +95,28 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
     expect(screen.queryByTestId("wb-overview-stats-library")).not.toBeInTheDocument();
     // 主操作仍在（对话库入口是恒定导航动作）。
     expect(screen.getByTestId("wb-overview-library-cta")).toBeInTheDocument();
+  });
+});
+
+// ===== P19-B6④ 设置页 WB 变体（备份诚实说明卡） =====
+
+import { SettingsPanel } from "../src/components/SettingsPanel";
+
+describe("SettingsPanel WB 变体（P19-B6 备份区诚实呈现）", () => {
+  it("WB 产品：备份策略说明卡在册，TRAE 备份管理面不渲染且零 IPC", async () => {
+    render(<SettingsPanel active={true} productId="workbuddy" />);
+
+    expect(screen.getByTestId("workbuddy-backup-note")).toHaveTextContent("备份策略");
+    expect(screen.getByTestId("workbuddy-backup-note").textContent).toContain("自动滚动单份");
+    expect(screen.getByText("WorkBuddy 的自动签到设置在「签到」页")).toBeInTheDocument();
+    // TRAE 备份管理面不渲染；数据面命令零调用。
+    expect(screen.queryByTestId("master-backup-section")).not.toBeInTheDocument();
+    expect(mockCoreInvoke).not.toHaveBeenCalled();
+  });
+
+  it("TRAE 产品：备份管理面照常（现有行为不变）", async () => {
+    render(<SettingsPanel active={true} productId="trae_cn" />);
+    // WB 变体不生效：TRAE 备份分区在数据到达后渲染（此处只断言 WB 卡不存在）。
+    expect(screen.queryByTestId("workbuddy-backup-note")).not.toBeInTheDocument();
   });
 });
