@@ -48,8 +48,8 @@ use traesync_infrastructure::trae_instance::{self as trae_instance_module, close
 use traesync_infrastructure::{
     apply_master_archive_changes as apply_master_archive_changes_inner,
     backup_master_trio_rolling_stamped, delete_master_sessions_with_backup_dir,
-    handover_master_records, list_master_backups_in, master_backup_db_name,
-    master_database_path, master_db_activity_detected,
+    handover_master_records, hard_delete_master_backup, list_master_backups_in,
+    master_backup_db_name, master_database_path, master_db_activity_detected,
     merge_master_projects as merge_master_projects_inner,
     merge_trae_cn_project_records_with_progress,
     preview_trae_cn_project_merge as preview_trae_cn_project_merge_infra,
@@ -1749,6 +1749,95 @@ fn master_backup_chain_inner(
         keep_policy: backup_keep_policy(storage_root),
         backups,
     })
+}
+
+// ===== P19-B6 手动删除备份（用户拍板新增；备份链条目级硬删） =====
+
+/// 手动删除回执（链条一致性口径：删除后剩余条目数直读）。
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MasterBackupDeleteDto {
+    /// 实际删除的备份 stamp（秒级 UNIX 时间）。
+    deleted_stamps: Vec<u64>,
+    /// 链内不存在的 stamp（拒绝并如实报告，不静默成功）。
+    missing_stamps: Vec<u64>,
+    /// 删除后剩余链条目数。
+    remaining: usize,
+    /// 备份所在目录（展示定位）。
+    backup_dir: String,
+}
+
+/// 手动删除备份主体（阻塞上下文，独立函数便于单测）。
+///
+/// 纪律：
+/// - **单次确认**（后端兜底）：`confirmed=false` 直接拒绝
+///   （`master_backup_delete_not_confirmed`）——UI 弹窗确认后才调用；
+/// - **链内限定**：只接受 `list_master_backups_in` 当前链条目（与
+///   get_master_backup_chain 同一枚举事实源——用户从链条勾选；链外
+///   stamp 一律 missing，绝不按文件名猜测删除异名散件）；
+/// - **硬删**：复用 P17-A3 `hard_delete_master_backup`（双格式成员 +
+///   凭据子目录直删不走回收站——备份属可再生数据，spec 10.4）；
+/// - **滚动语义不受影响**：本命令只删用户点名条目，不触发滚动
+///   （滚动仅由 create_master_backup 的「写新份后清旧」承担）；
+/// - **进程无关**：备份文件为工具自有数据，与 TRAE 客户端运行态无
+///   依赖（不触碰主库本体），无需关停实例。
+fn master_backups_delete_inner(
+    dir: &Path,
+    db_name: &str,
+    stamps: &[u64],
+    confirmed: bool,
+) -> Result<MasterBackupDeleteDto, String> {
+    if !confirmed {
+        return Err("master_backup_delete_not_confirmed".to_string());
+    }
+    if stamps.is_empty() {
+        return Err("master_backup_delete_empty_selection".to_string());
+    }
+    // 链内限定（与链条命令同一枚举口径）。
+    let chain: std::collections::HashSet<u64> = list_master_backups_in(dir, db_name)
+        .into_iter()
+        .map(|entry| entry.stamp_unix_seconds)
+        .collect();
+    let mut deleted_stamps = Vec::new();
+    let mut missing_stamps = Vec::new();
+    for stamp in stamps {
+        if chain.contains(stamp) {
+            hard_delete_master_backup(dir, db_name, *stamp);
+            deleted_stamps.push(*stamp);
+        } else {
+            missing_stamps.push(*stamp);
+        }
+    }
+    let remaining = list_master_backups_in(dir, db_name).len();
+    Ok(MasterBackupDeleteDto {
+        deleted_stamps,
+        missing_stamps,
+        remaining,
+        backup_dir: dir.display().to_string(),
+    })
+}
+
+/// P19-B6：手动删除主库备份（设置页备份区入口，**单次确认**：UI 弹窗
+/// 确认后 `confirmed=true` 调用）。按用户在备份链条中勾选的条目（stamp）
+/// 逐条硬删；链外 stamp 报告 missing；删除后链条即为空/剩余，滚动
+/// 「仅保留一份」语义不受影响。
+#[tauri::command]
+pub(crate) async fn delete_master_backups(
+    stamps: Vec<u64>,
+    confirmed: bool,
+    library_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<MasterBackupDeleteDto, String> {
+    ensure_real_preview(&state)?;
+    let storage_root = PathBuf::from(&state.storage_root);
+    run_blocking("master_backup_delete_join_failed", move || {
+        let ctx = resolve_library_context(library_id.as_deref(), &storage_root)?;
+        let db_path = master_database_path(&ctx.dir);
+        let db_name = master_backup_db_name(&db_path)?;
+        // 与 get_master_backup_chain 同一作用域活动目录（展示目录即删除目录）。
+        let active_dir = resolve_library_backup_dir(&storage_root, &db_path, &ctx.env_id);
+        master_backups_delete_inner(&active_dir, &db_name, &stamps, confirmed)
+    })
+    .await
 }
 
 /// P5-4：手动创建主库数据备份（设置页入口）。
@@ -8355,5 +8444,88 @@ mod restore_master_tests {
         )
         .unwrap_err();
         assert_eq!(error, "master_restore_backup_missing");
+    }
+}
+
+// ============================================================================
+// P19-B6 手动删除备份（master_backups_delete_inner）单测
+// ============================================================================
+
+#[cfg(test)]
+mod master_backup_delete_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// 夹具：备份目录内两条链条目（1000：压缩 db + wal + 凭据子目录；
+    /// 900：未压缩 db）+ 异名散件（永不触碰的对象）。
+    fn make_backup_dir() -> TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::write(dir.join("database.db.switch-bak-1000.zst"), [1u8; 100]).unwrap();
+        std::fs::write(dir.join("database.db.switch-bak-1000-wal.zst"), [1u8; 20]).unwrap();
+        std::fs::create_dir_all(dir.join("credentials-1000")).unwrap();
+        std::fs::write(dir.join("credentials-1000").join("cred.blob"), b"secret").unwrap();
+        std::fs::write(dir.join("database.db.switch-bak-900"), [1u8; 40]).unwrap();
+        std::fs::write(dir.join("database.db.switch-bak-abc"), [1u8; 7]).unwrap();
+        root
+    }
+
+    /// 未确认拒绝：confirmed=false 稳定错误码，目录零变化（单次确认纪律
+    /// 的后端兜底，不依赖 UI 弹窗自觉）。
+    #[test]
+    fn delete_requires_confirmation() {
+        let root = make_backup_dir();
+        let error = master_backups_delete_inner(root.path(), "database.db", &[1000], false)
+            .unwrap_err();
+        assert_eq!(error, "master_backup_delete_not_confirmed");
+        // 零副作用：条目原样。
+        assert!(root.path().join("database.db.switch-bak-1000.zst").is_file());
+        assert_eq!(list_master_backups_in(root.path(), "database.db").len(), 2);
+    }
+
+    /// 空选择拒绝：不出确认弹窗对应的空调用直接拒绝。
+    #[test]
+    fn delete_rejects_empty_selection() {
+        let root = make_backup_dir();
+        assert_eq!(
+            master_backups_delete_inner(root.path(), "database.db", &[], true).unwrap_err(),
+            "master_backup_delete_empty_selection"
+        );
+    }
+
+    /// 删除成功：双格式成员 + 凭据子目录整条目消失；未点名的条目与
+    /// 异名散件原样；链外 stamp 报告 missing；删除后链条一致性直读。
+    #[test]
+    fn delete_removes_named_entries_and_reports_missing() {
+        let root = make_backup_dir();
+        let dto = master_backups_delete_inner(
+            root.path(),
+            "database.db",
+            &[1000, 8000, 9000],
+            true,
+        )
+        .unwrap();
+        assert_eq!(dto.deleted_stamps, vec![1000]);
+        assert_eq!(dto.missing_stamps, vec![8000, 9000], "链外 stamp 拒绝并如实报告");
+        // 条目 1000 的全部成员（双格式 + 凭据子目录）消失。
+        assert!(!root.path().join("database.db.switch-bak-1000.zst").exists());
+        assert!(!root.path().join("database.db.switch-bak-1000-wal.zst").exists());
+        assert!(!root.path().join("credentials-1000").exists());
+        // 未点名条目与散件原样（硬删只及点名条目）。
+        assert!(root.path().join("database.db.switch-bak-900").is_file());
+        assert!(root.path().join("database.db.switch-bak-abc").is_file());
+        // 链条一致性：回执 remaining 与直接枚举一致（只剩 900）。
+        assert_eq!(dto.remaining, 1);
+        let chain = list_master_backups_in(root.path(), "database.db");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].stamp_unix_seconds, 900);
+        assert_eq!(dto.backup_dir, root.path().display().to_string());
+        // 删除后链条即为空/剩余：再删 900 → 链空（滚动语义不受影响）。
+        let dto = master_backups_delete_inner(root.path(), "database.db", &[900], true).unwrap();
+        assert_eq!(dto.deleted_stamps, vec![900]);
+        assert_eq!(dto.remaining, 0);
+        assert!(list_master_backups_in(root.path(), "database.db").is_empty());
+        // 异名散件即使链空也永不触碰（铁律：不自动删证据）。
+        assert!(root.path().join("database.db.switch-bak-abc").is_file());
     }
 }

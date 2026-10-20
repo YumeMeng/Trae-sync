@@ -1399,6 +1399,8 @@ pub fn run() {
             library_archive::get_backup_dir,
             library_archive::set_backup_dir,
             library_archive::migrate_master_backups,
+            // P19-B6 手动删除备份（用户拍板新增；单次确认 + 链内限定硬删）。
+            library_archive::delete_master_backups,
             library_archive::get_master_verification,
             // P5-8a 会话归档通道（ADR-0022）：归档/恢复统一走批量编排；真实删除独立提交。
             library_archive::apply_master_archive_changes,
