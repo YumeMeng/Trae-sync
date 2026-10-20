@@ -450,7 +450,8 @@ describe("应用工作区入口", () => {
     // accounts = ready：WorkBuddy 面板（会话健康卡在册）。
     fireEvent.click(screen.getByTestId("navigation-accounts"));
     expect(await screen.findByTestId("workbuddy-health-card")).toBeInTheDocument();
-    expect(screen.getByTestId("workbuddy-health-status")).toHaveTextContent("已登录");
+    // P18-B3 后登录态由 G10 slot-badge 承载（WorkBuddyLoginSlotBadge，无独立 testid）。
+    expect(screen.getByTestId("workbuddy-health-card")).toHaveTextContent("已登录");
 
     // checkin = ready：WorkBuddy 签到卡。
     fireEvent.click(screen.getByTestId("navigation-checkin"));
