@@ -34,6 +34,8 @@ pub mod checkin_credential;
 pub mod fused_login_credential;
 pub mod checkin_http;
 pub mod checkin_login;
+// P19-B4：OAuth 登录编排协议端口（四差异点参数化 + 共用编排骨架）。
+pub mod oauth_login_protocol;
 // P13-1：Trae CN 签到协议实装（status/claim，探针形状为唯一权威来源）。
 pub mod trae_cn_checkin;
 // P11-6：Trae CN 签到只读探针（ADR-0032 决策 4 门禁；status 类查询先行）。
@@ -179,6 +181,8 @@ pub use checkin_login::{
     LoginCallbackServer, LoginCancelResult, LoginError, LoginHandoff, LoginProduct, LoginReceipt,
     LoginSession, CALLBACK_TIMEOUT_SECONDS, LOGIN_HOST,
 };
+// P19-B4：OAuth 登录编排协议端口与共用编排骨架。
+pub use oauth_login_protocol::{run_login_flow, LoginFlowError, OAuthLoginProtocol};
 // P13-1：Trae CN 签到协议端口与 Real 实现（命令层经此引用）。
 pub use trae_cn_checkin::{
     claim_request, parse_claim_envelope, parse_status_envelope, status_request,
