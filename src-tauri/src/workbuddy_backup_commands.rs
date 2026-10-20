@@ -386,3 +386,167 @@ pub(crate) fn get_workbuddy_probe_info(
         data_root,
     ))
 }
+
+// ============================================================================
+// P19-B8 备份链管理 + 探针数据面单测
+// ============================================================================
+
+#[cfg(test)]
+mod workbuddy_backup_commands_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// 备份源夹具（workbuddy_backup 模块同款：配置 + 凭据 + 数据根成员），
+    /// 供创建/恢复闭环使用。
+    fn make_sources(root: &std::path::Path) -> WorkBuddyBackupSources {
+        let data_root = root.join(".workbuddy");
+        std::fs::create_dir_all(data_root.join("app")).unwrap();
+        std::fs::write(data_root.join("workbuddy.db"), b"db-v1").unwrap();
+        std::fs::write(data_root.join("device-id"), b"device-v1").unwrap();
+        let projects = data_root.join("projects").join("d-demo");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("sess-1.jsonl"), b"line-v1").unwrap();
+        WorkBuddyBackupSources {
+            app_config_root: data_root.join("app"),
+            auth_dir: root.join("auth"),
+            login_container_dir: root.join("containers"),
+            data_root,
+        }
+    }
+
+    /// CRUD 闭环：创建（滚动语义）→ 枚举一致 → 删除未确认拒绝 → 链外
+    /// stamp 拒绝 → 确认删除 → remaining 直读一致。
+    #[test]
+    fn backup_chain_crud_closed_loop() {
+        let root = tempdir().unwrap();
+        let sources = make_sources(root.path());
+        let target = root.path().join("backups");
+
+        // 创建：滚动单份（写新份清旧）。
+        let first = workbuddy_backup_create_inner(&target, &sources, 1000).unwrap();
+        assert_eq!(first.stamp_unix_seconds, 1000);
+        assert_eq!(first.rolled_over, 0, "首份无旧份可滚动");
+        workbuddy_backup_create_inner(&target, &sources, 2000).unwrap();
+        assert_eq!(first.rolled_over, 0);
+        // 枚举：滚动后只剩 2000 一条，成员数与源字节如实呈现。
+        let chain = workbuddy_backups_list_inner(&target);
+        assert_eq!(chain.backup_dir, target.display().to_string());
+        assert_eq!(chain.backups.len(), 1);
+        assert_eq!(chain.backups[0].stamp_unix_seconds, 2000);
+        assert_eq!(chain.backups[0].file_count, Some(3));
+        assert_eq!(chain.backups[0].source_bytes, Some(5 + 9 + 7));
+        assert!(chain.backups[0].compressed_bytes > 0);
+
+        // 未确认拒绝（零副作用）。
+        assert_eq!(
+            workbuddy_backups_delete_inner(&target, &[2000], false).unwrap_err(),
+            "workbuddy_backup_delete_not_confirmed"
+        );
+        assert_eq!(workbuddy_backups_list_inner(&target).backups.len(), 1);
+        // 空选择拒绝。
+        assert_eq!(
+            workbuddy_backups_delete_inner(&target, &[], true).unwrap_err(),
+            "workbuddy_backup_delete_empty_selection"
+        );
+        // 链外 stamp：拒绝并如实报告（不按目录名猜测删除）。
+        let dto = workbuddy_backups_delete_inner(&target, &[3000], true).unwrap();
+        assert!(dto.deleted_stamps.is_empty());
+        assert_eq!(dto.missing_stamps, vec![3000]);
+        assert_eq!(dto.remaining, 1);
+        // 确认删除：链条清空，remaining 直读一致。
+        let dto = workbuddy_backups_delete_inner(&target, &[2000], true).unwrap();
+        assert_eq!(dto.deleted_stamps, vec![2000]);
+        assert_eq!(dto.remaining, 0);
+        assert!(workbuddy_backups_list_inner(&target).backups.is_empty());
+    }
+
+    /// 恢复闭环：漂移源 → 恢复旧份 → 内容回退；恢复前置再备份保链
+    /// （keep_chain——滚动会清掉目标份）；链外 stamp 拒绝。
+    #[test]
+    fn restore_reverts_content_and_keeps_safety_backup_in_chain() {
+        let root = tempdir().unwrap();
+        let sources = make_sources(root.path());
+        let target = root.path().join("backups");
+        // 旧份 stamp=1000（内容 v1）。
+        workbuddy_backup_create_inner(&target, &sources, 1000).unwrap();
+        // 漂移：db/正文/身份材料全部改写。
+        std::fs::write(sources.data_root.join("workbuddy.db"), b"db-v2").unwrap();
+        std::fs::write(sources.data_root.join("device-id"), b"device-v2").unwrap();
+        std::fs::write(
+            sources
+                .data_root
+                .join("projects")
+                .join("d-demo")
+                .join("sess-1.jsonl"),
+            b"line-v2",
+        )
+        .unwrap();
+
+        // 恢复 stamp=1000（now=9000 → 安全份 9000）。
+        let receipt = workbuddy_backup_restore_inner(&target, &sources, 1000, 9000).unwrap();
+        assert_eq!(receipt.restored_stamp, 1000);
+        assert_eq!(receipt.safety_backup_stamp, 9000);
+        assert_eq!(receipt.restored_files, 3);
+        // 内容回退到 v1。
+        assert_eq!(std::fs::read(sources.data_root.join("workbuddy.db")).unwrap(), b"db-v1");
+        assert_eq!(std::fs::read(sources.data_root.join("device-id")).unwrap(), b"device-v1");
+        assert_eq!(
+            std::fs::read(
+                sources
+                    .data_root
+                    .join("projects")
+                    .join("d-demo")
+                    .join("sess-1.jsonl")
+            )
+            .unwrap(),
+            b"line-v1"
+        );
+        // 链条一致性：安全份（9000，保链不清目标）+ 恢复来源份（1000）并存。
+        let stamps: Vec<u64> = workbuddy_backups_list_inner(&target)
+            .backups
+            .iter()
+            .map(|entry| entry.stamp_unix_seconds)
+            .collect();
+        assert_eq!(stamps, vec![1000, 9000], "前置安全份保链，恢复来源份不被滚动清理");
+        // 链外 stamp 拒绝（恢复同样不按目录名猜测）。
+        assert_eq!(
+            workbuddy_backup_restore_inner(&target, &sources, 7000, 9001).unwrap_err(),
+            "workbuddy_restore_backup_missing"
+        );
+    }
+
+    /// 探针组装内核 fail-soft：各维度独立缺省（运行中但探针异常 → 版本面
+    /// None；进程枚举失败 → running None；全部成功 → 全量透传）。
+    #[test]
+    fn probe_info_assembles_fail_soft() {
+        // 全成功。
+        let full = workbuddy_probe_info_inner(
+            Some(4),
+            Some((
+                "workbuddy-desktop".to_string(),
+                "1.2.3".to_string(),
+                "win32".to_string(),
+            )),
+            Some((
+                PathBuf::from("E:/软件/workbuddy/WorkBuddy.exe"),
+                "common_path".to_string(),
+            )),
+            Some(PathBuf::from("C:/Users/u/.workbuddy")),
+        );
+        assert_eq!(full.running, Some(true));
+        assert_eq!(full.process_count, Some(4));
+        assert_eq!(full.version.as_deref(), Some("1.2.3"));
+        assert_eq!(full.install_source.as_deref(), Some("common_path"));
+        assert!(full.data_root.is_some());
+        // 客户端未运行（枚举成功 0 进程）+ 探针不可达 + 安装未探测到。
+        let offline = workbuddy_probe_info_inner(None, None, None, None);
+        assert_eq!(offline.running, None, "进程枚举失败不猜测");
+        assert_eq!(offline.version, None);
+        assert_eq!(offline.install_path, None);
+        assert_eq!(offline.data_root, None);
+        // 进程在但探针异常：running=true、版本面 None（环境页如实降级）。
+        let degraded = workbuddy_probe_info_inner(Some(0), None, None, None);
+        assert_eq!(degraded.running, Some(false));
+        assert_eq!(degraded.version, None);
+    }
+}
