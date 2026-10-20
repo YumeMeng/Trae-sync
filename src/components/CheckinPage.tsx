@@ -1,9 +1,7 @@
-﻿import { ProductBadge } from "./shared/ProductBadge";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+﻿import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { CalendarCheck, Loader2, RefreshCw, UserPlus } from "lucide-react";
+import { RefreshCw, UserPlus } from "lucide-react";
 import type {
   AutoCheckinStatusDto,
   CheckinBatchSummaryDto,
@@ -13,14 +11,18 @@ import type {
   ManagedAccountsViewDto,
 } from "../types/account_switch";
 import type { AppPage } from "./NavigationRail";
-import { EmptyState } from "./shared/EmptyState";
 import { PRODUCT_DISPLAY_NAME, sectionStateOf } from "../platform/productRegistry";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 import { effectiveDisplayName } from "../utils/accountDisplay";
 // 统一通知适配层（P11-1 切片②）：操作结果类提示一律经 notify 发出。
 import { notify } from "../platform/notify";
 import { CheckinSlotBadge, deriveCheckinSlotState } from "./StatusBadges";
-import { InterWaitCountdown } from "./shared/checkin/InterWaitCountdown";
+import { productUi } from "../platform/productUiRegistry";
+import { CheckinPageSkeleton } from "./shared/checkin/CheckinPageSkeleton";
+import { CheckinActionsRow } from "./shared/checkin/CheckinActionsRow";
+import { CheckinFlowRow } from "./shared/checkin/CheckinFlowRow";
+import { CheckinSelectRow, selectResultTone } from "./shared/checkin/CheckinRow";
+import { outcomeLabelFor } from "./shared/checkin/OutcomeLabels";
 
 /** 后端逐账号进度事件（checkin-progress）载荷；outcome 与 CheckinResultDto 同口径。 */
 interface CheckinProgressEvent {
@@ -318,7 +320,6 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
     () => realMode ? overview.filter((entry) => entry.checked_in !== true).map((entry) => entry.profile_id) : [],
     [realMode, overview],
   );
-  const showSelectedRun = realMode && selection.length > 0 && selection.length < poolIds.length;
   const progressTotal = liveProgress?.total ?? runIds.length;
   // 进度条与行阶段推演：liveProgress.completed 是权威游标（后端串行递增）。
   const progressCompleted = liveProgress?.completed ?? 0;
@@ -326,312 +327,152 @@ function WorkCheckinPage({ active, onNavigate }: Pick<CheckinPageProps, "active"
 
   // 区块能力三态（P11-6，ADR-0032 决策 2/4）：单产品塌缩后签到区块恒 ready，
   // 非 ready 说明卡随 PRODUCT_SECTION_STATES 塌缩移除（P15-10）。
-  if (!active) {
-    return (
-      <section className="checkin-page" role="region" aria-label="签到">
-        <header className="page-header">
-          <div className="page-header__copy">
-            <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
-            <ProductBadge productId="trae_cn" />
-          </div>
-        </header>
-        <EmptyState role="status" className="checkin-page__empty" description="正在读取签到信息…" />
-      </section>
-    );
-  }
+  // P19-B2④：页面编排（门控/页头/状态区/选择区块/进度条/列表/空态）由
+  // CheckinPageSkeleton 承担，本组件退化为 TRAE 数据与插槽提供方。
+  const product = productUi("trae_cn");
 
   return (
-    <section className="checkin-page" role="region" aria-label="签到">
-      <header className="page-header">
-        <div className="page-header__copy">
-          <h1 data-page-title="checkin" tabIndex={-1}>签到</h1>
-            <ProductBadge productId="trae_cn" />
+    <CheckinPageSkeleton
+      product={product}
+      active={active}
+      loading={false}
+      headerActions={realMode && poolIds.length > 0 ? (
+        <div className="page-header__actions">
+          {/* G15 纯本地刷新：重读缓存零联网，与签到/补签的网络操作分工。 */}
+          <button
+            className="btn"
+            type="button"
+            onClick={handleLocalRefresh}
+            disabled={localRefreshBusy}
+            data-testid="checkin-refresh-local"
+            title="重读本机缓存的账号信息（不联网）"
+          >
+            <RefreshCw size={15} className={localRefreshBusy ? "icon-spin" : undefined} aria-hidden="true" />刷新
+          </button>
         </div>
-        {/* G15 纯本地刷新：重读缓存零联网，与签到/补签的网络操作分工。 */}
-        {realMode && poolIds.length > 0 && (
-          <div className="page-header__actions">
-            <button
-              className="btn"
-              type="button"
-              onClick={handleLocalRefresh}
-              disabled={localRefreshBusy}
-              data-testid="checkin-refresh-local"
-              title="重读本机缓存的账号信息（不联网）"
-            >
-              <RefreshCw size={15} className={localRefreshBusy ? "icon-spin" : undefined} aria-hidden="true" />刷新
-            </button>
-          </div>
-        )}
-      </header>
-
-      {autoStatus && (
-        <p className="checkin-page__meta" role="status" data-testid="auto-checkin-status">
-          自动签到：{autoStatus.enabled ? `每日 ${autoStatus.daily_time_hhmm} 触发` : "已关闭"}
-          {autoStatus.enabled ? ` · ${autoLedgerLabel(autoStatus)}` : ""}
-        </p>
+      ) : undefined}
+      statusRegion={(
+        <>
+          {autoStatus && (
+            <p className="checkin-page__meta" role="status" data-testid="auto-checkin-status">
+              自动签到：{autoStatus.enabled ? `每日 ${autoStatus.daily_time_hhmm} 触发` : "已关闭"}
+              {autoStatus.enabled ? ` · ${autoLedgerLabel(autoStatus)}` : ""}
+            </p>
+          )}
+          {/* 常驻提示只保留两类：fixture 演示模式标识（一行）与异常态（能力读取失败或存储根
+              不可用，统一显示存储未就绪并附带原因）。正常态不展示 capability.message——
+              其中是开发注释型自述，用户不可据此行动。capability 数据照常读取，仅不再常驻展示。 */}
+          {capability?.transport === "fixture" && (
+            <p className="checkin-page__meta" role="status" data-testid="checkin-demo-banner">演示模式</p>
+          )}
+          {capability && capability.transport !== "fixture" && !capability.enabled && (
+            <p className="workbench__error" role="alert" data-testid="checkin-unavailable">
+              签到功能不可用：存储未就绪
+            </p>
+          )}
+        </>
       )}
-      {/* 常驻提示只保留两类：fixture 演示模式标识（一行）与异常态（能力读取失败或存储根
-          不可用，统一显示存储未就绪并附带原因）。正常态不展示 capability.message——
-          其中是开发注释型自述，用户不可据此行动。capability 数据照常读取，仅不再常驻展示。 */}
-      {capability?.transport === "fixture" && (
-        <p className="checkin-page__meta" role="status" data-testid="checkin-demo-banner">演示模式</p>
-      )}
-      {capability && capability.transport !== "fixture" && !capability.enabled && (
-        <p className="workbench__error" role="alert" data-testid="checkin-unavailable">
-          签到功能不可用：存储未就绪
-        </p>
-      )}
-
-      {poolIds.length > 0 ? (
-        <section className="checkin-page__selection" aria-labelledby="checkin-selection-heading">
-          <div className="account-center__section-heading">
-            <h3 id="checkin-selection-heading"><CalendarCheck size={16} aria-hidden="true" />签到账号</h3>
-            <span className="section-caption">已选 {selection.length}/{poolIds.length}</span>
-          </div>
-
-          {/* U-3 四动作直达（真实模式）：全签/补签常驻，勾选子集出现「签到所选」。 */}
-          {realMode ? (
-            <div className="checkin-page__action-row" data-testid="checkin-actions">
-              <button
-                className="btn btn--primary"
-                type="button"
-                onClick={() => void handleRunIds(poolIds)}
-                disabled={!capability?.enabled || busy}
-                data-testid="checkin-run-all"
-                title="对全部账号执行签到（已签账号自动跳过，不重复领取）"
-              >
-                <CalendarCheck size={15} aria-hidden="true" />{busy ? "签到执行中…" : `一键全签（${poolIds.length}）`}
-              </button>
-              <button
-                className="btn"
-                type="button"
-                onClick={() => void handleRunIds(pendingIds)}
-                disabled={!capability?.enabled || busy || pendingIds.length === 0}
-                data-testid="checkin-run-pending"
-                title="只对今日未签账号执行签到（少发请求）"
-              >
-                <CalendarCheck size={15} aria-hidden="true" />一键补签（{pendingIds.length}）
-              </button>
-              {showSelectedRun && (
-                <button
-                  className="btn"
-                  type="button"
-                  onClick={() => void handleRunIds(selection)}
-                  disabled={!capability?.enabled || busy}
-                  data-testid="checkin-run-selected"
-                >
-                  <CalendarCheck size={15} aria-hidden="true" />签到所选（{selection.length}）
-                </button>
-              )}
-              <button className="btn btn--quiet" type="button" onClick={() => void handleCancel()} disabled={!busy}>取消未开始任务</button>
-            </div>
-          ) : (
-            <div className="checkin-page__action-row">
-              <button className="btn btn--primary" type="button" onClick={() => void handleRun()} disabled={!capability?.enabled || selection.length === 0 || busy}>
-                <CalendarCheck size={15} aria-hidden="true" />{busy ? "签到执行中…" : `全部签到（${selection.length}）`}
-              </button>
-              <button className="btn btn--quiet" type="button" onClick={() => void handleCancel()} disabled={!busy}>取消未开始任务</button>
-            </div>
-          )}
-
-          {/* U-3 总进度条：串行批次期间 X/Y + 已完成比例。 */}
-          {busy && progressTotal > 0 && (
-            <div className="checkin-progress" role="status" data-testid="checkin-progress">
-              <div className="checkin-progress__track">
-                <div
-                  className="checkin-progress__fill"
-                  style={{ width: `${Math.round((progressCompleted / progressTotal) * 100)}%` }}
-                />
-              </div>
-              <span className="checkin-progress__label">
-                {progressCompleted}/{progressTotal} · 每账号走 状态 → 领取 → 复核，账号间自动间隔 3-8 秒
-              </span>
-            </div>
-          )}
-
-          {/* U-3 单列表演进式（真实模式）：同一行随流程变状态（排队/执行中/结果）。 */}
-          {realMode ? (
-            <ul className="checkin-flow" aria-label="签到账号与结果">
-              {overview.map((entry) => {
-                const live = liveResults.find((item) => item.profile_id === entry.profile_id);
-                const finalResult = summary?.results.find((result) => result.profile_id === entry.profile_id) ?? null;
-                const isCursor = busy && entry.profile_id === cursorId;
-                const doneInRun = busy && live !== undefined;
-                // 当前行尚未开始且处于账号间错峰等待：显示"N 秒后开始"。
-                const waitSecs = interWaits[entry.profile_id] ?? null;
-                const inWait = isCursor && !doneInRun && waitSecs !== null;
-                return (
-                  <CheckinFlowRow
-                    key={entry.profile_id}
-                    entry={entry}
-                    selected={selection.includes(entry.profile_id)}
-                    onToggle={() => toggle(entry.profile_id)}
-                    disabled={busy}
-                    phase={busy ? (doneInRun ? "done" : isCursor ? (inWait ? "inter_wait" : "running") : "queued") : "idle"}
-                    result={busy ? (live ?? null) : finalResult}
-                    waitSecs={inWait ? waitSecs : null}
-                    onInlineCheckin={() => void handleRunIds([entry.profile_id])}
-                  />
-                );
-              })}
-            </ul>
-          ) : (
-            <ul className="account-center__profile-list">
-              {savedPool.map((account) => (
-                <CheckinRow
-                  key={account.profile_id}
-                  profileId={account.profile_id}
-                  name={account.display_name}
-                  meta=""
-                  badge={null}
-                  selected={selection.includes(account.profile_id)}
-                  onToggle={() => toggle(account.profile_id)}
-                  disabled={busy}
-                  result={summary?.results.find((result) => result.profile_id === account.profile_id) ?? null}
-                />
-              ))}
-            </ul>
-          )}
-
-          {autoResults.length > 0 && (
-            <ul className="account-center__checkin-results" aria-label="自动签到结果" data-testid="auto-checkin-results">
-              {autoResults.map((item) => (
-                <li key={item.profile_id}>
-                  <strong>{item.screen_name || displayName(item.profile_id)}</strong>
-                  <span>{checkinOutcomeLabel(item.outcome, item.detail_code)}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+      entryCount={poolIds.length}
+      selectedCount={selection.length}
+      actions={realMode ? (
+        <CheckinActionsRow
+          variant="batch"
+          enabled={capability?.enabled ?? false}
+          busy={busy}
+          poolCount={poolIds.length}
+          pendingCount={pendingIds.length}
+          selectionCount={selection.length}
+          onRunAll={() => void handleRunIds(poolIds)}
+          onRunPending={() => void handleRunIds(pendingIds)}
+          onRunSelected={() => void handleRunIds(selection)}
+          onCancel={() => void handleCancel()}
+        />
       ) : (
-        <EmptyState
-          className="checkin-page__empty-actions"
-          description="还没有可签到的账号。先在「账号」页通过浏览器登录添加账号。"
-          action={
-            <button className="btn btn--primary" type="button" onClick={() => onNavigate("accounts")}>
-              <UserPlus size={15} aria-hidden="true" />去账号页添加
-            </button>
-          }
+        <CheckinActionsRow
+          variant="select"
+          enabled={capability?.enabled ?? false}
+          busy={busy}
+          poolCount={poolIds.length}
+          pendingCount={0}
+          selectionCount={selection.length}
+          onRunAll={() => void handleRun()}
+          onRunPending={() => undefined}
+          onRunSelected={() => void handleRun()}
+          onCancel={() => void handleCancel()}
         />
       )}
-    </section>
+      progress={busy ? { completed: progressCompleted, total: progressTotal } : null}
+      rows={realMode
+        ? overview.map((entry) => {
+          const live = liveResults.find((item) => item.profile_id === entry.profile_id);
+          const finalResult = summary?.results.find((result) => result.profile_id === entry.profile_id) ?? null;
+          const isCursor = busy && entry.profile_id === cursorId;
+          const doneInRun = busy && live !== undefined;
+          // 当前行尚未开始且处于账号间错峰等待：显示"N 秒后开始"。
+          const waitSecs = interWaits[entry.profile_id] ?? null;
+          const inWait = isCursor && !doneInRun && waitSecs !== null;
+          return (
+            <CheckinFlowRow
+              key={entry.profile_id}
+              productId="trae_cn"
+              profileId={entry.profile_id}
+              displayName={effectiveDisplayName(entry)}
+              badge={<CheckinSlotBadge state={deriveCheckinSlotState(entry)} />}
+              meta={entryMeta(entry)}
+              selected={selection.includes(entry.profile_id)}
+              onToggle={() => toggle(entry.profile_id)}
+              disabled={busy}
+              phase={busy ? (doneInRun ? "done" : isCursor ? (inWait ? "inter_wait" : "running") : "queued") : "idle"}
+              result={busy ? (live ?? null) : finalResult}
+              waitSecs={inWait ? waitSecs : null}
+              onInlineCheckin={() => void handleRunIds([entry.profile_id])}
+              inlineEnabled={entry.checked_in !== true}
+            />
+          );
+        })
+        : savedPool.map((account) => {
+          const result = summary?.results.find((item) => item.profile_id === account.profile_id) ?? null;
+          return (
+            <CheckinSelectRow
+              key={account.profile_id}
+              name={account.display_name}
+              meta=""
+              badge={null}
+              selected={selection.includes(account.profile_id)}
+              onToggle={() => toggle(account.profile_id)}
+              disabled={busy}
+              resultLabel={result ? outcomeLabelFor("trae_cn", result.outcome, result.detail_code) : null}
+              resultTone={selectResultTone(result?.outcome ?? null)}
+            />
+          );
+        })}
+      listVariant={realMode ? "flow" : "plain"}
+      footer={autoResults.length > 0 ? (
+        <ul className="account-center__checkin-results" aria-label="自动签到结果" data-testid="auto-checkin-results">
+          {autoResults.map((item) => (
+            <li key={item.profile_id}>
+              <strong>{item.screen_name || displayName(item.profile_id)}</strong>
+              <span>{outcomeLabelFor("trae_cn", item.outcome, item.detail_code)}</span>
+            </li>
+          ))}
+        </ul>
+      ) : undefined}
+      emptyState={{
+        className: "checkin-page__empty-actions",
+        description: "还没有可签到的账号。先在「账号」页通过浏览器登录添加账号。",
+        action: (
+          <button className="btn btn--primary" type="button" onClick={() => onNavigate("accounts")}>
+            <UserPlus size={15} aria-hidden="true" />去账号页添加
+          </button>
+        ),
+      }}
+    />
   );
 }
 
-/**
- * U-3 签到流单列行：勾选框 + 名字 + 签到槽位徽章 + meta + 行内单签按钮；
- * 执行期间随 phase 演进（queued 排队 / running 执行中高亮 / done 结果），
- * 批次结束后 result 直接落在行内——选择/执行/结果零重复。
- */
-function CheckinFlowRow({
-  entry,
-  selected,
-  onToggle,
-  disabled,
-  phase,
-  result,
-  waitSecs,
-  onInlineCheckin,
-}: {
-  entry: CheckinOverviewEntryDto;
-  selected: boolean;
-  onToggle: () => void;
-  disabled: boolean;
-  phase: "idle" | "queued" | "running" | "inter_wait" | "done";
-  result: CheckinResultDto | CheckinProgressEvent | null;
-  waitSecs: number | null;
-  onInlineCheckin: () => void;
-}) {
-  const unchecked = entry.checked_in !== true;
-  // G10 统一状态机：签到槽徽章由 derive* 纯函数求枚举态（今日尝试失败显示
-  // “签到失败/待重试”，与账号页同义同色）。
-  const checkinState = deriveCheckinSlotState(entry);
-  const outcome = result?.outcome ?? null;
-  const detailCode = result?.detail_code ?? null;
-  // 结果语气：claimed/already 安静（中性）；其余琥珀（需要关注）。
-  const resultTone = outcome === "claimed" || outcome === "already_checked_in" ? "ok" : "warn";
-  return (
-    <li className={`checkin-flow__row${phase === "running" ? " checkin-flow__row--active" : ""}`}>
-      <label className="checkin-flow__select">
-        <input type="checkbox" checked={selected} onChange={onToggle} disabled={disabled} />
-        <span className="checkin-flow__id">
-          <span className="checkin-flow__name-row">
-            <strong>{effectiveDisplayName(entry)}</strong>
-            <CheckinSlotBadge state={checkinState} />
-          </span>
-          <span className="checkin-flow__meta">{entryMeta(entry)}</span>
-        </span>
-      </label>
-      <span className="checkin-flow__side">
-        {phase === "queued" && <span className="checkin-flow__phase">排队中</span>}
-        {phase === "running" && (
-          <span className="checkin-flow__phase checkin-flow__phase--active">
-            <Loader2 size={13} className="checkin-flow__spinner" aria-hidden="true" />签到中…
-          </span>
-        )}
-        {phase === "inter_wait" && waitSecs !== null && (
-          <span className="checkin-flow__phase checkin-flow__phase--active" data-testid="checkin-inter-wait">
-            <InterWaitCountdown seconds={waitSecs} />
-          </span>
-        )}
-        {(phase === "done" || phase === "idle") && outcome && (
-          <span className={`checkin-flow__result checkin-flow__result--${resultTone}`}>
-            {checkinOutcomeLabel(outcome, detailCode)}
-          </span>
-        )}
-        {/* 行内单账号签到：仅未签账号可点；执行期间禁用。 */}
-        <button
-          className="btn checkin-flow__inline-btn"
-          type="button"
-          onClick={onInlineCheckin}
-          disabled={disabled || !unchecked}
-          title={unchecked ? "仅签到该账号" : "今日已签到"}
-          data-testid={`checkin-inline-${entry.profile_id}`}
-        >
-          <CalendarCheck size={13} aria-hidden="true" />签到
-        </button>
-      </span>
-    </li>
-  );
-}
-
-/** 签到选择行：复选框 + 账号名 + 今日状态 + 缓存积分 + 最近一次签到结果徽章。 */
-function CheckinRow({ name, meta, badge, selected, onToggle, disabled, result }: {
-  profileId: string;
-  name: string;
-  meta: string;
-  badge: ReactNode;
-  selected: boolean;
-  onToggle: () => void;
-  disabled: boolean;
-  result: CheckinResultDto | null;
-}) {
-  const resultTone = result?.outcome === "claimed" ? "safe"
-    : result?.outcome === "already_checked_in" ? "neutral" : "warning";
-  return (
-    <li className={`account-center__profile${selected ? " account-center__profile--selected" : ""}`}>
-      <label className="account-center__profile-select">
-        <input type="checkbox" checked={selected} onChange={onToggle} disabled={disabled} />
-        <span className="account-center__profile-copy">
-          <strong>{name}</strong>
-          {meta && <span>{meta}</span>}
-        </span>
-      </label>
-      <span className="account-center__profile-status">
-        {badge}
-        {result && (
-          <span className={`status-badge status-badge--${resultTone}`}>
-            {checkinOutcomeLabel(result.outcome, result.detail_code)}
-          </span>
-        )}
-      </span>
-    </li>
-  );
-}
-
-// useCountdownSeconds / InterWaitCountdown 已纯移动到
-// shared/checkin/InterWaitCountdown.tsx（P19-B1 步骤①：产品无关组件归位共享层）。
+// —— 以下为 TRAE 产品层私有工具（骨架插槽的数据组装面）——
+// CheckinFlowRow / CheckinRow / 批量按钮组已抽取到 shared/checkin/（P19-B2④）；
+// 结果文案表迁移至 shared/checkin/OutcomeLabels.ts（per-product 映射）。
 
 /** 行内元信息：模型额度（含时间标注）+ 最近验证。
  * 注：签到活动 credits 为静态池值（实证恒 200），不展示。 */
@@ -654,25 +495,7 @@ function autoLedgerLabel(status: AutoCheckinStatusDto): string {
   return ledger.running ? `今日执行中（${parts.join("，")}）` : `今日已完成（${parts.join("，")}）`;
 }
 
-// —— 以下工具函数与账号页共用同一口径；签到结果文案保持 ADR-0019 业务码透出规则。 ——
-function checkinOutcomeLabel(outcome: string, detailCode: string | null = null): string {
-  switch (detailCode) {
-    case "account_not_logged_in": return "未登录，请先添加账号";
-    case "recovery_required": return "存在中断的续期现场，需先恢复再签到";
-    case "credential_missing": return "登录材料缺失，请重新登录";
-    case "credential_unavailable": return "登录存储不可用，请重新登录";
-    case "credential_invalid": return "登录材料无效，请重新登录";
-    case "device_too_new": return "设备刚创建，请等待约 5 分钟后重试";
-    case "business_9074": return "设备信息未获服务端信任（9074），可在账号详情重置签到设备";
-    case "business_9095": return "该设备今日名额已用（9095），明日再试";
-    case "remint_failed": return "重置设备失败，请在账号详情手动重试";
-    case "business_20324": return "登录已失效（20324），请重新登录";
-    default: break;
-  }
-  // 未知业务码原样透出数值，保证排障不丢信息（ADR-0019：业务码不得压平）。
-  if (detailCode && detailCode.startsWith("business_")) return `服务端拒绝（${detailCode.slice("business_".length)}）`;
-  switch (outcome) { case "claimed": return "签到成功"; case "already_checked_in": return "今日已签到"; case "not_eligible": return "当前不可领取"; case "verification_failed": return "结果待复核"; case "auth_mismatch": return "授权不匹配"; case "credential_refresh_failed": return "登录续期失败，请重新登录"; case "network_error": return "网络错误"; case "profile_busy": return "账号忙"; default: return "签到失败"; }
-}
+// —— TRAE 业务码透出表已迁移至 shared/checkin/OutcomeLabels.ts（P19-B2④）。 ——
 function formatShortDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "时间不可用";
