@@ -437,7 +437,8 @@ describe("应用工作区入口", () => {
       total_credits: 700,
     }));
     // P19-B5 签到页逐账号行：per-account 状态查询（池空则不发）。
-    mockRoute("workbuddy_checkin_status_for", () => ({
+    // 联调期 cast：命令契约已冻结、后端落地中（be-engineer B5），入册后摘除。
+    mockRoute("workbuddy_checkin_status_for" as Parameters<typeof mockRoute>[0], () => ({
       today_checked_in: false,
       streak_days: 6,
       daily_credit: 100,

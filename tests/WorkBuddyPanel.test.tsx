@@ -70,13 +70,15 @@ function installWorkbuddyRoutes(options?: {
   mockRoute("get_workbuddy_session_health", () => health);
   mockRoute("list_workbuddy_accounts", () => options?.pool ?? defaultPool);
   mockRoute("workbuddy_checkin_status", () => checkinStatus);
-  mockRoute("workbuddy_checkin_status_for", (args: { profileId: string }) => {
+  // 联调期（P19-B5）：per-account 命令契约已冻结、后端落地中（be-engineer B5），
+  // CommandName 联合暂未包含——显式 cast，命令入册后摘除。
+  mockRoute("workbuddy_checkin_status_for" as Parameters<typeof mockRoute>[0], (args: { profileId: string }) => {
     const table = options?.statusFor;
     const status = table ? table[args.profileId] : { ...checkinStatus, checkin_dates: ["2026-10-20", "2026-10-19"] };
     if (status === null || status === undefined) return Promise.reject(new Error("row_unavailable"));
     return status;
   });
-  mockRoute("workbuddy_checkin_claim_for", () => ({ credit: 10, streak_days: 7, verified: true }));
+  mockRoute("workbuddy_checkin_claim_for" as Parameters<typeof mockRoute>[0], () => ({ credit: 10, streak_days: 7, verified: true }));
   mockRoute("get_workbuddy_auto_checkin_status", () =>
     autoStatus(options?.accounts ?? [
       { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
