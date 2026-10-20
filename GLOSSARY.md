@@ -57,3 +57,6 @@
 | 主库/副库 | 原生库 vs 副环境实例 | 单库，多实例实验后再定 | 存在几个库？如何区分原生与创建？ |
 | 收编/过户 | incorporate_master_records | transfer sessions.user_id（P18-B1） | 客户端游离记录如何纳入管理？归属字段是什么？ |
 | 归并 | merge_master_projects（主库内项目合并） | cwd 项目归并（sessions 批量 UPDATE + 目录迁移） | 项目维度是什么？如何合并？ |
+| 插件域 | preview_master_switch_plugins（插件账号绑定，切号同步） | 三层：账号级 pluginEnabled 开关 + 本地运行时插件（与账号零关联）+ 云端 Agent 插件（服务端按账号隔离）——切号同步无需求（B7 探查） | 插件装在哪？按账号绑定还是全局？切号后存续行为？ |
+| 设备管理 | list_remote_devices/clear_remote_device | 无管理面（absent，B7 探查）——设备维度=风控（Turing SDK 设备 token） | 有无设备列表端点？设备与账号什么关系？ |
+| 签到明细 | 概览含逐日流水 | checkin_dates 日期数组即天花板，明细端点不存在（absent，B7 探查） | 签到接口返回哪些字段？有无逐日明细？ |
