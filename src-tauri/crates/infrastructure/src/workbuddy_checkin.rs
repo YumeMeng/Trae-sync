@@ -251,6 +251,75 @@ pub fn checkin_status(
     Ok(classify(status, &body))
 }
 
+// ===== P19.2③ 积分余额对齐（billing 资源域——客户端「积分余额」真实口径） =====
+
+/// 资源汇总端点路径（**无 `/v2` 前缀**——resourcePrefix 基类为空串 +
+/// daemon 日志 62 次实测双确认；credit-source-findings §2.2。活动域签到
+/// 两接口才有 /v2，资源/成长域没有）。
+pub const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
+
+/// 账户资源包余额（Σ 汇总语义，对齐客户端 DesktopAccountRepo.billing →
+/// sumSummaryCapacity：余额 = Σ CycleRemainCapacity、总额 = Σ
+/// CycleTotalCapacity）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkBuddyResourceBalance {
+    /// 积分余额（随对话消耗减少、随周期/活动包发放增加——会话消耗扣减）。
+    pub credits_balance: u64,
+    /// 账户资源包总额。
+    pub credits_total: u64,
+}
+
+/// 资源汇总解析（纯函数，离线单测口径）：`sumSummaryCapacity` 同语义——
+/// 仅累加有限且 >0 的项；`CapacityType=4` 切片资源回退 SlicePeriod 精确
+/// 字段（Remain/Size）而非 Cycle* 常规字段。
+pub fn parse_resource_balance(data: &serde_json::Value) -> WorkBuddyResourceBalance {
+    let positive = |value: Option<serde_json::Value>| -> u64 {
+        value
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| value as u64)
+            .unwrap_or(0)
+    };
+    let mut balance = WorkBuddyResourceBalance::default();
+    let Some(packages) = data.get("Packages").and_then(|packages| packages.as_array()) else {
+        return balance;
+    };
+    for package in packages {
+        let sliced = package.get("CapacityType").and_then(|t| t.as_i64()) == Some(4);
+        let (remain_key, total_key) = if sliced {
+            (
+                "SlicePeriodCapacityRemainPrecise",
+                "SlicePeriodCapacitySizePrecise",
+            )
+        } else {
+            ("CycleRemainCapacity", "CycleTotalCapacity")
+        };
+        balance.credits_balance += positive(package.get(remain_key).cloned());
+        balance.credits_total += positive(package.get(total_key).cloned());
+    }
+    balance
+}
+
+/// 查询账户资源包余额（billing 域真实口径；headers 同签到族
+/// Authorization/X-User-Id——daemon buildHeaders 同族，**无
+/// X-Device-Token 要求**，credit-source-findings §3.1）。
+/// 401/403 归 [`WorkBuddyCheckinError::RequestFailed`]（调用方 fail-soft）。
+pub fn query_resource_summary_balance(
+    http: &reqwest::blocking::Client,
+    credentials: &WorkBuddyCheckinCredentials,
+) -> Result<WorkBuddyResourceBalance, WorkBuddyCheckinError> {
+    let (status, body) = post_json(http, credentials, RESOURCE_SUMMARY_PATH)?;
+    if !(200..300).contains(&status) {
+        return Err(WorkBuddyCheckinError::RequestFailed);
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| WorkBuddyCheckinError::RequestFailed)?;
+    if envelope.get("code").and_then(|code| code.as_i64()) != Some(0) {
+        return Err(WorkBuddyCheckinError::RequestFailed);
+    }
+    Ok(parse_resource_balance(&envelope.get("data").cloned().unwrap_or_default()))
+}
+
 /// 领取每日签到（幂等；当日重复领取返回 AlreadyCheckedIn）。
 pub fn checkin_claim(
     http: &reqwest::blocking::Client,
@@ -281,6 +350,11 @@ impl WorkBuddyCheckinSession {
     /// 领取每日签到（幂等）。
     pub fn claim(&self) -> Result<WorkBuddyCheckinOutcome, WorkBuddyCheckinError> {
         checkin_claim(&self.http, &self.credentials)
+    }
+
+    /// 查询账户资源包余额（P19.2③「积分余额」真实口径；调用方 fail-soft）。
+    pub fn resource_balance(&self) -> Result<WorkBuddyResourceBalance, WorkBuddyCheckinError> {
+        query_resource_summary_balance(&self.http, &self.credentials)
     }
 }
 
@@ -1115,6 +1189,71 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "workbuddy_session_file_missing"
+        );
+    }
+
+    // ===== P19.2③ 积分余额对齐（billing 资源域）单测 =====
+
+    /// 多包汇总：常规包 Σ Cycle* 字段（sumSummaryCapacity 同口径）。
+    #[test]
+    fn resource_balance_sums_packages() {
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"Packages":[
+                {"PackageCode":"free","CapacityType":0,"CycleTotalCapacity":2000,"CycleRemainCapacity":1500,"CycleUsedCapacity":500},
+                {"PackageCode":"activity","CapacityType":0,"CycleTotalCapacity":300,"CycleRemainCapacity":100,"CycleUsedCapacity":200}
+            ]}"#,
+        )
+        .unwrap();
+        let balance = parse_resource_balance(&data);
+        assert_eq!(balance.credits_balance, 1600, "余额 = Σ CycleRemainCapacity");
+        assert_eq!(balance.credits_total, 2300, "总额 = Σ CycleTotalCapacity");
+    }
+
+    /// CapacityType=4 切片资源：回退 SlicePeriod 精确字段（不走 Cycle*）。
+    #[test]
+    fn resource_balance_slice_capacity_fallback() {
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"Packages":[
+                {"PackageCode":"free","CycleTotalCapacity":2000,"CycleRemainCapacity":1500},
+                {"PackageCode":"sliced","CapacityType":4,"CycleTotalCapacity":9999,"CycleRemainCapacity":8888,
+                 "SlicePeriodCapacitySizePrecise":500,"SlicePeriodCapacityRemainPrecise":120}
+            ]}"#,
+        )
+        .unwrap();
+        let balance = parse_resource_balance(&data);
+        assert_eq!(balance.credits_balance, 1500 + 120);
+        assert_eq!(balance.credits_total, 2000 + 500);
+    }
+
+    /// 空包/缺字段/非正值（sumSummaryCapacity 仅累加有限且 >0 的项）。
+    #[test]
+    fn resource_balance_empty_and_non_positive_are_zero() {
+        assert_eq!(parse_resource_balance(&serde_json::json!({})), WorkBuddyResourceBalance::default(), "缺 Packages");
+        assert_eq!(
+            parse_resource_balance(&serde_json::json!({"Packages": []})),
+            WorkBuddyResourceBalance::default(),
+            "空包列表"
+        );
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"Packages":[
+                {"PackageCode":"x","CycleTotalCapacity":-5,"CycleRemainCapacity":0},
+                {"PackageCode":"y","CycleTotalCapacity":100,"CycleRemainCapacity":30}
+            ]}"#,
+        )
+        .unwrap();
+        let balance = parse_resource_balance(&data);
+        assert_eq!(balance.credits_balance, 30, "0/负值不累加");
+        assert_eq!(balance.credits_total, 100);
+    }
+
+    /// 端点断言：资源汇总路径**无 /v2 前缀**（daemon 日志 62 次实测口径），
+    /// 全 URL = https://{domain}/billing/meter/get-user-resource-summary。
+    #[test]
+    fn resource_summary_path_has_no_v2_prefix() {
+        assert!(!RESOURCE_SUMMARY_PATH.starts_with("/v2"));
+        assert_eq!(
+            format!("https://www.workbuddy.cn{RESOURCE_SUMMARY_PATH}"),
+            "https://www.workbuddy.cn/billing/meter/get-user-resource-summary"
         );
     }
 }
