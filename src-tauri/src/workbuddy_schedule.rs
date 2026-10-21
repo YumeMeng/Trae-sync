@@ -356,6 +356,10 @@ pub(crate) struct WorkBuddyCheckinAccountStatusDto {
     pub credits_balance: Option<u64>,
     /// 账户资源包总额（billing 资源域 Σ CycleTotalCapacity）。
     pub credits_total: Option<u64>,
+    /// P19.2⑤ 余额查询失败原因（稳定错误码，含 401 兜底重试后仍失败的
+    /// 终态码；None = 余额成功或整行失败〔整行失败看 error〕）。
+    /// 前端「--」处展示该原因（title/副文案）。
+    pub balance_error: Option<String>,
     /// 已签日期列表（YYYY-MM-DD；签到日历数据源，矩阵 #57）。
     pub checkin_dates: Vec<String>,
     /// P19.2② 脱敏手机号（服务端预脱敏形态如 `133****1304`，直显；
@@ -365,42 +369,41 @@ pub(crate) struct WorkBuddyCheckinAccountStatusDto {
     pub error: Option<String>,
 }
 
+/// 单账号查询产物（status + 余额诊断；overview 编排内核的 status_fn 回执）。
+#[derive(Debug, Clone)]
+pub(crate) struct WorkBuddyProfileStatusSnapshot {
+    pub today_checked_in: bool,
+    pub streak_days: u32,
+    pub daily_credit: u32,
+    pub total_credits: u32,
+    pub checkin_dates: Vec<String>,
+    pub balance: Option<traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance>,
+    pub balance_error: Option<String>,
+}
+
 /// 单账号 status 查询（生产闭包：先续期该账号〔断连兜底〕再 status；
-/// status 成功后顺带查资源包余额〔best-effort fail-soft：余额失败只落
-/// None，不失败整行〕）。P19.1 401 兜底：AuthMismatch 时强制刷新换新对
-/// 后重试一次。
-/// 返回 (today_checked_in, streak, daily, 本期签到累计, dates, 余额)。
+/// status 成功后顺带查资源包余额）。P19.1 401 兜底：status AuthMismatch
+/// 时强制刷新换新对后重试一次。P19.2⑤：余额失败不再静默——按
+/// [`WorkBuddyBalanceError`] 分类落 balance_error；余额 401 时复用强制
+/// 刷新原语换新对重试一次（与签到链同口径），重试仍失败落终态错误码。
 pub(crate) fn query_profile_status(
     login_root: &Path,
     profile_id: &str,
-) -> Result<
-    (
-        bool,
-        u32,
-        u32,
-        u32,
-        Vec<String>,
-        Option<traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance>,
-    ),
-    String,
-> {
-    use traesync_infrastructure::workbuddy_checkin::WorkBuddyCheckinSession;
+) -> Result<WorkBuddyProfileStatusSnapshot, String> {
+    use traesync_infrastructure::workbuddy_checkin::{
+        WorkBuddyBalanceError, WorkBuddyCheckinSession,
+    };
     let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
     let read_status =
-        |session: &WorkBuddyCheckinSession| {
+        |session: &WorkBuddyCheckinSession| -> Result<(bool, u32, u32, u32, Vec<String>), String> {
             match session.status() {
-                Ok(WorkBuddyCheckinOutcome::Status(status)) => {
-                    // P19.2③ 余额对齐（best-effort：查询失败不失败整行）。
-                    let balance = session.resource_balance().ok();
-                    Ok((
-                        status.today_checked_in,
-                        status.streak_days,
-                        status.daily_credit,
-                        status.total_credits,
-                        status.checkin_dates,
-                        balance,
-                    ))
-                }
+                Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok((
+                    status.today_checked_in,
+                    status.streak_days,
+                    status.daily_credit,
+                    status.total_credits,
+                    status.checkin_dates,
+                )),
                 Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
                     Err("workbuddy_checkin_auth_mismatch".to_string())
                 }
@@ -408,63 +411,70 @@ pub(crate) fn query_profile_status(
                 Err(error) => Err(error.code().to_string()),
             }
         };
-    let (session, _renewal) = open_session_for_profile(login_root, profile_id, now)
+    let (mut session, _renewal) = open_session_for_profile(login_root, profile_id, now)
         .map_err(|error| map_pool_error(&error))?;
-    match read_status(&session) {
-        Err(code) if code == "workbuddy_checkin_auth_mismatch" => {
-            // P19.1：强制刷新（忽略阈值）换新对后重试一次。
-            let (session, _renewal) =
-                open_session_for_profile_forced(login_root, profile_id, now)
-                    .map_err(|error| map_pool_error(&error))?;
-            read_status(&session)
+    let (today_checked_in, streak_days, daily_credit, total_credits, checkin_dates) =
+        match read_status(&session) {
+            Ok(value) => value,
+            Err(code) if code == "workbuddy_checkin_auth_mismatch" => {
+                // P19.1：强制刷新（忽略阈值）换新对后重试一次。
+                let (refreshed, _renewal) =
+                    open_session_for_profile_forced(login_root, profile_id, now)
+                        .map_err(|error| map_pool_error(&error))?;
+                session = refreshed;
+                read_status(&session)?
+            }
+            Err(code) => return Err(code),
+        };
+    // P19.2⑤ 余额（诊断透出；401 → 强制刷新换新对重试一次）。
+    let (balance, balance_error) = match session.resource_balance() {
+        Ok(balance) => (Some(balance), None),
+        Err(WorkBuddyBalanceError::AuthMismatch) => {
+            // 强制刷新换新对后重试一次（与签到链同口径）。
+            match open_session_for_profile_forced(login_root, profile_id, now) {
+                Ok((session, _renewal)) => match session.resource_balance() {
+                    Ok(balance) => (Some(balance), None),
+                    Err(error) => (None, Some(error.code())),
+                },
+                Err(error) => (None, Some(map_pool_error(&error))),
+            }
         }
-        other => other,
-    }
+        Err(error) => (None, Some(error.code())),
+    };
+    Ok(WorkBuddyProfileStatusSnapshot {
+        today_checked_in,
+        streak_days,
+        daily_credit,
+        total_credits,
+        checkin_dates,
+        balance,
+        balance_error,
+    })
 }
 
 /// 聚合编排内核（注入 status 闭包，离线单测 fail-soft 语义）：
 /// 逐账号查询，单账号任何失败只落到该账号的 error 字段。
 fn workbuddy_checkin_overview_inner(
     targets: Vec<(String, String)>,
-    status_fn: &dyn Fn(
-        &str,
-    ) -> Result<
-        (
-            bool,
-            u32,
-            u32,
-            u32,
-            Vec<String>,
-            Option<traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance>,
-        ),
-        String,
-    >,
+    status_fn: &dyn Fn(&str) -> Result<WorkBuddyProfileStatusSnapshot, String>,
 ) -> Vec<WorkBuddyCheckinAccountStatusDto> {
     targets
         .into_iter()
         .map(|(profile_id, screen_name)| match status_fn(&profile_id) {
-            Ok((
-                today_checked_in,
-                streak_days,
-                daily_credit,
-                total_credits,
-                checkin_dates,
-                balance,
-            )) => {
-                WorkBuddyCheckinAccountStatusDto {
-                    profile_id,
-                    screen_name,
-                    today_checked_in: Some(today_checked_in),
-                    streak_days: Some(streak_days),
-                    daily_credit: Some(daily_credit),
-                    total_credits: Some(total_credits),
-                    credits_balance: balance.map(|value| value.credits_balance),
-                    credits_total: balance.map(|value| value.credits_total),
-                    checkin_dates,
-                    masked_phone: None,
-                    error: None,
-                }
-            }
+            Ok(snapshot) => WorkBuddyCheckinAccountStatusDto {
+                profile_id,
+                screen_name,
+                today_checked_in: Some(snapshot.today_checked_in),
+                streak_days: Some(snapshot.streak_days),
+                daily_credit: Some(snapshot.daily_credit),
+                total_credits: Some(snapshot.total_credits),
+                credits_balance: snapshot.balance.map(|value| value.credits_balance),
+                credits_total: snapshot.balance.map(|value| value.credits_total),
+                balance_error: snapshot.balance_error,
+                checkin_dates: snapshot.checkin_dates,
+                masked_phone: None,
+                error: None,
+            },
             Err(code) => WorkBuddyCheckinAccountStatusDto {
                 profile_id,
                 screen_name,
@@ -474,6 +484,7 @@ fn workbuddy_checkin_overview_inner(
                 total_credits: None,
                 credits_balance: None,
                 credits_total: None,
+                balance_error: None,
                 checkin_dates: Vec::new(),
                 masked_phone: None,
                 error: Some(code),
@@ -599,7 +610,7 @@ pub(crate) async fn workbuddy_checkin_claim_profile(
 /// 领取后的连签天数（best-effort 回读：status 失败按 0，不阻塞回执）。
 fn claim_streak_after(login_root: &Path, profile_id: &str) -> u32 {
     query_profile_status(login_root, profile_id)
-        .map(|(_, streak, _, _, _, _)| streak)
+        .map(|snapshot| snapshot.streak_days)
         .unwrap_or(0)
 }
 
@@ -1288,7 +1299,7 @@ mod workbuddy_b5_tests {
 
     /// overview 编排内核 fail-soft：账号一成功、账号二失败——失败只落
     /// 本条 error 字段，不阻塞他账号。余额字段随 status 成功透传
-    /// （P19.2③：credits_balance/credits_total）。
+    /// （P19.2③/P19.2⑤：credits_balance/credits_total + balance_error）。
     #[test]
     fn overview_is_fail_soft_per_account() {
         let targets = vec![
@@ -1299,23 +1310,18 @@ mod workbuddy_b5_tests {
             credits_balance: 1600,
             credits_total: 2300,
         });
-        let results: std::collections::HashMap<
-            String,
-            Result<
-                (
-                    bool,
-                    u32,
-                    u32,
-                    u32,
-                    Vec<String>,
-                    Option<traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance>,
-                ),
-                String,
-            >,
-        > = [
+        let results: std::collections::HashMap<String, Result<WorkBuddyProfileStatusSnapshot, String>> = [
             (
                 "wb-uid-1",
-                Ok((true, 6, 100, 600, vec!["2026-10-20".to_string()], balance)),
+                Ok(WorkBuddyProfileStatusSnapshot {
+                    today_checked_in: true,
+                    streak_days: 6,
+                    daily_credit: 100,
+                    total_credits: 600,
+                    checkin_dates: vec!["2026-10-20".to_string()],
+                    balance,
+                    balance_error: None,
+                }),
             ),
             (
                 "wb-uid-2",
@@ -1330,6 +1336,7 @@ mod workbuddy_b5_tests {
         assert_eq!(overview.len(), 2, "失败账号不缩短批查结果");
         let first = &overview[0];
         assert!(first.error.is_none());
+        assert!(first.balance_error.is_none());
         assert_eq!(first.today_checked_in, Some(true));
         assert_eq!(first.total_credits, Some(600), "本期签到累计（活动域）");
         assert_eq!(first.credits_balance, Some(1600), "余额（资源域）");
@@ -1342,7 +1349,41 @@ mod workbuddy_b5_tests {
         );
         assert_eq!(second.today_checked_in, None, "失败账号状态字段为 None");
         assert_eq!(second.credits_balance, None);
+        assert_eq!(second.balance_error, None, "整行失败时诊断归 error");
         assert!(second.checkin_dates.is_empty());
+    }
+
+    /// P19.2⑤ 余额失败不失败整行：balance_error 落因、credits_balance
+    /// 为 None、status 字段照常。
+    #[test]
+    fn overview_carries_balance_error_without_failing_row() {
+        let targets = vec![("wb-uid-1".to_string(), "账号一".to_string())];
+        let results: std::collections::HashMap<String, Result<WorkBuddyProfileStatusSnapshot, String>> = [(
+            "wb-uid-1",
+            Ok(WorkBuddyProfileStatusSnapshot {
+                today_checked_in: false,
+                streak_days: 0,
+                daily_credit: 100,
+                total_credits: 500,
+                checkin_dates: Vec::new(),
+                balance: None,
+                balance_error: Some("workbuddy_balance_unreachable".to_string()),
+            }),
+        )]
+        .into_iter()
+        .map(|(id, outcome)| (id.to_string(), outcome))
+        .collect();
+        let status_fn = |pid: &str| results[pid].clone();
+        let overview = workbuddy_checkin_overview_inner(targets, &status_fn);
+        let first = &overview[0];
+        assert!(first.error.is_none(), "status 成功 → 整行不失败");
+        assert_eq!(first.today_checked_in, Some(false));
+        assert_eq!(first.credits_balance, None);
+        assert_eq!(
+            first.balance_error.as_deref(),
+            Some("workbuddy_balance_unreachable"),
+            "余额失败原因透出（前端 -- 处展示）"
+        );
     }
 
     /// claim 单账号命令编排：池内缺失账号 → 稳定错误码（复用调度口径）。
