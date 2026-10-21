@@ -114,6 +114,27 @@ function installWorkbuddyRoutes(options?: {
     ]));
   mockRoute("set_workbuddy_account_auto_checkin", () => undefined);
   mockRoute("set_workbuddy_auto_checkin_settings", () => undefined);
+  mockRoute("preview_workbuddy_switch", () => ({
+    current_label: "甲账号",
+    target_label: "乙账号",
+    pending_local_rows: 12,
+    pending_project_count: 3,
+    current_account_rows: 40,
+    cloud_residual_rows: 0,
+  }));
+  mockRoute("switch_workbuddy_account", () => ({
+    switched: true,
+    target_label: "乙账号",
+    previous_label: "甲账号",
+    transfer_executed: true,
+    updated_rows: 12,
+    verified_sessions: 12,
+    missing_body_files: 0,
+    cloud_residual_rows: 0,
+    transfer_error: null,
+    restarted: true,
+    post_status: "active",
+  }));
   mockRoute("begin_workbuddy_login", () => ({ auth_url: "https://auth.example/xyz", attempt_id: 7 }));
   mockRoute("complete_workbuddy_login", () => ({
     profile_id: "wb-uid-9", account_id: "uid-9", screen_name: "新账号", acceptance: "passed",
@@ -478,5 +499,97 @@ describe("WorkBuddyPanel 添加账号（P19-B4 登录编排消费）", () => {
         expect.stringContaining("已有登录正在进行"),
       );
     });
+  });
+});
+
+describe("WorkBuddyPanel 切号两段式（P19.1② preview + confirmed switch 契约消费）", () => {
+  beforeEach(() => {
+    resetRoutes();
+    installFakeInvoke();
+    window.localStorage.clear();
+    installWorkbuddyRoutes();
+  });
+
+  it("选账号 → preview 影响面弹窗（待过户数在册）→ 确认后 switch(targetAccountId, confirmed=true)", async () => {
+    render(<WorkBuddyPanel active={true} />);
+
+    // 选账号动作先调 preview（只读零副作用），弹窗带影响面数字。
+    fireEvent.click(await screen.findByTestId("workbuddy-switch-wb-uid-2"));
+    const dialog = await screen.findByTestId("workbuddy-switch-dialog");
+    expect(dialog.textContent).toContain("「甲账号」");
+    expect(dialog.textContent).toContain("「乙账号」");
+    expect(dialog.textContent).toContain("12 条本地会话（3 个项目）");
+    // preview 以 account_id 调用（be 契约：targetAccountId = 池行 account_id）。
+    expect(mockCoreInvoke.mock.calls).toContainEqual(
+      ["preview_workbuddy_switch", { targetAccountId: "uid-2" }],
+    );
+
+    fireEvent.click(screen.getByTestId("workbuddy-switch-dialog-confirm"));
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["switch_workbuddy_account", { targetAccountId: "uid-2", confirmed: true }],
+      );
+    });
+    await waitFor(() => {
+      expect(vi.mocked(notify.success)).toHaveBeenCalledWith(
+        expect.stringContaining("已切换登录到「乙账号」"),
+        undefined,
+      );
+    });
+    expect(vi.mocked(notify.success)).toHaveBeenCalledWith(
+      expect.stringContaining("12 条本地会话已随行"),
+      undefined,
+    );
+  });
+
+  it("部分成功：switched=true 且 transfer_error 非空 → 成功通知 + 过户失败警告（切号不回滚）", async () => {
+    mockRoute("switch_workbuddy_account", () => ({
+      switched: true,
+      target_label: "乙账号",
+      previous_label: "甲账号",
+      transfer_executed: null,
+      updated_rows: null,
+      verified_sessions: null,
+      missing_body_files: null,
+      cloud_residual_rows: 2,
+      transfer_error: "workbuddy_transfer_db_locked",
+      restarted: true,
+      post_status: "active",
+    }));
+    render(<WorkBuddyPanel active={true} />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-switch-wb-uid-2"));
+    await screen.findByTestId("workbuddy-switch-dialog");
+    fireEvent.click(screen.getByTestId("workbuddy-switch-dialog-confirm"));
+    await waitFor(() => {
+      expect(vi.mocked(notify.success)).toHaveBeenCalledWith(
+        expect.stringContaining("已切换登录到「乙账号」"),
+        undefined,
+      );
+    });
+    expect(vi.mocked(notify.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("历史会话过户失败"),
+      expect.stringContaining("切号本身不受影响"),
+    );
+    // cloud 红线：>0 时成功通知明示不随行。
+    expect(vi.mocked(notify.success)).toHaveBeenCalledWith(
+      expect.stringContaining("2 条云端会话不随行"),
+      undefined,
+    );
+  });
+
+  it("preview 失败不开弹窗：如实报错（客户端登录面不可读时 switch 也必然失败）", async () => {
+    mockRoute("preview_workbuddy_switch", () => Promise.reject("workbuddy_data_root_unavailable"));
+    render(<WorkBuddyPanel active={true} />);
+
+    fireEvent.click(await screen.findByTestId("workbuddy-switch-wb-uid-2"));
+    await waitFor(() => {
+      expect(vi.mocked(notify.error)).toHaveBeenCalledWith(
+        expect.stringContaining("切号预览未完成"),
+      );
+    });
+    expect(screen.queryByTestId("workbuddy-switch-dialog")).not.toBeInTheDocument();
+    // 未发起 switch（confirmed 入口未触达）。
+    expect(mockCoreInvoke.mock.calls.some(([cmd]) => cmd === "switch_workbuddy_account")).toBe(false);
   });
 });

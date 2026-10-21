@@ -7,6 +7,7 @@ import type {
   WorkBuddyCheckinParticipationDto,
   WorkBuddyLoginSummaryDto,
   WorkBuddyDeepHealthDto,
+  WorkBuddySwitchPreviewDto,
 } from "../types/product";
 import {
   beginWorkBuddyLogin,
@@ -21,6 +22,7 @@ import {
   listWorkBuddyAccounts,
   listWorkBuddyCheckinAccounts,
   loadWorkBuddySessionHealth,
+  previewWorkBuddySwitch,
   refreshWorkBuddyAccount,
   switchWorkBuddyAccount,
   type WorkBuddyAutoCheckinStatusDto,
@@ -230,14 +232,66 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     }
   }, [refresh]);
 
-  // P17-T6/A4 切号执行：单次确认 → switch 命令（切号成功即自动过户，无感切换）→ 刷新。
+  // P19.1② 切号两段式（be 契约 c3b517d）：选账号 → preview（影响面只读预览）
+  // → 弹窗确认 → switch(confirmed=true)（写凭据 + 自动过户 + 冷启动）→ 回执。
+  const [switchPreview, setSwitchPreview] = useState<WorkBuddySwitchPreviewDto | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+
+  const handleSwitchIntent = useCallback((account: WorkBuddyLoginSummaryDto) => {
+    if (previewBusy || switching) return;
+    setSwitchTarget(account.profile_id);
+    setSwitchPreview(null);
+    setPreviewBusy(true);
+    void previewWorkBuddySwitch(account.account_id)
+      .then((preview) => setSwitchPreview(preview))
+      .catch((reason: unknown) => {
+        // 预览失败不开弹窗：多为客户端登录面不可读（.info 缺失），switch 也会失败，
+        // 如实报错比降级弹窗诚实。
+        setSwitchTarget(null);
+        notify.error(
+          `WorkBuddy：切号预览未完成——${safeUiErrorMessage(reason, "请确认客户端已登录后重试。")}`,
+        );
+      })
+      .finally(() => setPreviewBusy(false));
+  }, [previewBusy, switching]);
+
+  // 切号执行：单次确认后 switch(confirmed=true)；switched=true 即成功，
+  // 过户结果看 transfer_* 三组字段（过户失败不回滚切号，部分成功要明示）。
   const runSwitch = useCallback(async () => {
-    if (!switchTarget) return;
+    if (!switchTarget || switching) return;
+    const account = pool.find((item) => item.profile_id === switchTarget);
+    if (!account) return;
     setSwitching(true);
     try {
-      const saved = await switchWorkBuddyAccount(switchTarget);
-      notify.success(`WorkBuddy：已切换登录到「${saved.screen_name || "所选账号"}」`);
+      const receipt = await switchWorkBuddyAccount(account.account_id, true);
+      if (!receipt.switched) {
+        // 防御分支：后端约定失败走 Err，switched=false 仍如实报错不伪装成功。
+        throw new Error("workbuddy_switch_verify_failed");
+      }
+      const transferText = receipt.transfer_executed === true
+        ? `历史会话过户完成（${receipt.updated_rows ?? 0} 条本地会话已随行）`
+        : "无待过户会话";
+      const cloudText = (receipt.cloud_residual_rows ?? 0) > 0
+        ? `；原账号 ${receipt.cloud_residual_rows} 条云端会话不随行（不碰云端数据）`
+        : "";
+      const missing = receipt.missing_body_files ?? 0;
+      notify.success(
+        `WorkBuddy：已切换登录到「${receipt.target_label}」，${transferText}${cloudText}。`,
+        missing > 0 ? `其中 ${missing} 条会话正文文件缺失，可到库页复核。` : undefined,
+      );
+      if (receipt.transfer_error) {
+        notify.warning(
+          `切号成功，但历史会话过户失败（${receipt.transfer_error}）。`,
+          "会话归属可稍后重试过户兜底恢复，切号本身不受影响。",
+        );
+      }
+      if (receipt.post_status && receipt.post_status !== "active") {
+        notify.info(
+          `客户端冷启动后登录态为 ${receipt.post_status}；如客户端提示重新登录，属切号预期行为。`,
+        );
+      }
       setSwitchTarget(null);
+      setSwitchPreview(null);
       await refresh(false);
     } catch (reason: unknown) {
       notify.error(
@@ -246,7 +300,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     } finally {
       setSwitching(false);
     }
-  }, [refresh, switchTarget]);
+  }, [refresh, switchTarget, switching]);
 
   // P19-B4 添加账号：begin（自动拉起浏览器）→ complete（阻塞等待授权）→
   // 成功入池刷新。acceptance 语义与 TRAE 一致：failed 不回滚、如实警告、
@@ -306,11 +360,6 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       setRenewing(false);
     }
   }, [refresh]);
-
-  // P17-T6/A4 切号：wbipc RPC 编排在后端（logout → saveOauthToken →
-  // 回读校验）。P18-B1 认知修正：会话 = 本地 SQLite 索引（按账号隔离）+
-  // 本地 jsonl 正文（全局共享）；切号只换登录态，历史会话不可见需用
-
 
   // P19-B2⑤：账号页编排（门控/页头/健康卡位/控件行/池行/空态）由
   // AccountPageSkeleton 承担（ADR-0036 铁律），本组件退化为 WB 数据与插槽提供方。
@@ -374,10 +423,10 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
         cardMeta={expiryMeta}
         listMetric={creditsMetric}
         cardMetric={cardCredits}
-        actionBusy={switching}
+        actionBusy={switching || previewBusy}
         onOpen={ops.onOpen}
-        onAction={() => setSwitchTarget(account.profile_id)}
-        actionTitle="让 WorkBuddy 客户端切换登录到此账号（切号成功后历史会话归属自动随行，无感切换）"
+        onAction={() => handleSwitchIntent(account)}
+        actionTitle="预览切号影响面并切换客户端登录（历史会话归属自动随行，无需手动转移）"
         actionLabel="切换到此账号"
       />
     );
@@ -523,14 +572,17 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
             />
           )}
 
-          {/* P17-T6/A4 切号单次确认（覆盖性操作：改写客户端登录态）。 */}
-          {switchTarget && (
+          {/* P19.1② 切号单次确认（preview 影响面在册；覆盖性操作：改写客户端登录态）。 */}
+          {switchTarget && switchPreview && (
             <ConfirmDialog
               title="切换 WorkBuddy 登录账号"
               lines={[
-                "将让 WorkBuddy 客户端退出当前账号并登录到所选账号（写入客户端登录态）。",
-                "历史会话记录在本机并按账号隔离；切号成功后历史会话归属自动随行，无需手动转移。",
-                "需要 WorkBuddy 客户端处于运行状态；切换完成后客户端即已登录新账号。",
+                `将让 WorkBuddy 客户端退出当前账号「${switchPreview.current_label}」并登录到「${switchPreview.target_label ?? "所选账号"}」（写入客户端登录态）。`,
+                `切号成功即自动过户：${switchPreview.pending_local_rows ?? 0} 条本地会话（${switchPreview.pending_project_count ?? 0} 个项目）随行转移，无需手动操作。`,
+                ...((switchPreview.cloud_residual_rows ?? 0) > 0
+                  ? [`注意：当前账号还有 ${switchPreview.cloud_residual_rows} 条云端会话，不在转移范围（本工具不碰云端数据）。`]
+                  : []),
+                "需要 WorkBuddy 客户端处于运行状态；切换完成后客户端会自动重启读取新账号。",
               ]}
               confirmLabel="确认切换"
               busyLabel="切换中…"

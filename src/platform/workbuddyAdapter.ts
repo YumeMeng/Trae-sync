@@ -10,6 +10,7 @@ import type {
   WorkBuddyRefreshStatusDto,
   WorkBuddySessionHealthDto,
   WorkBuddySwitchDto,
+  WorkBuddySwitchPreviewDto,
   WorkBuddyTransferDto,
 } from "../types/product";
 import type {
@@ -115,13 +116,28 @@ export function refreshWorkBuddyAccount(): Promise<WorkBuddyRefreshStatusDto> {
 }
 
 /**
- * 切换 WorkBuddy 客户端登录账号（P17-T6/A4，单次确认入口：UI 弹窗确认后
- * 调用）。切号只换客户端登录态；本地会话索引按账号隔离（workbuddy.db
- * sessions.user_id），切号后如看不到历史会话，用「转移历史会话」过户
- * 恢复（P18-B1）。
+ * 切号影响面预览（P19.1②，只读零副作用）：选账号后、确认弹窗前调用。
+ * targetAccountId = 目标账号 uid（池行 account_id）；null = 仅当前账号
+ * 清单视图。统计失败降级 null，不阻塞切号入口。
+ * 错误码：workbuddy_switch_same_account（目标 = 当前账号）。
  */
-export function switchWorkBuddyAccount(profileId: string): Promise<WorkBuddySwitchDto> {
-  return invoke<WorkBuddySwitchDto>("switch_workbuddy_account", { profileId });
+export function previewWorkBuddySwitch(
+  targetAccountId: string | null,
+): Promise<WorkBuddySwitchPreviewDto> {
+  return invoke<WorkBuddySwitchPreviewDto>("preview_workbuddy_switch", { targetAccountId });
+}
+
+/**
+ * 切换 WorkBuddy 客户端登录账号（P19.1② 单次确认入口：UI 弹窗确认后
+ * confirmed=true 调用）。切号成功即自动执行历史会话过户（显式方向、含软删
+ * 行、cloud 红线不碰）并冷启动客户端；过户失败不回滚切号（回执
+ * transfer_error 如实报因，可稍后用库页兜底重试）。
+ */
+export function switchWorkBuddyAccount(
+  targetAccountId: string,
+  confirmed: boolean,
+): Promise<WorkBuddySwitchDto> {
+  return invoke<WorkBuddySwitchDto>("switch_workbuddy_account", { targetAccountId, confirmed });
 }
 
 // ===== P18-B1 会话过户 =====

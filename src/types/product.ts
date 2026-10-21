@@ -122,15 +122,50 @@ export interface WorkBuddyCheckinClaimDto {
   readonly verified: boolean;
 }
 
-/** WorkBuddy 凭据续期回执（renewed=false = access 仍充裕，未轮换）。 */
 /**
- * P17-T6/A4 WorkBuddy 切号回执（switch_workbuddy_account 返回；脱敏）。
+ * P19.1② WorkBuddy 切号回执（switch_workbuddy_account 返回；脱敏——账号
+ * 一律展示名标签，uid 不进主视野）。切号 + 自动过户编排：过户失败不回滚
+ * 切号（switched=true 且 transfer_error 非空 = 部分成功，UI 明示）。
  */
 export interface WorkBuddySwitchDto {
-  /** 切换到的账号展示名（uid 不进主视野）。 */
-  readonly screen_name: string;
-  /** 本次是否先做了池凭据续期（false = access 充裕，未轮换）。 */
-  readonly renewed: boolean;
+  /** 切号是否成功（写凭据 + 验证通过；失败时本命令整体 Err）。 */
+  readonly switched: boolean;
+  /** 切换到的账号展示名。 */
+  readonly target_label: string;
+  /** 切号前账号展示名（过户方向起点；防御同账号时 null）。 */
+  readonly previous_label: string | null;
+  /** 过户结果：true = 执行了事务过户；false = 待过户为 0；null = 过户未执行（报因看 transfer_error）。 */
+  readonly transfer_executed: boolean | null;
+  readonly updated_rows: number | null;
+  readonly verified_sessions: number | null;
+  readonly missing_body_files: number | null;
+  /** 切号前账号名下 cloud 会话数（红线：不碰；>0 UI 明示）。 */
+  readonly cloud_residual_rows: number | null;
+  /** 过户失败报因（稳定错误码；null = 成功或无需过户）。 */
+  readonly transfer_error: string | null;
+  /** 过户后是否发起了冷启动（重启客户端读新凭据与新库态）。 */
+  readonly restarted: boolean;
+  /** 冷启动后文件面登录态（active/access_expired/...；best-effort）。 */
+  readonly post_status: string | null;
+}
+
+/**
+ * P19.1② 切号影响面预览（preview_workbuddy_switch 返回；只读零副作用，
+ * 统计失败降级 null——预览不阻塞切号入口）。
+ */
+export interface WorkBuddySwitchPreviewDto {
+  /** 当前登录账号展示名（预览基准）。 */
+  readonly current_label: string;
+  /** 目标账号展示名（null = 仅账号清单，未选定目标）。 */
+  readonly target_label: string | null;
+  /** 切到目标后将被转移的本地会话数（含软删行）。 */
+  readonly pending_local_rows: number | null;
+  /** 待过户会话涉及的项目数（cwd 维度 distinct）。 */
+  readonly pending_project_count: number | null;
+  /** 目标账号现有会话数。 */
+  readonly current_account_rows: number | null;
+  /** 当前账号名下 cloud 会话数（红线：不碰；>0 UI 明示）。 */
+  readonly cloud_residual_rows: number | null;
 }
 
 export interface WorkBuddyRefreshStatusDto {
