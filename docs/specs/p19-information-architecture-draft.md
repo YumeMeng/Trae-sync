@@ -41,7 +41,7 @@
 | 过滤器行 | [必备] | 过滤维度：全部 / 已归档 / 凭据异常 / 自动签到开关态；排序：昵称/验证时间/额度 | 单选 + 排序切换 | — | `get_account_registry` | `list_workbuddy_accounts`（含 allAccounts 历史数组） |
 | 视图切换 | [必备] | 列表视图 / 卡片视图 | 双态切换，记忆用户选择 | — | 前端本地 | 前端本地（同一组件） |
 | 账号行 ×N | [必备] | 头像+昵称(display_name)+双徽章（账号源/状态）+最近验证时间+uid+凭据剩余天数+模型积分+切换按钮 | 行点击→详情；切换按钮→单次确认后切换 | "暂无账号 → 添加第一个账号"（按钮触发添加编排） | `get_managed_credential_statuses` + `get_checkin_overview`（积分列） | `list_workbuddy_accounts`（uid/nickname）；凭据剩余=.info `expiresAt`；模型积分=`workbuddy_checkin_status` total_credits |
-| 详情页 | [能力开关] | display_name 编辑 / 归档开关 / 删除（含 purge 前置预览）/ 原始字段只读区 | 编辑保存、归档即生效、删除走单次确认 | — | `set_account_display_name` / `set_account_archived` / `purge_account_records` | 移植三个命令的 WB 适配器（八域对齐方案第 4 条） |
+| 详情页 | [能力开关] | display_name 编辑 / 归档开关 / 删除（含 purge 前置预览）/ 原始字段只读区 | 编辑保存、归档即生效、删除走单次确认 | — | `set_account_display_name` / `set_account_archived` / `purge_account_records` | P19.1 详情视图实装（WorkBuddyAccountDetail：凭据健康度/积分/参与开关/技术细节）；备注名/归档/删除/手机号在 WB 命令面与 DTO 无数据源 → 诚实缺席标注，待移植三个命令 |
 | 隔离浏览器入口 | [能力开关] | — | — | — | TRAE 专用 | `absent`（WB 捕获为文件解密链路，无需隔离浏览器；探针已闭环） |
 
 ### 1.3 签到页（Check-in）

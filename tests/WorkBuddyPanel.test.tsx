@@ -151,16 +151,56 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     }
   });
 
-  it("能力开关生效：creditsColumn 只给当前客户端登录账号行积分块 + 「使用中」标记", async () => {
+  it("能力开关生效：creditsColumn 逐账号积分块（overview 数据面）+ 「使用中」标记", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyPanel active={true} />);
 
     await screen.findByTestId("workbuddy-pool-list");
-    // uid-1 = 当前客户端登录账号（健康卡 uid 同源）：积分块 + 使用中 chip。
+    // P19.1：积分摘要扩展为全部池行（get_workbuddy_checkin_overview 逐账号数据面）。
     expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("700");
+    expect(screen.getByTestId("workbuddy-credits-uid-2")).toHaveTextContent("700");
+    // 使用中 chip 仍只标当前客户端登录账号。
     expect(screen.getByTestId("workbuddy-pool-current-wb-uid-1")).toHaveTextContent("使用中");
-    expect(screen.queryByTestId("workbuddy-credits-uid-2")).not.toBeInTheDocument();
     expect(screen.queryByTestId("workbuddy-pool-current-wb-uid-2")).not.toBeInTheDocument();
+  });
+
+  it("详情实装：行点击进详情，凭据/积分/参与开关在册，无命令面区块诚实标注", async () => {
+    installWorkbuddyRoutes();
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    fireEvent.click(screen.getByTestId("workbuddy-pool-card-wb-uid-2"));
+    // 详情视图在册（registry detailView: full）：基础信息 + 凭据健康度 + 积分。
+    expect(await screen.findByTestId("workbuddy-account-detail")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-detail-status")).toHaveTextContent("正常");
+    expect(screen.getByTestId("workbuddy-detail-current")).toHaveTextContent("不是当前账号");
+    expect(screen.getByTestId("workbuddy-detail-credits")).toHaveTextContent("700");
+    expect(screen.getByTestId("workbuddy-detail-streak")).toHaveTextContent("6");
+    // 凭据到期时间轴（池 DTO 数据源）。
+    expect(screen.getByText("访问凭据（access）").nextElementSibling).toHaveTextContent("剩");
+    // 参与开关 = 后端有效参与（wb-uid-2 显式关闭 → 未勾选）。
+    expect((screen.getByTestId("workbuddy-detail-participation-toggle").querySelector("input") as HTMLInputElement).checked).toBe(false);
+    // 无命令面区块诚实缺席（备注名/归档/删除/手机号）。
+    expect(screen.getByTestId("workbuddy-detail-absent-note")).toHaveTextContent("暂未提供");
+    // 返回列表。
+    fireEvent.click(screen.getByTestId("workbuddy-account-detail-back"));
+    expect(await screen.findByTestId("workbuddy-pool-list")).toBeInTheDocument();
+  });
+
+  it("详情参与开关：翻转写 set_workbuddy_account_auto_checkin 并回读有效参与", async () => {
+    installWorkbuddyRoutes();
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    fireEvent.click(screen.getByTestId("workbuddy-pool-card-wb-uid-2"));
+    const toggle = await screen.findByTestId("workbuddy-detail-participation-toggle");
+    fireEvent.click(toggle.querySelector("input") as HTMLInputElement);
+    await waitFor(() => {
+      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
+      expect(calls).toContainEqual(["set_workbuddy_account_auto_checkin", { profileId: "wb-uid-2", enabled: true }]);
+    });
+    // 回读后开关翻转（mock 回执不变，仍断言写入调用与提示）。
+    expect(notify.success).toHaveBeenCalledWith("WorkBuddy：已加入每日自动签到。");
   });
 
   it("U-2 双视图：卡片视图切换生效并按产品分 key 记忆偏好", async () => {

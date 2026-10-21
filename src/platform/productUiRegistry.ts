@@ -62,9 +62,8 @@ const TRAE_CN_UI: ProductUiContext = {
 };
 
 /**
- * WorkBuddy（预置条目，P19-B2 消费）：账号/签到 ready（单账号卡形态）；
- * 总览/环境/主库 pending 与 productRegistry 原声明一致。
- * B1 阶段 WB 尚未消费骨架，此处先冻结能力开关声明。
+ * WorkBuddy（预置条目，P19-B2 消费）：账号/签到 ready（逐账号行形态）；
+ * 总览/环境/主库已随 P19-B6 落地。能力声明与实装状态同步维护。
  */
 const WORKBUDDY_UI: ProductUiContext = {
   productId: "workbuddy",
@@ -79,7 +78,8 @@ const WORKBUDDY_UI: ProductUiContext = {
     creditsColumn: true,
     health: "deep",
     attentionFilter: false,
-    detailView: "pool-only",
+    // P19.1 详情实装：WB 账号详情视图落地（凭据/积分/参与开关 + 诚实缺席标注）。
+    detailView: "full",
     sortCheckin: false,
   },
   sectionStates: {

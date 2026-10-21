@@ -5,7 +5,6 @@ import type {
   WorkBuddySessionHealthDto,
   WorkBuddyCheckinAccountStatusDto,
   WorkBuddyCheckinParticipationDto,
-  WorkBuddyCheckinStatusDto,
   WorkBuddyLoginSummaryDto,
   WorkBuddyDeepHealthDto,
 } from "../types/product";
@@ -19,7 +18,6 @@ import {
   completeWorkBuddyLogin,
   fetchWorkBuddyAutoCheckinStatus,
   fetchWorkBuddyCheckinOverview,
-  fetchWorkBuddyCheckinStatus,
   listWorkBuddyAccounts,
   listWorkBuddyCheckinAccounts,
   loadWorkBuddySessionHealth,
@@ -35,6 +33,7 @@ import {
 } from "./StatusBadges";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { AccountPageSkeleton } from "./shared/account/AccountPageSkeleton";
+import { WorkBuddyAccountDetail } from "./WorkBuddyAccountDetail";
 import { ACCOUNT_SORT_OPTIONS, type AccountSort } from "./shared/account/AccountListControls";
 import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "./shared/account/AccountRow";
 import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
@@ -134,8 +133,10 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  // P18-B3：积分入账号卡（签到状态 best-effort 读取，失败不阻塞健康卡）。
-  const [checkinStatus, setCheckinStatus] = useState<WorkBuddyCheckinStatusDto | null>(null);
+  // P19.1 详情实装：逐账号签到/积分数据面（overview 批查，fail-soft 落空数组）。
+  // （P18-B3 的单账号 workbuddy_checkin_status 读取已退役：账号卡行积分摘要
+  //  与详情页统一走 get_workbuddy_checkin_overview 逐账号数据面。）
+  const [checkinOverview, setCheckinOverview] = useState<readonly WorkBuddyCheckinAccountStatusDto[]>([]);
   // P18-B3：深度健康检测（文件面 + 实时面；按钮单发，结果常驻健康卡）。
   const [checkingHealth, setCheckingHealth] = useState(false);
   // 捕获：单次确认弹窗 → 执行 → 刷新健康与账号池。
@@ -174,10 +175,10 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       setHealth(nextHealth);
       setPool(nextPool);
       setLoadError(null);
-      // 积分数据 best-effort：失败只影响积分行显示（置空），不阻塞健康卡。
-      fetchWorkBuddyCheckinStatus()
-        .then((status) => setCheckinStatus(status))
-        .catch(() => setCheckinStatus(null));
+      // 逐账号积分/签到面（P19.1）：账号卡行积分摘要与详情页共用，fail-soft。
+      fetchWorkBuddyCheckinOverview()
+        .then((rows) => setCheckinOverview(rows))
+        .catch(() => setCheckinOverview([]));
     } catch (reason: unknown) {
       setLoadError(safeUiErrorMessage(reason, "WorkBuddy 登录状态暂时不可读取，请稍后重试。"));
     } finally {
@@ -324,7 +325,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     // 「使用中」= 当前客户端登录账号（健康卡的 uid 与池账号 account_id 同源）。
     isSelected: health?.uid === account.account_id,
   }));
-  const renderPoolRow = (record: SharedAccountRecord) => {
+  const renderPoolRow = (record: SharedAccountRecord, ops: { onOpen(): void }) => {
     const account = pool.find((item) => item.profile_id === record.id);
     if (!account) return null;
     const poolState = deriveWorkBuddyPoolLoginState({
@@ -332,17 +333,24 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       refresh_expires_at_unix_seconds: account.refresh_token_expires_at_unix_seconds,
       now_unix_seconds: Math.floor(Date.now() / 1000),
     });
-    // creditsColumn 能力开关（IA 草案 §1.2）：仅当前客户端登录账号有积分数据面。
-    const creditsMetric = uiProduct.capabilities.creditsColumn && record.isSelected && checkinStatus ? (
-      <div className="account-item__credits" title="WorkBuddy 当前登录账号的积分余额（签到数据面）">
-        <strong data-testid={`workbuddy-credits-${account.account_id}`}>{checkinStatus.total_credits}</strong>
+    // creditsColumn 能力开关（IA 草案 §1.2）：逐账号积分摘要（overview 数据面，
+    // P19.1 由「仅当前登录账号」扩展为全部池行）；读取失败/无数据 = 未读取。
+    const overviewRow = checkinOverview.find((row) => row.profile_id === account.profile_id) ?? null;
+    const creditsLabel = overviewRow?.error
+      ? "状态未知"
+      : overviewRow?.total_credits != null
+        ? `${overviewRow.total_credits}`
+        : "未读取";
+    const creditsMetric = uiProduct.capabilities.creditsColumn ? (
+      <div className="account-item__credits" title="WorkBuddy 账号的积分余额（签到数据面，逐账号）">
+        <strong data-testid={`workbuddy-credits-${account.account_id}`}>{creditsLabel}</strong>
         <span className="account-item__credits-label">积分余额</span>
       </div>
     ) : null;
-    const cardCredits = uiProduct.capabilities.creditsColumn && record.isSelected && checkinStatus ? (
-      <div className="account-card__credits" title="WorkBuddy 当前登录账号的积分余额（签到数据面）">
+    const cardCredits = uiProduct.capabilities.creditsColumn ? (
+      <div className="account-card__credits" title="WorkBuddy 账号的积分余额（签到数据面，逐账号）">
         <span className="account-card__credits-value" data-testid={`workbuddy-credits-${account.account_id}`}>
-          {checkinStatus.total_credits}
+          {creditsLabel}
         </span>
         <span className="account-item__credits-label">积分余额</span>
       </div>
@@ -367,6 +375,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
         listMetric={creditsMetric}
         cardMetric={cardCredits}
         actionBusy={switching}
+        onOpen={ops.onOpen}
         onAction={() => setSwitchTarget(account.profile_id)}
         actionTitle="让 WorkBuddy 客户端切换登录到此账号（切号成功后历史会话归属自动随行，无感切换）"
         actionLabel="切换到此账号"
@@ -475,12 +484,26 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       }}
       listTestId="workbuddy-pool-list"
       entries={poolEntries}
-      renderRow={(record) => renderPoolRow(record)}
+      renderRow={renderPoolRow}
       emptyState={{
         className: "workbuddy-page__empty",
         description: "还没有保存 WorkBuddy 账号。点击右上角「添加账号」通过浏览器登录，或在客户端登录后点「保存当前登录账号」。",
       }}
-      detailView={() => null}
+      // P19.1 详情实装：账号详情视图（凭据/积分/参与开关 + 诚实缺席标注）。
+      detailView={(profileId, ops) => {
+        const account = pool.find((item) => item.profile_id === profileId);
+        if (!account) return null;
+        return (
+          <WorkBuddyAccountDetail
+            account={account}
+            isCurrentLogin={health?.uid === account.account_id}
+            onDataChanged={async () => {
+              await refresh(false);
+            }}
+            onBack={ops.onBack}
+          />
+        );
+      }}
       dialogs={(
         <>
           {captureDialogOpen && (
