@@ -65,6 +65,12 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
     /credential_maintenance_state_unavailable/i,
     "凭据维护状态暂时不可读取，本次未发起自动刷新；请检查本地存储后重试。",
   ],
+  // ===== P19.2⑤ WorkBuddy 余额诊断（be dbd46a0 契约）：balance_error 稳定码 =====
+  //（必须位于下方 /auth_mismatch/ 通用通配之前，专码优先命中）
+  [
+    /workbuddy_balance_auth_mismatch/i,
+    "登录凭据已失效，请重新捕获该账号（客户端重新登录后「保存当前登录账号」或重新添加）。",
+  ],
   [
     /binding_mismatch|auth_mismatch/i,
     "账号绑定信息与本机登录凭据不一致，请重新登录该账号。",
@@ -721,6 +727,25 @@ const KNOWN_ERROR_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
   [
     /workbuddy_switch_refresh_failed|workbuddy_switch_join_failed|workbuddy_switch_io|workbuddy_switch_frame_too_large/i,
     "切号未完成，请稍后重试。",
+  ],
+  // ===== P19.2⑤ WorkBuddy 余额诊断（续）：非 auth 族余额错误码 =====
+  [
+    // 可变后缀形态：workbuddy_balance_rejected:http_{status} / api_{code}。
+    // 稳定码本身不进界面（ADR-0031），后缀业务码聚合为同一人话。
+    /^workbuddy_balance_rejected:/i,
+    "服务端拒绝了余额查询（可能为限流或风控），请稍后重试。",
+  ],
+  [
+    /workbuddy_balance_parse_failed/i,
+    "服务端响应异常，余额暂不可读，请稍后刷新。",
+  ],
+  [
+    /workbuddy_balance_unreachable/i,
+    "网络异常，请稍后刷新。",
+  ],
+  [
+    /workbuddy_balance_credentials_incomplete/i,
+    "该账号凭据不完整，请重新捕获。",
   ],
   // ===== P13-3 Trae CN 归档/恢复：CN 实例生命周期专属拒绝码 =====
   //（DB 层错误沿用上方 master_archive_* 既有族，同一事务原语共用词表）

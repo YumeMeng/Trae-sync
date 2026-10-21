@@ -89,6 +89,12 @@ export interface WorkBuddyCheckinAccountStatusDto {
   readonly credits_balance: number | null;
   /** 账户资源包总额（Σ CycleTotalCapacity；与余额同源 best-effort）。 */
   readonly credits_total: number | null;
+  /**
+   * P19.2⑤ 余额查询失败原因（稳定错误码；null = 余额成功或整行失败
+   * 〔整行失败看 error〕）。credits_balance 为 null 且本字段非空时，
+   * 「--」处展示原因（safeUiError 映射人话，码不进界面）。
+   */
+  readonly balance_error: string | null;
   /** YYYY-MM-DD，签到日历数据源。 */
   readonly checkin_dates: readonly string[];
   /** P19.2④ 脱敏手机号（池记录未采集 = null，UI 显示「--」）。 */

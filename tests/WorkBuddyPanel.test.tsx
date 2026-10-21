@@ -80,6 +80,7 @@ const overviewRow = (
   total_credits: 700,
   credits_balance: 420,
   credits_total: 840,
+  balance_error: null,
   masked_phone: "133****1304",
   checkin_dates: ["2026-10-20", "2026-10-19"],
   error: null,
@@ -362,6 +363,27 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("--");
     // 本期签到累计不受余额查询失败影响。
     expect(screen.getByTestId("workbuddy-pool-list").textContent).toContain("本期签到累计 700");
+  });
+
+  it("余额诊断（P19.2⑤）：balance_error 映射人话进卡行悬浮与详情页「--」处", async () => {
+    installWorkbuddyRoutes({ overview: [
+      overviewRow("wb-uid-1", "甲账号", { credits_balance: null, credits_total: null, balance_error: "workbuddy_balance_auth_mismatch" }),
+      overviewRow("wb-uid-2", "乙账号", { credits_balance: null, credits_total: null, balance_error: "workbuddy_balance_unreachable" }),
+    ] });
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    // 卡行仍「--」，悬浮提示 = safeUiError 人话（码不进界面）。
+    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("--");
+    expect(screen.getByTestId("workbuddy-credits-uid-1").closest("div")?.getAttribute("title"))
+      .toContain("登录凭据已失效");
+
+    // 详情页在「--」处展示原因。
+    fireEvent.click(screen.getByTestId("workbuddy-pool-card-wb-uid-2"));
+    expect(await screen.findByTestId("workbuddy-account-detail")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-detail-credits")).toHaveTextContent("--（网络异常，请稍后刷新。）");
+    // 稳定码不进界面。
+    expect(screen.getByTestId("workbuddy-detail-credits").textContent).not.toContain("workbuddy_balance");
   });
 
   it("U-2 双视图：卡片视图切换生效并按产品分 key 记忆偏好", async () => {

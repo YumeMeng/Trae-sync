@@ -404,14 +404,22 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     // P19.2④ 脱敏手机号（服务端预脱敏直显）：有值才进卡行，未采集整段隐藏
     // （be 契约明确不要占位符）；权威展示源 = 池 DTO。
     const phoneText = account.masked_phone ? ` · ${account.masked_phone}` : "";
+    // P19.2⑤ 余额诊断：fail-soft「--」时悬浮提示失败原因（safeUiError 人话）。
+    const balanceHint = overviewRow
+      && !overviewRow.error
+      && overviewRow.credits_balance == null
+      && overviewRow.balance_error
+      ? safeUiErrorMessage(overviewRow.balance_error, "余额暂不可读，请稍后刷新。")
+      : null;
+    const balanceTitle = balanceHint ?? "WorkBuddy 账号的积分余额（billing 真实口径，逐账号）";
     const creditsMetric = uiProduct.capabilities.creditsColumn ? (
-      <div className="account-item__credits" title="WorkBuddy 账号的积分余额（billing 真实口径，逐账号）">
+      <div className="account-item__credits" title={balanceTitle}>
         <strong data-testid={`workbuddy-credits-${account.account_id}`}>{balanceLabel}</strong>
         <span className="account-item__credits-label">积分余额</span>
       </div>
     ) : null;
     const cardCredits = uiProduct.capabilities.creditsColumn ? (
-      <div className="account-card__credits" title="WorkBuddy 账号的积分余额（billing 真实口径，逐账号）">
+      <div className="account-card__credits" title={balanceTitle}>
         <span className="account-card__credits-value" data-testid={`workbuddy-credits-${account.account_id}`}>
           {balanceLabel}
         </span>

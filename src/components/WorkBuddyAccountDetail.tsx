@@ -242,7 +242,9 @@ export function WorkBuddyAccountDetail({
                   ? overview.credits_balance
                   : overview == null
                     ? "未获取"
-                    : "--"}
+                    : overview.balance_error
+                      ? `--（${safeUiErrorMessage(overview.balance_error, "余额暂不可读，请稍后刷新。")}）`
+                      : "--"}
             </dd>
           </div>
           <div className="account-detail__fact">
