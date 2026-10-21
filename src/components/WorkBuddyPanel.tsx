@@ -609,65 +609,15 @@ interface WorkBuddyCheckinPageProps {
 }
 
 /**
-/**
  * P19-B5 后端契约消费（be-engineer edbd20b/9609f9a）：
  * - get_workbuddy_checkin_overview：逐账号状态批查（后端 fail-soft，error 落条目）
  * - workbuddy_checkin_claim_profile / workbuddy_checkin_claim_batch：单签/批量
  *   （幂等 AlreadyCheckedIn → credit=0 verified=true；批量不可中断，无取消）
  * - opt-out 后端化：auto_checkin_store touched 权威，enabled = 有效参与
  *   （未显式设置默认 true，八域对齐 #3）——B2 的前端 touched 集与归一化退役。
+ * P19.2：签到历史点阵条删除（用户拍板「显示签到的账号就行」），IA §1.3 签到
+ * 日历 WB 侧豁免；checkin_dates 字段保留在 DTO（后端数据面不变）。
  */
-
-/** 近 N 天日期串（YYYY-MM-DD 本地时区；升序，旧→今）。 */
-function lastDayKeys(n: number): string[] {
-  const out: string[] = [];
-  for (let i = n - 1; i >= 0; i -= 1) {
-    const day = new Date();
-    day.setDate(day.getDate() - i);
-    out.push(`${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`);
-  }
-  return out;
-}
-
-/** 签到历史条（IA 草案 §1.3 签到日历的近 N 天形态）：每账号一行近 14 天点阵。 */
-function WbCheckinHistoryStrip({ rows }: {
-  rows: readonly WorkBuddyCheckinAccountStatusDto[];
-}) {
-  const days = lastDayKeys(14);
-  return (
-    <div className="workbuddy-card" data-testid="workbuddy-checkin-history">
-      <div className="workbuddy-card__title">签到历史（近 14 天）</div>
-      {rows.map((row) => {
-        const checked = new Set(row.checkin_dates);
-        return (
-          <div className="account-list__row" key={row.profile_id} data-testid={`workbuddy-history-${row.profile_id}`}>
-            <div className="account-item__main">
-              <span className="account-card__avatar" aria-hidden="true">
-                {(row.screen_name || "W").trim().charAt(0).toUpperCase()}
-              </span>
-              <div className="account-item__id">
-                <div className="account-item__name-row">
-                  <strong className="account-item__name">{row.screen_name || "WorkBuddy 账号"}</strong>
-                </div>
-              </div>
-            </div>
-            <div className="account-item__side">
-              <span
-                className="account-item__meta"
-                role="img"
-                aria-label={`近 14 天签到 ${days.filter((day) => checked.has(day)).length} 天（实心=已签）`}
-              >
-                {row.error
-                  ? "状态未知"
-                  : days.map((day) => (checked.has(day) ? "●" : "○")).join("")}
-              </span>
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
 
 export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   // 逐账号签到状态（后端聚合批查，fail-soft 落条目 error）。
@@ -858,7 +808,6 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
         />
       ))}
       listVariant="flow"
-      footer={rows.length > 0 ? <WbCheckinHistoryStrip rows={rows} /> : undefined}
       content={null}
     />
   );

@@ -55,7 +55,7 @@
 | 参与集行 | [必备] | "已选 N / M"+全选/反选；默认全参与（八域对齐方案第 3 条） | 复选 | — | `list_checkin_accounts` | 移植：WB 参与集 = 账号池 ∩ 自动签到开关态（`set_workbuddy_account_auto_checkin` 已有） |
 | 批量操作行 | [能力开关] | 一键签到(N) / 一键补签(N) / 刷新额度 / 刷新凭据 | 单次确认纪律（写操作不重试） | — | `run_checkin` + `cancel_checkin` + refresh_* | 移植批量编排；底层 `workbuddy_checkin_claim` 已复用（幂等 code=10001 对齐 already_checked_in） |
 | 签到账号行 ×N | [必备] | 复选+昵称+额度（total_credits/daily_credit）+爆存时点+最近验证时间+独立签到按钮 | 独立签到=单账号单次确认 | "参与集为空 → 去账号页添加/开启自动签到"（TRAE 同款空态文案模板） | `get_checkin_overview` 逐行 | `workbuddy_checkin_status` 逐账号（接口字段已实证齐全——P17 误判③已翻案） |
-| 签到日历 | [能力开关] | 每账号 checkin_dates 月历视图 | 月份切换；点日期看当日明细 | 无记录月份显示空月历 | Trae 签到记录表 | `workbuddy_checkin_status.checkin_dates`（字段已实证） |
+| 签到日历 | [能力开关] | 每账号 checkin_dates 月历视图 | 月份切换；点日期看当日明细 | 无记录月份显示空月历 | Trae 签到记录表 | **WB 豁免**（P19.2 用户拍板：「不需要这些内容，显示签到的账号就行」——近 14 天点阵条已删，checkin_dates 字段保留在 DTO 备后端数据面） |
 | 虚拟设备管理 | [能力开关] | 设备指纹/重置 | 重置=单次确认 | — | `reset_checkin_device` | `pending`（WB 直连 Bearer 无设备绑定字段；探针若发现风控再升级为重定义） |
 | 签到登录编排 | [能力开关] | — | — | — | begin/complete/cancel_checkin_login | `absent`（WB 签到直连接口无需独立登录态，token 即凭据；探针实证） |
 

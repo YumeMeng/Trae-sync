@@ -275,7 +275,7 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
 });
 
 describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消费）", () => {
-  it("骨架渲染：逐账号行（复选+昵称+额度/连签 meta）+ 批量按钮组 + 历史条 + 自动签到状态行", async () => {
+  it("骨架渲染：逐账号行（复选+昵称+额度/连签 meta）+ 批量按钮组 + 自动签到状态行", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyCheckinPage active={true} />);
 
@@ -287,9 +287,9 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     expect(flow!.querySelectorAll(".checkin-flow__row")).toHaveLength(2);
     // 行内 meta：额度列 + 连签（IA 草案 §1.3 签到账号行字段）。
     expect(flow!.textContent).toContain("额度 700 积分 · 连签 6 天");
-    // 历史条（checkin_dates 近 14 天点阵）在册。
-    expect(screen.getByTestId("workbuddy-checkin-history")).toBeInTheDocument();
-    expect(screen.getByTestId("workbuddy-history-wb-uid-1")).toBeInTheDocument();
+    // P19.2：签到历史点阵条删除（用户拍板「显示签到的账号就行」）。
+    expect(screen.queryByTestId("workbuddy-checkin-history")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("workbuddy-history-wb-uid-1")).not.toBeInTheDocument();
     expect(screen.getByTestId("workbuddy-auto-checkin-meta")).toHaveTextContent("每日 09:30 触发");
     expect(screen.getByTestId("product-badge-workbuddy")).toBeInTheDocument();
   });
@@ -352,8 +352,8 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     render(<WorkBuddyCheckinPage active={true} />);
 
     await screen.findByTestId("checkin-run-all");
-    // 行徽章与历史条双处 fail-soft 标注。
-    expect(screen.getAllByText("状态未知")).toHaveLength(2);
+    // 行徽章 fail-soft 标注（历史条已随 P19.2 删除，仅行内一处）。
+    expect(screen.getAllByText("状态未知")).toHaveLength(1);
     // 他行正常渲染额度 meta；失败行不可单签。
     expect(document.querySelector("ul.checkin-flow")!.textContent).toContain("额度 700 积分");
     expect(screen.getByTestId("checkin-inline-wb-uid-1")).toBeDisabled();
