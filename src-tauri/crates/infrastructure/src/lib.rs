@@ -118,6 +118,9 @@ pub mod workbuddy_switch_experiment;
 pub mod workbuddy_switch_flow;
 // P17-T4c②：WorkBuddy 账号捕获编排（快照→解密→容器落盘；铸造待单次确认）。
 pub mod workbuddy_capture;
+// P19.2①：WorkBuddy 账号档案存储（pool 旁表——备注名/归档为工具侧账号级
+// 属性，capture/switch 只动代次容器，本表天然不被破坏）。
+pub mod workbuddy_account_profile;
 // P17-T5 并列骨架：当前产品指针（产品管理页/切换器持久化状态，注册表校验）。
 pub mod product_context;
 // P16-T2：存储根派生路径唯一来源（checkin/products-trae_cn/product-state/fused-login）。
