@@ -46,14 +46,15 @@
 
 ### 1.3 签到页（Check-in）
 
-产品无关规格：`参与集行 + 批量操作行 + [签到账号行]×N + 调度设置 + 日历 + 空态`。
+产品无关规格：`参与集行 + 批量操作行 + [签到账号行]×N + 今日台账状态条 + 日历 + 空态`。
+
+> P19.1 修正：**每日自动签到设置卡归设置页**（以 Trae 真机为事实源——真机的调度设置在设置页，签到页只留签到动作区）。WB 侧随此排布：`WorkBuddyAutoCheckinSettings`（总开关/触发时间/台账/参与集行）由 WB 设置页变体消费，签到页仅保留只读的自动签到状态条。
 
 | 区块 | 必备性 | 显示字段 | 交互 | 空态 | TRAE 数据源 | WB 数据源 |
 |---|---|---|---|---|---|---|
 | 参与集行 | [必备] | "已选 N / M"+全选/反选；默认全参与（八域对齐方案第 3 条） | 复选 | — | `list_checkin_accounts` | 移植：WB 参与集 = 账号池 ∩ 自动签到开关态（`set_workbuddy_account_auto_checkin` 已有） |
 | 批量操作行 | [能力开关] | 一键签到(N) / 一键补签(N) / 刷新额度 / 刷新凭据 | 单次确认纪律（写操作不重试） | — | `run_checkin` + `cancel_checkin` + refresh_* | 移植批量编排；底层 `workbuddy_checkin_claim` 已复用（幂等 code=10001 对齐 already_checked_in） |
 | 签到账号行 ×N | [必备] | 复选+昵称+额度（total_credits/daily_credit）+爆存时点+最近验证时间+独立签到按钮 | 独立签到=单账号单次确认 | "参与集为空 → 去账号页添加/开启自动签到"（TRAE 同款空态文案模板） | `get_checkin_overview` 逐行 | `workbuddy_checkin_status` 逐账号（接口字段已实证齐全——P17 误判③已翻案） |
-| 调度设置 | [必备] | 定时窗口 / 重试策略 / 失败通知开关 | 保存即生效 | — | `get/set_auto_checkin_settings` | `get/set_workbuddy_auto_checkin_settings` 已复用（同一组件双数据源） |
 | 签到日历 | [能力开关] | 每账号 checkin_dates 月历视图 | 月份切换；点日期看当日明细 | 无记录月份显示空月历 | Trae 签到记录表 | `workbuddy_checkin_status.checkin_dates`（字段已实证） |
 | 虚拟设备管理 | [能力开关] | 设备指纹/重置 | 重置=单次确认 | — | `reset_checkin_device` | `pending`（WB 直连 Bearer 无设备绑定字段；探针若发现风控再升级为重定义） |
 | 签到登录编排 | [能力开关] | — | — | — | begin/complete/cancel_checkin_login | `absent`（WB 签到直连接口无需独立登录态，token 即凭据；探针实证） |
@@ -86,10 +87,11 @@
 
 ### 1.6 设置页（Settings）
 
-产品无关规格：`备份区 + 存储区 + 恢复包区 + 转移账本 + 产品与运行状态 + 插件入口`。
+产品无关规格：`自动签到设置区 + 备份区 + 存储区 + 恢复包区 + 转移账本 + 产品与运行状态 + 插件入口`。
 
 | 区块 | 必备性 | 显示字段 | 交互 | 空态 | TRAE 数据源 | WB 数据源 |
 |---|---|---|---|---|---|---|
+| 自动签到设置 | [必备] | 总开关 / 触发时间 / 今日台账 / 账号参与清单 | 保存即生效 | — | `get/set_auto_checkin_settings` | `get/set_workbuddy_auto_checkin_settings` + `list/set_workbuddy_checkin_accounts`（P19.1 归位：签到页 → 设置页，对齐 Trae 真机） |
 | 备份区 | [必备] | 备份目录 / 保留策略 / 备份链列表（时间+大小+可恢复点） | 手动备份 / 恢复 / **手动删除备份**（本次新增，八域对齐方案第 7 条）/ 迁移备份 | "尚无备份 → 立即创建" | `create_master_backup` / `get_master_backup_chain` / `restore_master_backup` / `migrate_master_backups` / `get/set_backup_dir` / `get/set_backup_retention` | 全套复用（治理骨架产品无关）；WB 备份范围补凭据材料（.info/keyblob/device-id——P17 8.7 缺口警示，待拍板） |
 | 存储区 | [能力开关] | 存储根状态 / 各账号占用 / 删除计划预览 | 迁移存储根 / 计划删除（两步：plan→apply） | — | `get_storage_root_state` / `migrate_storage_root_command` / `plan_storage_deletion` / `apply_storage_deletion` | 移植（`~/.workbuddy` 根组已定常量） |
 | 恢复包区 | [必备] | 已导出恢复包列表 | 导出 / 导入 | "无恢复包" | `export/import_recovery_package_command` | 复用 |

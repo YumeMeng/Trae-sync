@@ -102,20 +102,60 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
 
 import { SettingsPanel } from "../src/components/SettingsPanel";
 
-describe("SettingsPanel WB 变体（P19-B6 备份区诚实呈现）", () => {
-  it("WB 产品：备份链管理面在册，TRAE 备份管理面不渲染", async () => {
+describe("SettingsPanel WB 变体（P19-B6 备份区诚实呈现 + P19.1 签到设置卡归位）", () => {
+  it("WB 产品：每日自动签到真设置卡归位设置页，TRAE 备份管理面不渲染", async () => {
+    mockRoute("get_workbuddy_auto_checkin_status", () => ({
+      enabled: true,
+      daily_time_hhmm: "09:30",
+      ledger: null,
+    }));
+    mockRoute("list_workbuddy_checkin_accounts", () => [
+      { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
+      { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
+    ]);
     mockRoute("list_workbuddy_backups", () => ({
       backup_dir: "C:" + String.fromCharCode(92) + "data",
       backups: [],
     }));
     render(<SettingsPanel active={true} productId="workbuddy" />);
 
+    // P19.1 归位：真设置卡在册（总开关/触发时间/参与清单；testid 契约随卡迁移不变）。
+    expect(await screen.findByTestId("workbuddy-auto-checkin-settings")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-auto-checkin-enabled-toggle")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-auto-checkin-time-input")).toBeInTheDocument();
+    // 参与清单 = 后端有效参与语义（wb-uid-2 被显式关闭 → 未勾选）。
+    expect((screen.getByTestId("workbuddy-auto-checkin-account-wb-uid-1") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId("workbuddy-auto-checkin-account-wb-uid-2") as HTMLInputElement).checked).toBe(false);
+    // 旧「签到指引卡」退役（P19.1 以 Trae 真机排布为准：设置在设置页）。
+    expect(screen.queryByText("WorkBuddy 的自动签到设置在「签到」页")).not.toBeInTheDocument();
     // B8 管理面（P19-B6 缺口闭环）：链/手动备份/删除入口在册。
     expect(await screen.findByTestId("workbuddy-backup-section")).toBeInTheDocument();
     expect(screen.getByTestId("workbuddy-backup-create")).toBeInTheDocument();
-    expect(screen.getByText("WorkBuddy 的自动签到设置在「签到」页")).toBeInTheDocument();
     // TRAE 备份管理面不渲染。
     expect(screen.queryByTestId("master-backup-section")).not.toBeInTheDocument();
+  });
+
+  it("全部参与入口（设置页）：一键把显式关闭的账号批量重新置为参与", async () => {
+    mockRoute("get_workbuddy_auto_checkin_status", () => ({
+      enabled: true,
+      daily_time_hhmm: "09:30",
+      ledger: null,
+    }));
+    mockRoute("list_workbuddy_checkin_accounts", () => [
+      { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: false },
+      { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
+    ]);
+    render(<SettingsPanel active={true} productId="workbuddy" />);
+
+    const button = await screen.findByTestId("workbuddy-auto-checkin-participate-all");
+    expect(button).toHaveTextContent("全部参与（2）");
+    fireEvent.click(button);
+    await waitFor(() => {
+      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
+      expect(calls).toHaveLength(2);
+      expect(calls).toContainEqual(["set_workbuddy_account_auto_checkin", { profileId: "wb-uid-1", enabled: true }]);
+      expect(calls).toContainEqual(["set_workbuddy_account_auto_checkin", { profileId: "wb-uid-2", enabled: true }]);
+    });
   });
 
   it("TRAE 产品：备份管理面照常（现有行为不变）", async () => {

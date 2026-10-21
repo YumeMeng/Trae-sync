@@ -306,7 +306,7 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     expect(screen.queryByRole("button", { name: "取消未开始任务" })).not.toBeInTheDocument();
   });
 
-  it("参与集（后端有效参与）：未显式设置默认参与，显式关闭被尊重且不触发归一", async () => {
+  it("参与集（后端有效参与）：默认选择 = 参与集且不触发归一写操作", async () => {
     installWorkbuddyRoutes({ accounts: [
       { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
       { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
@@ -314,33 +314,11 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     render(<WorkBuddyCheckinPage active={true} />);
 
     await screen.findByTestId("checkin-run-all");
-    const checkbox = await screen.findByTestId("workbuddy-auto-checkin-account-wb-uid-2") as HTMLInputElement;
-    // enabled = 后端有效参与语义（opt-out 后端化，前端 touched 集退役）。
-    expect(checkbox.checked).toBe(false);
-    expect((screen.getByTestId("workbuddy-auto-checkin-account-wb-uid-1") as HTMLInputElement).checked).toBe(true);
     // 批量选择默认选中参与集（IA §1.3：wb-uid-2 被显式关闭 → 不在默认选择内）。
     expect(screen.getByText("已选 1/2")).toBeInTheDocument();
-    // 无前端归一化写操作。
+    // 无前端归一化写操作（参与开关 UI 已随设置卡归位设置页，P19.1）。
     const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
     expect(calls).toHaveLength(0);
-  });
-
-  it("全部参与入口：一键把显式关闭的账号批量重新置为参与", async () => {
-    installWorkbuddyRoutes({ accounts: [
-      { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: false },
-      { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
-    ] });
-    render(<WorkBuddyCheckinPage active={true} />);
-
-    const button = await screen.findByTestId("workbuddy-auto-checkin-participate-all");
-    expect(button).toHaveTextContent("全部参与（2）");
-    fireEvent.click(button);
-    await waitFor(() => {
-      const calls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "set_workbuddy_account_auto_checkin");
-      expect(calls).toHaveLength(2);
-      expect(calls).toContainEqual(["set_workbuddy_account_auto_checkin", { profileId: "wb-uid-1", enabled: true }]);
-      expect(calls).toContainEqual(["set_workbuddy_account_auto_checkin", { profileId: "wb-uid-2", enabled: true }]);
-    });
   });
 
   it("今日已签到：行内单签禁用 + 签到槽徽章翻转", async () => {

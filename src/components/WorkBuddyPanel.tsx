@@ -24,8 +24,6 @@ import {
   listWorkBuddyCheckinAccounts,
   loadWorkBuddySessionHealth,
   refreshWorkBuddyAccount,
-  setWorkBuddyAccountAutoCheckin,
-  setWorkBuddyAutoCheckinSettings,
   switchWorkBuddyAccount,
   type WorkBuddyAutoCheckinStatusDto,
 } from "../platform/workbuddyAdapter";
@@ -41,7 +39,6 @@ import { ACCOUNT_SORT_OPTIONS, type AccountSort } from "./shared/account/Account
 import { SharedAccountEntry, type AccountView, type SharedAccountRecord } from "./shared/account/AccountRow";
 import { accountPreferenceKey, readStoredPreference, writeStoredPreference } from "./shared/account/preferences";
 import { CheckinPageSkeleton } from "./shared/checkin/CheckinPageSkeleton";
-import { AutoCheckinSettingsCard } from "./shared/checkin/AutoCheckinSettingsCard";
 import { CheckinActionsRow } from "./shared/checkin/CheckinActionsRow";
 import { CheckinFlowRow } from "./shared/checkin/CheckinFlowRow";
 import { productUi } from "../platform/productUiRegistry";
@@ -612,7 +609,6 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
   // P17-A5 每日自动签到：设置（status 命令）+ 参与集行（list 命令，有效参与）。
   const [autoStatus, setAutoStatus] = useState<WorkBuddyAutoCheckinStatusDto | null>(null);
   const [participation, setParticipation] = useState<readonly WorkBuddyCheckinParticipationDto[]>([]);
-  const [autoBusy, setAutoBusy] = useState(false);
 
   const refresh = useCallback(async (initial: boolean) => {
     if (initial) setLoading(true);
@@ -659,55 +655,6 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
       return rows.map((row) => row.profile_id);
     });
   }, [rows, participation]);
-
-  const handleSaveAutoSettings = useCallback(
-    (enabled: boolean, dailyTimeHhmm: string) => {
-      if (autoBusy) return;
-      setAutoBusy(true);
-      void setWorkBuddyAutoCheckinSettings(enabled, dailyTimeHhmm)
-        .then(refreshAuto)
-        .then(() => {
-          notify.success(enabled
-            ? `WorkBuddy：每日自动签到已开启，每日 ${dailyTimeHhmm} 后自动执行（参与账号逐个错峰）。`
-            : "WorkBuddy：每日自动签到已关闭。");
-        })
-        .catch((reason: unknown) => notify.error(
-          `WorkBuddy：自动签到设置保存失败——${safeUiErrorMessage(reason, "请稍后重试。")}`,
-        ))
-        .finally(() => setAutoBusy(false));
-    },
-    [autoBusy, refreshAuto],
-  );
-
-  const handleToggleAccount = useCallback(
-    (profileId: string, enabled: boolean) => {
-      if (autoBusy) return;
-      setAutoBusy(true);
-      // 显式设置写后端 touched+enabled（opt-out 永久尊重，be-engineer B5 契约）。
-      void setWorkBuddyAccountAutoCheckin(profileId, enabled)
-        .then(refreshAuto)
-        .catch((reason: unknown) => notify.error(
-          `WorkBuddy：参与状态保存失败——${safeUiErrorMessage(reason, "请稍后重试。")}`,
-        ))
-        .finally(() => setAutoBusy(false));
-    },
-    [autoBusy, refreshAuto],
-  );
-
-  // 批量置 true 入口：把显式关闭的账号全部重新参与（单次语义，后端持久）。
-  const handleParticipateAll = useCallback(() => {
-    if (autoBusy) return;
-    const targets = participation.filter((account) => !account.enabled);
-    if (targets.length === 0) return;
-    setAutoBusy(true);
-    void (async () => {
-      for (const account of targets) {
-        await setWorkBuddyAccountAutoCheckin(account.profile_id, true).catch(() => undefined);
-      }
-      await refreshAuto();
-      notify.success(`WorkBuddy：已把 ${targets.length} 个账号全部置为参与自动签到。`);
-    })().finally(() => setAutoBusy(false));
-  }, [autoBusy, participation, refreshAuto]);
 
   const toggle = useCallback((profileId: string) => {
     setSelection((current) => current.includes(profileId)
@@ -837,29 +784,7 @@ export function WorkBuddyCheckinPage({ active }: WorkBuddyCheckinPageProps) {
       ))}
       listVariant="flow"
       footer={rows.length > 0 ? <WbCheckinHistoryStrip rows={rows} /> : undefined}
-      content={autoStatus ? (
-        <AutoCheckinSettingsCard
-          testIdPrefix="workbuddy"
-          enabled={autoStatus.enabled}
-          dailyTimeHhmm={autoStatus.daily_time_hhmm}
-          busy={autoBusy}
-          toggleSummary="开启后到点自动执行（断连自动续期兜底）"
-          ledgerNote={autoStatus.ledger
-            ? autoStatus.ledger.running
-              ? `今日执行中（完成 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
-              : `今日已完成（成功 ${autoStatus.ledger.completed}/${autoStatus.ledger.total}${autoStatus.ledger.failed ? `，失败 ${autoStatus.ledger.failed}` : ""}）`
-            : null}
-          accounts={participation.map((account) => ({
-            profileId: account.profile_id,
-            displayName: account.screen_name,
-            // enabled = 后端有效参与（list 命令，与批量选择同源；P19-B6 数据源统一）。
-            participating: account.enabled,
-          }))}
-          onSettingsChange={handleSaveAutoSettings}
-          onParticipationChange={handleToggleAccount}
-          onParticipateAll={handleParticipateAll}
-        />
-      ) : null}
+      content={null}
     />
   );
 }

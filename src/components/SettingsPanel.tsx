@@ -13,6 +13,7 @@ import { safeUiErrorMessage } from "../utils/safeUiError";
 import { notify } from "../platform/notify";
 import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { EmptyState } from "./shared/EmptyState";
+import { WorkBuddyAutoCheckinSettings } from "./WorkBuddyAutoCheckinSettings";
 import { WorkBuddyBackupSection } from "./WorkBuddyBackupSection";
 
 interface SettingsPanelProps {
@@ -253,8 +254,9 @@ export function SettingsPanel({ active, productId = "trae_cn" }: SettingsPanelPr
       .finally(() => setAutoBusy(false));
   }, [autoBusy, loadAutoStatus]);
 
-  // WB 设置变体（IA §1.6 备份区诚实呈现）：自动签到设置入口在签到页；
-  // WB 备份 = 彻底删除前置自动滚动单份（无独立链命令 → 不渲染不可用按钮）。
+  // WB 设置变体（IA §1.6 备份区诚实呈现；P19.1③ 每日自动签到设置卡归位设置页，
+  // 对齐 TRAE 真机排布——签到页只留签到动作区）；WB 备份 = 彻底删除前置自动
+  // 滚动单份（无独立链命令 → 不渲染不可用按钮）。
   if (productId === "workbuddy") {
     return (
       <section className="settings-panel" role="region" aria-label="设置">
@@ -271,12 +273,7 @@ export function SettingsPanel({ active, productId = "trae_cn" }: SettingsPanelPr
             <h3>自动签到</h3>
           </div>
         </div>
-        <EmptyState
-          panel
-          className="workbuddy-page__empty"
-          title="WorkBuddy 的自动签到设置在「签到」页"
-          description="总开关、触发时间与账号参与清单由签到页底部的「每日自动签到」设置卡承载（与 TRAE 设置页同模板）。"
-        />
+        <WorkBuddyAutoCheckinSettings />
 
         <div className="settings-panel__section-heading">
           <div>
