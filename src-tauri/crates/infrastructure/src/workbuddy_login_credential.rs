@@ -233,6 +233,18 @@ impl WorkBuddyLoginStore {
         self.record_path(profile_id).is_file()
     }
 
+    /// P19.2① 池记录删除（彻底删除账号的代次容器清理；工具侧自有容器，
+    /// 不触碰客户端 `.info` 会话文件）。幂等：容器不存在视为已删除。
+    /// 返回是否实际删除了文件。
+    pub fn remove(&self, profile_id: &str) -> Result<bool, WorkBuddyLoginStoreError> {
+        let path = self.record_path(profile_id);
+        if !path.is_file() {
+            return Ok(false);
+        }
+        fs::remove_file(&path).map_err(|_| WorkBuddyLoginStoreError::Io)?;
+        Ok(true)
+    }
+
     /// 脱敏清单：扫描容器目录全部 `.wbsess` 文件并读取摘要。
     /// 损坏文件跳过（清单是展示面，坏一个不拖垮全部）。
     pub fn list(&self) -> Result<Vec<WorkBuddyLoginSummary>, WorkBuddyLoginStoreError> {

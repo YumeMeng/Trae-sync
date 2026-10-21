@@ -148,16 +148,242 @@ pub(crate) fn get_workbuddy_session_health(
     Ok(session_health_dto(&snapshot, status, &state))
 }
 
-/// WorkBuddy 账号池（workbuddy-login 容器脱敏清单；真实模式门禁）。
+/// WorkBuddy 账号池（workbuddy-login 容器脱敏清单 + 档案字段；真实模式门禁）。
+/// P19.2①：清单带档案旁表字段（display_name/archived）——**全量返回，
+/// 归档过滤由前端执行**（后端不替前端裁剪，与参与集同哲学）。
 #[tauri::command]
 pub(crate) fn list_workbuddy_accounts(
     state: State<AppState>,
-) -> Result<Vec<traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginSummary>, String>
-{
+) -> Result<Vec<WorkBuddyAccountEntryDto>, String> {
     ensure_login_real_mode_workbuddy(&state)?;
-    let store = WorkBuddyLoginStore::new(workbuddy_login_root(&state)?);
-    store.list().map_err(|_| "workbuddy_pool_invalid".to_string())
+    let login_root = workbuddy_login_root(&state)?;
+    let store = WorkBuddyLoginStore::new(login_root.clone());
+    let summaries = store
+        .list()
+        .map_err(|_| "workbuddy_pool_invalid".to_string())?;
+    let profiles =
+        traesync_infrastructure::workbuddy_account_profile::WorkBuddyAccountProfileStore::new(
+            login_root,
+        );
+    Ok(summaries
+        .iter()
+        .map(|summary| workbuddy_account_entry(summary, &profiles))
+        .collect())
 }
+
+/// WorkBuddy 账号条目（池摘要 + 档案旁表字段；不含任何令牌材料）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddyAccountEntryDto {
+    // ---- WorkBuddyLoginSummary 平铺（既有消费面不破坏） ----
+    pub profile_id: String,
+    pub account_id: String,
+    pub screen_name: String,
+    pub domain: String,
+    pub access_token_expires_at_unix_seconds: u64,
+    pub refresh_token_expires_at_unix_seconds: u64,
+    pub minted_at_unix_seconds: u64,
+    pub last_updated_at_unix_seconds: u64,
+    // ---- P19.2① 档案（pool 旁表） ----
+    /// 用户备注名（空串 = 未设置；展示优先级：备注名 > 捕获昵称 > 兜底）。
+    pub display_name: String,
+    /// 归档标记（fe 据此过滤列表；默认 false = 在册）。
+    pub archived: bool,
+}
+
+/// 摘要 + 档案 → 条目 DTO（档案读取失败按缺省条目降级——展示面不阻塞）。
+fn workbuddy_account_entry(
+    summary: &traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginSummary,
+    profiles: &traesync_infrastructure::workbuddy_account_profile::WorkBuddyAccountProfileStore,
+) -> WorkBuddyAccountEntryDto {
+    let profile = profiles.get(&summary.account_id).unwrap_or_default();
+    WorkBuddyAccountEntryDto {
+        profile_id: summary.profile_id.clone(),
+        account_id: summary.account_id.clone(),
+        screen_name: summary.screen_name.clone(),
+        domain: summary.domain.clone(),
+        access_token_expires_at_unix_seconds: summary.access_token_expires_at_unix_seconds,
+        refresh_token_expires_at_unix_seconds: summary.refresh_token_expires_at_unix_seconds,
+        minted_at_unix_seconds: summary.minted_at_unix_seconds,
+        last_updated_at_unix_seconds: summary.last_updated_at_unix_seconds,
+        display_name: profile.display_name,
+        archived: profile.archived,
+    }
+}
+
+/// 账号在池校验（清单面核对，防路径形态 account_id 逃逸）。
+fn pool_contains(
+    store: &WorkBuddyLoginStore,
+    account_id: &str,
+) -> Result<bool, String> {
+    let profile_id =
+        traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginRecord::profile_id_for(
+            account_id,
+        );
+    Ok(store
+        .list()
+        .map_err(|_| "workbuddy_pool_invalid".to_string())?
+        .iter()
+        .any(|summary| summary.profile_id == profile_id))
+}
+
+/// 设置账号备注名（**档案旁表写入**——.info 无此字段〔nickname 为加密
+/// 信封且语义不符〕，落工具侧账号档案存储，capture/switch 只动代次容器
+/// 天然不破坏）。account_id 必须在池内。
+#[tauri::command]
+pub(crate) async fn set_workbuddy_account_display_name(
+    account_id: String,
+    display_name: String,
+    state: State<'_, AppState>,
+) -> Result<WorkBuddyAccountEntryDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state)?;
+    run_blocking("workbuddy_account_profile_join_failed", move || {
+        let store = WorkBuddyLoginStore::new(login_root.clone());
+        if !pool_contains(&store, &account_id)? {
+            return Err("workbuddy_pool_record_missing".to_string());
+        }
+        let profiles =
+            traesync_infrastructure::workbuddy_account_profile::WorkBuddyAccountProfileStore::new(
+                &login_root,
+            );
+        profiles
+            .set_display_name(&account_id, &display_name, unix_ms_now() / 1000)
+            .map_err(|error| error.code().to_string())?;
+        account_entry_of(&login_root, &account_id)
+    })
+    .await
+}
+
+/// 设置账号归档标记（档案旁表；归档账号列表过滤由前端执行）。account_id
+/// 必须在池内。
+#[tauri::command]
+pub(crate) async fn set_workbuddy_account_archived(
+    account_id: String,
+    archived: bool,
+    state: State<'_, AppState>,
+) -> Result<WorkBuddyAccountEntryDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state)?;
+    run_blocking("workbuddy_account_profile_join_failed", move || {
+        let store = WorkBuddyLoginStore::new(login_root.clone());
+        if !pool_contains(&store, &account_id)? {
+            return Err("workbuddy_pool_record_missing".to_string());
+        }
+        let profiles =
+            traesync_infrastructure::workbuddy_account_profile::WorkBuddyAccountProfileStore::new(
+                &login_root,
+            );
+        profiles
+            .set_archived(&account_id, archived, unix_ms_now() / 1000)
+            .map_err(|error| error.code().to_string())?;
+        account_entry_of(&login_root, &account_id)
+    })
+    .await
+}
+
+/// 池摘要 + 档案 → 条目 DTO（账号定位失败 = 池记录缺失）。
+fn account_entry_of(login_root: &Path, account_id: &str) -> Result<WorkBuddyAccountEntryDto, String> {
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    let profile_id =
+        traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginRecord::profile_id_for(
+            account_id,
+        );
+    let summary = store
+        .list()
+        .map_err(|_| "workbuddy_pool_invalid".to_string())?
+        .into_iter()
+        .find(|summary| summary.profile_id == profile_id)
+        .ok_or_else(|| "workbuddy_pool_record_missing".to_string())?;
+    let profiles =
+        traesync_infrastructure::workbuddy_account_profile::WorkBuddyAccountProfileStore::new(
+            login_root,
+        );
+    Ok(workbuddy_account_entry(&summary, &profiles))
+}
+
+/// 账号彻底删除回执（P19.2①；脱敏——只报计数与缺失清单）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddyAccountsPurgeDto {
+    pub confirmed: bool,
+    /// 实际删除的池记录数（含其档案旁表条目）。
+    pub purged_accounts: usize,
+    /// 请求中不在池内的 account_id（未删除，如实回执）。
+    pub missing_accounts: Vec<String>,
+    /// 档案旁表清理失败的 account_id（池记录已删；残留无害，幂等可重试）。
+    pub profile_cleanup_failed: Vec<String>,
+    /// 删除后池内剩余账号数。
+    pub remaining_accounts: usize,
+}
+
+/// 账号彻底删除（**单次确认入口**；命名对齐库域 purge_workbuddy_sessions）。
+///
+/// 边界（写清）：删除范围 = 工具侧池记录（`{root}/wb-{uid}.wbsess` 代次
+/// 容器）+ 档案旁表条目（备注名/归档）；**不触碰客户端 `.info` 会话文件、
+/// 不做客户端登出**——客户端登录态独立存续，需清除登录态由用户在客户端
+/// 操作。删除后该账号不可再被切号/直连签到选中（池为空时签到回退机器
+/// 解密路径）。
+#[tauri::command]
+pub(crate) async fn purge_workbuddy_accounts(
+    account_ids: Vec<String>,
+    confirmed: bool,
+    state: State<'_, AppState>,
+) -> Result<WorkBuddyAccountsPurgeDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    if !confirmed {
+        return Err("workbuddy_purge_confirmation_required".to_string());
+    }
+    let login_root = workbuddy_login_root(&state)?;
+    run_blocking("workbuddy_account_purge_join_failed", move || {
+        // 去重保序（重复条目只删一次，回执不重复计数）。
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<String> = account_ids
+            .into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+        let store = WorkBuddyLoginStore::new(login_root.clone());
+        let summaries = store
+            .list()
+            .map_err(|_| "workbuddy_pool_invalid".to_string())?;
+        let mut purged = Vec::new();
+        let mut missing_accounts = Vec::new();
+        for account_id in &ids {
+            let profile_id =
+                traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginRecord::profile_id_for(account_id);
+            if summaries.iter().any(|summary| summary.profile_id == profile_id) {
+                store
+                    .remove(&profile_id)
+                    .map_err(|_| "workbuddy_pool_store_io".to_string())?;
+                purged.push(account_id.clone());
+            } else {
+                missing_accounts.push(account_id.clone());
+            }
+        }
+        // 档案旁表清理（失败不回滚池删除——池记录已删、残留无害，幂等可重试）。
+        let profiles =
+            traesync_infrastructure::workbuddy_account_profile::WorkBuddyAccountProfileStore::new(
+                &login_root,
+            );
+        let profile_cleanup_failed = if profiles.remove(&purged).is_ok() {
+            Vec::new()
+        } else {
+            purged.clone()
+        };
+        let remaining_accounts = store
+            .list()
+            .map_err(|_| "workbuddy_pool_invalid".to_string())?
+            .len();
+        Ok(WorkBuddyAccountsPurgeDto {
+            confirmed: true,
+            purged_accounts: purged.len(),
+            missing_accounts,
+            profile_cleanup_failed,
+            remaining_accounts,
+        })
+    })
+    .await
+}
+
+/// WorkBuddy 续期验证探针回执（P19.1④；回答用户核心质疑「保存当前
 
 /// WorkBuddy 签到状态查询（只读；解密借客户端运行时，客户端可关可开）。
 /// P19.1 401 兜底：池路径 AuthMismatch 时强制刷新换新对重试一次
@@ -761,18 +987,31 @@ fn direction_source_str(
     }
 }
 
-/// uid → 展示名：账号池昵称优先（profile_id 惯例 wb-{uid}），缺省自然语言
-/// 标签兜底。uid 只在容器查询内部使用，不落到返回值。
+/// uid → 展示名：**备注名优先**（P19.2① 档案旁表）> 账号池捕获昵称
+/// （profile_id 惯例 wb-{uid}）> 兜底自然语言标签。uid 只在容器查询内部
+/// 使用，不落到返回值。
 fn workbuddy_account_label(
     uid: &str,
     login_root: Option<&Path>,
     fallback: &str,
 ) -> String {
-    let from_pool = login_root
-        .and_then(|root| {
-            let store = WorkBuddyLoginStore::new(root.to_path_buf());
-            store.list().ok()
-        })
+    let Some(root) = login_root else {
+        return fallback.to_string();
+    };
+    // 备注名（档案旁表；读取失败按未设置降级）。
+    let display_name =
+        traesync_infrastructure::workbuddy_account_profile::WorkBuddyAccountProfileStore::new(root)
+            .get(uid)
+            .ok()
+            .map(|profile| profile.display_name)
+            .filter(|name| !name.trim().is_empty());
+    if let Some(name) = display_name {
+        return name;
+    }
+    // 池捕获昵称。
+    let from_pool = WorkBuddyLoginStore::new(root.to_path_buf())
+        .list()
+        .ok()
         .and_then(|summaries| {
             let profile_id =
                 traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginRecord::profile_id_for(uid);

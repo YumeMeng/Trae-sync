@@ -1,5 +1,5 @@
 // GENERATED FILE —— 本文件由 scripts/gen-command-union.mjs 自动生成，勿手改。
-// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（132 条）。
+// 来源：src-tauri/src/lib.rs 的 tauri::generate_handler![...] 命令清单（135 条）。
 // 重新生成：pnpm gen:commands。漂移检测：tests/commandNames.test.ts（golden 比对）。
 
 /** 前端可 invoke 的命令名集合（Tauri 2 惯例：invoke 名 = 后端函数名）。 */
@@ -98,6 +98,7 @@ export type CommandName =
   | "preview_trae_cn_project_merge"
   | "preview_workbuddy_switch"
   | "purge_account_records"
+  | "purge_workbuddy_accounts"
   | "purge_workbuddy_sessions"
   | "read_work_cn_state"
   | "refresh_checkin_credentials"
@@ -122,7 +123,9 @@ export type CommandName =
   | "set_backup_retention"
   | "set_current_product"
   | "set_environment_current_account"
+  | "set_workbuddy_account_archived"
   | "set_workbuddy_account_auto_checkin"
+  | "set_workbuddy_account_display_name"
   | "set_workbuddy_auto_checkin_settings"
   | "switch_account"
   | "switch_and_handoff"

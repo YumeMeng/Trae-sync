@@ -1303,6 +1303,11 @@ pub fn run() {
             workbuddy_commands::workbuddy_checkin_claim,
             workbuddy_commands::refresh_workbuddy_account,
             workbuddy_commands::capture_workbuddy_account,
+            // P19.2① 账号档案管理（备注名/归档 = 工具侧 pool 旁表；彻底
+            // 删除 = 单次确认入口，只删工具侧池记录+档案，不碰客户端 .info）。
+            workbuddy_commands::set_workbuddy_account_display_name,
+            workbuddy_commands::set_workbuddy_account_archived,
+            workbuddy_commands::purge_workbuddy_accounts,
             // P19.1④ 续期验证探针（非破坏：快照时间戳 + 实调刷新端点 +
             // 信封检测分支——「保存的账号能否持续更新」的用户可感知证据链）。
             workbuddy_commands::verify_workbuddy_capture_renewal,
