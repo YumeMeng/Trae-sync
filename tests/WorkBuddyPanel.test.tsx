@@ -37,6 +37,10 @@ const poolEntry = (profileId: string, accountId: string, screenName: string) => 
   account_id: accountId,
   screen_name: screenName,
   domain: "workbuddy.example",
+  // P19.2④ 档案字段（list_workbuddy_accounts 全量返回）。
+  display_name: "",
+  archived: false,
+  masked_phone: "",
   access_token_expires_at_unix_seconds: 1799999999,
   refresh_token_expires_at_unix_seconds: 1799999999,
   minted_at_unix_seconds: 1000,
@@ -76,6 +80,7 @@ const overviewRow = (
   total_credits: 700,
   credits_balance: 420,
   credits_total: 840,
+  masked_phone: "133****1304",
   checkin_dates: ["2026-10-20", "2026-10-19"],
   error: null,
   ...over,
@@ -189,8 +194,13 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     expect(screen.queryByTestId("workbuddy-pool-current-wb-uid-2")).not.toBeInTheDocument();
   });
 
-  it("详情实装：行点击进详情，凭据/积分/参与开关在册，无命令面区块诚实标注", async () => {
+  it("详情实装：行点击进详情，凭据/积分/参与开关在册，档案管理实装", async () => {
     installWorkbuddyRoutes();
+    // wb-uid-2 带脱敏手机号（验证「有值才显示手机号行」）。
+    mockRoute("list_workbuddy_accounts", () => [
+      poolEntry("wb-uid-1", "uid-1", "甲账号"),
+      { ...poolEntry("wb-uid-2", "uid-2", "乙账号"), masked_phone: "133****1304" },
+    ]);
     render(<WorkBuddyPanel active={true} />);
 
     await screen.findByTestId("workbuddy-pool-list");
@@ -203,15 +213,116 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     expect(screen.getByTestId("workbuddy-detail-credits")).toHaveTextContent("420");
     expect(screen.getByTestId("workbuddy-detail-accumulated")).toHaveTextContent("700");
     expect(screen.getByTestId("workbuddy-detail-streak")).toHaveTextContent("6");
+    // P19.2④：脱敏手机号只读行在册（池记录已采集）。
+    expect(screen.getByTestId("workbuddy-detail-phone")).toHaveTextContent("133****1304");
     // 凭据到期时间轴（池 DTO 数据源）。
     expect(screen.getByText("访问凭据（access）").nextElementSibling).toHaveTextContent("剩");
     // 参与开关 = 后端有效参与（wb-uid-2 显式关闭 → 未勾选）。
     expect((screen.getByTestId("workbuddy-detail-participation-toggle").querySelector("input") as HTMLInputElement).checked).toBe(false);
-    // 无命令面区块诚实缺席（备注名/归档/删除/手机号）。
-    expect(screen.getByTestId("workbuddy-detail-absent-note")).toHaveTextContent("暂未提供");
+    // P19.2④：档案管理实装（备注名/归档/删除），缺席标注退役。
+    expect(screen.getByTestId("workbuddy-detail-alias-input")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-detail-archived-toggle")).toBeInTheDocument();
+    expect(screen.getByTestId("workbuddy-detail-purge")).toBeInTheDocument();
     // 返回列表。
     fireEvent.click(screen.getByTestId("workbuddy-account-detail-back"));
     expect(await screen.findByTestId("workbuddy-pool-list")).toBeInTheDocument();
+  });
+
+  it("展示名优先级（P19.2④）：备注名 > 捕获昵称 > 兜底标签", async () => {
+    mockRoute("get_workbuddy_session_health", () => health);
+    mockRoute("list_workbuddy_accounts", () => [
+      { ...poolEntry("wb-a", "uid-a", "A账号"), display_name: "备注优先" },
+      { ...poolEntry("wb-b", "uid-b", ""), display_name: "" },
+      { ...poolEntry("wb-c", "uid-c", "C账号"), display_name: "" },
+    ]);
+    mockRoute("get_workbuddy_checkin_overview", () => []);
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    const names = () =>
+      screen.getAllByTestId(/^workbuddy-pool-card-/)
+        .map((row) => row.querySelector("strong")?.textContent);
+    expect(names()).toEqual(["备注优先", "WorkBuddy 账号", "C账号"]);
+  });
+
+  it("档案管理（P19.2④）：备注名编辑写 set_workbuddy_account_display_name（accountId 口径）", async () => {
+    installWorkbuddyRoutes();
+    mockRoute("set_workbuddy_account_display_name", () => ({
+      profile_id: "wb-uid-2", account_id: "uid-2", screen_name: "乙账号",
+      domain: "workbuddy.example", access_token_expires_at_unix_seconds: 1799999999,
+      refresh_token_expires_at_unix_seconds: 1799999999, minted_at_unix_seconds: 1000,
+      last_updated_at_unix_seconds: 2000, display_name: "我的小号", archived: false, masked_phone: "",
+    }));
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    fireEvent.click(screen.getByTestId("workbuddy-pool-card-wb-uid-2"));
+    const input = await screen.findByTestId("workbuddy-detail-alias-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "我的小号" } });
+    fireEvent.click(screen.getByTestId("workbuddy-detail-alias-save"));
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["set_workbuddy_account_display_name", { accountId: "uid-2", displayName: "我的小号" }],
+      );
+    });
+    expect(vi.mocked(notify.success)).toHaveBeenCalledWith("备注名已保存。");
+  });
+
+  it("档案管理（P19.2④）：归档开关写 set_workbuddy_account_archived 并提示不退出参与集", async () => {
+    installWorkbuddyRoutes();
+    mockRoute("set_workbuddy_account_archived", () => ({
+      profile_id: "wb-uid-2", account_id: "uid-2", screen_name: "乙账号",
+      domain: "workbuddy.example", access_token_expires_at_unix_seconds: 1799999999,
+      refresh_token_expires_at_unix_seconds: 1799999999, minted_at_unix_seconds: 1000,
+      last_updated_at_unix_seconds: 2000, display_name: "", archived: true, masked_phone: "",
+    }));
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    fireEvent.click(screen.getByTestId("workbuddy-pool-card-wb-uid-2"));
+    const toggle = await screen.findByTestId("workbuddy-detail-archived-toggle");
+    // 提示文案写明：归档不自动退出签到参与集。
+    expect(toggle.textContent).toContain("不会自动退出签到参与集");
+    // 手机号未采集 → 整行隐藏（不显示占位符）。
+    expect(screen.queryByTestId("workbuddy-detail-phone")).not.toBeInTheDocument();
+    fireEvent.click(toggle.querySelector("input") as HTMLInputElement);
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["set_workbuddy_account_archived", { accountId: "uid-2", archived: true }],
+      );
+    });
+    expect(vi.mocked(notify.success)).toHaveBeenCalledWith("账号已归档。");
+  });
+
+  it("档案管理（P19.2④）：删除走单次确认，边界文案写明不碰客户端登录态", async () => {
+    installWorkbuddyRoutes();
+    mockRoute("purge_workbuddy_accounts", () => ({
+      confirmed: true,
+      purged_accounts: 1,
+      missing_accounts: [],
+      profile_cleanup_failed: [],
+      remaining_accounts: 1,
+    }));
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    fireEvent.click(screen.getByTestId("workbuddy-pool-card-wb-uid-2"));
+    fireEvent.click(await screen.findByTestId("workbuddy-detail-purge"));
+    const dialog = await screen.findByTestId("workbuddy-detail-purge-dialog");
+    // 边界文案：不触碰客户端 .info / 不登出；删除后不可切号/直连签到。
+    expect(dialog.textContent).toContain("不会改动 WorkBuddy 客户端的登录状态");
+    expect(dialog.textContent).toContain("不可再切换登录或直连签到");
+    fireEvent.click(screen.getByTestId("workbuddy-detail-purge-dialog-confirm"));
+    await waitFor(() => {
+      expect(mockCoreInvoke.mock.calls).toContainEqual(
+        ["purge_workbuddy_accounts", { accountIds: ["uid-2"], confirmed: true }],
+      );
+    });
+    await waitFor(() => {
+      expect(notify.success).toHaveBeenCalledWith(
+        expect.stringContaining("已删除"),
+      );
+    });
   });
 
   it("详情参与开关：翻转写 set_workbuddy_account_auto_checkin 并回读有效参与", async () => {
@@ -365,7 +476,8 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     installWorkbuddyRoutes({ overview: [
       overviewRow("wb-uid-1", "甲账号", {
         error: "workbuddy_checkin_auth_mismatch",
-        today_checked_in: null, streak_days: null, daily_credit: null, total_credits: null, checkin_dates: [],
+        today_checked_in: null, streak_days: null, daily_credit: null, total_credits: null,
+        credits_balance: null, credits_total: null, masked_phone: null, checkin_dates: [],
       }),
       overviewRow("wb-uid-2", "乙账号"),
     ] });

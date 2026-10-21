@@ -91,6 +91,8 @@ export interface WorkBuddyCheckinAccountStatusDto {
   readonly credits_total: number | null;
   /** YYYY-MM-DD，签到日历数据源。 */
   readonly checkin_dates: readonly string[];
+  /** P19.2④ 脱敏手机号（池记录未采集 = null，UI 显示「--」）。 */
+  readonly masked_phone: string | null;
   /** 稳定错误码；null = ok。 */
   readonly error: string | null;
 }
@@ -193,6 +195,41 @@ export interface WorkBuddyLoginSummaryDto {
   readonly refresh_token_expires_at_unix_seconds: number;
   readonly minted_at_unix_seconds: number;
   readonly last_updated_at_unix_seconds: number;
+}
+
+/**
+ * WorkBuddy 账号条目（P19.2④ 池摘要 + 档案旁表字段；不含任何令牌材料）。
+ * list_workbuddy_accounts 回执：档案字段**全量返回，归档过滤由前端执行**
+ * （与参与集同哲学）。
+ */
+export interface WorkBuddyAccountEntryDto {
+  readonly profile_id: string;
+  readonly account_id: string;
+  readonly screen_name: string;
+  readonly domain: string;
+  readonly access_token_expires_at_unix_seconds: number;
+  readonly refresh_token_expires_at_unix_seconds: number;
+  readonly minted_at_unix_seconds: number;
+  readonly last_updated_at_unix_seconds: number;
+  /** 用户备注名（空串 = 未设置；展示优先级：备注名 > 捕获昵称 > 兜底标签）。 */
+  readonly display_name: string;
+  /** 归档标记（fe 据此过滤/标注列表；默认 false = 在册）。 */
+  readonly archived: boolean;
+  /** 脱敏手机号（服务端预脱敏形态如 133****1304，直显不二次脱敏；空串 = 未采集）。 */
+  readonly masked_phone: string;
+}
+
+/** WorkBuddy 账号彻底删除回执（单次确认入口；只报计数与缺失清单，脱敏）。 */
+export interface WorkBuddyAccountsPurgeDto {
+  readonly confirmed: boolean;
+  /** 实际删除的池记录数（含其档案旁表条目）。 */
+  readonly purged_accounts: number;
+  /** 请求中不在池内的 account_id（未删除，如实回执）。 */
+  readonly missing_accounts: readonly string[];
+  /** 档案旁表清理失败的 account_id（池记录已删；残留无害，幂等可重试）。 */
+  readonly profile_cleanup_failed: readonly string[];
+  /** 删除后池内剩余账号数。 */
+  readonly remaining_accounts: number;
 }
 
 /**

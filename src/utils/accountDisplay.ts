@@ -21,3 +21,15 @@ export function displayMobile(entry: {
 }): string {
   return entry.mobile_full?.trim() || entry.masked_mobile;
 }
+
+/**
+ * WorkBuddy 账号展示名统一口径（P19.2④，与后端标签生成同优先级）：
+ * 备注名 > 捕获昵称 > 兜底标签。池行/详情/切号回执等所有 WB 账号名
+ * 展示点必须经由此函数，保证备注名设置后全局立即一致。
+ */
+export function workbuddyDisplayName(entry: {
+  display_name: string;
+  screen_name: string;
+}): string {
+  return entry.display_name.trim() || entry.screen_name || "WorkBuddy 账号";
+}

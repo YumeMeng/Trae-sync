@@ -39,13 +39,13 @@ function installOverviewRoutes(options?: { failStats?: boolean }) {
     {
       profile_id: "wb-uid-1", screen_name: "甲账号",
       today_checked_in: true, streak_days: 6, daily_credit: 100, total_credits: 700,
-      credits_balance: 420, credits_total: 1000,
+      credits_balance: 420, credits_total: 1000, masked_phone: "133****1304",
       checkin_dates: ["2026-10-20"], error: null,
     },
     {
       profile_id: "wb-uid-2", screen_name: "乙账号",
       today_checked_in: false, streak_days: 1, daily_credit: 100, total_credits: 500,
-      credits_balance: 300, credits_total: 800,
+      credits_balance: 300, credits_total: 800, masked_phone: null,
       checkin_dates: [], error: null,
     },
   ]);
@@ -173,6 +173,7 @@ function errorRow(profileId: string, screenName: string) {
     total_credits: null,
     credits_balance: null,
     credits_total: null,
+    masked_phone: null,
     checkin_dates: [] as string[],
     error: "workbuddy_checkin_runtime_error",
   };
@@ -189,6 +190,7 @@ function creditsRow(profileId: string, screenName: string, totalCredits: number,
     total_credits: totalCredits,
     credits_balance: balance,
     credits_total: balance * 2,
+    masked_phone: "138****5678",
     checkin_dates: ["2026-10-20"] as string[],
     error: null,
   };

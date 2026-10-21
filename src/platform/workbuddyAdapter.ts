@@ -6,6 +6,8 @@ import type {
   WorkBuddyCheckinParticipationDto,
   WorkBuddyCheckinStatusDto,
   WorkBuddyDeepHealthDto,
+  WorkBuddyAccountEntryDto,
+  WorkBuddyAccountsPurgeDto,
   WorkBuddyLoginSummaryDto,
   WorkBuddyRefreshStatusDto,
   WorkBuddySessionHealthDto,
@@ -55,8 +57,12 @@ export function checkWorkBuddyLoginHealth(): Promise<WorkBuddyDeepHealthDto> {
 }
 
 /** 读取工具账号池（workbuddy-login 容器脱敏清单）。 */
-export function listWorkBuddyAccounts(): Promise<readonly WorkBuddyLoginSummaryDto[]> {
-  return invoke<readonly WorkBuddyLoginSummaryDto[]>("list_workbuddy_accounts");
+/**
+ * 账号池清单（P19.2④ 池摘要 + 档案旁表字段）：档案字段全量返回，归档
+ * 过滤/标注由前端执行（与参与集同哲学）。
+ */
+export function listWorkBuddyAccounts(): Promise<readonly WorkBuddyAccountEntryDto[]> {
+  return invoke<readonly WorkBuddyAccountEntryDto[]>("list_workbuddy_accounts");
 }
 
 /** 查询直连签到状态（借客户端运行时解密，客户端可关可开）。 */
@@ -138,6 +144,45 @@ export function switchWorkBuddyAccount(
   confirmed: boolean,
 ): Promise<WorkBuddySwitchDto> {
   return invoke<WorkBuddySwitchDto>("switch_workbuddy_account", { targetAccountId, confirmed });
+}
+
+// ===== P19.2④ 账号档案管理（be b962ae8 契约） =====
+
+/**
+ * 设置账号备注名（档案旁表写入，不碰 .info）：空/空白 = 清除备注（回退
+ * 捕获昵称）；≤100 字符，超限 → workbuddy_account_profile_name_too_long。
+ */
+export function setWorkBuddyAccountDisplayName(
+  accountId: string,
+  displayName: string,
+): Promise<WorkBuddyAccountEntryDto> {
+  return invoke<WorkBuddyAccountEntryDto>("set_workbuddy_account_display_name", { accountId, displayName });
+}
+
+/**
+ * 设置账号归档标记：只影响列表过滤/标注展示，不自动退出签到参与集
+ * （停止自动签到请用 set_workbuddy_account_auto_checkin）。
+ */
+export function setWorkBuddyAccountArchived(
+  accountId: string,
+  archived: boolean,
+): Promise<WorkBuddyAccountEntryDto> {
+  return invoke<WorkBuddyAccountEntryDto>("set_workbuddy_account_archived", { accountId, archived });
+}
+
+/**
+ * 账号彻底删除（单次确认入口：UI 弹窗确认后 confirmed=true 调用）。
+ * 删除范围 = 工具侧池记录 + 档案旁表（备注名/归档）；不触碰客户端 .info、
+ * 不做客户端登出；删除后该账号不可再切号/直连签到，重新捕获可恢复。
+ */
+export function purgeWorkBuddyAccounts(
+  accountIds: readonly string[],
+  confirmed: boolean,
+): Promise<WorkBuddyAccountsPurgeDto> {
+  return invoke<WorkBuddyAccountsPurgeDto>("purge_workbuddy_accounts", {
+    accountIds: [...accountIds],
+    confirmed,
+  });
 }
 
 // ===== P18-B1 会话过户 =====

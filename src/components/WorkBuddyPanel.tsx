@@ -3,9 +3,9 @@ import { Activity, RefreshCw, ShieldCheck, UserPlus } from "lucide-react";
 import type { ReactNode } from "react";
 import type {
   WorkBuddySessionHealthDto,
+  WorkBuddyAccountEntryDto,
   WorkBuddyCheckinAccountStatusDto,
   WorkBuddyCheckinParticipationDto,
-  WorkBuddyLoginSummaryDto,
   WorkBuddyDeepHealthDto,
   WorkBuddySwitchPreviewDto,
 } from "../types/product";
@@ -45,6 +45,7 @@ import { CheckinFlowRow } from "./shared/checkin/CheckinFlowRow";
 import { productUi } from "../platform/productUiRegistry";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+import { workbuddyDisplayName } from "../utils/accountDisplay";
 
 /**
  * WorkBuddy 产品域页面（P17-T5 并列骨架一期）。
@@ -131,7 +132,7 @@ interface WorkBuddyPanelProps {
 
 export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   const [health, setHealth] = useState<WorkBuddySessionHealthDto | null>(null);
-  const [pool, setPool] = useState<readonly WorkBuddyLoginSummaryDto[]>([]);
+  const [pool, setPool] = useState<readonly WorkBuddyAccountEntryDto[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -237,7 +238,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   const [switchPreview, setSwitchPreview] = useState<WorkBuddySwitchPreviewDto | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
 
-  const handleSwitchIntent = useCallback((account: WorkBuddyLoginSummaryDto) => {
+  const handleSwitchIntent = useCallback((account: WorkBuddyAccountEntryDto) => {
     if (previewBusy || switching) return;
     setSwitchTarget(account.profile_id);
     setSwitchPreview(null);
@@ -365,11 +366,13 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   // AccountPageSkeleton 承担（ADR-0036 铁律），本组件退化为 WB 数据与插槽提供方。
   const uiProduct = productUi("workbuddy");
   const visiblePool = accountSort === "name"
-    ? [...pool].sort((a, b) => (a.screen_name || "").localeCompare(b.screen_name || "", "zh-Hans-CN"))
+    ? [...pool].sort((a, b) =>
+        workbuddyDisplayName(a).localeCompare(workbuddyDisplayName(b), "zh-Hans-CN"))
     : pool;
   const poolEntries = visiblePool.map((account) => ({
     id: account.profile_id,
-    displayName: account.screen_name || "WorkBuddy 账号",
+    // P19.2④ 展示优先级：备注名 > 捕获昵称 > 兜底（与后端标签生成同口径）。
+    displayName: workbuddyDisplayName(account),
     lastVerifiedAt: null,
     // 「使用中」= 当前客户端登录账号（健康卡的 uid 与池账号 account_id 同源）。
     isSelected: health?.uid === account.account_id,
@@ -427,7 +430,20 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
         testId={`workbuddy-pool-card-${account.profile_id}`}
         actionTestId={`workbuddy-switch-${account.profile_id}`}
         selectedTestId={`workbuddy-pool-current-${account.profile_id}`}
-        statusContent={<WorkBuddyPoolSlotBadge state={poolState} />}
+        statusContent={(
+          <>
+            {account.archived && (
+              <span
+                className="slot-badge slot-badge--idle"
+                title="已归档：账号保留在池中，可随时在详情页取消归档"
+                data-testid={`workbuddy-archived-${account.profile_id}`}
+              >
+                已归档
+              </span>
+            )}
+            <WorkBuddyPoolSlotBadge state={poolState} />
+          </>
+        )}
         listMeta={expiryMeta}
         cardMeta={expiryMeta}
         listMetric={creditsMetric}

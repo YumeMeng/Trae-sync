@@ -1,36 +1,44 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowLeft, CalendarClock, Coins, Cpu, KeyRound } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { ArrowLeft, CalendarClock, Coins, Cpu, KeyRound, Phone, Trash2, UserPen } from "lucide-react";
 import type {
+  WorkBuddyAccountEntryDto,
   WorkBuddyCheckinAccountStatusDto,
-  WorkBuddyLoginSummaryDto,
 } from "../types/product";
 import {
   fetchWorkBuddyCheckinOverview,
   listWorkBuddyCheckinAccounts,
+  purgeWorkBuddyAccounts,
+  setWorkBuddyAccountArchived,
   setWorkBuddyAccountAutoCheckin,
+  setWorkBuddyAccountDisplayName,
 } from "../platform/workbuddyAdapter";
 import { WorkBuddyPoolSlotBadge, deriveWorkBuddyPoolLoginState } from "./StatusBadges";
+import { ConfirmDialog } from "./shared/ConfirmDialog";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
+import { workbuddyDisplayName } from "../utils/accountDisplay";
 
 interface WorkBuddyAccountDetailProps {
-  /** 详情目标账号（账号池清单条目）。 */
-  account: WorkBuddyLoginSummaryDto;
+  /** 详情目标账号（账号池清单条目，P19.2④ 含档案字段）。 */
+  account: WorkBuddyAccountEntryDto;
   /** 是否为当前客户端登录账号（健康卡 uid 与池 account_id 同源）。 */
   isCurrentLogin: boolean;
-  /** 数据变更（参与开关翻转）后通知列表页重读。 */
+  /** 数据变更（备注名/归档/参与/删除）后通知列表页重读。 */
   onDataChanged: () => Promise<void>;
   /** 返回账号列表。 */
   onBack: () => void;
 }
 
+type DetailAction = "alias" | "archive" | "purge" | "participation" | null;
+
 /**
- * WorkBuddy 账号详情（P19.1 详情实装，对照 AdapterAccountDetail 轻量结构）：
- * 基础信息 + 凭据健康度 + 签到与积分 + 自动签到参与开关 + 技术细节折叠。
+ * WorkBuddy 账号详情（P19.1 详情实装 + P19.2④ 档案管理转实装，对照
+ * AdapterAccountDetail 轻量结构）：基础信息（含脱敏手机号）+ 凭据健康度 +
+ * 签到与积分 + 自动签到参与开关 + 档案管理（备注名/归档/删除）+ 技术细节折叠。
  *
- * 数据源纪律：只用既有命令面（池清单 / checkin overview / 参与集命令）；
- * 备注名编辑、归档/删除与手机号在 WB 命令面与 DTO 中均无对应实现
- * （IA 草案 §1.2 判定「移植」待后端），区块诚实标注缺席三态，不发明数据。
+ * 数据源纪律：全部经既有命令面（be b962ae8 契约）；删除 = 工具侧池记录 +
+ * 档案旁表，不触碰客户端 .info、不做客户端登出（弹窗文案写明边界）。
  */
 export function WorkBuddyAccountDetail({
   account,
@@ -40,18 +48,25 @@ export function WorkBuddyAccountDetail({
 }: WorkBuddyAccountDetailProps) {
   const [overview, setOverview] = useState<WorkBuddyCheckinAccountStatusDto | null>(null);
   const [participating, setParticipating] = useState<boolean | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<DetailAction>(null);
+  // P19.2④ 备注名草稿：进入详情时以档案值为准；外部数据刷新时同步重置。
+  const [aliasDraft, setAliasDraft] = useState(account.display_name);
+  useEffect(() => {
+    setAliasDraft(account.display_name);
+  }, [account.display_name, account.account_id]);
+  // 删除确认弹层（破坏性操作，单次确认纪律）。
+  const [purgeDialogOpen, setPurgeDialogOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    // 积分/签到状态（overview 已有 total_credits/streak）；参与集 = 有效参与。
+    // 积分/签到状态（overview：余额/累计/连签）；参与集 = 有效参与。
     void fetchWorkBuddyCheckinOverview()
       .then((rows) => {
         if (!cancelled) {
           setOverview(rows.find((row) => row.profile_id === account.profile_id) ?? null);
         }
       })
-      .catch(() => undefined); // fail-soft：积分区显示「未读取」
+      .catch(() => undefined); // fail-soft：积分区显示「未获取」
     void listWorkBuddyCheckinAccounts()
       .then((rows) => {
         if (!cancelled) {
@@ -59,14 +74,45 @@ export function WorkBuddyAccountDetail({
           setParticipating(row ? row.enabled : null);
         }
       })
-      .catch(() => undefined); // fail-soft：参与行显示「未读取」
+      .catch(() => undefined); // fail-soft：参与行显示「不可读取」
     return () => { cancelled = true; };
   }, [account.profile_id]);
 
+  // 备注名保存：trim 后为空 = 清除（回退捕获昵称）；≤100 字符由后端校验。
+  const aliasDirty = aliasDraft.trim() !== account.display_name;
+  const handleSaveAlias = useCallback(() => {
+    if (busy !== null || !aliasDirty) return;
+    setBusy("alias");
+    void setWorkBuddyAccountDisplayName(account.account_id, aliasDraft.trim())
+      .then(async (entry) => {
+        notify.success(entry.display_name ? "备注名已保存。" : "备注名已清除，恢复捕获昵称。");
+        await onDataChanged();
+      })
+      .catch((reason: unknown) => notify.error(
+        `WorkBuddy：备注名保存失败——${safeUiErrorMessage(reason, "请稍后重试。")}`,
+      ))
+      .finally(() => setBusy(null));
+  }, [account.account_id, aliasDraft, busy, onDataChanged]);
+
+  // 归档开关：只影响列表标注，不自动退出签到参与集（提示文案写明）。
+  const handleToggleArchived = useCallback(() => {
+    if (busy !== null) return;
+    setBusy("archive");
+    void setWorkBuddyAccountArchived(account.account_id, !account.archived)
+      .then(async () => {
+        notify.success(!account.archived ? "账号已归档。" : "账号已取消归档。");
+        await onDataChanged();
+      })
+      .catch((reason: unknown) => notify.error(
+        `WorkBuddy：归档设置失败——${safeUiErrorMessage(reason, "请稍后重试。")}`,
+      ))
+      .finally(() => setBusy(null));
+  }, [account.account_id, account.archived, busy, onDataChanged]);
+
   // 参与开关翻转：显式写后端 touched+enabled（opt-out 永久尊重，B5 契约）。
   const handleToggleParticipation = useCallback(() => {
-    if (busy || participating === null) return;
-    setBusy(true);
+    if (busy !== null || participating === null) return;
+    setBusy("participation");
     void setWorkBuddyAccountAutoCheckin(account.profile_id, !participating)
       .then(async () => {
         const rows = await listWorkBuddyCheckinAccounts();
@@ -80,15 +126,43 @@ export function WorkBuddyAccountDetail({
       .catch((reason: unknown) => notify.error(
         `WorkBuddy：参与状态保存失败——${safeUiErrorMessage(reason, "请稍后重试。")}`,
       ))
-      .finally(() => setBusy(false));
+      .finally(() => setBusy(null));
   }, [account.profile_id, busy, onDataChanged, participating]);
+
+  // 彻底删除：单次确认弹层 → purge(confirmed=true) → 回读刷新 → 回列表。
+  const runPurge = useCallback(() => {
+    if (busy !== null) return;
+    setBusy("purge");
+    void purgeWorkBuddyAccounts([account.account_id], true)
+      .then(async (receipt) => {
+        if (receipt.profile_cleanup_failed.length > 0) {
+          notify.warning(
+            "账号已从池中删除，但档案备注清理未完成（残留无害，可忽略）。",
+          );
+        } else {
+          notify.success(
+            `WorkBuddy：账号「${workbuddyDisplayName(account)}」已删除（剩余 ${receipt.remaining_accounts} 个账号）。`,
+          );
+        }
+        setPurgeDialogOpen(false);
+        await onDataChanged();
+        onBack();
+      })
+      .catch((reason: unknown) => {
+        setPurgeDialogOpen(false);
+        notify.error(
+          `WorkBuddy：删除未完成——${safeUiErrorMessage(reason, "账号数据未被改动，请稍后重试。")}`,
+        );
+      })
+      .finally(() => setBusy(null));
+  }, [account, busy, onDataChanged, onBack]);
 
   const poolState = deriveWorkBuddyPoolLoginState({
     access_expires_at_unix_seconds: account.access_token_expires_at_unix_seconds,
     refresh_expires_at_unix_seconds: account.refresh_token_expires_at_unix_seconds,
     now_unix_seconds: Math.floor(Date.now() / 1000),
   });
-  const displayName = account.screen_name || "WorkBuddy 账号";
+  const displayName = workbuddyDisplayName(account);
 
   return (
     <section className="account-detail" role="region" aria-label="账号详情" data-testid="workbuddy-account-detail">
@@ -101,7 +175,7 @@ export function WorkBuddyAccountDetail({
         </div>
       </header>
 
-      {/* 基础信息：凭据状态、当前登录标记、账号域、最近更新（全部来自池清单 DTO）。 */}
+      {/* 基础信息：凭据状态、当前登录标记、脱敏手机号（有值才显示）、最近更新。 */}
       <section className="account-detail__section" aria-labelledby="workbuddy-detail-basic">
         <h2 id="workbuddy-detail-basic"><Coins size={16} aria-hidden="true" />基础信息</h2>
         <dl className="account-detail__facts">
@@ -123,6 +197,14 @@ export function WorkBuddyAccountDetail({
               )}
             </dd>
           </div>
+          {account.masked_phone && (
+            <div className="account-detail__fact">
+              <dt>手机号</dt>
+              <dd data-testid="workbuddy-detail-phone">
+                <Phone size={13} aria-hidden="true" /> {account.masked_phone}
+              </dd>
+            </div>
+          )}
           <div className="account-detail__fact">
             <dt>最近更新</dt>
             <dd data-testid="workbuddy-detail-updated">{formatUnixTime(account.last_updated_at_unix_seconds)}</dd>
@@ -147,7 +229,7 @@ export function WorkBuddyAccountDetail({
         <p className="account-detail__hint">应用会在切号与凭据充裕判断下自动续期；也可在账号页用「刷新登录凭据」手动续期。</p>
       </section>
 
-      {/* 签到与积分：overview 数据面（total_credits/streak/今日状态）。 */}
+      {/* 签到与积分：overview 数据面（credits_balance 余额主展示 + 累计/连签/今日）。 */}
       <section className="account-detail__section" aria-labelledby="workbuddy-detail-checkin">
         <h2 id="workbuddy-detail-checkin"><CalendarClock size={16} aria-hidden="true" />签到与积分</h2>
         <dl className="account-detail__facts">
@@ -205,7 +287,7 @@ export function WorkBuddyAccountDetail({
             <input
               type="checkbox"
               checked={participating}
-              disabled={busy}
+              disabled={busy !== null}
               onChange={handleToggleParticipation}
             />
             <span className="account-center__profile-copy">
@@ -216,14 +298,79 @@ export function WorkBuddyAccountDetail({
         )}
       </section>
 
-      {/* 档案管理能力缺口（诚实缺席）：WB 命令面暂无备注名/归档/删除命令，
-          DTO 无手机号字段——待后端移植后实装（IA 草案 §1.2 判定「移植」）。 */}
-      <section className="account-detail__section" aria-labelledby="workbuddy-detail-absent">
-        <h2 id="workbuddy-detail-absent">档案管理</h2>
-        <p className="account-detail__hint" data-testid="workbuddy-detail-absent-note">
-          备注名编辑、归档与删除需要账号档案命令面（WorkBuddy 后端暂未提供）；
-          WorkBuddy 账号档案不包含手机号数据。以上区块将随后端命令面补齐而实装。
-        </p>
+      {/* P19.2④ 档案管理（be b962ae8 契约）：备注名编辑 + 归档开关；
+          删除下沉到独立危险区（单次确认）。 */}
+      <section className="account-detail__section" aria-labelledby="workbuddy-detail-profile">
+        <h2 id="workbuddy-detail-profile"><UserPen size={16} aria-hidden="true" />档案管理</h2>
+        <dl className="account-detail__facts">
+          <div className="account-detail__fact">
+            <dt>备注名</dt>
+            <dd data-testid="workbuddy-detail-alias">
+              <input
+                type="text"
+                value={aliasDraft}
+                placeholder={account.screen_name}
+                maxLength={100}
+                disabled={busy !== null}
+                data-testid="workbuddy-detail-alias-input"
+                onChange={(event) => setAliasDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && aliasDirty) {
+                    event.preventDefault();
+                    handleSaveAlias();
+                  }
+                }}
+              />
+              <button
+                className="btn"
+                type="button"
+                onClick={handleSaveAlias}
+                disabled={!aliasDirty || busy !== null}
+                data-testid="workbuddy-detail-alias-save"
+              >
+                {busy === "alias" ? "保存中…" : "保存"}
+              </button>
+            </dd>
+          </div>
+          <div className="account-detail__fact">
+            <dt>归档</dt>
+            <dd>
+              <label className="account-center__profile-select" data-testid="workbuddy-detail-archived-toggle">
+                <input
+                  type="checkbox"
+                  checked={account.archived}
+                  disabled={busy !== null}
+                  onChange={handleToggleArchived}
+                />
+                <span className="account-center__profile-copy">
+                  <strong>{account.archived ? "已归档" : "在册"}</strong>
+                  <span>归档只影响账号列表标注；不会自动退出签到参与集（需停止自动签到请关闭上方参与开关）。</span>
+                </span>
+              </label>
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      {/* 危险区：彻底删除（单次确认；边界文案写明——不碰客户端登录态）。 */}
+      <section className="account-detail__section account-detail__section--danger" aria-labelledby="workbuddy-detail-danger">
+        <h2 id="workbuddy-detail-danger">危险操作</h2>
+        <div className="account-detail__danger-row">
+          <p className="account-detail__danger-hint">
+            删除范围 = 工具侧账号池记录与档案备注（备注名/归档）；
+            不会改动 WorkBuddy 客户端的登录状态（客户端如需退出登录请在客户端操作）。
+            删除后该账号不可再切换登录或直连签到；重新保存或登录可恢复。
+          </p>
+          <button
+            className="btn btn--danger"
+            type="button"
+            onClick={() => setPurgeDialogOpen(true)}
+            disabled={busy !== null}
+            data-testid="workbuddy-detail-purge"
+          >
+            <Trash2 size={15} aria-hidden="true" />{busy === "purge" ? "删除中…" : "删除账号"}
+          </button>
+        </div>
       </section>
 
       {/* 技术细节：排障用标识，默认折叠。 */}
@@ -244,6 +391,28 @@ export function WorkBuddyAccountDetail({
           </div>
         </dl>
       </details>
+
+      {/* 删除单次确认弹层（覆盖性操作；写明边界）。 */}
+      {purgeDialogOpen && (
+        <ConfirmDialog
+          title="删除 WorkBuddy 账号"
+          lines={[
+            `确定从工具账号池删除「${displayName}」吗？`,
+            "将移除：工具侧账号池记录、账号档案备注（备注名/归档）。",
+            "不会改动 WorkBuddy 客户端的登录状态（不登出、不碰客户端数据）。",
+            "删除后该账号不可再切换登录或直连签到；重新保存或登录可恢复。",
+          ]}
+          confirmLabel="确认删除"
+          busyLabel="删除中…"
+          danger
+          busy={busy === "purge"}
+          onCancel={() => {
+            if (busy !== "purge") setPurgeDialogOpen(false);
+          }}
+          onConfirm={() => runPurge()}
+          testId="workbuddy-detail-purge-dialog"
+        />
+      )}
     </section>
   );
 }
