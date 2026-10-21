@@ -258,6 +258,37 @@ pub fn checkin_status(
 /// 两接口才有 /v2，资源/成长域没有）。
 pub const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 
+/// P19.2⑤ 余额查询失败分类（诊断透出口径——fail-soft 不再静默吞因：
+/// 前端「--」处可展示稳定错误码/文案）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkBuddyBalanceError {
+    /// 401/403——token 失效（调用方可用强制刷新原语重试一次）。
+    AuthMismatch,
+    /// 服务端拒绝：HTTP 4xx 或信封 code≠0（载荷 = 稳定错误码后缀：
+    /// `http_{status}` / `api_{code}`）。
+    Rejected { detail: String },
+    /// 响应形态不符（非 JSON / 缺 data / data 非对象）。
+    ParseFailed,
+    /// 网络/超时/5xx。
+    Unreachable,
+    /// 凭据上下文不完整（domain/uid 为空）。
+    CredentialsIncomplete,
+}
+
+impl WorkBuddyBalanceError {
+    pub fn code(&self) -> String {
+        match self {
+            Self::AuthMismatch => "workbuddy_balance_auth_mismatch".to_string(),
+            Self::Rejected { detail } => format!("workbuddy_balance_rejected:{detail}"),
+            Self::ParseFailed => "workbuddy_balance_parse_failed".to_string(),
+            Self::Unreachable => "workbuddy_balance_unreachable".to_string(),
+            Self::CredentialsIncomplete => {
+                "workbuddy_balance_credentials_incomplete".to_string()
+            }
+        }
+    }
+}
+
 /// 账户资源包余额（Σ 汇总语义，对齐客户端 DesktopAccountRepo.billing →
 /// sumSummaryCapacity：余额 = Σ CycleRemainCapacity、总额 = Σ
 /// CycleTotalCapacity）。
@@ -300,24 +331,70 @@ pub fn parse_resource_balance(data: &serde_json::Value) -> WorkBuddyResourceBala
     balance
 }
 
-/// 查询账户资源包余额（billing 域真实口径；headers 同签到族
-/// Authorization/X-User-Id——daemon buildHeaders 同族，**无
-/// X-Device-Token 要求**，credit-source-findings §3.1）。
-/// 401/403 归 [`WorkBuddyCheckinError::RequestFailed`]（调用方 fail-soft）。
+/// 余额响应分类（纯函数，离线单测口径；HTTP 状态与 body 分离传入）。
+/// 401/403 → AuthMismatch；4xx → Rejected；5xx → Unreachable；非 JSON /
+/// 缺 data → ParseFailed；信封 code≠0 → Rejected（api 前缀）。
+fn classify_balance_response(
+    http_status: u16,
+    body: &str,
+) -> Result<WorkBuddyResourceBalance, WorkBuddyBalanceError> {
+    if http_status == 401 || http_status == 403 {
+        return Err(WorkBuddyBalanceError::AuthMismatch);
+    }
+    if (400..500).contains(&http_status) {
+        return Err(WorkBuddyBalanceError::Rejected {
+            detail: format!("http_{http_status}"),
+        });
+    }
+    if !(200..300).contains(&http_status) {
+        return Err(WorkBuddyBalanceError::Unreachable);
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| WorkBuddyBalanceError::ParseFailed)?;
+    if envelope.get("code").and_then(|code| code.as_i64()) != Some(0) {
+        let api_code = envelope
+            .get("code")
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(WorkBuddyBalanceError::Rejected {
+            detail: format!("api_{api_code}"),
+        });
+    }
+    let data = envelope.get("data").cloned().unwrap_or_default();
+    if !data.is_object() {
+        return Err(WorkBuddyBalanceError::ParseFailed);
+    }
+    Ok(parse_resource_balance(&data))
+}
+
+/// 查询账户资源包余额（billing 域真实口径；P19.2⑤ 请求构造按 asar 对照
+/// 对齐：body `{}` + Authorization/X-User-Id/Content-Type + Accept-Language
+/// ——web 层 fetchResourceSummary 显式带、daemon buildHeaders 同族；
+/// **无 X-Device-Token**（credit-source-findings §3.1 结论经本轮复核成立）。
+/// 失败按 [`WorkBuddyBalanceError`] 分类透出，不再静默归并）。
 pub fn query_resource_summary_balance(
     http: &reqwest::blocking::Client,
     credentials: &WorkBuddyCheckinCredentials,
-) -> Result<WorkBuddyResourceBalance, WorkBuddyCheckinError> {
-    let (status, body) = post_json(http, credentials, RESOURCE_SUMMARY_PATH)?;
-    if !(200..300).contains(&status) {
-        return Err(WorkBuddyCheckinError::RequestFailed);
+) -> Result<WorkBuddyResourceBalance, WorkBuddyBalanceError> {
+    if credentials.domain.trim().is_empty() || credentials.uid.trim().is_empty() {
+        return Err(WorkBuddyBalanceError::CredentialsIncomplete);
     }
-    let envelope: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| WorkBuddyCheckinError::RequestFailed)?;
-    if envelope.get("code").and_then(|code| code.as_i64()) != Some(0) {
-        return Err(WorkBuddyCheckinError::RequestFailed);
-    }
-    Ok(parse_resource_balance(&envelope.get("data").cloned().unwrap_or_default()))
+    let url = format!("https://{}{RESOURCE_SUMMARY_PATH}", credentials.domain.trim());
+    let response = http
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", credentials.access_token))
+        .header("X-User-Id", credentials.uid.trim())
+        .header("Content-Type", "application/json")
+        .header("Accept-Language", "zh-CN")
+        .body("{}")
+        .timeout(Duration::from_secs(30))
+        .send()
+        .map_err(|_| WorkBuddyBalanceError::Unreachable)?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .map_err(|_| WorkBuddyBalanceError::Unreachable)?;
+    classify_balance_response(status, &body)
 }
 
 /// 领取每日签到（幂等；当日重复领取返回 AlreadyCheckedIn）。
@@ -352,8 +429,9 @@ impl WorkBuddyCheckinSession {
         checkin_claim(&self.http, &self.credentials)
     }
 
-    /// 查询账户资源包余额（P19.2③「积分余额」真实口径；调用方 fail-soft）。
-    pub fn resource_balance(&self) -> Result<WorkBuddyResourceBalance, WorkBuddyCheckinError> {
+    /// 查询账户资源包余额（P19.2③「积分余额」真实口径；P19.2⑤ 失败按
+    /// [`WorkBuddyBalanceError`] 分类透出，401 交由调用方走强制刷新重试）。
+    pub fn resource_balance(&self) -> Result<WorkBuddyResourceBalance, WorkBuddyBalanceError> {
         query_resource_summary_balance(&self.http, &self.credentials)
     }
 }
@@ -1254,6 +1332,84 @@ mod tests {
         assert_eq!(
             format!("https://www.workbuddy.cn{RESOURCE_SUMMARY_PATH}"),
             "https://www.workbuddy.cn/billing/meter/get-user-resource-summary"
+        );
+    }
+
+    // ===== P19.2⑤ 余额诊断分类单测 =====
+
+    const BALANCE_OK_BODY: &str = r#"{"code":0,"msg":"OK","data":{"Packages":[
+        {"PackageCode":"free","CycleTotalCapacity":2000,"CycleRemainCapacity":1500}]}}"#;
+
+    /// 401/403 → AuthMismatch（调用方触发强制刷新重试链）。
+    #[test]
+    fn balance_classify_auth_mismatch() {
+        assert_eq!(
+            classify_balance_response(401, BALANCE_OK_BODY).unwrap_err(),
+            WorkBuddyBalanceError::AuthMismatch
+        );
+        assert_eq!(
+            classify_balance_response(403, "any").unwrap_err(),
+            WorkBuddyBalanceError::AuthMismatch
+        );
+    }
+
+    /// 4xx → Rejected(http_{status})；信封 code≠0 → Rejected(api_{code})。
+    #[test]
+    fn balance_classify_rejected() {
+        assert_eq!(
+            classify_balance_response(404, BALANCE_OK_BODY).unwrap_err(),
+            WorkBuddyBalanceError::Rejected { detail: "http_404".into() }
+        );
+        assert_eq!(
+            classify_balance_response(200, r#"{"code":10001,"msg":"invalid"}"#).unwrap_err(),
+            WorkBuddyBalanceError::Rejected { detail: "api_10001".into() }
+        );
+    }
+
+    /// 5xx → Unreachable；非 JSON / 缺 data → ParseFailed。
+    #[test]
+    fn balance_classify_unreachable_and_parse_failed() {
+        assert_eq!(
+            classify_balance_response(502, "server error").unwrap_err(),
+            WorkBuddyBalanceError::Unreachable
+        );
+        assert_eq!(
+            classify_balance_response(200, "not json").unwrap_err(),
+            WorkBuddyBalanceError::ParseFailed
+        );
+        assert_eq!(
+            classify_balance_response(200, r#"{"code":0}"#).unwrap_err(),
+            WorkBuddyBalanceError::ParseFailed,
+            "code=0 但缺 data 不猜（空 Packages 与缺 data 语义不同）"
+        );
+    }
+
+    /// 成功路径：余额照解析；错误码表稳定（契约值不漂移）。
+    #[test]
+    fn balance_classify_success_and_error_codes() {
+        assert_eq!(
+            classify_balance_response(200, BALANCE_OK_BODY).unwrap(),
+            WorkBuddyResourceBalance { credits_balance: 1500, credits_total: 2000 }
+        );
+        assert_eq!(
+            WorkBuddyBalanceError::AuthMismatch.code(),
+            "workbuddy_balance_auth_mismatch"
+        );
+        assert_eq!(
+            WorkBuddyBalanceError::ParseFailed.code(),
+            "workbuddy_balance_parse_failed"
+        );
+        assert_eq!(
+            WorkBuddyBalanceError::Unreachable.code(),
+            "workbuddy_balance_unreachable"
+        );
+        assert_eq!(
+            WorkBuddyBalanceError::CredentialsIncomplete.code(),
+            "workbuddy_balance_credentials_incomplete"
+        );
+        assert_eq!(
+            WorkBuddyBalanceError::Rejected { detail: "http_400".into() }.code(),
+            "workbuddy_balance_rejected:http_400"
         );
     }
 }
