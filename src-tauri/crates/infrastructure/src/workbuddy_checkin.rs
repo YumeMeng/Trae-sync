@@ -450,7 +450,7 @@ pub fn renew_pool_record(
     let mut record = store
         .load(&summary.profile_id, &summary.account_id)
         .map_err(|_| WorkBuddyPoolError::RecordMissing)?;
-    renew_record(http, store, &mut record, now_unix)
+    renew_record(http, store, &mut record, now_unix, false)
 }
 
 /// 按指定账号续期（P17-A5 自动调度：多账号池逐账号 claim 前的断连兜底）。
@@ -462,7 +462,32 @@ pub fn renew_pool_profile(
     now_unix: u64,
 ) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
     let mut record = load_pool_record(store, profile_id)?;
-    renew_record(http, store, &mut record, now_unix)
+    renew_record(http, store, &mut record, now_unix, false)
+}
+
+/// P19.1：按指定账号**强制刷新**（忽略 access 充裕阈值）——401 兜底
+/// 重试链的基础原语：AuthMismatch 时先强刷换新对再重开 session 重试。
+/// 轮换纪律不变：新对原子写回（refreshToken 一次性，旧对即作废）。
+pub fn renew_pool_profile_forced(
+    http: &reqwest::blocking::Client,
+    store: &WorkBuddyLoginStore,
+    profile_id: &str,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+    let mut record = load_pool_record(store, profile_id)?;
+    renew_record(http, store, &mut record, now_unix, true)
+}
+
+/// P19.1：池首账号强制刷新（"当前账号"路径〔机器回退/池优先混装〕的
+/// 401 兜底用；池为空 → PoolEmpty 由调用方回退机器路径）。
+pub fn renew_pool_record_forced(
+    http: &reqwest::blocking::Client,
+    store: &WorkBuddyLoginStore,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+    let summaries = store.list().map_err(|_| WorkBuddyPoolError::StoreIo)?;
+    let summary = summaries.first().ok_or(WorkBuddyPoolError::PoolEmpty)?;
+    renew_pool_profile_forced(http, store, &summary.profile_id, now_unix)
 }
 
 /// 按容器清单定位并加载指定账号（不存在 → RecordMissing）。
@@ -480,17 +505,26 @@ fn load_pool_record(
         .map_err(|_| WorkBuddyPoolError::RecordMissing)
 }
 
+/// 续期跳过判定（纯函数，单测口径）：非强制且 access 距过期仍充裕
+/// （> [`RENEW_THRESHOLD_SECS`]）才跳过；强制刷新（401 兜底）永不跳过。
+fn should_skip_renewal(access_expires_in_secs: u64, force: bool) -> bool {
+    !force && access_expires_in_secs > RENEW_THRESHOLD_SECS
+}
+
 /// 续期内核（按记录；access 充裕跳过不轮换，临近过期刷新 + 原子写回）。
+/// `force`：P19.1 强制刷新（忽略阈值——401 兜底重试链用；轮换副作用
+/// 不变：新对原子写回，旧对即作废）。
 fn renew_record(
     http: &reqwest::blocking::Client,
     store: &WorkBuddyLoginStore,
     record: &mut WorkBuddyLoginRecord,
     now_unix: u64,
+    force: bool,
 ) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
     let access_expires_in = record
         .access_token_expires_at_unix_seconds
         .saturating_sub(now_unix);
-    if access_expires_in > RENEW_THRESHOLD_SECS {
+    if should_skip_renewal(access_expires_in, force) {
         return Ok(WorkBuddyRenewalOutcome::Skipped {
             access_expires_in_secs: access_expires_in,
         });
@@ -721,5 +755,20 @@ mod tests {
             WorkBuddyPoolError::ResponseInvalid.code(),
             "workbuddy_refresh_response_invalid"
         );
+    }
+
+    /// P19.1 强制刷新判定（401 兜底重试链）：充裕跳过 / 临近过期刷新 /
+    /// 强制永不跳过（三态离线口径）。
+    #[test]
+    fn forced_renewal_skips_threshold_only_when_not_forced() {
+        // 充裕（> 3 天阈值）：非强制跳过，强制刷新。
+        assert!(should_skip_renewal(RENEW_THRESHOLD_SECS + 1, false));
+        assert!(!should_skip_renewal(RENEW_THRESHOLD_SECS + 1, true));
+        // 临界（= 阈值）：不大于阈值 → 不跳过（触发刷新）。
+        assert!(!should_skip_renewal(RENEW_THRESHOLD_SECS, false));
+        // 已过期（saturating 归零）：不跳过。
+        assert!(!should_skip_renewal(0, false));
+        // 强制永不跳过（已过期同样刷新）。
+        assert!(!should_skip_renewal(0, true));
     }
 }
