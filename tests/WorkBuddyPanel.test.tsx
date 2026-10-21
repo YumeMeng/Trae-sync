@@ -132,7 +132,7 @@ afterEach(() => {
 });
 
 describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
-  it("骨架渲染：页头产品徽章 + 健康卡 + 池清单行走 SharedAccountEntry 规格 + 五动作在册", async () => {
+  it("骨架渲染：页头产品徽章 + 池清单行走 SharedAccountEntry 规格 + 动作在册", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyPanel active={true} />);
 
@@ -145,8 +145,8 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     // 当前客户端登录账号行显示「使用中」chip（与 AccountCenter 同语义），非当前行才是切换按钮。
     expect(screen.getByTestId("workbuddy-pool-current-wb-uid-1")).toHaveTextContent("使用中");
     expect(screen.getByTestId("workbuddy-switch-wb-uid-2")).toHaveTextContent("切换到此账号");
-    // 五个页头动作（刷新/续期/健康检测/过户/捕获）在册。
-    for (const testId of ["workbuddy-refresh", "workbuddy-renew-credentials", "workbuddy-deep-health-button", "workbuddy-transfer-button", "workbuddy-capture-button"]) {
+    // 页头动作（刷新/续期/健康检测/捕获/添加账号）在册（P19.1：过户按钮退役）。
+    for (const testId of ["workbuddy-refresh", "workbuddy-renew-credentials", "workbuddy-deep-health-button", "workbuddy-capture-button", "workbuddy-add-account-button"]) {
       expect(screen.getByTestId(testId)).toBeInTheDocument();
     }
   });
