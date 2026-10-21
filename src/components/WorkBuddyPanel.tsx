@@ -383,13 +383,14 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       now_unix_seconds: Math.floor(Date.now() / 1000),
     });
     // creditsColumn 能力开关（IA 草案 §1.2）：逐账号积分摘要（overview 数据面，
-    // P19.1 由「仅当前登录账号」扩展为全部池行）；读取失败/无数据 = 未读取。
+    // P19.1 由「仅当前登录账号」扩展为全部池行）；读取失败 = 查询失败，未查询
+    // = 未获取（P19.2 措辞统一），真实 0 余额照实显示，禁止静默 0。
     const overviewRow = checkinOverview.find((row) => row.profile_id === account.profile_id) ?? null;
     const creditsLabel = overviewRow?.error
-      ? "状态未知"
+      ? "查询失败"
       : overviewRow?.total_credits != null
         ? `${overviewRow.total_credits}`
-        : "未读取";
+        : "未获取";
     const creditsMetric = uiProduct.capabilities.creditsColumn ? (
       <div className="account-item__credits" title="WorkBuddy 账号的积分余额（签到数据面，逐账号）">
         <strong data-testid={`workbuddy-credits-${account.account_id}`}>{creditsLabel}</strong>

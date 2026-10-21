@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { CalendarCheck, Database, UserRound } from "lucide-react";
+import { CalendarCheck, Database, RefreshCw, UserRound } from "lucide-react";
 import type { AppPage } from "../components/NavigationRail";
 import type { WorkBuddyCheckinAccountStatusDto, WorkBuddyCheckinParticipationDto } from "../types/product";
 import type { WorkBuddyLibraryStatsDto } from "../types/workbuddyLibrary";
@@ -26,6 +26,8 @@ export function WorkBuddyOverviewPage({ active, onNavigate }: WorkBuddyOverviewP
   const [checkinRows, setCheckinRows] = useState<readonly WorkBuddyCheckinAccountStatusDto[] | null>(null);
   // 会话统计卡（P19-B3 get_workbuddy_library_stats）。
   const [libraryStats, setLibraryStats] = useState<WorkBuddyLibraryStatsDto | null>(null);
+  // 积分未获取占位行的刷新动作（重新拉取三路 summary）。
+  const [refreshing, setRefreshing] = useState(false);
 
   const loadSummary = useCallback(async () => {
     const [participationResult, overviewResult, statsResult] = await Promise.allSettled([
@@ -38,6 +40,12 @@ export function WorkBuddyOverviewPage({ active, onNavigate }: WorkBuddyOverviewP
     setLibraryStats(statsResult.status === "fulfilled" ? statsResult.value : null);
   }, []);
 
+  const handleRefreshSummary = useCallback(() => {
+    if (refreshing) return;
+    setRefreshing(true);
+    void loadSummary().finally(() => setRefreshing(false));
+  }, [loadSummary, refreshing]);
+
   useEffect(() => {
     if (!active) return;
     void loadSummary();
@@ -46,7 +54,11 @@ export function WorkBuddyOverviewPage({ active, onNavigate }: WorkBuddyOverviewP
   const accountCount = participation?.length ?? 0;
   const knownRows = checkinRows?.filter((row) => row.error === null) ?? [];
   const checkedCount = knownRows.filter((row) => row.today_checked_in === true).length;
+  // P19.2 积分假 0 修复：只有真实拿到 total_credits 的账号才进合计；
+  // 全部未获取（error/查询失败）时显示占位 + 刷新动作，禁止静默 0。
+  const creditsKnownCount = knownRows.filter((row) => row.total_credits !== null).length;
   const creditsTotal = knownRows.reduce((sum, row) => sum + (row.total_credits ?? 0), 0);
+  const creditsPartial = creditsKnownCount > 0 && creditsKnownCount < accountCount;
 
   return (
     <section className="overview-page" role="region" aria-label="总览">
@@ -72,10 +84,29 @@ export function WorkBuddyOverviewPage({ active, onNavigate }: WorkBuddyOverviewP
               <strong>{checkedCount}<em>/{accountCount}</em></strong>
               <span>今日签到</span>
             </div>
-            <div className="overview-checkin__stat" title="各账号积分余额合计">
-              <strong>{creditsTotal > 0 ? creditsTotal : "—"}</strong>
-              <span>积分合计</span>
-            </div>
+            {/* P19.2 积分假 0 修复：未获取 = 占位 + 刷新动作；部分成功注明 N/M；禁止静默 0。 */}
+            {accountCount > 0 && creditsKnownCount === 0 ? (
+              <div className="overview-checkin__stat" data-testid="wb-overview-credits-unknown">
+                <strong>未获取</strong>
+                <span>积分合计</span>
+                <button
+                  type="button"
+                  className="btn btn--quiet"
+                  onClick={handleRefreshSummary}
+                  disabled={refreshing}
+                  data-testid="wb-overview-credits-refresh"
+                  title="重新读取各账号积分（此前读取失败或尚未查询）"
+                >
+                  <RefreshCw size={13} className={refreshing ? "icon-spin" : undefined} aria-hidden="true" />
+                  点击刷新
+                </button>
+              </div>
+            ) : (
+              <div className="overview-checkin__stat" title="各账号积分余额合计">
+                <strong>{accountCount > 0 ? creditsTotal : "—"}</strong>
+                <span>积分合计{creditsPartial ? `（${creditsKnownCount}/${accountCount} 账号已获取）` : ""}</span>
+              </div>
+            )}
           </div>
           <div className="overview-checkin__actions">
             <button

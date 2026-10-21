@@ -96,7 +96,72 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
     // 主操作仍在（对话库入口是恒定导航动作）。
     expect(screen.getByTestId("wb-overview-library-cta")).toBeInTheDocument();
   });
+
+  it("积分假 0 修复（P19.2）：全账号未获取 → 占位 + 点击刷新，禁止静默 0", async () => {
+    installOverviewRoutes();
+    mockRoute("get_workbuddy_checkin_overview", () => [
+      errorRow("wb-uid-1", "甲账号"),
+      errorRow("wb-uid-2", "乙账号"),
+    ]);
+    render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
+
+    const unknown = await screen.findByTestId("wb-overview-credits-unknown");
+    expect(unknown.textContent).toContain("未获取");
+    expect(unknown.textContent).not.toMatch(/积分合计\s*0/);
+    // 点击刷新后重新拉取（覆盖回成功路由 → 恢复真实合计）。
+    mockRoute("get_workbuddy_checkin_overview", () => [
+      creditsRow("wb-uid-1", "甲账号", 700),
+      creditsRow("wb-uid-2", "乙账号", 500),
+    ]);
+    fireEvent.click(screen.getByTestId("wb-overview-credits-refresh"));
+    await waitFor(() => {
+      expect(screen.queryByTestId("wb-overview-credits-unknown")).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("1200");
+  });
+
+  it("积分假 0 修复（P19.2）：部分成功 → 仅合计 known 账号并注明 N/M 账号已获取", async () => {
+    installOverviewRoutes();
+    mockRoute("get_workbuddy_checkin_overview", () => [
+      creditsRow("wb-uid-1", "甲账号", 700),
+      errorRow("wb-uid-2", "乙账号"),
+    ]);
+    render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
+
+    await screen.findByTestId("wb-overview-checkin");
+    // 合计只含获取成功的账号；注明 N/M。
+    expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("700");
+    expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("1/2 账号已获取");
+  });
 });
+
+/** P19.2 积分占位测试构造器：全字段 null + error 码行。 */
+function errorRow(profileId: string, screenName: string) {
+  return {
+    profile_id: profileId,
+    screen_name: screenName,
+    today_checked_in: null,
+    streak_days: null,
+    daily_credit: null,
+    total_credits: null,
+    checkin_dates: [] as string[],
+    error: "workbuddy_checkin_runtime_error",
+  };
+}
+
+/** P19.2 积分占位测试构造器：指定积分的 ok 行。 */
+function creditsRow(profileId: string, screenName: string, totalCredits: number) {
+  return {
+    profile_id: profileId,
+    screen_name: screenName,
+    today_checked_in: true,
+    streak_days: 6,
+    daily_credit: 100,
+    total_credits: totalCredits,
+    checkin_dates: ["2026-10-20"] as string[],
+    error: null,
+  };
+}
 
 // ===== P19-B6④ 设置页 WB 变体（备份诚实说明卡） =====
 

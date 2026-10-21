@@ -155,26 +155,26 @@ export function WorkBuddyAccountDetail({
             <dt>积分余额</dt>
             <dd data-testid="workbuddy-detail-credits">
               {overview?.error
-                ? "状态未知（签到状态读取失败）"
+                ? "查询失败（签到状态读取失败）"
                 : overview?.total_credits != null
                   ? overview.total_credits
-                  : "未读取"}
+                  : "未获取"}
             </dd>
           </div>
           <div className="account-detail__fact">
             <dt>连签天数</dt>
-            <dd data-testid="workbuddy-detail-streak">{overview?.streak_days ?? "未读取"}</dd>
+            <dd data-testid="workbuddy-detail-streak">{overview?.error ? "查询失败" : overview?.streak_days ?? "未获取"}</dd>
           </div>
           <div className="account-detail__fact">
             <dt>今日签到</dt>
             <dd data-testid="workbuddy-detail-today">
               {overview?.error
-                ? "状态未知"
+                ? "查询失败"
                 : overview?.today_checked_in === true
                   ? "已签到"
                   : overview?.today_checked_in === false
                     ? "未签到"
-                    : "未读取"}
+                    : "未获取"}
             </dd>
           </div>
         </dl>
