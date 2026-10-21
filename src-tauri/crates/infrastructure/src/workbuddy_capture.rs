@@ -113,6 +113,9 @@ pub struct WorkBuddyCaptureSource {
     pub identity: WorkBuddyAccountIdentity,
     pub device_id: String,
     pub decrypted: WorkBuddyDecryptedTokens,
+    /// P19.2② 脱敏手机号（accounts 快照 `phoneNumber`——服务端预脱敏形态
+    /// 如 `133****1304`，工具直显不二次处理；best-effort 采集，失败为空）。
+    pub masked_mobile: String,
 }
 
 /// 捕获编排错误。
@@ -159,7 +162,7 @@ pub fn build_workbuddy_login_record(
         profile_id: WorkBuddyLoginRecord::profile_id_for(&source.snapshot.uid),
         account_id: source.snapshot.uid.clone(),
         screen_name: source.identity.screen_name.clone(),
-        masked_mobile: String::new(),
+        masked_mobile: source.masked_mobile.clone(),
         access_token: source.decrypted.access_token.clone(),
         refresh_token: source.decrypted.refresh_token.clone(),
         access_token_expires_at_unix_seconds: seconds(source.snapshot.auth.expires_at),
@@ -199,17 +202,58 @@ pub fn capture_workbuddy_login_from_machine(
         ))?;
     let decrypted = decrypt_session_tokens(&info_path, client_exe)
         .map_err(|error| WorkBuddyCaptureError::Decrypt(error.code().to_string()))?;
+    // P19.2② 脱敏手机号采集（best-effort 只读探查；失败不阻塞捕获）。
+    let masked_mobile =
+        fetch_masked_phone_best_effort(&snapshot.auth.domain, &decrypted.access_token, &snapshot.uid);
     let source = WorkBuddyCaptureSource {
         snapshot,
         identity,
         device_id,
         decrypted,
+        masked_mobile,
     };
     let record = build_workbuddy_login_record(&source, now_unix_seconds)?;
     login_store
         .save(&record)
         .map_err(|error| WorkBuddyCaptureError::Store(error.to_string()))?;
     Ok(record)
+}
+
+/// P19.2② 脱敏手机号采集（best-effort 只读 GET /v2/plugin/accounts；
+/// Bearer 取自本次解密凭据，token 不落日志；解析复用
+/// workbuddy_login::parse_snapshot_accounts——快照 `phoneNumber` 为服务端
+/// 预脱敏形态，工具直显；任何失败返回空串，不阻塞捕获主流程）。
+fn fetch_masked_phone_best_effort(domain: &str, access_token: &str, uid: &str) -> String {
+    use std::time::Duration;
+    if domain.trim().is_empty() || access_token.trim().is_empty() || uid.trim().is_empty() {
+        return String::new();
+    }
+    let url = format!("https://{}/v2/plugin/accounts", domain.trim());
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return String::new(),
+    };
+    let response = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("X-Domain", domain.trim())
+        .header("Content-Type", "application/json")
+        .send()
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => return String::new(),
+    };
+    let Ok(body) = response.text() else {
+        return String::new();
+    };
+    crate::workbuddy_login::parse_snapshot_accounts(&body)
+        .into_iter()
+        .find(|account| account.uid == uid)
+        .map(|account| account.masked_phone)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -249,6 +293,7 @@ mod tests {
                 access_source: crate::workbuddy_credential::WorkBuddyTokenSource::Envelope,
                 refresh_source: crate::workbuddy_credential::WorkBuddyTokenSource::Envelope,
             },
+            masked_mobile: "133****1304".to_string(),
         }
     }
 
@@ -275,6 +320,8 @@ mod tests {
         );
         assert_eq!(record.domain, "www.workbuddy.cn");
         assert_eq!(record.device_id, "2db49f20-2b3f-4761-ab53-9d213f361a5b");
+        // P19.2② 脱敏手机号透传（服务端预脱敏形态直存直显）。
+        assert_eq!(record.masked_mobile, "133****1304");
         assert_eq!(record.minted_at_unix_seconds, 1_800_000_000);
     }
 

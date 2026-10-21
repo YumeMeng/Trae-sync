@@ -379,28 +379,54 @@ pub fn classify_account_poll(http_status: u16, body: &str) -> AccountPollOutcome
     }
 }
 
-/// accounts 快照解析（纯函数；data 为账号数组，取 uid 清单；宽松容错）。
-pub fn parse_account_snapshot(body: &str) -> Vec<String> {
+/// accounts 快照账号条目（P19.2②：含服务端**预脱敏**手机号——真机 200
+/// 实测字段名 `phoneNumber`、值形态 `133****1304`；asar 无客户端脱敏
+/// 逻辑、`maskedPhone` 全量唯一命中在 AgentMail 邮箱域与账号无关）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkBuddySnapshotAccount {
+    pub uid: String,
+    /// 脱敏手机号（服务端下发即星号形态，工具直显；缺省空串）。
+    pub masked_phone: String,
+}
+
+/// accounts 快照解析（纯函数；兼容两形态：data 为账号数组 / data.accounts
+/// 数组——2026-10-21 只读探查真机 200 为后者，旧实现只认前者属失修；
+/// 宽松容错：解析失败返回空清单）。
+pub fn parse_snapshot_accounts(body: &str) -> Vec<WorkBuddySnapshotAccount> {
     let Ok(envelope) = serde_json::from_str::<WbEnvelope>(body) else {
         return Vec::new();
     };
     let Some(data) = envelope.data else {
         return Vec::new();
     };
-    data.as_array()
-        .map(|accounts| {
-            accounts
-                .iter()
-                .filter_map(|account| {
-                    account
-                        .get("uid")
-                        .or_else(|| account.get("id"))
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                })
-                .collect()
+    let accounts = data.get("accounts").cloned().unwrap_or(data);
+    let Some(accounts) = accounts.as_array() else {
+        return Vec::new();
+    };
+    accounts
+        .iter()
+        .filter_map(|account| {
+            let uid = account
+                .get("uid")
+                .or_else(|| account.get("id"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)?;
+            let masked_phone = account
+                .get("phoneNumber")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(WorkBuddySnapshotAccount { uid, masked_phone })
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+/// accounts 快照解析（纯函数；data 为账号数组，取 uid 清单；宽松容错）。
+pub fn parse_account_snapshot(body: &str) -> Vec<String> {
+    parse_snapshot_accounts(body)
+        .into_iter()
+        .map(|account| account.uid)
+        .collect()
 }
 
 // ============================================================================
@@ -412,8 +438,8 @@ pub fn parse_account_snapshot(body: &str) -> Vec<String> {
 pub struct WorkBuddyLoginCredentials {
     pub auth: WorkBuddyAuthTokens,
     pub account: Option<WorkBuddyLoginAccount>,
-    /// accounts 快照 uid 清单（多账号盘点；best-effort，可空）。
-    pub snapshot_uids: Vec<String>,
+    /// accounts 快照账号条目（多账号盘点 + 脱敏手机号；best-effort，可空）。
+    pub snapshot_accounts: Vec<WorkBuddySnapshotAccount>,
 }
 
 /// ④ 首登验收回执（只含非敏感字段，与 Trae 登录回执同语义）。
@@ -549,10 +575,11 @@ impl WorkBuddyLoginProtocol {
         }
     }
 
-    /// ⑤ accounts 快照（best-effort：失败不影响登录编排）。
-    fn fetch_snapshot(&self, access_token: &str) -> Vec<String> {
+    /// ⑤ accounts 快照（best-effort：失败不影响登录编排；P19.2② 一并
+    /// 取服务端预脱敏手机号）。
+    fn fetch_snapshot(&self, access_token: &str) -> Vec<WorkBuddySnapshotAccount> {
         match self.http.send(build_snapshot_request(&self.origin, access_token)) {
-            Ok(response) => parse_account_snapshot(&response.body),
+            Ok(response) => parse_snapshot_accounts(&response.body),
             Err(_) => Vec::new(),
         }
     }
@@ -626,11 +653,11 @@ impl OAuthLoginProtocol for WorkBuddyLoginProtocol {
     ) -> Result<WorkBuddyLoginCredentials, LoginFlowError> {
         let auth = self.poll_tokens_until_ready(&state, control, should_abort)?;
         let account = self.fetch_account(&state, &auth.access_token);
-        let snapshot_uids = self.fetch_snapshot(&auth.access_token);
+        let snapshot_accounts = self.fetch_snapshot(&auth.access_token);
         Ok(WorkBuddyLoginCredentials {
             auth,
             account,
-            snapshot_uids,
+            snapshot_accounts,
         })
     }
 
@@ -647,7 +674,7 @@ impl OAuthLoginProtocol for WorkBuddyLoginProtocol {
         let WorkBuddyLoginCredentials {
             auth,
             account,
-            snapshot_uids: _,
+            snapshot_accounts,
         } = credentials;
         // 账号身份缺失 = 无法确定容器归属，验收失败（凭据不入池）。
         let Some(account) = account else {
@@ -687,7 +714,13 @@ impl OAuthLoginProtocol for WorkBuddyLoginProtocol {
             profile_id: WorkBuddyLoginRecord::profile_id_for(&account.uid),
             account_id: account.uid.clone(),
             screen_name: account.screen_name,
-            masked_mobile: String::new(),
+            // P19.2② 服务端预脱敏手机号（accounts 快照按 uid 匹配；
+            // best-effort——快照缺失/失败为空串，不阻塞入池）。
+            masked_mobile: snapshot_accounts
+                .iter()
+                .find(|snapshot| snapshot.uid == account.uid)
+                .map(|snapshot| snapshot.masked_phone.clone())
+                .unwrap_or_default(),
             access_token: auth.access_token,
             refresh_token: auth.refresh_token,
             access_token_expires_at_unix_seconds: access_expires_at,
@@ -944,6 +977,32 @@ mod tests {
         assert!(parse_account_snapshot("not-json").is_empty());
     }
 
+    /// P19.2② 快照双形态 + 脱敏手机号：真机 200 实测 data 为
+    /// `{accounts:[…]}` 字典（旧实现只认 data 数组属失修——探查定论）；
+    /// phoneNumber 为服务端预脱敏形态，原样提取。
+    #[test]
+    fn snapshot_accounts_parse_both_shapes_and_masked_phone() {
+        // 形态一：data.accounts 字典（真机实测形态）。
+        let wrapped = r#"{"code":0,"msg":"","data":{"accounts":[
+            {"uid":"uid-1","phoneNumber":"133****1304","pluginEnabled":true},
+            {"uid":"uid-2","nickname":"梦梦"}
+        ]}}"#;
+        let entries = parse_snapshot_accounts(wrapped);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].uid, "uid-1");
+        assert_eq!(entries[0].masked_phone, "133****1304");
+        assert_eq!(entries[1].uid, "uid-2");
+        assert_eq!(entries[1].masked_phone, "", "无 phoneNumber 字段为空串");
+        // 形态二：data 数组（旧形态兼容）。
+        let flat = r#"{"code":0,"data":[{"uid":"uid-1","phoneNumber":"138****5678"}]}"#;
+        let entries = parse_snapshot_accounts(flat);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].masked_phone, "138****5678");
+        // 宽松容错：损坏输入空清单。
+        assert!(parse_snapshot_accounts("not-json").is_empty());
+        assert!(parse_snapshot_accounts(r#"{"code":0,"data":{"other":1}}"#).is_empty());
+    }
+
     // ---- 轮询状态机（注入式三态）----
 
     #[test]
@@ -1080,7 +1139,10 @@ mod tests {
                 uid: "89b16d6b-0549-4e1e-8ced-918b5c8152ae".into(),
                 screen_name: "梦梦".into(),
             }),
-            snapshot_uids: vec!["89b16d6b-0549-4e1e-8ced-918b5c8152ae".into()],
+            snapshot_accounts: vec![WorkBuddySnapshotAccount {
+                uid: "89b16d6b-0549-4e1e-8ced-918b5c8152ae".into(),
+                masked_phone: "133****1304".into(),
+            }],
         }
     }
 
