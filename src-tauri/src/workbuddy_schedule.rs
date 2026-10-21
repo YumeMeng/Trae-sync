@@ -348,31 +348,56 @@ pub(crate) struct WorkBuddyCheckinAccountStatusDto {
     pub today_checked_in: Option<bool>,
     pub streak_days: Option<u32>,
     pub daily_credit: Option<u32>,
+    /// **本期签到累计**获得积分（活动域，只增不减——不是余额；余额看
+    /// credits_balance。P19.2③ 语义改名对齐客户端真实口径）。
     pub total_credits: Option<u32>,
+    /// 积分余额（billing 资源域 Σ CycleRemainCapacity，随对话消耗减少——
+    /// 客户端「积分余额」真实口径；查询失败/未采集为 None，fail-soft）。
+    pub credits_balance: Option<u64>,
+    /// 账户资源包总额（billing 资源域 Σ CycleTotalCapacity）。
+    pub credits_total: Option<u64>,
     /// 已签日期列表（YYYY-MM-DD；签到日历数据源，矩阵 #57）。
     pub checkin_dates: Vec<String>,
     /// 失败时的稳定错误码（None = 查询成功）。
     pub error: Option<String>,
 }
 
-/// 单账号 status 查询（生产闭包：先续期该账号〔断连兜底〕再 status）。
-/// P19.1 401 兜底：AuthMismatch 时强制刷新换新对后重试一次。
-/// 返回 (today_checked_in, streak, daily, total, dates)。
+/// 单账号 status 查询（生产闭包：先续期该账号〔断连兜底〕再 status；
+/// status 成功后顺带查资源包余额〔best-effort fail-soft：余额失败只落
+/// None，不失败整行〕）。P19.1 401 兜底：AuthMismatch 时强制刷新换新对
+/// 后重试一次。
+/// 返回 (today_checked_in, streak, daily, 本期签到累计, dates, 余额)。
 pub(crate) fn query_profile_status(
     login_root: &Path,
     profile_id: &str,
-) -> Result<(bool, u32, u32, u32, Vec<String>), String> {
+) -> Result<
+    (
+        bool,
+        u32,
+        u32,
+        u32,
+        Vec<String>,
+        Option<traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance>,
+    ),
+    String,
+> {
+    use traesync_infrastructure::workbuddy_checkin::WorkBuddyCheckinSession;
     let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
     let read_status =
-        |session: &traesync_infrastructure::workbuddy_checkin::WorkBuddyCheckinSession| {
+        |session: &WorkBuddyCheckinSession| {
             match session.status() {
-                Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok((
-                    status.today_checked_in,
-                    status.streak_days,
-                    status.daily_credit,
-                    status.total_credits,
-                    status.checkin_dates,
-                )),
+                Ok(WorkBuddyCheckinOutcome::Status(status)) => {
+                    // P19.2③ 余额对齐（best-effort：查询失败不失败整行）。
+                    let balance = session.resource_balance().ok();
+                    Ok((
+                        status.today_checked_in,
+                        status.streak_days,
+                        status.daily_credit,
+                        status.total_credits,
+                        status.checkin_dates,
+                        balance,
+                    ))
+                }
                 Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
                     Err("workbuddy_checkin_auth_mismatch".to_string())
                 }
@@ -398,23 +423,42 @@ pub(crate) fn query_profile_status(
 /// 逐账号查询，单账号任何失败只落到该账号的 error 字段。
 fn workbuddy_checkin_overview_inner(
     targets: Vec<(String, String)>,
-    status_fn: &dyn Fn(&str) -> Result<(bool, u32, u32, u32, Vec<String>), String>,
+    status_fn: &dyn Fn(
+        &str,
+    ) -> Result<
+        (
+            bool,
+            u32,
+            u32,
+            u32,
+            Vec<String>,
+            Option<traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance>,
+        ),
+        String,
+    >,
 ) -> Vec<WorkBuddyCheckinAccountStatusDto> {
     targets
         .into_iter()
         .map(|(profile_id, screen_name)| match status_fn(&profile_id) {
-            Ok((today_checked_in, streak_days, daily_credit, total_credits, checkin_dates)) => {
-                WorkBuddyCheckinAccountStatusDto {
-                    profile_id,
-                    screen_name,
-                    today_checked_in: Some(today_checked_in),
-                    streak_days: Some(streak_days),
-                    daily_credit: Some(daily_credit),
-                    total_credits: Some(total_credits),
-                    checkin_dates,
-                    error: None,
-                }
-            }
+            Ok((
+                today_checked_in,
+                streak_days,
+                daily_credit,
+                total_credits,
+                checkin_dates,
+                balance,
+            )) => WorkBuddyCheckinAccountStatusDto {
+                profile_id,
+                screen_name,
+                today_checked_in: Some(today_checked_in),
+                streak_days: Some(streak_days),
+                daily_credit: Some(daily_credit),
+                total_credits: Some(total_credits),
+                credits_balance: balance.map(|value| value.credits_balance),
+                credits_total: balance.map(|value| value.credits_total),
+                checkin_dates,
+                error: None,
+            },
             Err(code) => WorkBuddyCheckinAccountStatusDto {
                 profile_id,
                 screen_name,
@@ -422,6 +466,8 @@ fn workbuddy_checkin_overview_inner(
                 streak_days: None,
                 daily_credit: None,
                 total_credits: None,
+                credits_balance: None,
+                credits_total: None,
                 checkin_dates: Vec::new(),
                 error: Some(code),
             },
@@ -529,7 +575,7 @@ pub(crate) async fn workbuddy_checkin_claim_profile(
 /// 领取后的连签天数（best-effort 回读：status 失败按 0，不阻塞回执）。
 fn claim_streak_after(login_root: &Path, profile_id: &str) -> u32 {
     query_profile_status(login_root, profile_id)
-        .map(|(_, streak, _, _, _)| streak)
+        .map(|(_, streak, _, _, _, _)| streak)
         .unwrap_or(0)
 }
 
@@ -1217,20 +1263,35 @@ mod workbuddy_b5_tests {
     }
 
     /// overview 编排内核 fail-soft：账号一成功、账号二失败——失败只落
-    /// 本条 error 字段，不阻塞他账号。
+    /// 本条 error 字段，不阻塞他账号。余额字段随 status 成功透传
+    /// （P19.2③：credits_balance/credits_total）。
     #[test]
     fn overview_is_fail_soft_per_account() {
         let targets = vec![
             ("wb-uid-1".to_string(), "账号一".to_string()),
             ("wb-uid-2".to_string(), "账号二".to_string()),
         ];
+        let balance = Some(traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance {
+            credits_balance: 1600,
+            credits_total: 2300,
+        });
         let results: std::collections::HashMap<
             String,
-            Result<(bool, u32, u32, u32, Vec<String>), String>,
+            Result<
+                (
+                    bool,
+                    u32,
+                    u32,
+                    u32,
+                    Vec<String>,
+                    Option<traesync_infrastructure::workbuddy_checkin::WorkBuddyResourceBalance>,
+                ),
+                String,
+            >,
         > = [
             (
                 "wb-uid-1",
-                Ok((true, 6, 100, 600, vec!["2026-10-20".to_string()])),
+                Ok((true, 6, 100, 600, vec!["2026-10-20".to_string()], balance)),
             ),
             (
                 "wb-uid-2",
@@ -1246,7 +1307,9 @@ mod workbuddy_b5_tests {
         let first = &overview[0];
         assert!(first.error.is_none());
         assert_eq!(first.today_checked_in, Some(true));
-        assert_eq!(first.total_credits, Some(600));
+        assert_eq!(first.total_credits, Some(600), "本期签到累计（活动域）");
+        assert_eq!(first.credits_balance, Some(1600), "余额（资源域）");
+        assert_eq!(first.credits_total, Some(2300));
         assert_eq!(first.checkin_dates, vec!["2026-10-20".to_string()]);
         let second = &overview[1];
         assert_eq!(
@@ -1254,6 +1317,7 @@ mod workbuddy_b5_tests {
             Some("workbuddy_checkin_refresh_rejected")
         );
         assert_eq!(second.today_checked_in, None, "失败账号状态字段为 None");
+        assert_eq!(second.credits_balance, None);
         assert!(second.checkin_dates.is_empty());
     }
 

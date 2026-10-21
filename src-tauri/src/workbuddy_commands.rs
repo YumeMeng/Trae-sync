@@ -77,6 +77,8 @@ pub struct WorkBuddyCheckinStatusDto {
     pub today_checked_in: bool,
     pub streak_days: u32,
     pub daily_credit: u32,
+    /// **本期签到累计**获得积分（活动域，只增不减——不是余额；P19.2③
+    /// 语义改名。余额真实口径走 overview 的 credits_balance）。
     pub total_credits: u32,
 }
 
