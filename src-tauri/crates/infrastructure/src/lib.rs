@@ -113,6 +113,9 @@ pub mod workbuddy_library;
 // P18-B2：WorkBuddy 切号实验执行器（骨架完整实现、真机执行入口锁定待
 // 统一验收——组合根无命令注册，示例执行器双重确认门禁）。
 pub mod workbuddy_switch_experiment;
+// P19.1：WorkBuddy 切号自动过户编排（切号成功即自动过户——对齐 Trae
+// 切号语义；显式方向 previous→target 防方向反转；过户失败不回滚切号）。
+pub mod workbuddy_switch_flow;
 // P17-T4c②：WorkBuddy 账号捕获编排（快照→解密→容器落盘；铸造待单次确认）。
 pub mod workbuddy_capture;
 // P17-T5 并列骨架：当前产品指针（产品管理页/切换器持久化状态，注册表校验）。
