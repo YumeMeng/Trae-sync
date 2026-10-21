@@ -121,6 +121,8 @@ pub struct WorkBuddyLoginSummary {
     pub account_id: String,
     pub screen_name: String,
     pub domain: String,
+    /// P19.2② 脱敏手机号（服务端预脱敏形态如 `133****1304`；空串 = 未采集）。
+    pub masked_mobile: String,
     pub access_token_expires_at_unix_seconds: u64,
     pub refresh_token_expires_at_unix_seconds: u64,
     pub minted_at_unix_seconds: u64,
@@ -140,6 +142,7 @@ impl WorkBuddyLoginRecord {
             account_id: self.account_id.clone(),
             screen_name: self.screen_name.clone(),
             domain: self.domain.clone(),
+            masked_mobile: self.masked_mobile.clone(),
             access_token_expires_at_unix_seconds: self.access_token_expires_at_unix_seconds,
             refresh_token_expires_at_unix_seconds: self.refresh_token_expires_at_unix_seconds,
             minted_at_unix_seconds: self.minted_at_unix_seconds,

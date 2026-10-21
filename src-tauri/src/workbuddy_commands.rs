@@ -188,6 +188,9 @@ pub struct WorkBuddyAccountEntryDto {
     pub display_name: String,
     /// 归档标记（fe 据此过滤列表；默认 false = 在册）。
     pub archived: bool,
+    /// P19.2② 脱敏手机号（服务端预脱敏形态如 `133****1304`；空串 = 未采集
+    /// ——重捕获/OAuth 登录后补齐）。
+    pub masked_phone: String,
 }
 
 /// 摘要 + 档案 → 条目 DTO（档案读取失败按缺省条目降级——展示面不阻塞）。
@@ -207,6 +210,7 @@ fn workbuddy_account_entry(
         last_updated_at_unix_seconds: summary.last_updated_at_unix_seconds,
         display_name: profile.display_name,
         archived: profile.archived,
+        masked_phone: summary.masked_mobile.clone(),
     }
 }
 

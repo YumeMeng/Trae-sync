@@ -358,6 +358,9 @@ pub(crate) struct WorkBuddyCheckinAccountStatusDto {
     pub credits_total: Option<u64>,
     /// 已签日期列表（YYYY-MM-DD；签到日历数据源，矩阵 #57）。
     pub checkin_dates: Vec<String>,
+    /// P19.2② 脱敏手机号（服务端预脱敏形态如 `133****1304`，直显；
+    /// None = 池记录未采集——重捕获/OAuth 登录后补齐）。
+    pub masked_phone: Option<String>,
     /// 失败时的稳定错误码（None = 查询成功）。
     pub error: Option<String>,
 }
@@ -447,18 +450,21 @@ fn workbuddy_checkin_overview_inner(
                 total_credits,
                 checkin_dates,
                 balance,
-            )) => WorkBuddyCheckinAccountStatusDto {
-                profile_id,
-                screen_name,
-                today_checked_in: Some(today_checked_in),
-                streak_days: Some(streak_days),
-                daily_credit: Some(daily_credit),
-                total_credits: Some(total_credits),
-                credits_balance: balance.map(|value| value.credits_balance),
-                credits_total: balance.map(|value| value.credits_total),
-                checkin_dates,
-                error: None,
-            },
+            )) => {
+                WorkBuddyCheckinAccountStatusDto {
+                    profile_id,
+                    screen_name,
+                    today_checked_in: Some(today_checked_in),
+                    streak_days: Some(streak_days),
+                    daily_credit: Some(daily_credit),
+                    total_credits: Some(total_credits),
+                    credits_balance: balance.map(|value| value.credits_balance),
+                    credits_total: balance.map(|value| value.credits_total),
+                    checkin_dates,
+                    masked_phone: None,
+                    error: None,
+                }
+            }
             Err(code) => WorkBuddyCheckinAccountStatusDto {
                 profile_id,
                 screen_name,
@@ -469,6 +475,7 @@ fn workbuddy_checkin_overview_inner(
                 credits_balance: None,
                 credits_total: None,
                 checkin_dates: Vec::new(),
+                masked_phone: None,
                 error: Some(code),
             },
         })
@@ -501,9 +508,26 @@ pub(crate) async fn get_workbuddy_checkin_overview(
         let login_root_for_query = login_root.clone();
         let status_fn =
             |pid: &str| query_profile_status(&login_root_for_query, pid);
-        Ok(workbuddy_checkin_overview_inner(targets, &status_fn))
+        let mut rows = workbuddy_checkin_overview_inner(targets, &status_fn);
+        // P19.2② 脱敏手机号（池记录采集面；容器读取失败 = None，fail-soft
+        // 不阻塞状态行）。
+        use traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginStore;
+        let store = WorkBuddyLoginStore::new(login_root);
+        for row in rows.iter_mut() {
+            row.masked_phone = store
+                .load(&row.profile_id, account_id_of(&row.profile_id))
+                .ok()
+                .map(|record| record.masked_mobile)
+                .filter(|phone| !phone.trim().is_empty());
+        }
+        Ok(rows)
     })
     .await
+}
+
+/// profile_id（`wb-{uid}` 惯例）→ account_id（uid）——容器读取绑定键。
+fn account_id_of(profile_id: &str) -> &str {
+    profile_id.strip_prefix("wb-").unwrap_or(profile_id)
 }
 
 /// WB 参与集（矩阵 #46 list_checkin_accounts WB 版）：池内账号逐条带
