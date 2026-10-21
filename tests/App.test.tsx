@@ -450,11 +450,9 @@ describe("应用工作区入口", () => {
       expect(screen.getByRole("combobox", { name: "当前产品" })).toHaveValue("workbuddy");
     });
 
-    // accounts = ready：WorkBuddy 面板（会话健康卡在册）。
+    // accounts = ready：WorkBuddy 面板（P19.1：健康卡退役，池清单承载账号面）。
     fireEvent.click(screen.getByTestId("navigation-accounts"));
-    expect(await screen.findByTestId("workbuddy-health-card")).toBeInTheDocument();
-    // P18-B3 后登录态由 G10 slot-badge 承载（WorkBuddyLoginSlotBadge，无独立 testid）。
-    expect(screen.getByTestId("workbuddy-health-card")).toHaveTextContent("已登录");
+    expect(await screen.findByTestId("workbuddy-add-account-button")).toBeInTheDocument();
 
     // checkin = ready：WorkBuddy 签到页（P19-B5 逐账号行形态，池空时历史条不渲染，
     // 但调度设置卡与页头骨架在册——断言骨架区块承载）。
@@ -483,6 +481,6 @@ describe("应用工作区入口", () => {
     });
     fireEvent.click(screen.getByTestId("navigation-accounts"));
     expect(await screen.findByRole("region", { name: "账号" })).toBeVisible();
-    expect(screen.queryByTestId("workbuddy-health-card")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("workbuddy-add-account-button")).not.toBeInTheDocument();
   });
 });

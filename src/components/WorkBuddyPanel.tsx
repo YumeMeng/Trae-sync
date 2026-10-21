@@ -34,7 +34,6 @@ import {
 } from "../platform/workbuddyAdapter";
 import {
   CheckinSlotBadge,
-  WorkBuddyLoginSlotBadge,
   WorkBuddyPoolSlotBadge,
   deriveCheckinSlotState,
   deriveWorkBuddyPoolLoginState,
@@ -169,7 +168,6 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
   // P18-B3：积分入账号卡（签到状态 best-effort 读取，失败不阻塞健康卡）。
   const [checkinStatus, setCheckinStatus] = useState<WorkBuddyCheckinStatusDto | null>(null);
   // P18-B3：深度健康检测（文件面 + 实时面；按钮单发，结果常驻健康卡）。
-  const [deepHealth, setDeepHealth] = useState<WorkBuddyDeepHealthDto | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
   // 捕获：单次确认弹窗 → 执行 → 刷新健康与账号池。
   const [captureDialogOpen, setCaptureDialogOpen] = useState(false);
@@ -224,13 +222,12 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     setCheckingHealth(true);
     try {
       const result = await checkWorkBuddyLoginHealth();
-      setDeepHealth(result);
       if (result.live_status === "verified") {
-        notify.success("WorkBuddy：健康检测通过（本地登录态有效，实时凭据验证可用）");
+        notify.success(`WorkBuddy：健康检测通过——${liveHealthLabel(result.live_status)}`);
       } else if (result.live_status === "probe_failed") {
-        notify.error("WorkBuddy：健康检测发现异常——客户端运行中但凭据回读失败，建议重启客户端。");
+        notify.error(`WorkBuddy：健康检测发现异常——${liveHealthLabel(result.live_status)}`);
       } else {
-        notify.info("WorkBuddy：本地健康检测完成（客户端未运行，未做实时验证）。");
+        notify.info(`WorkBuddy：${liveHealthLabel(result.live_status)}`);
       }
     } catch (reason: unknown) {
       notify.error(
@@ -553,44 +550,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
           </button>
         ),
       } : undefined}
-      statusRegion={health ? (
-        <div className="workbuddy-card" data-testid="workbuddy-health-card">
-          <div className="workbuddy-card__title">客户端登录状态</div>
-          <InfoRow label="登录状态">
-            {/* P18-B3：徽章统一走 G10 slot-badge 体系（与账号页/签到页同义同色）。 */}
-            <WorkBuddyLoginSlotBadge status={health.status} />
-          </InfoRow>
-          <InfoRow label="账号池">
-            {health.captured_in_pool
-              ? "当前登录账号已保存到 Trae Sync 账号池"
-              : "尚未保存到 Trae Sync 账号池"}
-          </InfoRow>
-          <InfoRow label="登录有效期至">
-            {formatUnixTime(health.access_expires_at_unix_seconds) ?? "未知"}
-          </InfoRow>
-          <InfoRow label="续期凭据有效期至">
-            {formatUnixTime(health.refresh_expires_at_unix_seconds) ?? "未知"}
-          </InfoRow>
-          {/* P18-B3：积分入账号卡（签到数据面已有；读取失败显示未知）。 */}
-          <InfoRow label="积分余额">
-            {checkinStatus ? `${checkinStatus.total_credits} 积分` : "未知"}
-          </InfoRow>
-          <InfoRow label="已连续签到">
-            {checkinStatus ? `${checkinStatus.streak_days} 天` : "未知"}
-          </InfoRow>
-          {deepHealth && (
-            <InfoRow label="健康检测">
-              <span
-                className={`slot-badge ${deepHealth.live_status === "verified" ? "slot-badge--ok" : deepHealth.live_status === "probe_failed" ? "slot-badge--danger" : "slot-badge--idle"}`}
-                data-testid="workbuddy-deep-health-result"
-              >
-                <i className="slot-badge__dot" aria-hidden="true" />
-                {liveHealthLabel(deepHealth.live_status)}
-              </span>
-            </InfoRow>
-          )}
-        </div>
-      ) : null}
+      statusRegion={null}
       entryCount={pool.length}
       showControls={pool.length > 0}
       controls={{

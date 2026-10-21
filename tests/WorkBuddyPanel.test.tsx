@@ -136,7 +136,7 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyPanel active={true} />);
 
-    expect(await screen.findByTestId("workbuddy-health-card")).toBeInTheDocument();
+    expect(await screen.findByTestId("workbuddy-pool-list")).toBeInTheDocument();
     expect(screen.getByTestId("product-badge-workbuddy")).toBeInTheDocument();
     // 池清单行对齐账号页模板（account-list__row + 切换按钮 + 池清单锚点保留）。
     const list = screen.getByTestId("workbuddy-pool-list");
@@ -155,7 +155,7 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyPanel active={true} />);
 
-    await screen.findByTestId("workbuddy-health-card");
+    await screen.findByTestId("workbuddy-pool-list");
     // uid-1 = 当前客户端登录账号（健康卡 uid 同源）：积分块 + 使用中 chip。
     expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("700");
     expect(screen.getByTestId("workbuddy-pool-current-wb-uid-1")).toHaveTextContent("使用中");
