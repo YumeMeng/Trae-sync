@@ -1303,6 +1303,9 @@ pub fn run() {
             workbuddy_commands::workbuddy_checkin_claim,
             workbuddy_commands::refresh_workbuddy_account,
             workbuddy_commands::capture_workbuddy_account,
+            // P19.1④ 续期验证探针（非破坏：快照时间戳 + 实调刷新端点 +
+            // 信封检测分支——「保存的账号能否持续更新」的用户可感知证据链）。
+            workbuddy_commands::verify_workbuddy_capture_renewal,
             workbuddy_commands::switch_workbuddy_account,
             // P19.1② 切号影响面预览（只读零副作用，对齐 Trae preview 形态）。
             workbuddy_commands::preview_workbuddy_switch,

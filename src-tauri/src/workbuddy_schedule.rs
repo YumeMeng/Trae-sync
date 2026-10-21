@@ -30,7 +30,8 @@ use tauri::Emitter;
 
 use traesync_domain::CheckinOutcome;
 use traesync_infrastructure::workbuddy_checkin::{
-    open_session_for_profile, WorkBuddyCheckinOutcome, WorkBuddyPoolError,
+    open_session_for_profile, open_session_for_profile_forced, WorkBuddyCheckinOutcome,
+    WorkBuddyPoolError,
 };
 use traesync_infrastructure::{
     AutoCheckinBatchState, AutoCheckinLedger, AutoCheckinSettings, AutoCheckinStore,
@@ -355,27 +356,41 @@ pub(crate) struct WorkBuddyCheckinAccountStatusDto {
 }
 
 /// 单账号 status 查询（生产闭包：先续期该账号〔断连兜底〕再 status）。
+/// P19.1 401 兜底：AuthMismatch 时强制刷新换新对后重试一次。
 /// 返回 (today_checked_in, streak, daily, total, dates)。
 pub(crate) fn query_profile_status(
     login_root: &Path,
     profile_id: &str,
 ) -> Result<(bool, u32, u32, u32, Vec<String>), String> {
     let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
+    let read_status =
+        |session: &traesync_infrastructure::workbuddy_checkin::WorkBuddyCheckinSession| {
+            match session.status() {
+                Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok((
+                    status.today_checked_in,
+                    status.streak_days,
+                    status.daily_credit,
+                    status.total_credits,
+                    status.checkin_dates,
+                )),
+                Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
+                    Err("workbuddy_checkin_auth_mismatch".to_string())
+                }
+                Ok(other) => Err(format!("workbuddy_checkin_unexpected_response:{other:?}")),
+                Err(error) => Err(error.code().to_string()),
+            }
+        };
     let (session, _renewal) = open_session_for_profile(login_root, profile_id, now)
         .map_err(|error| map_pool_error(&error))?;
-    match session.status() {
-        Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok((
-            status.today_checked_in,
-            status.streak_days,
-            status.daily_credit,
-            status.total_credits,
-            status.checkin_dates,
-        )),
-        Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-            Err("workbuddy_checkin_auth_mismatch".to_string())
+    match read_status(&session) {
+        Err(code) if code == "workbuddy_checkin_auth_mismatch" => {
+            // P19.1：强制刷新（忽略阈值）换新对后重试一次。
+            let (session, _renewal) =
+                open_session_for_profile_forced(login_root, profile_id, now)
+                    .map_err(|error| map_pool_error(&error))?;
+            read_status(&session)
         }
-        Ok(other) => Err(format!("workbuddy_checkin_unexpected_response:{other:?}")),
-        Err(error) => Err(error.code().to_string()),
+        other => other,
     }
 }
 
@@ -732,6 +747,7 @@ pub(crate) struct WorkBuddyProfileClaimReceipt {
 /// 逐账号签到核心（B5 拆分自 claim_workbuddy_profile）：`open_session_for_profile`
 /// 内建断连兜底（access 充裕跳过/临近过期刷新写回），随后 status → claim →
 /// status 复核翻转。复核不过 = RuntimeError（credit 不外显）。
+/// P19.1 401 兜底：AuthMismatch 时强制刷新换新对后重试一次。
 pub(crate) fn claim_workbuddy_profile_detailed(
     login_root: &Path,
     profile_id: &str,
@@ -739,68 +755,83 @@ pub(crate) fn claim_workbuddy_profile_detailed(
     let now = traesync_infrastructure::workbuddy_credential::unix_ms_now() / 1000;
     let (session, _renewal) = open_session_for_profile(login_root, profile_id, now)
         .map_err(|error| map_pool_error(&error))?;
+    let receipt = claim_with_session(&session);
+    if receipt.detail_code.as_deref() == Some("workbuddy_checkin_auth_mismatch") {
+        // P19.1：强制刷新（忽略阈值）换新对后重试一次（轮换副作用：旧对
+        // 即作废；重试仍失败如实报因——引导重新捕获/OAuth）。
+        let (session, _renewal) = open_session_for_profile_forced(login_root, profile_id, now)
+            .map_err(|error| map_pool_error(&error))?;
+        return Ok(claim_with_session(&session));
+    }
+    Ok(receipt)
+}
+
+/// 单会话签到动作序列（先查后领 + 复核翻转；P19.1 拆出供 401 重试复用）。
+fn claim_with_session(
+    session: &traesync_infrastructure::workbuddy_checkin::WorkBuddyCheckinSession,
+) -> WorkBuddyProfileClaimReceipt {
     // 先查后领（写操作纪律：已签不重复发请求）。
     let before = match session.status() {
         Ok(WorkBuddyCheckinOutcome::Status(status)) => status,
         Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-            return Ok(WorkBuddyProfileClaimReceipt {
+            return WorkBuddyProfileClaimReceipt {
                 outcome: CheckinOutcome::RuntimeError,
                 detail_code: Some("workbuddy_checkin_auth_mismatch".to_string()),
                 credit: 0,
-            })
+            }
         }
         Ok(other) => {
-            return Ok(WorkBuddyProfileClaimReceipt {
+            return WorkBuddyProfileClaimReceipt {
                 outcome: CheckinOutcome::RuntimeError,
                 detail_code: Some(format!("workbuddy_checkin_unexpected_response:{other:?}")),
                 credit: 0,
-            })
+            }
         }
         Err(error) => {
-            return Ok(WorkBuddyProfileClaimReceipt {
+            return WorkBuddyProfileClaimReceipt {
                 outcome: CheckinOutcome::RuntimeError,
                 detail_code: Some(error.code().to_string()),
                 credit: 0,
-            })
+            }
         }
     };
     if before.today_checked_in {
-        return Ok(WorkBuddyProfileClaimReceipt {
+        return WorkBuddyProfileClaimReceipt {
             outcome: CheckinOutcome::AlreadyCheckedIn,
             detail_code: None,
             credit: 0,
-        });
+        };
     }
     let claim = match session.claim() {
         Ok(WorkBuddyCheckinOutcome::Claimed(claim)) => claim,
         Ok(WorkBuddyCheckinOutcome::AlreadyCheckedIn) => {
             // 并发窗口（查询后他端已签）：幂等空操作。
-            return Ok(WorkBuddyProfileClaimReceipt {
+            return WorkBuddyProfileClaimReceipt {
                 outcome: CheckinOutcome::AlreadyCheckedIn,
                 detail_code: None,
                 credit: 0,
-            });
+            };
         }
         Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-            return Ok(WorkBuddyProfileClaimReceipt {
+            return WorkBuddyProfileClaimReceipt {
                 outcome: CheckinOutcome::RuntimeError,
                 detail_code: Some("workbuddy_checkin_auth_mismatch".to_string()),
                 credit: 0,
-            })
+            }
         }
         Ok(other) => {
-            return Ok(WorkBuddyProfileClaimReceipt {
+            return WorkBuddyProfileClaimReceipt {
                 outcome: CheckinOutcome::RuntimeError,
                 detail_code: Some(format!("workbuddy_checkin_rejected:{other:?}")),
                 credit: 0,
-            })
+            }
         }
         Err(error) => {
-            return Ok(WorkBuddyProfileClaimReceipt {
+            return WorkBuddyProfileClaimReceipt {
                 outcome: CheckinOutcome::RuntimeError,
                 detail_code: Some(error.code().to_string()),
                 credit: 0,
-            })
+            }
         }
     };
     // 复核翻转才算真实入账（与手动 claim 同纪律）。
@@ -809,17 +840,17 @@ pub(crate) fn claim_workbuddy_profile_detailed(
         Ok(WorkBuddyCheckinOutcome::Status(status)) if status.today_checked_in
     );
     if !verified {
-        return Ok(WorkBuddyProfileClaimReceipt {
+        return WorkBuddyProfileClaimReceipt {
             outcome: CheckinOutcome::RuntimeError,
             detail_code: Some("workbuddy_checkin_unverified".to_string()),
             credit: 0,
-        });
+        };
     }
-    Ok(WorkBuddyProfileClaimReceipt {
+    WorkBuddyProfileClaimReceipt {
         outcome: CheckinOutcome::Claimed,
         detail_code: None,
         credit: claim.credit,
-    })
+    }
 }
 
 /// 逐账号自动签到（P17-A5 核心，调度口径薄封装）。

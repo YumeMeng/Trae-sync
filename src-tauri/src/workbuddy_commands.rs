@@ -26,9 +26,9 @@ use traesync_infrastructure::storage_roots::{
 };
 use traesync_infrastructure::workbuddy_capture::capture_workbuddy_login_from_machine;
 use traesync_infrastructure::workbuddy_checkin::{
-    open_session_from_machine, open_session_from_pool, renew_pool_credentials,
-    WorkBuddyCheckinOutcome, WorkBuddyCheckinSession, WorkBuddyPoolError,
-    WorkBuddyRenewalOutcome,
+    open_session_from_machine, open_session_from_pool, open_session_from_pool_forced,
+    renew_pool_credentials, verify_capture_renewal, WorkBuddyCheckinOutcome,
+    WorkBuddyCheckinSession, WorkBuddyPoolError, WorkBuddyRenewalOutcome,
 };
 use traesync_infrastructure::workbuddy_credential::{
     current_session_status, load_session_snapshot, unix_ms_now, WorkBuddySessionStatus,
@@ -158,24 +158,39 @@ pub(crate) fn list_workbuddy_accounts(
 }
 
 /// WorkBuddy 签到状态查询（只读；解密借客户端运行时，客户端可关可开）。
+/// P19.1 401 兜底：池路径 AuthMismatch 时强制刷新换新对重试一次
+/// （机器解密路径无池凭据，不重试）。
 #[tauri::command]
 pub(crate) async fn workbuddy_checkin_status(state: State<'_, AppState>) -> Result<WorkBuddyCheckinStatusDto, String> {
     ensure_login_real_mode_workbuddy(&state)?;
     let login_root = workbuddy_login_root(&state).ok();
     run_blocking("workbuddy_checkin_join_failed", move || {
-        let session = open_checkin_session_any(login_root.as_deref(), &workbuddy_client_exe()?)?;
-        match session.status() {
-            Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok(WorkBuddyCheckinStatusDto {
-                today_checked_in: status.today_checked_in,
-                streak_days: status.streak_days,
-                daily_credit: status.daily_credit,
-                total_credits: status.total_credits,
-            }),
-            Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-                Err("workbuddy_checkin_auth_mismatch".to_string())
+        let (session, from_pool) =
+            open_checkin_session_any(login_root.as_deref(), &workbuddy_client_exe()?)?;
+        let read_status = |session: &WorkBuddyCheckinSession| -> Result<WorkBuddyCheckinStatusDto, String> {
+            match session.status() {
+                Ok(WorkBuddyCheckinOutcome::Status(status)) => Ok(WorkBuddyCheckinStatusDto {
+                    today_checked_in: status.today_checked_in,
+                    streak_days: status.streak_days,
+                    daily_credit: status.daily_credit,
+                    total_credits: status.total_credits,
+                }),
+                Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
+                    Err("workbuddy_checkin_auth_mismatch".to_string())
+                }
+                Ok(other) => Err(format!("workbuddy_checkin_unexpected_response:{other:?}")),
+                Err(error) => Err(error.code().to_string()),
             }
-            Ok(other) => Err(format!("workbuddy_checkin_unexpected_response:{other:?}")),
-            Err(error) => Err(error.code().to_string()),
+        };
+        match read_status(&session) {
+            Err(code) if code == "workbuddy_checkin_auth_mismatch" && from_pool => {
+                // P19.1：强制刷新（忽略阈值）换新对后重试一次。
+                let (session, _renewal) =
+                    open_session_from_pool_forced(login_root.as_deref().expect("from_pool 必有根"), unix_ms_now() / 1000)
+                        .map_err(|error| error.code().to_string())?;
+                read_status(&session)
+            }
+            other => other,
         }
     })
     .await
@@ -183,57 +198,71 @@ pub(crate) async fn workbuddy_checkin_status(state: State<'_, AppState>) -> Resu
 
 /// WorkBuddy 签到领取（幂等；编排 = 查询未签才领 + 复核翻转确认）。
 /// 已签时直接返回 verified=true（today_checked_in 复核口径）。
+/// P19.1 401 兜底：池路径 AuthMismatch 时强制刷新换新对重试一次。
 #[tauri::command]
 pub(crate) async fn workbuddy_checkin_claim(state: State<'_, AppState>) -> Result<WorkBuddyCheckinClaimDto, String> {
     ensure_login_real_mode_workbuddy(&state)?;
     let login_root = workbuddy_login_root(&state).ok();
     run_blocking("workbuddy_checkin_join_failed", move || {
-        let session = open_checkin_session_any(login_root.as_deref(), &workbuddy_client_exe()?)?;
-        // 先查后领（写操作纪律：已签不重复发请求）。
-        let before = match session.status() {
-            Ok(WorkBuddyCheckinOutcome::Status(status)) => status,
-            Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-                return Err("workbuddy_checkin_auth_mismatch".to_string())
-            }
-            Ok(other) => return Err(format!("workbuddy_checkin_unexpected_response:{other:?}")),
-            Err(error) => return Err(error.code().to_string()),
-        };
-        if before.today_checked_in {
-            return Ok(WorkBuddyCheckinClaimDto {
-                credit: 0,
-                streak_days: before.streak_days,
-                verified: true,
-            });
-        }
-        let claim = match session.claim() {
-            Ok(WorkBuddyCheckinOutcome::Claimed(claim)) => claim,
-            Ok(WorkBuddyCheckinOutcome::AlreadyCheckedIn) => {
-                // 并发窗口（查询后他端已签）：幂等空操作，复核口径确认。
+        let (session, from_pool) =
+            open_checkin_session_any(login_root.as_deref(), &workbuddy_client_exe()?)?;
+        let claim_with_session = |session: &WorkBuddyCheckinSession| -> Result<WorkBuddyCheckinClaimDto, String> {
+            // 先查后领（写操作纪律：已签不重复发请求）。
+            let before = match session.status() {
+                Ok(WorkBuddyCheckinOutcome::Status(status)) => status,
+                Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
+                    return Err("workbuddy_checkin_auth_mismatch".to_string())
+                }
+                Ok(other) => return Err(format!("workbuddy_checkin_unexpected_response:{other:?}")),
+                Err(error) => return Err(error.code().to_string()),
+            };
+            if before.today_checked_in {
                 return Ok(WorkBuddyCheckinClaimDto {
                     credit: 0,
                     streak_days: before.streak_days,
                     verified: true,
                 });
             }
-            Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
-                return Err("workbuddy_checkin_auth_mismatch".to_string())
+            let claim = match session.claim() {
+                Ok(WorkBuddyCheckinOutcome::Claimed(claim)) => claim,
+                Ok(WorkBuddyCheckinOutcome::AlreadyCheckedIn) => {
+                    // 并发窗口（查询后他端已签）：幂等空操作，复核口径确认。
+                    return Ok(WorkBuddyCheckinClaimDto {
+                        credit: 0,
+                        streak_days: before.streak_days,
+                        verified: true,
+                    });
+                }
+                Ok(WorkBuddyCheckinOutcome::AuthMismatch) => {
+                    return Err("workbuddy_checkin_auth_mismatch".to_string())
+                }
+                Ok(other) => return Err(format!("workbuddy_checkin_rejected:{other:?}")),
+                Err(error) => return Err(error.code().to_string()),
+            };
+            // 复核：today_checked_in 翻转才算真实入账。
+            let verified = match session.status() {
+                Ok(WorkBuddyCheckinOutcome::Status(status)) => status.today_checked_in,
+                _ => false,
+            };
+            if !verified {
+                return Err("workbuddy_checkin_unverified".to_string());
             }
-            Ok(other) => return Err(format!("workbuddy_checkin_rejected:{other:?}")),
-            Err(error) => return Err(error.code().to_string()),
+            Ok(WorkBuddyCheckinClaimDto {
+                credit: claim.credit,
+                streak_days: claim.streak_days,
+                verified: true,
+            })
         };
-        // 复核：today_checked_in 翻转才算真实入账。
-        let verified = match session.status() {
-            Ok(WorkBuddyCheckinOutcome::Status(status)) => status.today_checked_in,
-            _ => false,
-        };
-        if !verified {
-            return Err("workbuddy_checkin_unverified".to_string());
+        match claim_with_session(&session) {
+            Err(code) if code == "workbuddy_checkin_auth_mismatch" && from_pool => {
+                // P19.1：强制刷新（忽略阈值）换新对后重试一次。
+                let (session, _renewal) =
+                    open_session_from_pool_forced(login_root.as_deref().expect("from_pool 必有根"), unix_ms_now() / 1000)
+                        .map_err(|error| error.code().to_string())?;
+                claim_with_session(&session)
+            }
+            other => other,
         }
-        Ok(WorkBuddyCheckinClaimDto {
-            credit: claim.credit,
-            streak_days: claim.streak_days,
-            verified: true,
-        })
     })
     .await
 }
@@ -242,27 +271,30 @@ pub(crate) async fn workbuddy_checkin_claim(state: State<'_, AppState>) -> Resul
 /// 临近过期自动续期写回），池为空或不可用时回退机器解密（.info 现解密，
 /// 覆盖未捕获账号）。池错误仅在机器回退同样失败时优先暴露——refresh
 /// 拒绝（池 refresh 已轮换作废）引导重新捕获，比机器解密错误更有引导性。
+/// 返回 (会话, 是否池路径)——P19.1 401 兜底只对池路径重试（机器路径
+/// 无池凭据可刷）。
 fn open_checkin_session_any(
     login_root: Option<&Path>,
     client_exe: &Path,
-) -> Result<WorkBuddyCheckinSession, String> {
+) -> Result<(WorkBuddyCheckinSession, bool), String> {
     let now = unix_ms_now() / 1000;
     let pool_error = if let Some(root) = login_root {
         match open_session_from_pool(root, now) {
-            Ok((session, _renewal)) => return Ok(session),
+            Ok((session, _renewal)) => return Ok((session, true)),
             Err(error) => Some(error),
         }
     } else {
         None
     };
-    open_session_from_machine(client_exe, DEFAULT_AUTH_ID).map_err(|machine_error| {
+    let session = open_session_from_machine(client_exe, DEFAULT_AUTH_ID).map_err(|machine_error| {
         match pool_error {
             Some(error @ (WorkBuddyPoolError::RefreshRejected | WorkBuddyPoolError::RecordMissing)) => {
                 error.code().to_string()
             }
             _ => machine_error,
         }
-    })
+    })?;
+    Ok((session, false))
 }
 
 /// WorkBuddy 凭据手动续期（对齐 Trae「刷新登录凭据」入口语义）：
@@ -323,6 +355,73 @@ pub(crate) async fn capture_workbuddy_account(
         let record = capture_workbuddy_login_from_machine(&client_exe, &store, unix_ms_now())
             .map_err(|error| format!("{}:{:?}", error.code(), error))?;
         Ok(record.summary())
+    })
+    .await
+}
+
+/// WorkBuddy 续期验证探针回执（P19.1④；回答用户核心质疑「保存当前
+/// 登录账号真的能持续更新吗」）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddyRenewalVerifyDto {
+    /// 当前登录账号 uid（快照明文面）。
+    pub uid: String,
+    /// .info 快照时间戳（Unix 秒；0 = 未知）。
+    pub info_last_refresh_unix_seconds: u64,
+    pub info_access_expires_unix_seconds: u64,
+    pub info_refresh_expires_unix_seconds: u64,
+    /// .info 文件修改时刻（Unix 秒；0 = 不可得）。
+    pub info_modified_unix_seconds: u64,
+    /// 续期链路验证结果：true = 实调刷新端点成功且新对已原子写回池容器。
+    pub renewed: bool,
+    /// 刷新后（或现有）有效期（Unix 秒）。
+    pub access_expires_at_unix_seconds: u64,
+    pub refresh_expires_at_unix_seconds: u64,
+}
+
+/// WorkBuddy 续期验证探针（**非破坏**：只读 .info 与池容器；写仅限池
+/// 容器自身的刷新轮换原子写回，生产会话文件零触碰）。
+///
+/// 编排 = 读凭据快照时间戳 → 按当前登录账号定位池记录 → 实调
+/// `POST /v2/plugin/auth/token/refresh`（强制刷新，忽略阈值）验证续期
+/// 链路 → 回执成功与否/新过期时间。信封检测分支：当前登录账号 token
+/// 为 `$wbEncrypted` 加密信封且无明文池凭据时诚实报
+/// `workbuddy_verify_envelope_encrypted`（登录态已加密，请用 OAuth 添加
+/// 账号）；无池记录（非信封）报 `workbuddy_verify_credential_mismatch`；
+/// 刷新被拒报 `workbuddy_verify_refresh_rejected`。
+#[tauri::command]
+pub(crate) async fn verify_workbuddy_capture_renewal(
+    state: State<'_, AppState>,
+) -> Result<WorkBuddyRenewalVerifyDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state)?;
+    run_blocking("workbuddy_verify_join_failed", move || {
+        use traesync_infrastructure::workbuddy_checkin::force_renew_pool_profile;
+        let store = WorkBuddyLoginStore::new(login_root.clone());
+        let load_snapshot = || {
+            traesync_infrastructure::workbuddy_credential::load_session_snapshot(DEFAULT_AUTH_ID)
+        };
+        let info_modified_unix = || -> Option<u64> {
+            let path = traesync_infrastructure::workbuddy_credential::session_file(DEFAULT_AUTH_ID)?;
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs())
+        };
+        let now = unix_ms_now() / 1000;
+        let renew = |profile_id: &str| force_renew_pool_profile(&login_root, profile_id, now);
+        let report = verify_capture_renewal(&store, &load_snapshot, &info_modified_unix, &renew)
+            .map_err(|error| error.code())?;
+        Ok(WorkBuddyRenewalVerifyDto {
+            uid: report.uid,
+            info_last_refresh_unix_seconds: report.info_last_refresh_unix_seconds,
+            info_access_expires_unix_seconds: report.info_access_expires_unix_seconds,
+            info_refresh_expires_unix_seconds: report.info_refresh_expires_unix_seconds,
+            info_modified_unix_seconds: report.info_modified_unix_seconds,
+            renewed: report.renewed,
+            access_expires_at_unix_seconds: report.access_expires_at_unix_seconds,
+            refresh_expires_at_unix_seconds: report.refresh_expires_at_unix_seconds,
+        })
     })
     .await
 }
