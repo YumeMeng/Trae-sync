@@ -89,18 +89,19 @@ export function WorkBuddyOverviewPage({ active, onNavigate }: WorkBuddyOverviewP
               <span>今日签到</span>
             </div>
             {/* P19.2③ 拆两行：积分余额（credits_balance，主展示）+ 本期签到累计
-                （total_credits，活动域语义）。各自独立占位化，禁止静默 0。 */}
+                （total_credits，活动域语义）。各自独立占位化，禁止静默 0。
+                P19.2⑤：全部余额查询失败 → 占位注明失败账号计数（balance_error 汇总）。 */}
             {accountCount > 0 && balanceKnownCount === 0 ? (
               <div className="overview-checkin__stat" data-testid="wb-overview-credits-unknown">
-                <strong>未获取</strong>
-                <span>积分余额</span>
+                <strong>余额查询失败</strong>
+                <span>积分余额（{accountCount} 个账号均未获取到余额）</span>
                 <button
                   type="button"
                   className="btn btn--quiet"
                   onClick={handleRefreshSummary}
                   disabled={refreshing}
                   data-testid="wb-overview-credits-refresh"
-                  title="重新读取各账号积分余额（此前读取失败或尚未查询）"
+                  title="重新读取各账号积分余额；仍失败的原因可逐账号到账号详情页查看"
                 >
                   <RefreshCw size={13} className={refreshing ? "icon-spin" : undefined} aria-hidden="true" />
                   点击刷新

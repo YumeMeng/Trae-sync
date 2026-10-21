@@ -113,7 +113,9 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
     render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
 
     const unknown = await screen.findByTestId("wb-overview-credits-unknown");
-    expect(unknown.textContent).toContain("未获取");
+    // P19.2⑤：占位注明失败账号计数（balance_error 汇总口径）。
+    expect(unknown.textContent).toContain("余额查询失败");
+    expect(unknown.textContent).toContain("2 个账号均未获取到余额");
     expect(unknown.textContent).not.toMatch(/积分余额\s*0/);
     // 点击刷新后重新拉取（覆盖回成功路由 → 恢复真实余额 420+300=720）。
     mockRoute("get_workbuddy_checkin_overview", () => [
@@ -157,8 +159,8 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
     // 本期签到累计照常展示（total_credits 不受余额查询失败影响）。
     expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("1200");
     expect(screen.queryByTestId("wb-overview-accum-unknown")).not.toBeInTheDocument();
-    // 不报错（无 error 行 → knownRows 正常，无失败提示态）。
-    expect(screen.queryByText(/查询失败/)).not.toBeInTheDocument();
+    // P19.2⑤：占位行注明失败账号计数（balance_error 汇总口径）。
+    expect(screen.getByTestId("wb-overview-credits-unknown").textContent).toContain("2 个账号均未获取到余额");
   });
 });
 

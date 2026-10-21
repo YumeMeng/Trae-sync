@@ -387,9 +387,9 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     });
     // creditsColumn 能力开关（IA 草案 §1.2）：逐账号积分余额摘要（P19.2③ 主
     // 展示 = credits_balance，billing 真实口径）。四态：未拉到 overview=「未获取」；
-    // 整行失败=「查询失败」；余额查询 fail-soft null（error 空）=「--」不报错
-    // （be 5dc3b72 契约）；真实 0 照实显示。total_credits 语义已纠正为「本期
-    // 签到累计」（活动域只增不减），作次要展示进 meta 行。
+    // 整行失败=「查询失败」；余额查询 fail-soft null（error 空）=「余额查询失败」
+    // （悬浮提示原因人话，P19.2⑤）；真实 0 照实显示。total_credits 语义已纠正
+    // 为「本期签到累计」（活动域只增不减），作次要展示进 meta 行。
     const overviewRow = checkinOverview.find((row) => row.profile_id === account.profile_id) ?? null;
     const balanceLabel = overviewRow == null
       ? "未获取"
@@ -397,7 +397,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
         ? "查询失败"
         : overviewRow.credits_balance != null
           ? `${overviewRow.credits_balance}`
-          : "--";
+          : "余额查询失败";
     const accumText = overviewRow && !overviewRow.error && overviewRow.total_credits != null
       ? ` · 本期签到累计 ${overviewRow.total_credits}`
       : "";

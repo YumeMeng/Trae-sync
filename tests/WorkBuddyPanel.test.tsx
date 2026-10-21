@@ -351,7 +351,7 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     expect(notify.success).toHaveBeenCalledWith("WorkBuddy：已加入每日自动签到。");
   });
 
-  it("余额 fail-soft（P19.2③）：status ok 但余额查询失败 → 卡行「--」不报错，累计照常", async () => {
+  it("余额 fail-soft（P19.2③）：status ok 但余额查询失败 → 卡行「余额查询失败」不报错，累计照常", async () => {
     installWorkbuddyRoutes({ overview: [
       overviewRow("wb-uid-1", "甲账号", { credits_balance: null, credits_total: null }),
       overviewRow("wb-uid-2", "乙账号", { credits_balance: null, credits_total: null }),
@@ -359,8 +359,8 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     render(<WorkBuddyPanel active={true} />);
 
     await screen.findByTestId("workbuddy-pool-list");
-    // be 5dc3b72 契约：余额查询失败（error 仍空）→ 显示「--」，不要报错弹窗。
-    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("--");
+    // be 5dc3b72 契约：余额查询失败（error 仍空）→ 占位文字（P19.2⑤ 口径），不报错弹窗。
+    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("余额查询失败");
     // 本期签到累计不受余额查询失败影响。
     expect(screen.getByTestId("workbuddy-pool-list").textContent).toContain("本期签到累计 700");
   });
@@ -373,15 +373,15 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     render(<WorkBuddyPanel active={true} />);
 
     await screen.findByTestId("workbuddy-pool-list");
-    // 卡行仍「--」，悬浮提示 = safeUiError 人话（码不进界面）。
-    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("--");
+    // 卡行占位文字（P19.2⑤ 口径），悬浮提示 = safeUiError 人话（码不进界面）。
+    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("余额查询失败");
     expect(screen.getByTestId("workbuddy-credits-uid-1").closest("div")?.getAttribute("title"))
       .toContain("登录凭据已失效");
 
-    // 详情页在「--」处展示原因。
+    // 详情页在占位处展示原因人话。
     fireEvent.click(screen.getByTestId("workbuddy-pool-card-wb-uid-2"));
     expect(await screen.findByTestId("workbuddy-account-detail")).toBeInTheDocument();
-    expect(screen.getByTestId("workbuddy-detail-credits")).toHaveTextContent("--（网络异常，请稍后刷新。）");
+    expect(screen.getByTestId("workbuddy-detail-credits")).toHaveTextContent("余额查询失败（网络异常，请稍后刷新。）");
     // 稳定码不进界面。
     expect(screen.getByTestId("workbuddy-detail-credits").textContent).not.toContain("workbuddy_balance");
   });
