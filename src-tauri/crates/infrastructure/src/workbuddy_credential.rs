@@ -28,12 +28,42 @@ pub const LOGOUT_MARKER_SUFFIX: &str = ".logged-out";
 /// 会话存储根（环境驱动）：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth`。
 /// 代码依据：FilePathServiceImpl.getBasePath win32 = `%LOCALAPPDATA%\{z._i}`，
 /// `z._i = CodeBuddyExtension`（本机实测该目录存在且含 auth 会话文件）。
+///
+/// P19.1 路径回退加固：LOCALAPPDATA 之下无 auth 目录（或环境变量缺失）时
+/// 回退探测 `%APPDATA%` 同构路径（非标安装/便携形态的多路径实践）；两者
+/// 均不可探测时保持 LOCALAPPDATA 口径（既有错误码语义不变——文件缺失即
+/// [`WorkBuddySessionError::FileMissing`]，不猜路径形态）。
 pub fn auth_dir() -> Option<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA").ok()?;
-    if local.trim().is_empty() {
-        return None;
+    let local = non_empty_env("LOCALAPPDATA");
+    let roaming = non_empty_env("APPDATA");
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(local) = local {
+        roots.push(PathBuf::from(local));
     }
-    Some(auth_dir_in(Path::new(&local)))
+    if let Some(roaming) = roaming {
+        roots.push(PathBuf::from(roaming));
+    }
+    auth_dir_from_candidates(&roots)
+}
+
+/// 空白环境变量折叠为 None（既有 LOCALAPPDATA 空串防御的泛化）。
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 纯选择逻辑（候选根依序探测；测试注入用）：第一个 auth 目录存在的根
+/// 胜出；全部不存在时保留首个候选（缺省口径，错误码语义不变）。
+fn auth_dir_from_candidates(roots: &[PathBuf]) -> Option<PathBuf> {
+    for root in roots {
+        let candidate = auth_dir_in(root);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    roots.first().map(|root| auth_dir_in(root))
 }
 
 /// 纯路径构造（给定 `%LOCALAPPDATA%` 根；测试注入用）。
@@ -657,5 +687,35 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, WorkBuddyDecryptError::ClientExeMissing);
+    }
+
+    /// P19.1 路径回退选择：首个 auth 目录存在的候选胜出；全部缺失时
+    /// 保留首个候选口径（不猜、错误码语义不变）；空候选列表 → None。
+    #[test]
+    fn auth_dir_candidates_fallback_selection() {
+        let primary = tempfile::tempdir().unwrap();
+        let secondary = tempfile::tempdir().unwrap();
+        // 两个候选都无 auth 目录 → 保留首个（LOCALAPPDATA 口径）。
+        let roots = vec![primary.path().to_path_buf(), secondary.path().to_path_buf()];
+        assert_eq!(
+            auth_dir_from_candidates(&roots),
+            Some(auth_dir_in(primary.path())),
+            "全部缺失保留首个候选"
+        );
+        assert_eq!(auth_dir_from_candidates(&[]), None);
+        // 首个候选补上 auth 目录 → 胜出。
+        std::fs::create_dir_all(auth_dir_in(primary.path())).unwrap();
+        assert_eq!(
+            auth_dir_from_candidates(&roots),
+            Some(auth_dir_in(primary.path()))
+        );
+        // 首个移除 auth 目录、第二个补上 → 回退到 %APPDATA% 同构候选。
+        std::fs::remove_dir_all(auth_dir_in(primary.path())).unwrap();
+        std::fs::create_dir_all(auth_dir_in(secondary.path())).unwrap();
+        assert_eq!(
+            auth_dir_from_candidates(&roots),
+            Some(auth_dir_in(secondary.path())),
+            "LOCALAPPDATA 缺失回退 %APPDATA%"
+        );
     }
 }

@@ -564,6 +564,26 @@ pub fn renew_pool_credentials(
     renew_pool_record(&pool_http(), &store, now_unix)
 }
 
+/// P19.1：按指定账号强制刷新便捷入口（401 兜底重试链 / 续期验证探针用；
+/// 自建 HTTP 客户端）。轮换副作用不变：新对原子写回，旧对即作废。
+pub fn force_renew_pool_profile(
+    login_root: &Path,
+    profile_id: &str,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    renew_pool_profile_forced(&pool_http(), &store, profile_id, now_unix)
+}
+
+/// P19.1：池首账号强制刷新便捷入口（"当前账号"路径 401 兜底用）。
+pub fn force_renew_pool_record(
+    login_root: &Path,
+    now_unix: u64,
+) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    renew_pool_record_forced(&pool_http(), &store, now_unix)
+}
+
 /// 从工具账号池打开签到会话（P17-T4c⑤ 池优先路径）：access 充裕直接用
 /// （零轮换）；临近过期先续期（刷新 + 原子写回）再用新 access。池为空时
 /// 返回 [`WorkBuddyPoolError::PoolEmpty`]，由组合根回退机器解密路径。
@@ -579,6 +599,36 @@ pub fn open_session_from_pool(
     let record = store
         .load(&summary.profile_id, &summary.account_id)
         .map_err(|_| WorkBuddyPoolError::RecordMissing)?;
+    Ok((session_from_record(http, &record), renewal))
+}
+
+/// P19.1：池首账号**强制续期**后打开会话（当前账号路径 401 兜底——
+/// status/claim 返回 AuthMismatch 时换新对重试一次）。
+pub fn open_session_from_pool_forced(
+    login_root: &Path,
+    now_unix: u64,
+) -> Result<(WorkBuddyCheckinSession, WorkBuddyRenewalOutcome), WorkBuddyPoolError> {
+    let http = pool_http();
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    let renewal = renew_pool_record_forced(&http, &store, now_unix)?;
+    let summaries = store.list().map_err(|_| WorkBuddyPoolError::StoreIo)?;
+    let summary = summaries.first().ok_or(WorkBuddyPoolError::PoolEmpty)?;
+    let record = store
+        .load(&summary.profile_id, &summary.account_id)
+        .map_err(|_| WorkBuddyPoolError::RecordMissing)?;
+    Ok((session_from_record(http, &record), renewal))
+}
+
+/// P19.1：按指定账号**强制续期**后打开会话（逐账号路径 401 兜底重试链）。
+pub fn open_session_for_profile_forced(
+    login_root: &Path,
+    profile_id: &str,
+    now_unix: u64,
+) -> Result<(WorkBuddyCheckinSession, WorkBuddyRenewalOutcome), WorkBuddyPoolError> {
+    let http = pool_http();
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    let renewal = renew_pool_profile_forced(&http, &store, profile_id, now_unix)?;
+    let record = load_pool_record(&store, profile_id)?;
     Ok((session_from_record(http, &record), renewal))
 }
 
@@ -616,6 +666,123 @@ fn pool_http() -> reqwest::blocking::Client {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("WorkBuddy 池 HTTP 客户端构建失败")
+}
+
+// ===== P19.1 续期验证探针（用户核心质疑：「保存当前登录账号真的能持续更新吗」）=====
+
+/// 验证探针错误（组合根只暴露稳定错误码）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkBuddyRenewalVerifyError {
+    /// 会话快照不可用（载荷 = workbuddy_session_* 稳定错误码——客户端
+    /// 未登录/文件损坏，探针无从定位「当前登录账号」）。
+    Snapshot(String),
+    /// 当前登录账号的 .info token 为 `$wbEncrypted` 加密信封且工具侧无该
+    /// 账号的明文池凭据——诚实报告：登录态已加密，请用 OAuth 添加账号。
+    EnvelopeEncrypted,
+    /// 当前登录账号无对应池记录（未捕获/账号不匹配；token 非信封形态）。
+    CredentialMismatch,
+    /// 实调刷新被拒（refreshToken 已轮换/吊销）——保存的凭据无法持续更新。
+    RefreshRejected,
+    /// 刷新请求失败/响应形态不符。
+    RequestFailed,
+    /// 池容器读写失败。
+    StoreIo,
+}
+
+impl WorkBuddyRenewalVerifyError {
+    pub fn code(&self) -> String {
+        match self {
+            Self::Snapshot(code) => code.clone(),
+            Self::EnvelopeEncrypted => "workbuddy_verify_envelope_encrypted".to_string(),
+            Self::CredentialMismatch => "workbuddy_verify_credential_mismatch".to_string(),
+            Self::RefreshRejected => "workbuddy_verify_refresh_rejected".to_string(),
+            Self::RequestFailed => "workbuddy_verify_request_failed".to_string(),
+            Self::StoreIo => "workbuddy_pool_store_io".to_string(),
+        }
+    }
+}
+
+/// 续期验证回执（探针内核口径；组合根 DTO 的来源）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkBuddyRenewalVerifyReport {
+    /// 当前登录账号 uid（.info 快照明文面）。
+    pub uid: String,
+    /// .info 快照时间戳（Unix 秒；0 = 快照未提供该字段）。
+    pub info_last_refresh_unix_seconds: u64,
+    pub info_access_expires_unix_seconds: u64,
+    pub info_refresh_expires_unix_seconds: u64,
+    /// .info 文件修改时刻（Unix 秒；0 = 不可得）。
+    pub info_modified_unix_seconds: u64,
+    /// 续期链路验证结果：true = 实调刷新成功且新对已原子写回池容器。
+    pub renewed: bool,
+    /// 刷新后的有效期（Unix 秒；renewed=false 时为池记录现值）。
+    pub access_expires_at_unix_seconds: u64,
+    pub refresh_expires_at_unix_seconds: u64,
+}
+
+/// 续期验证探针内核（注入式，离线四态单测：刷新成功/失败/凭据不匹配/
+/// 信封检测；生产装配在组合根命令层——`renew` 闭包注入
+/// [`renew_pool_profile_forced`]，真实调用刷新端点并原子写回）。
+///
+/// 非破坏边界：只读 .info 快照与池容器，写仅限池容器自身（刷新轮换的
+/// 原子写回），生产会话文件零触碰。
+pub fn verify_capture_renewal(
+    store: &WorkBuddyLoginStore,
+    load_snapshot: &dyn Fn() -> Result<WorkBuddySessionSnapshot, crate::workbuddy_credential::WorkBuddySessionError>,
+    info_modified_unix: &dyn Fn() -> Option<u64>,
+    renew: &dyn Fn(&str) -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError>,
+) -> Result<WorkBuddyRenewalVerifyReport, WorkBuddyRenewalVerifyError> {
+    // 1) 当前登录账号（.info 快照明文元数据）。
+    let snapshot = load_snapshot()
+        .map_err(|error| WorkBuddyRenewalVerifyError::Snapshot(error.code().to_string()))?;
+    let profile_id = WorkBuddyLoginRecord::profile_id_for(&snapshot.uid);
+    // 2) 按当前登录账号定位池记录；无记录 → 信封检测分支优先（诚实报因）。
+    let summaries = store.list().map_err(|_| WorkBuddyRenewalVerifyError::StoreIo)?;
+    let summary = summaries
+        .iter()
+        .find(|summary| summary.profile_id == profile_id);
+    let Some(summary) = summary else {
+        return Err(
+            if snapshot.has_encrypted_access_token || snapshot.has_encrypted_refresh_token {
+                WorkBuddyRenewalVerifyError::EnvelopeEncrypted
+            } else {
+                WorkBuddyRenewalVerifyError::CredentialMismatch
+            },
+        );
+    };
+    // 3) 实调刷新端点验证续期链路（强制刷新：忽略阈值——探针目的就是验证）。
+    let outcome = renew(&summary.profile_id).map_err(|error| match error {
+        WorkBuddyPoolError::RefreshRejected => WorkBuddyRenewalVerifyError::RefreshRejected,
+        WorkBuddyPoolError::StoreIo => WorkBuddyRenewalVerifyError::StoreIo,
+        _ => WorkBuddyRenewalVerifyError::RequestFailed,
+    })?;
+    // 4) 回执（Renewed 携带新对有效期；防御性 Skipped 读池记录现值）。
+    let (renewed, access_expires_at, refresh_expires_at) = match outcome {
+        WorkBuddyRenewalOutcome::Renewed {
+            access_expires_at_unix_seconds,
+            refresh_expires_at_unix_seconds,
+        } => (true, access_expires_at_unix_seconds, refresh_expires_at_unix_seconds),
+        WorkBuddyRenewalOutcome::Skipped { .. } => {
+            let record = store
+                .load(&summary.profile_id, &summary.account_id)
+                .map_err(|_| WorkBuddyRenewalVerifyError::StoreIo)?;
+            (
+                false,
+                record.access_token_expires_at_unix_seconds,
+                record.refresh_token_expires_at_unix_seconds,
+            )
+        }
+    };
+    Ok(WorkBuddyRenewalVerifyReport {
+        uid: snapshot.uid,
+        info_last_refresh_unix_seconds: snapshot.auth.last_refresh_time.unwrap_or(0) / 1000,
+        info_access_expires_unix_seconds: snapshot.auth.expires_at.unwrap_or(0) / 1000,
+        info_refresh_expires_unix_seconds: snapshot.auth.refresh_expires_at.unwrap_or(0) / 1000,
+        info_modified_unix_seconds: info_modified_unix().unwrap_or(0),
+        renewed,
+        access_expires_at_unix_seconds: access_expires_at,
+        refresh_expires_at_unix_seconds: refresh_expires_at,
+    })
 }
 
 #[cfg(test)]
@@ -770,5 +937,184 @@ mod tests {
         assert!(!should_skip_renewal(0, false));
         // 强制永不跳过（已过期同样刷新）。
         assert!(!should_skip_renewal(0, true));
+    }
+
+    // ===== P19.1 续期验证探针（四态离线单测） =====
+
+    use crate::workbuddy_credential::parse_session_snapshot;
+
+    /// 明文 token 形态快照（5.5.x 口径；uid 与池记录对齐）。
+    const VERIFY_SNAPSHOT_PLAIN: &str = r#"{
+  "auth": {
+    "accessToken": "plain-access",
+    "refreshToken": "plain-refresh",
+    "tokenType": "Bearer",
+    "domain": "www.workbuddy.cn",
+    "lastRefreshTime": 1792219259894,
+    "expiresAt": 1794638459316,
+    "refreshExpiresAt": 1794811259316
+  },
+  "account": { "uid": "uid-1", "uin": "330126449009" },
+  "accounts": [ { "uid": "uid-1" } ],
+  "allAccounts": [ { "uid": "uid-1" } ]
+}"#;
+
+    /// 加密信封形态快照（5.6.2+ 口径；工具侧无明文凭据的分支用）。
+    const VERIFY_SNAPSHOT_ENVELOPE: &str = r#"{
+  "auth": {
+    "accessToken": { "$wbEncrypted": 1, "envelope": "x" },
+    "refreshToken": { "$wbEncrypted": 1, "envelope": "x" },
+    "domain": "www.workbuddy.cn",
+    "expiresAt": 1794638459316
+  },
+  "account": { "uid": "uid-1", "uin": "330126449009" },
+  "accounts": [ { "uid": "uid-1" } ],
+  "allAccounts": [ { "uid": "uid-1" } ]
+}"#;
+
+    fn verify_pool(login_root: &Path, uid: &str) -> WorkBuddyLoginStore {
+        std::fs::create_dir_all(login_root).unwrap();
+        let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+        store
+            .save(&WorkBuddyLoginRecord {
+                profile_id: format!("wb-{uid}"),
+                account_id: uid.to_string(),
+                screen_name: "账号一".to_string(),
+                masked_mobile: String::new(),
+                access_token: "old-access".to_string(),
+                refresh_token: "old-refresh".to_string(),
+                access_token_expires_at_unix_seconds: 1_800_000_000,
+                refresh_token_expires_at_unix_seconds: 1_810_000_000,
+                domain: "www.workbuddy.cn".to_string(),
+                session_state: "s".to_string(),
+                device_id: "dev".to_string(),
+                minted_at_unix_seconds: 1,
+                last_updated_at_unix_seconds: 1,
+            })
+            .unwrap();
+        store
+    }
+
+    fn verify_snapshot_loader(content: &'static str) -> impl Fn() -> Result<
+        crate::workbuddy_credential::WorkBuddySessionSnapshot,
+        crate::workbuddy_credential::WorkBuddySessionError,
+    > {
+        move || parse_session_snapshot(content)
+    }
+
+    /// 状态一：刷新成功——实调刷新成功且新对已写回（renewed=true + 新
+    /// 有效期 + 快照时间戳随回执）。
+    #[test]
+    fn verify_renewal_reports_success_with_new_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = verify_pool(temp.path(), "uid-1");
+        let renew =
+            |profile_id: &str| -> Result<WorkBuddyRenewalOutcome, WorkBuddyPoolError> {
+                assert_eq!(profile_id, "wb-uid-1");
+                Ok(WorkBuddyRenewalOutcome::Renewed {
+                    access_expires_at_unix_seconds: 1_900_000_000,
+                    refresh_expires_at_unix_seconds: 1_910_000_000,
+                })
+            };
+        let report = verify_capture_renewal(
+            &store,
+            &verify_snapshot_loader(VERIFY_SNAPSHOT_PLAIN),
+            &|| Some(1_792_220_000),
+            &renew,
+        )
+        .unwrap();
+        assert_eq!(report.uid, "uid-1");
+        assert!(report.renewed, "续期链路验证通过");
+        assert_eq!(report.access_expires_at_unix_seconds, 1_900_000_000);
+        assert_eq!(report.refresh_expires_at_unix_seconds, 1_910_000_000);
+        // 快照时间戳（ms → s 换算口径）。
+        assert_eq!(report.info_last_refresh_unix_seconds, 1_792_219_259);
+        assert_eq!(report.info_access_expires_unix_seconds, 1_794_638_459);
+        assert_eq!(report.info_modified_unix_seconds, 1_792_220_000);
+    }
+
+    /// 状态二：刷新失败——被拒（refreshToken 已轮换/吊销）与请求失败
+    /// 分别映射（保存的凭据无法持续更新，如实报因）。
+    #[test]
+    fn verify_renewal_reports_refresh_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = verify_pool(temp.path(), "uid-1");
+        let rejected = |_: &str| Err(WorkBuddyPoolError::RefreshRejected);
+        assert_eq!(
+            verify_capture_renewal(
+                &store,
+                &verify_snapshot_loader(VERIFY_SNAPSHOT_PLAIN),
+                &|| None,
+                &rejected
+            )
+            .unwrap_err()
+            .code(),
+            "workbuddy_verify_refresh_rejected"
+        );
+        let failed = |_: &str| Err(WorkBuddyPoolError::RequestFailed);
+        assert_eq!(
+            verify_capture_renewal(
+                &store,
+                &verify_snapshot_loader(VERIFY_SNAPSHOT_PLAIN),
+                &|| None,
+                &failed
+            )
+            .unwrap_err()
+            .code(),
+            "workbuddy_verify_request_failed"
+        );
+    }
+
+    /// 状态三：凭据不匹配——当前登录账号无对应池记录（token 明文形态，
+    /// 非信封）→ workbuddy_verify_credential_mismatch。
+    #[test]
+    fn verify_renewal_reports_credential_mismatch_without_pool_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = verify_pool(temp.path(), "uid-1");
+        // 快照账号 uid-other：池里只有 uid-1 → 无匹配记录。
+        let snapshot_other = VERIFY_SNAPSHOT_PLAIN.replace("uid-1", "uid-other");
+        let loader = move || parse_session_snapshot(&snapshot_other);
+        let renew = |_: &str| unreachable!("无匹配记录不得发起刷新");
+        assert_eq!(
+            verify_capture_renewal(&store, &loader, &|| None, &renew)
+                .unwrap_err()
+                .code(),
+            "workbuddy_verify_credential_mismatch"
+        );
+    }
+
+    /// 状态四：信封检测——当前登录账号 token 为 `$wbEncrypted` 加密信封
+    /// 且工具侧无该账号明文池凭据 → 诚实报「登录态已加密，请用 OAuth
+    /// 添加账号」（workbuddy_verify_envelope_encrypted）。
+    #[test]
+    fn verify_renewal_reports_envelope_encrypted_without_pool_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = verify_pool(temp.path(), "uid-1");
+        let snapshot_other = VERIFY_SNAPSHOT_ENVELOPE.replace("uid-1", "uid-other");
+        let loader = move || parse_session_snapshot(&snapshot_other);
+        let renew = |_: &str| unreachable!("无匹配记录不得发起刷新");
+        assert_eq!(
+            verify_capture_renewal(&store, &loader, &|| None, &renew)
+                .unwrap_err()
+                .code(),
+            "workbuddy_verify_envelope_encrypted"
+        );
+    }
+
+    /// 快照不可用（文件缺失等）：Snapshot(载荷 = 会话域稳定错误码) 优先。
+    #[test]
+    fn verify_renewal_reports_snapshot_unavailable_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = verify_pool(temp.path(), "uid-1");
+        let loader = || {
+            Err(crate::workbuddy_credential::WorkBuddySessionError::FileMissing)
+        };
+        let renew = |_: &str| unreachable!("快照不可用不得发起刷新");
+        assert_eq!(
+            verify_capture_renewal(&store, &loader, &|| None, &renew)
+                .unwrap_err()
+                .code(),
+            "workbuddy_session_file_missing"
+        );
     }
 }
