@@ -51,6 +51,7 @@ fn default_sources() -> WorkBuddyBackupSources {
             .join("Trae Sync")
             .join("data")
             .join("workbuddy-login"),
+        data_root: user_profile().join(".workbuddy"),
     }
 }
 
@@ -72,6 +73,7 @@ fn main() -> ExitCode {
         auth_dir: PathBuf::from(args.get(2).cloned().unwrap_or_default()).abs_or(fallback.auth_dir),
         login_container_dir: PathBuf::from(args.get(3).cloned().unwrap_or_default())
             .abs_or(fallback.login_container_dir),
+        data_root: fallback.data_root,
     };
     let target = PathBuf::from(args.get(4).cloned().unwrap_or_default()).abs_or(default_target());
 
