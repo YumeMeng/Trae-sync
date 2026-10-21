@@ -39,11 +39,13 @@ function installOverviewRoutes(options?: { failStats?: boolean }) {
     {
       profile_id: "wb-uid-1", screen_name: "甲账号",
       today_checked_in: true, streak_days: 6, daily_credit: 100, total_credits: 700,
+      credits_balance: 420, credits_total: 1000,
       checkin_dates: ["2026-10-20"], error: null,
     },
     {
       profile_id: "wb-uid-2", screen_name: "乙账号",
       today_checked_in: false, streak_days: 1, daily_credit: 100, total_credits: 500,
+      credits_balance: 300, credits_total: 800,
       checkin_dates: [], error: null,
     },
   ]);
@@ -62,14 +64,19 @@ afterEach(() => {
 });
 
 describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
-  it("渲染：签到与账号统计卡（账号/今日已签/积分合计）+ 会话统计卡 + 主操作", async () => {
+  it("渲染：签到与账号统计卡（账号/今日已签/余额+累计两行）+ 会话统计卡 + 主操作", async () => {
     installOverviewRoutes();
     const pages: AppPage[] = [];
     render(<WorkBuddyOverviewPage active={true} onNavigate={(page) => pages.push(page)} />);
 
-    // 签到与账号卡：账号 2、今日已签 1/2、积分合计 1200。
-    expect(await screen.findByTestId("wb-overview-checkin")).toBeInTheDocument();
-    expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("签到与账号");
+    // 签到与账号卡：账号 2、今日已签 1/2；P19.2③ 拆两行——积分余额 720
+    //（credits_balance 420+300）+ 本期签到累计 1200（total_credits 700+500）。
+    const checkin = await screen.findByTestId("wb-overview-checkin");
+    expect(checkin.textContent).toContain("签到与账号");
+    expect(checkin.textContent).toContain("720");
+    expect(checkin.textContent).toContain("积分余额");
+    expect(checkin.textContent).toContain("1200");
+    expect(checkin.textContent).toContain("本期签到累计");
     expect(screen.getByTestId("wb-overview-checkin-cta")).toHaveTextContent("去签到（余 1）");
     // 会话统计卡：库内会话/项目/账号 + 最近活跃。
     expect(screen.getByTestId("wb-overview-stats-library").textContent).toContain("42");
@@ -107,31 +114,51 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
 
     const unknown = await screen.findByTestId("wb-overview-credits-unknown");
     expect(unknown.textContent).toContain("未获取");
-    expect(unknown.textContent).not.toMatch(/积分合计\s*0/);
-    // 点击刷新后重新拉取（覆盖回成功路由 → 恢复真实合计）。
+    expect(unknown.textContent).not.toMatch(/积分余额\s*0/);
+    // 点击刷新后重新拉取（覆盖回成功路由 → 恢复真实余额 420+300=720）。
     mockRoute("get_workbuddy_checkin_overview", () => [
-      creditsRow("wb-uid-1", "甲账号", 700),
-      creditsRow("wb-uid-2", "乙账号", 500),
+      creditsRow("wb-uid-1", "甲账号", 700, 420),
+      creditsRow("wb-uid-2", "乙账号", 500, 300),
     ]);
     fireEvent.click(screen.getByTestId("wb-overview-credits-refresh"));
     await waitFor(() => {
       expect(screen.queryByTestId("wb-overview-credits-unknown")).not.toBeInTheDocument();
     });
+    expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("720");
     expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("1200");
   });
 
   it("积分假 0 修复（P19.2）：部分成功 → 仅合计 known 账号并注明 N/M 账号已获取", async () => {
     installOverviewRoutes();
     mockRoute("get_workbuddy_checkin_overview", () => [
-      creditsRow("wb-uid-1", "甲账号", 700),
+      creditsRow("wb-uid-1", "甲账号", 700, 420),
       errorRow("wb-uid-2", "乙账号"),
     ]);
     render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
 
     await screen.findByTestId("wb-overview-checkin");
-    // 合计只含获取成功的账号；注明 N/M。
+    // 余额/累计合计只含获取成功的账号；注明 N/M。
+    expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("420");
     expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("700");
     expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("1/2 账号已获取");
+  });
+
+  it("余额 fail-soft（P19.2③）：status ok 但余额查询失败 → 余额占位、累计照常，无错误弹窗", async () => {
+    installOverviewRoutes();
+    mockRoute("get_workbuddy_checkin_overview", () => [
+      { ...creditsRow("wb-uid-1", "甲账号", 700, 420), credits_balance: null, credits_total: null },
+      { ...creditsRow("wb-uid-2", "乙账号", 500, 300), credits_balance: null, credits_total: null },
+    ]);
+    render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
+
+    await screen.findByTestId("wb-overview-checkin");
+    // 余额全 null（error 仍空）→ 余额行占位化（合计无从谈起），不显示 0。
+    expect(screen.getByTestId("wb-overview-credits-unknown")).toBeInTheDocument();
+    // 本期签到累计照常展示（total_credits 不受余额查询失败影响）。
+    expect(screen.getByTestId("wb-overview-checkin").textContent).toContain("1200");
+    expect(screen.queryByTestId("wb-overview-accum-unknown")).not.toBeInTheDocument();
+    // 不报错（无 error 行 → knownRows 正常，无失败提示态）。
+    expect(screen.queryByText(/查询失败/)).not.toBeInTheDocument();
   });
 });
 
@@ -144,13 +171,15 @@ function errorRow(profileId: string, screenName: string) {
     streak_days: null,
     daily_credit: null,
     total_credits: null,
+    credits_balance: null,
+    credits_total: null,
     checkin_dates: [] as string[],
     error: "workbuddy_checkin_runtime_error",
   };
 }
 
-/** P19.2 积分占位测试构造器：指定积分的 ok 行。 */
-function creditsRow(profileId: string, screenName: string, totalCredits: number) {
+/** P19.2 积分测试构造器：指定累计与余额的 ok 行。 */
+function creditsRow(profileId: string, screenName: string, totalCredits: number, balance: number) {
   return {
     profile_id: profileId,
     screen_name: screenName,
@@ -158,6 +187,8 @@ function creditsRow(profileId: string, screenName: string, totalCredits: number)
     streak_days: 6,
     daily_credit: 100,
     total_credits: totalCredits,
+    credits_balance: balance,
+    credits_total: balance * 2,
     checkin_dates: ["2026-10-20"] as string[],
     error: null,
   };

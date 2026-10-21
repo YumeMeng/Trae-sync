@@ -79,7 +79,16 @@ export interface WorkBuddyCheckinAccountStatusDto {
   readonly today_checked_in: boolean | null;
   readonly streak_days: number | null;
   readonly daily_credit: number | null;
+  /** 本期签到累计获得（活动域，只增不减）——不是余额，展示语义「本期签到累计」。 */
   readonly total_credits: number | null;
+  /**
+   * P19.2③ 积分余额（billing 资源域 Σ CycleRemainCapacity，随对话消耗减少、
+   * 随周期/活动包发放增加——客户端「积分余额」真实口径）。best-effort：
+   * status 成功但余额查询失败时为 null（error 仍空），UI 显示「--」不报错。
+   */
+  readonly credits_balance: number | null;
+  /** 账户资源包总额（Σ CycleTotalCapacity；与余额同源 best-effort）。 */
+  readonly credits_total: number | null;
   /** YYYY-MM-DD，签到日历数据源。 */
   readonly checkin_dates: readonly string[];
   /** 稳定错误码；null = ok。 */

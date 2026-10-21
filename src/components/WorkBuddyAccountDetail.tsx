@@ -156,6 +156,18 @@ export function WorkBuddyAccountDetail({
             <dd data-testid="workbuddy-detail-credits">
               {overview?.error
                 ? "查询失败（签到状态读取失败）"
+                : overview?.credits_balance != null
+                  ? overview.credits_balance
+                  : overview == null
+                    ? "未获取"
+                    : "--"}
+            </dd>
+          </div>
+          <div className="account-detail__fact">
+            <dt>本期签到累计</dt>
+            <dd data-testid="workbuddy-detail-accumulated">
+              {overview?.error
+                ? "查询失败"
                 : overview?.total_credits != null
                   ? overview.total_credits
                   : "未获取"}

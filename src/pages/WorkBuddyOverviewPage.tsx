@@ -54,8 +54,12 @@ export function WorkBuddyOverviewPage({ active, onNavigate }: WorkBuddyOverviewP
   const accountCount = participation?.length ?? 0;
   const knownRows = checkinRows?.filter((row) => row.error === null) ?? [];
   const checkedCount = knownRows.filter((row) => row.today_checked_in === true).length;
-  // P19.2 积分假 0 修复：只有真实拿到 total_credits 的账号才进合计；
-  // 全部未获取（error/查询失败）时显示占位 + 刷新动作，禁止静默 0。
+  // P19.2③ 积分余额对齐（be 5dc3b72）：主展示 = credits_balance（billing 资源域
+  // 真实余额）；total_credits 语义已纠正为「本期签到累计」（活动域，只增不减），
+  // 次要展示。两行各自独立占位化（P19.2② 假 0 纪律），禁止静默 0。
+  const balanceKnownCount = knownRows.filter((row) => row.credits_balance !== null).length;
+  const balanceTotal = knownRows.reduce((sum, row) => sum + (row.credits_balance ?? 0), 0);
+  const balancePartial = balanceKnownCount > 0 && balanceKnownCount < accountCount;
   const creditsKnownCount = knownRows.filter((row) => row.total_credits !== null).length;
   const creditsTotal = knownRows.reduce((sum, row) => sum + (row.total_credits ?? 0), 0);
   const creditsPartial = creditsKnownCount > 0 && creditsKnownCount < accountCount;
@@ -84,27 +88,39 @@ export function WorkBuddyOverviewPage({ active, onNavigate }: WorkBuddyOverviewP
               <strong>{checkedCount}<em>/{accountCount}</em></strong>
               <span>今日签到</span>
             </div>
-            {/* P19.2 积分假 0 修复：未获取 = 占位 + 刷新动作；部分成功注明 N/M；禁止静默 0。 */}
-            {accountCount > 0 && creditsKnownCount === 0 ? (
+            {/* P19.2③ 拆两行：积分余额（credits_balance，主展示）+ 本期签到累计
+                （total_credits，活动域语义）。各自独立占位化，禁止静默 0。 */}
+            {accountCount > 0 && balanceKnownCount === 0 ? (
               <div className="overview-checkin__stat" data-testid="wb-overview-credits-unknown">
                 <strong>未获取</strong>
-                <span>积分合计</span>
+                <span>积分余额</span>
                 <button
                   type="button"
                   className="btn btn--quiet"
                   onClick={handleRefreshSummary}
                   disabled={refreshing}
                   data-testid="wb-overview-credits-refresh"
-                  title="重新读取各账号积分（此前读取失败或尚未查询）"
+                  title="重新读取各账号积分余额（此前读取失败或尚未查询）"
                 >
                   <RefreshCw size={13} className={refreshing ? "icon-spin" : undefined} aria-hidden="true" />
                   点击刷新
                 </button>
               </div>
             ) : (
-              <div className="overview-checkin__stat" title="各账号积分余额合计">
+              <div className="overview-checkin__stat" title="各账号积分余额合计（billing 资源域，随对话消耗减少）">
+                <strong>{accountCount > 0 ? balanceTotal : "—"}</strong>
+                <span>积分余额{balancePartial ? `（${balanceKnownCount}/${accountCount} 账号已获取）` : ""}</span>
+              </div>
+            )}
+            {accountCount > 0 && creditsKnownCount === 0 ? (
+              <div className="overview-checkin__stat" data-testid="wb-overview-accum-unknown">
+                <strong>未获取</strong>
+                <span>本期签到累计</span>
+              </div>
+            ) : (
+              <div className="overview-checkin__stat" title="本期签到活动累计获得（只增不减，非余额）">
                 <strong>{accountCount > 0 ? creditsTotal : "—"}</strong>
-                <span>积分合计{creditsPartial ? `（${creditsKnownCount}/${accountCount} 账号已获取）` : ""}</span>
+                <span>本期签到累计{creditsPartial ? `（${creditsKnownCount}/${accountCount} 账号已获取）` : ""}</span>
               </div>
             )}
           </div>

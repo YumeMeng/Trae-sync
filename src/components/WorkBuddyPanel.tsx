@@ -382,25 +382,32 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       refresh_expires_at_unix_seconds: account.refresh_token_expires_at_unix_seconds,
       now_unix_seconds: Math.floor(Date.now() / 1000),
     });
-    // creditsColumn 能力开关（IA 草案 §1.2）：逐账号积分摘要（overview 数据面，
-    // P19.1 由「仅当前登录账号」扩展为全部池行）；读取失败 = 查询失败，未查询
-    // = 未获取（P19.2 措辞统一），真实 0 余额照实显示，禁止静默 0。
+    // creditsColumn 能力开关（IA 草案 §1.2）：逐账号积分余额摘要（P19.2③ 主
+    // 展示 = credits_balance，billing 真实口径）。四态：未拉到 overview=「未获取」；
+    // 整行失败=「查询失败」；余额查询 fail-soft null（error 空）=「--」不报错
+    // （be 5dc3b72 契约）；真实 0 照实显示。total_credits 语义已纠正为「本期
+    // 签到累计」（活动域只增不减），作次要展示进 meta 行。
     const overviewRow = checkinOverview.find((row) => row.profile_id === account.profile_id) ?? null;
-    const creditsLabel = overviewRow?.error
-      ? "查询失败"
-      : overviewRow?.total_credits != null
-        ? `${overviewRow.total_credits}`
-        : "未获取";
+    const balanceLabel = overviewRow == null
+      ? "未获取"
+      : overviewRow.error
+        ? "查询失败"
+        : overviewRow.credits_balance != null
+          ? `${overviewRow.credits_balance}`
+          : "--";
+    const accumText = overviewRow && !overviewRow.error && overviewRow.total_credits != null
+      ? ` · 本期签到累计 ${overviewRow.total_credits}`
+      : "";
     const creditsMetric = uiProduct.capabilities.creditsColumn ? (
-      <div className="account-item__credits" title="WorkBuddy 账号的积分余额（签到数据面，逐账号）">
-        <strong data-testid={`workbuddy-credits-${account.account_id}`}>{creditsLabel}</strong>
+      <div className="account-item__credits" title="WorkBuddy 账号的积分余额（billing 真实口径，逐账号）">
+        <strong data-testid={`workbuddy-credits-${account.account_id}`}>{balanceLabel}</strong>
         <span className="account-item__credits-label">积分余额</span>
       </div>
     ) : null;
     const cardCredits = uiProduct.capabilities.creditsColumn ? (
-      <div className="account-card__credits" title="WorkBuddy 账号的积分余额（签到数据面，逐账号）">
+      <div className="account-card__credits" title="WorkBuddy 账号的积分余额（billing 真实口径，逐账号）">
         <span className="account-card__credits-value" data-testid={`workbuddy-credits-${account.account_id}`}>
-          {creditsLabel}
+          {balanceLabel}
         </span>
         <span className="account-item__credits-label">积分余额</span>
       </div>
@@ -410,6 +417,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
         登录有效期至 {formatUnixTime(account.access_token_expires_at_unix_seconds) ?? "未知"}
         {" · "}
         更新于 {formatUnixTime(account.last_updated_at_unix_seconds) ?? "未知"}
+        {accumText}
       </p>
     );
     return (

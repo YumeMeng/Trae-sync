@@ -74,6 +74,8 @@ const overviewRow = (
   streak_days: 6,
   daily_credit: 100,
   total_credits: 700,
+  credits_balance: 420,
+  credits_total: 840,
   checkin_dates: ["2026-10-20", "2026-10-19"],
   error: null,
   ...over,
@@ -172,14 +174,16 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     }
   });
 
-  it("能力开关生效：creditsColumn 逐账号积分块（overview 数据面）+ 「使用中」标记", async () => {
+  it("能力开关生效：creditsColumn 逐账号余额块（P19.2③ credits_balance 主展示）+ 「使用中」标记", async () => {
     installWorkbuddyRoutes();
     render(<WorkBuddyPanel active={true} />);
 
     await screen.findByTestId("workbuddy-pool-list");
-    // P19.1：积分摘要扩展为全部池行（get_workbuddy_checkin_overview 逐账号数据面）。
-    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("700");
-    expect(screen.getByTestId("workbuddy-credits-uid-2")).toHaveTextContent("700");
+    // P19.2③：主展示 = credits_balance（billing 真实口径）。
+    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("420");
+    expect(screen.getByTestId("workbuddy-credits-uid-2")).toHaveTextContent("420");
+    // 次要展示：本期签到累计（total_credits 活动域）进 meta 行。
+    expect(screen.getByTestId("workbuddy-pool-list").textContent).toContain("本期签到累计 700");
     // 使用中 chip 仍只标当前客户端登录账号。
     expect(screen.getByTestId("workbuddy-pool-current-wb-uid-1")).toHaveTextContent("使用中");
     expect(screen.queryByTestId("workbuddy-pool-current-wb-uid-2")).not.toBeInTheDocument();
@@ -195,7 +199,9 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     expect(await screen.findByTestId("workbuddy-account-detail")).toBeInTheDocument();
     expect(screen.getByTestId("workbuddy-detail-status")).toHaveTextContent("正常");
     expect(screen.getByTestId("workbuddy-detail-current")).toHaveTextContent("不是当前账号");
-    expect(screen.getByTestId("workbuddy-detail-credits")).toHaveTextContent("700");
+    // P19.2③：积分余额主展示 = credits_balance；本期签到累计 = total_credits。
+    expect(screen.getByTestId("workbuddy-detail-credits")).toHaveTextContent("420");
+    expect(screen.getByTestId("workbuddy-detail-accumulated")).toHaveTextContent("700");
     expect(screen.getByTestId("workbuddy-detail-streak")).toHaveTextContent("6");
     // 凭据到期时间轴（池 DTO 数据源）。
     expect(screen.getByText("访问凭据（access）").nextElementSibling).toHaveTextContent("剩");
@@ -222,6 +228,20 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     });
     // 回读后开关翻转（mock 回执不变，仍断言写入调用与提示）。
     expect(notify.success).toHaveBeenCalledWith("WorkBuddy：已加入每日自动签到。");
+  });
+
+  it("余额 fail-soft（P19.2③）：status ok 但余额查询失败 → 卡行「--」不报错，累计照常", async () => {
+    installWorkbuddyRoutes({ overview: [
+      overviewRow("wb-uid-1", "甲账号", { credits_balance: null, credits_total: null }),
+      overviewRow("wb-uid-2", "乙账号", { credits_balance: null, credits_total: null }),
+    ] });
+    render(<WorkBuddyPanel active={true} />);
+
+    await screen.findByTestId("workbuddy-pool-list");
+    // be 5dc3b72 契约：余额查询失败（error 仍空）→ 显示「--」，不要报错弹窗。
+    expect(screen.getByTestId("workbuddy-credits-uid-1")).toHaveTextContent("--");
+    // 本期签到累计不受余额查询失败影响。
+    expect(screen.getByTestId("workbuddy-pool-list").textContent).toContain("本期签到累计 700");
   });
 
   it("U-2 双视图：卡片视图切换生效并按产品分 key 记忆偏好", async () => {
