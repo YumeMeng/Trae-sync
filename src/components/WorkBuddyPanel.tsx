@@ -401,6 +401,9 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     const accumText = overviewRow && !overviewRow.error && overviewRow.total_credits != null
       ? ` · 本期签到累计 ${overviewRow.total_credits}`
       : "";
+    // P19.2④ 脱敏手机号（服务端预脱敏直显）：有值才进卡行，未采集整段隐藏
+    // （be 契约明确不要占位符）；权威展示源 = 池 DTO。
+    const phoneText = account.masked_phone ? ` · ${account.masked_phone}` : "";
     const creditsMetric = uiProduct.capabilities.creditsColumn ? (
       <div className="account-item__credits" title="WorkBuddy 账号的积分余额（billing 真实口径，逐账号）">
         <strong data-testid={`workbuddy-credits-${account.account_id}`}>{balanceLabel}</strong>
@@ -421,6 +424,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
         {" · "}
         更新于 {formatUnixTime(account.last_updated_at_unix_seconds) ?? "未知"}
         {accumText}
+        {phoneText}
       </p>
     );
     return (

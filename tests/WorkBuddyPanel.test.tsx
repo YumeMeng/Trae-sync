@@ -181,6 +181,11 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
 
   it("能力开关生效：creditsColumn 逐账号余额块（P19.2③ credits_balance 主展示）+ 「使用中」标记", async () => {
     installWorkbuddyRoutes();
+    // wb-uid-2 带脱敏手机号（验证卡行直显）。
+    mockRoute("list_workbuddy_accounts", () => [
+      poolEntry("wb-uid-1", "uid-1", "甲账号"),
+      { ...poolEntry("wb-uid-2", "uid-2", "乙账号"), masked_phone: "133****1304" },
+    ]);
     render(<WorkBuddyPanel active={true} />);
 
     await screen.findByTestId("workbuddy-pool-list");
@@ -189,6 +194,8 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
     expect(screen.getByTestId("workbuddy-credits-uid-2")).toHaveTextContent("420");
     // 次要展示：本期签到累计（total_credits 活动域）进 meta 行。
     expect(screen.getByTestId("workbuddy-pool-list").textContent).toContain("本期签到累计 700");
+    // P19.2④：脱敏手机号卡行直显（服务端预脱敏形态，有值才显示）。
+    expect(screen.getByTestId("workbuddy-pool-list").textContent).toContain("133****1304");
     // 使用中 chip 仍只标当前客户端登录账号。
     expect(screen.getByTestId("workbuddy-pool-current-wb-uid-1")).toHaveTextContent("使用中");
     expect(screen.queryByTestId("workbuddy-pool-current-wb-uid-2")).not.toBeInTheDocument();
@@ -243,6 +250,8 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
       screen.getAllByTestId(/^workbuddy-pool-card-/)
         .map((row) => row.querySelector("strong")?.textContent);
     expect(names()).toEqual(["备注优先", "WorkBuddy 账号", "C账号"]);
+    // 手机号未采集 → 卡行整段隐藏（不显示占位符）。
+    expect(screen.getByTestId("workbuddy-pool-list").textContent).not.toContain("****");
   });
 
   it("档案管理（P19.2④）：备注名编辑写 set_workbuddy_account_display_name（accountId 口径）", async () => {
