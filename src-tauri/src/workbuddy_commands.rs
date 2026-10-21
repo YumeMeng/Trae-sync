@@ -327,64 +327,294 @@ pub(crate) async fn capture_workbuddy_account(
     .await
 }
 
-/// WorkBuddy 切号回执（P17-T6/A4；脱敏）。
+/// WorkBuddy 切号回执（P19.1②：切号 + 自动过户编排；脱敏——账号一律
+/// 展示名标签，uid 不进主视野）。
 #[derive(Debug, Serialize)]
 pub struct WorkBuddySwitchDto {
-    /// 切换到的账号展示名（界面表达纪律：uid 不进主视野）。
-    pub screen_name: String,
-    /// 本次是否先做了池凭据续期（false = access 充裕，未轮换）。
-    pub renewed: bool,
+    /// 切号是否成功（写凭据 + 验证通过；失败时本命令整体 Err）。
+    pub switched: bool,
+    /// 切换到的账号展示名。
+    pub target_label: String,
+    /// 切号前账号展示名（过户方向起点；防御同账号时 None）。
+    pub previous_label: Option<String>,
+    /// 过户结果：true = 执行了事务过户；false = 待过户为 0（无需关库）；
+    /// None = 过户未执行（前置失败——报因看 transfer_error）。
+    pub transfer_executed: Option<bool>,
+    pub updated_rows: Option<u64>,
+    pub verified_sessions: Option<u64>,
+    pub missing_body_files: Option<u64>,
+    /// 切号前账号名下 cloud 会话数（红线：不碰；>0 UI 明示）。
+    pub cloud_residual_rows: Option<u64>,
+    /// 过户失败报因（稳定错误码；None = 成功或无需过户）。
+    /// **过户失败不回滚切号**（会话归属可后补）。
+    pub transfer_error: Option<String>,
+    /// 过户后是否发起了冷启动（重启客户端读新凭据与新库态）。
+    pub restarted: bool,
+    /// 冷启动后文件面登录态（active/access_expired/...；best-effort
+    /// 强验证，失败不否定切号）。
+    pub post_status: Option<String>,
 }
 
-/// WorkBuddy 切号（**单次确认入口**；P17-A4 真机调试后暂不可用）。
+/// 切号影响面预览回执（对齐 Trae preview_master_switch 形态；只读零副作用，
+/// db 缺失/读取失败降级 None——预览不阻塞切号入口）。
+#[derive(Debug, Serialize)]
+pub struct WorkBuddySwitchPreviewDto {
+    /// 当前登录账号展示名（预览基准）。
+    pub current_label: String,
+    /// 目标账号展示名（None = 仅账号清单，未选定目标）。
+    pub target_label: Option<String>,
+    /// 切到目标后将被转移的本地会话数（含软删行）。
+    pub pending_local_rows: Option<u64>,
+    /// 待过户会话涉及的项目数（cwd 维度 distinct）。
+    pub pending_project_count: Option<u64>,
+    /// 目标账号现有会话数。
+    pub current_account_rows: Option<u64>,
+    /// 当前账号名下 cloud 会话数（红线：不碰；>0 UI 明示）。
+    pub cloud_residual_rows: Option<u64>,
+}
+
+/// WorkBuddy 切号（**单次确认入口**；P19.1② 自动过户编排生产装配）。
 ///
-/// **A4 真机调试定案（asar 实读）**：wbipc broker 只注册 `wb.request`
-/// （HTTP 代理）/entitlement/wecom-a2a 三根管道；`auth:login/logout/
-/// saveOauthToken` 是 Electron IPC 通道（app 内部），**不在 wbipc 协议面**
-/// ——spec 8.4 的切号写路径前提被真机推翻，切号机制需重设计（主理人决策）。
-/// 本命令现执行**只读会话验证**（握手 → ListPipes → GetPipe → http.fetch
-/// 签到状态，零写操作）作为真机证据链，随后返回稳定错误码
-/// `workbuddy_switch_pipe_unavailable`；UI 文案由该错误码呈现。
+/// 编排 = 读切号前 .info uid → 写目标凭据（ToolEnvelope AES-256-GCM 信封，
+/// 取自账号池；前置进程纪律 observe/close）→ 验证 → 显式方向自动过户
+/// （含软删行；cloud 红线不碰）→ 冷启动 → 强验证。过户失败不回滚切号
+/// （失败如实报因在回执 transfer_error）。
 #[tauri::command]
 pub(crate) async fn switch_workbuddy_account(
-    _profile_id: String,
+    target_account_id: String,
+    confirmed: bool,
     state: State<'_, AppState>,
 ) -> Result<WorkBuddySwitchDto, String> {
     ensure_login_real_mode_workbuddy(&state)?;
-    let _login_root = workbuddy_login_root(&state)?;
+    if !confirmed {
+        return Err("workbuddy_switch_confirmation_required".to_string());
+    }
+    let login_root = workbuddy_login_root(&state)?;
     run_blocking("workbuddy_switch_join_failed", move || {
-        // 1) 客户端运行中（探针端口组；未运行 = wbipc 通道不存在）。
-        traesync_infrastructure::workbuddy_instance::probe_local_api_default()
-            .map_err(|error| error.code().to_string())
-            .map_err(|code| {
-                if code == "workbuddy_probe_all_ports_failed" {
-                    "workbuddy_switch_client_offline".to_string()
-                } else {
-                    code
-                }
-            })?;
-        // 2) wbipc 端点（ticket 随客户端启动轮换；不可读 = 客户端未运行）。
-        let endpoint_path =
-            traesync_infrastructure::workbuddy_wbipc::default_endpoint_path()
-                .ok_or("workbuddy_switch_endpoint_missing".to_string())?;
-        let endpoint_raw = std::fs::read_to_string(&endpoint_path)
-            .map_err(|_| "workbuddy_switch_endpoint_missing".to_string())?;
-        let endpoint =
-            parse_endpoint(&endpoint_raw).map_err(|error| error.code())?;
-        // 3) 只读会话验证（真机证据链；零写操作——不做凭据轮换）。
-        let _evidence =
-            verify_client_session_via_rpc(&endpoint, &|| {
-                traesync_infrastructure::workbuddy_wbipc::PipeTransport::connect(
-                    &endpoint.pipe_path,
-                )
-                .map(|transport| Box::new(transport) as Box<dyn WbipcTransport>)
-            })
-            .map_err(|error| error.code())?;
-        // 4) 切号写路径在 wbipc 面不存在（A4 定案）——稳定错误码交由
-        //    UI 呈现；机制重设计后此处接入新编排。
-        Err("workbuddy_switch_pipe_unavailable".to_string())
+        switch_workbuddy_account_blocking(&login_root, &target_account_id)
     })
     .await
+}
+
+/// 切号编排生产装配（阻塞闭包体；注入式内核见
+/// `infrastructure::workbuddy_switch_flow::switch_with_auto_transfer`）。
+fn switch_workbuddy_account_blocking(
+    login_root: &Path,
+    target_account_id: &str,
+) -> Result<WorkBuddySwitchDto, String> {
+    use traesync_infrastructure::workbuddy_credential as credential;
+    use traesync_infrastructure::workbuddy_switch_experiment as experiment;
+    use traesync_infrastructure::workbuddy_switch_flow::{
+        switch_with_auto_transfer, SwitchFlowDeps, SwitchFlowError, TransferFlowResult,
+    };
+    use traesync_infrastructure::workbuddy_transfer as transfer;
+
+    // 0) 目标账号必须在池（切号凭据来源；uid = pool account_id）。
+    let store = WorkBuddyLoginStore::new(login_root.to_path_buf());
+    let target_profile = traesync_infrastructure::workbuddy_login_credential::WorkBuddyLoginRecord::profile_id_for(target_account_id);
+    let target_record = store
+        .load(&target_profile, target_account_id)
+        .map_err(|_| SwitchFlowError::TargetNotInPool.code().to_string())?;
+
+    // 数据根（会话过户 db/projects）；安装 exe 探测（冷启动用，缺省跳过）。
+    let data_root = transfer::default_data_root()
+        .ok_or_else(|| "workbuddy_data_root_unavailable".to_string())?;
+    let client_exe = transfer::discover_install().map(|found| found.exe);
+
+    // 1) 读切号前 .info uid（快照解析；错误映射进实验域——.info 缺失/损坏）。
+    let read_current_uid = || -> Result<String, SwitchFlowError> {
+        let snapshot = credential::load_session_snapshot(DEFAULT_AUTH_ID).map_err(|error| {
+            SwitchFlowError::Experiment(match error {
+                credential::WorkBuddySessionError::FileMissing => {
+                    experiment::ExperimentError::InfoMissing
+                }
+                _ => experiment::ExperimentError::InfoMalformed,
+            })
+        })?;
+        Ok(snapshot.uid)
+    };
+
+    // 2) 切号实验（写 .info 目标凭据；**不含冷启动**——延后到过户后统一执行）。
+    let run_experiment = || -> Result<experiment::ExperimentReceipt, experiment::ExperimentError> {
+        let auth_dir = credential::auth_dir().ok_or(experiment::ExperimentError::InfoMissing)?;
+        let exe = client_exe.as_ref().ok_or_else(|| {
+            experiment::ExperimentError::KeyFetchFailed(
+                "workbuddy_decrypt_client_exe_missing".to_string(),
+            )
+        })?;
+        let key = experiment::fetch_derived_key(exe)?;
+        let target = experiment::TargetTokens {
+            access_token: target_record.access_token.clone(),
+            refresh_token: target_record.refresh_token.clone(),
+            access_expires_at_ms: target_record.access_token_expires_at_unix_seconds * 1000,
+            refresh_expires_at_ms: target_record.refresh_token_expires_at_unix_seconds * 1000,
+            session_state: target_record.session_state.clone(),
+        };
+        let observe = || transfer::observe_client_real();
+        let close = || transfer::close_client_real();
+        let deps = experiment::ExperimentDeps {
+            observe: &observe,
+            close: &close,
+            start: None,
+            restart_settle: Duration::ZERO,
+            now_ms: &credential::unix_ms_now,
+        };
+        experiment::run_switch_experiment(
+            &auth_dir,
+            DEFAULT_AUTH_ID,
+            &target,
+            experiment::WriteMode::ToolEnvelope,
+            Some(&key),
+            &deps,
+        )
+    };
+
+    // 3) 切号验证（.info 当前账号 == 目标）。
+    let verify_switch = || -> Result<String, SwitchFlowError> {
+        credential::load_session_snapshot(DEFAULT_AUTH_ID)
+            .map(|snapshot| snapshot.uid)
+            .map_err(|_| SwitchFlowError::Experiment(experiment::ExperimentError::InfoMalformed))
+    };
+
+    // 4) 自动过户（显式方向 current=目标、previous=切号前；零行转 Nothing）。
+    let run_transfer = |current: &str, previous: &str| {
+        let db = transfer::db_path(&data_root);
+        let plan = transfer::build_transfer_plan(&db, current, previous)?;
+        if plan.pending_local_rows == 0 {
+            return Ok(TransferFlowResult::Nothing {
+                current_sessions: plan.current_account_rows,
+            });
+        }
+        let receipt = transfer::transfer_sessions(
+            &db,
+            &transfer::projects_path(&data_root),
+            current,
+            previous,
+        )?;
+        Ok(TransferFlowResult::Executed(receipt))
+    };
+
+    // 5) 过户前置进程纪律 + 冷启动 + 强验证（真实进程面）。
+    let observe = || transfer::observe_client_real();
+    let close = || transfer::close_client_real();
+    let start = || {
+        client_exe
+            .as_ref()
+            .map(|exe| transfer::start_client_real(exe))
+            .unwrap_or(false)
+    };
+    let post_verify = || -> Option<String> {
+        let snapshot = credential::load_session_snapshot(DEFAULT_AUTH_ID).ok()?;
+        let marker = credential::logout_marker_file(DEFAULT_AUTH_ID)?
+            .exists();
+        let status = credential::session_status_with(
+            Some(&snapshot),
+            marker,
+            credential::unix_ms_now(),
+        );
+        Some(session_status_str(status).to_string())
+    };
+    let deps = SwitchFlowDeps {
+        read_current_uid: &read_current_uid,
+        run_experiment: &run_experiment,
+        verify_switch: &verify_switch,
+        run_transfer: &run_transfer,
+        observe: &observe,
+        close: &close,
+        start: Some(&start),
+        post_verify: Some(&post_verify),
+    };
+    let outcome = switch_with_auto_transfer(target_account_id, &deps)
+        .map_err(|error| error.code().to_string())?;
+
+    // 6) 回执组装（脱敏：uid → 展示名标签）。
+    Ok(WorkBuddySwitchDto {
+        switched: outcome.switched,
+        target_label: workbuddy_account_label(
+            &outcome.target_uid,
+            Some(login_root),
+            "目标账号",
+        ),
+        previous_label: outcome.previous_uid.as_deref().map(|uid| {
+            workbuddy_account_label(uid, Some(login_root), "当前登录的账号")
+        }),
+        transfer_executed: outcome.transfer.as_ref().map(|result| match result {
+            TransferFlowResult::Executed(_) => true,
+            TransferFlowResult::Nothing { .. } => false,
+        }),
+        updated_rows: match outcome.transfer.as_ref() {
+            Some(TransferFlowResult::Executed(receipt)) => Some(receipt.updated_rows),
+            _ => None,
+        },
+        verified_sessions: match outcome.transfer.as_ref() {
+            Some(TransferFlowResult::Executed(receipt)) => Some(receipt.verified_sessions),
+            _ => None,
+        },
+        missing_body_files: match outcome.transfer.as_ref() {
+            Some(TransferFlowResult::Executed(receipt)) => Some(receipt.missing_body_files),
+            _ => None,
+        },
+        cloud_residual_rows: match outcome.transfer.as_ref() {
+            Some(TransferFlowResult::Executed(receipt)) => Some(receipt.cloud_residual_rows),
+            _ => None,
+        },
+        transfer_error: outcome.transfer_error,
+        restarted: outcome.restarted,
+        post_status: outcome.post_status,
+    })
+}
+
+/// 切号影响面预览（只读零副作用；对齐 Trae preview_master_switch 形态）。
+/// 方向口径与执行一致：previous = 当前 .info uid、current = 目标账号。
+#[tauri::command]
+pub(crate) fn preview_workbuddy_switch(
+    target_account_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<WorkBuddySwitchPreviewDto, String> {
+    ensure_login_real_mode_workbuddy(&state)?;
+    let login_root = workbuddy_login_root(&state)?;
+    let target = target_account_id.as_deref();
+    // previous = 切号前账号（当前 .info uid）。
+    let snapshot = load_session_snapshot(DEFAULT_AUTH_ID)
+        .map_err(|error| error.code().to_string())?;
+    let previous = snapshot.uid;
+    if let Some(target) = target {
+        if target == previous {
+            return Err(
+                traesync_infrastructure::workbuddy_switch_flow::SwitchFlowError::SameAccount
+                    .code()
+                    .to_string(),
+            );
+        }
+    }
+    // 影响面统计（db 缺失/读取失败降级 None——预览不阻塞切号入口）。
+    let influence = || -> Option<(Option<u64>, Option<u64>, Option<u64>, Option<u64>)> {
+        use traesync_infrastructure::workbuddy_transfer::{build_transfer_plan, db_path, default_data_root};
+        let db = db_path(&default_data_root()?);
+        let pending_project_count =
+            traesync_infrastructure::workbuddy_switch_flow::count_pending_projects(&db, &previous);
+        let Some(target) = target else {
+            return Some((None, pending_project_count, None, None));
+        };
+        let plan = build_transfer_plan(&db, target, &previous).ok()?;
+        Some((
+            Some(plan.pending_local_rows),
+            pending_project_count,
+            Some(plan.current_account_rows),
+            Some(plan.cloud_residual_rows),
+        ))
+    };
+    let (pending_local_rows, pending_project_count, current_account_rows, cloud_residual_rows) =
+        influence().unwrap_or((None, None, None, None));
+    Ok(WorkBuddySwitchPreviewDto {
+        current_label: workbuddy_account_label(&previous, Some(&login_root), "当前登录的账号"),
+        target_label: target
+            .map(|uid| workbuddy_account_label(uid, Some(&login_root), "目标账号")),
+        pending_local_rows,
+        pending_project_count,
+        current_account_rows,
+        cloud_residual_rows,
+    })
 }
 
 // ===== P18-B1 会话过户（wb_transfer.py 产品化；单次确认入口） =====

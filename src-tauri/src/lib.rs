@@ -1304,6 +1304,8 @@ pub fn run() {
             workbuddy_commands::refresh_workbuddy_account,
             workbuddy_commands::capture_workbuddy_account,
             workbuddy_commands::switch_workbuddy_account,
+            // P19.1② 切号影响面预览（只读零副作用，对齐 Trae preview 形态）。
+            workbuddy_commands::preview_workbuddy_switch,
             // P18-B1 会话过户（单次确认入口；dry_run=true 只出计划不动库）。
             workbuddy_commands::transfer_workbuddy_sessions,
             // P19-B3 主库移植：WB 库域命令（只读在线浏览/体检/统计 +
