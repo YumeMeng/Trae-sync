@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, CalendarClock, Coins, Cpu, KeyRound, Phone, Trash2, UserPen } from "lucide-react";
 import type {
   WorkBuddyAccountEntryDto,
@@ -60,7 +59,7 @@ export function WorkBuddyAccountDetail({
   useEffect(() => {
     let cancelled = false;
     // 积分/签到状态（overview：余额/累计/连签）；参与集 = 有效参与。
-    void fetchWorkBuddyCheckinOverview()
+    void fetchWorkBuddyCheckinOverview(null)
       .then((rows) => {
         if (!cancelled) {
           setOverview(rows.find((row) => row.profile_id === account.profile_id) ?? null);

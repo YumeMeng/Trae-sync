@@ -179,7 +179,7 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
       setPool(nextPool);
       setLoadError(null);
       // 逐账号积分/签到面（P19.1）：账号卡行积分摘要与详情页共用，fail-soft。
-      fetchWorkBuddyCheckinOverview()
+      fetchWorkBuddyCheckinOverview(null)
         .then((rows) => setCheckinOverview(rows))
         .catch(() => setCheckinOverview([]));
     } catch (reason: unknown) {
