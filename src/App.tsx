@@ -4,24 +4,17 @@ import { listen } from "@tauri-apps/api/event";
 import type { WorkspaceStateDto } from "./types/workspace";
 import { TitleBar } from "./components/TitleBar";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { AccountWorkbench } from "./components/AccountWorkbench";
-import { CheckinPage } from "./components/CheckinPage";
-import { EnvironmentPage } from "./components/EnvironmentPage";
-import { OverviewPage } from "./pages/OverviewPage";
-import { WorkBuddyOverviewPage } from "./pages/WorkBuddyOverviewPage";
-import { MasterLibraryDetail } from "./pages/MasterLibraryDetail";
-import { WorkBuddyLibraryPage } from "./pages/WorkBuddyLibraryPage";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
-import { WorkBuddyCheckinPage, WorkBuddyPanel } from "./components/WorkBuddyPanel";
-import { WorkBuddyEnvironmentPage } from "./components/WorkBuddyEnvironmentPage";
 import type { LibraryRef } from "./components/LibrarySessionsPanel";
+// 页面槽位接缝（P2a）：六区块的两种实现登记在 sectionSlots，App 只做解析。
+import { SECTION_SLOTS, resolveSection } from "./app/transition/sectionSlots";
 import {
   detailLibraryRefFor,
   loadCurrentProduct,
   loadProductEntries,
   setCurrentProduct,
 } from "./platform/productRegistry";
-import { CURRENT_PRODUCT_ID, WORKBUDDY_PRODUCT_ID } from "./types/product";
+import { CURRENT_PRODUCT_ID } from "./types/product";
 import type { CurrentProductDto, ProductEntryDto } from "./types/product";
 import { notify, Toaster } from "./platform/notify";
 import { safeUiErrorMessage } from "./utils/safeUiError";
@@ -40,10 +33,10 @@ interface AutoCheckinFinishedEvent {
   skipped: number;
 }
 
-// 应用根组件：P17-T5 并列骨架——产品上下文（标题栏切换器）驱动各页面槽位
-// 的分支渲染：TRAE 产品走完整工作区五页；WorkBuddy 产品当前只有账号与
-// 签到两个 ready 区块（WorkBuddyPanel / WorkBuddyCheckinPage），其余区块
-// 渲染 pending 说明卡（诚实占位）。settings 是应用级设置，两产品共用。
+// 应用根组件：P17-T5 并列骨架——产品上下文（标题栏切换器）驱动各页面槽位。
+// P2a 接缝：六区块各自的两种实现登记在 app/transition/sectionSlots.tsx，
+// 本文件只按当前产品解析一次（resolveSection），不再内联产品三目；
+// 哪个页面渲染哪套实现是槽位表的事实，壳层不再关心。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -67,8 +60,14 @@ export default function App() {
   // 主库详情页的库实例（ADR-0032 决策 5）：环境页入口注入优先，缺省主库。
   const detailLibrary = detailLibraryRefFor(libraryDetail);
 
-  // 当前产品是否 WorkBuddy：决定各页面槽位的分支渲染（并列骨架一期）。
-  const isWorkBuddy = currentProduct?.product_id === WORKBUDDY_PRODUCT_ID;
+  // 页面槽位解析（P2a 接缝）：产品 → 区块实现的唯一选择点。
+  // 各槽位组件以统一形状接收属性（异构属性见 sectionSlots 的 any-exception 说明）。
+  const productId = currentProduct?.product_id ?? CURRENT_PRODUCT_ID;
+  const OverviewSection = resolveSection(SECTION_SLOTS.overview, productId);
+  const AccountsSection = resolveSection(SECTION_SLOTS.accounts, productId);
+  const CheckinSection = resolveSection(SECTION_SLOTS.checkin, productId);
+  const EnvironmentSection = resolveSection(SECTION_SLOTS.environment, productId);
+  const LibrarySection = resolveSection(SECTION_SLOTS["master-library"], productId);
 
   const handlePageChange = useCallback((page: AppPage) => {
     // 离开库详情页即重置库实例引用，避免下次进入主库详情残留副库上下文。
@@ -253,65 +252,43 @@ export default function App() {
       <div className="app-body">
         <NavigationRail activePage={activePage} onPageChange={handlePageChange} />
         <main id="main-content" className="app-main" ref={mainRef}>
-          {/* 页面槽位按当前产品分支渲染：不同组件类型切换即卸载重挂载，
-              数据新鲜度天然由重挂载重拉保证，无需额外刷新信号。 */}
+          {/* 页面槽位由 sectionSlots 解析：不同组件类型切换即卸载重挂载，
+              数据新鲜度天然由重挂载重拉保证，无需额外刷新信号。
+              P2a 接缝：产品判断只发生在 resolveSection 一处，此处零三目。 */}
           {state && (
             <div className="app-page" hidden={activePage !== "overview"}>
-              {isWorkBuddy ? (
-                <WorkBuddyOverviewPage
-                  active={activePage === "overview"}
-                  onNavigate={handlePageChange}
-                />
-              ) : (
-                <OverviewPage
-                  state={state}
-                  active={activePage === "overview"}
-                  onNavigate={handlePageChange}
-                />
-              )}
+              <OverviewSection
+                state={state}
+                active={activePage === "overview"}
+                onNavigate={handlePageChange}
+              />
             </div>
           )}
           <div className="app-page" hidden={activePage !== "accounts"}>
-            {isWorkBuddy ? (
-              <WorkBuddyPanel active={activePage === "accounts"} />
-            ) : (
-              <AccountWorkbench active={activePage === "accounts"} />
-            )}
+            <AccountsSection active={activePage === "accounts"} />
           </div>
           <div className="app-page" hidden={activePage !== "checkin"}>
-            {isWorkBuddy ? (
-              <WorkBuddyCheckinPage active={activePage === "checkin"} />
-            ) : (
-              <CheckinPage
-                active={activePage === "checkin"}
-                onNavigate={handlePageChange}
-              />
-            )}
+            <CheckinSection
+              active={activePage === "checkin"}
+              onNavigate={handlePageChange}
+            />
           </div>
           <div className="app-page" hidden={activePage !== "environment"}>
-            {isWorkBuddy ? (
-              <WorkBuddyEnvironmentPage active={activePage === "environment"} />
-            ) : (
-              <EnvironmentPage
-                active={activePage === "environment"}
-                onOpenMasterDetail={handleOpenMasterDetail}
-                onOpenLibraryDetail={handleOpenLibraryDetail}
-              />
-            )}
+            <EnvironmentSection
+              active={activePage === "environment"}
+              onOpenMasterDetail={handleOpenMasterDetail}
+              onOpenLibraryDetail={handleOpenLibraryDetail}
+            />
           </div>
           <div className="app-page" hidden={activePage !== "master-library"}>
-            {isWorkBuddy ? (
-              <WorkBuddyLibraryPage active={activePage === "master-library"} />
-            ) : (
-              <MasterLibraryDetail
-                active={activePage === "master-library"}
-                onNavigate={handlePageChange}
-                library={detailLibrary}
-              />
-            )}
+            <LibrarySection
+              active={activePage === "master-library"}
+              onNavigate={handlePageChange}
+              library={detailLibrary}
+            />
           </div>
           <div className="app-page" hidden={activePage !== "settings"}>
-            <SettingsPanel active={activePage === "settings"} productId={currentProduct?.product_id ?? CURRENT_PRODUCT_ID} />
+            <SettingsPanel active={activePage === "settings"} productId={productId} />
           </div>
         </main>
       </div>
