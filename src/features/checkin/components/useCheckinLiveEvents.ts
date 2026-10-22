@@ -8,6 +8,9 @@ import { listen } from "@tauri-apps/api/event";
  * - checkin-phase：账号间错峰等待（inter_wait，剩余秒数由前端本地递减）
  * - auto-checkin-progress：自动批次逐账号结果 + 今日台账实时回填
  * - auto-checkin-finished：自动批次完成（台账翻完成态 + 重读快照）
+ * - workbuddy-auto-checkin-progress / workbuddy-auto-checkin-finished：
+ *   WorkBuddy 后端的同名事件（载荷与 TRAE 同构），共用同一回调——
+ *   两个产品的事件名都监听，页面内不做产品判断。
  *
  * 回调经 ref 取最新值，订阅只在 active 变化时重建——避免每次渲染重新注册。
  */
@@ -64,6 +67,9 @@ export function useCheckinLiveEvents(active: boolean, handlers: CheckinLiveHandl
     subscribe<CheckinPhasePayload>("checkin-phase", (payload) => latest.current.onPhase(payload));
     subscribe<CheckinProgressPayload>("auto-checkin-progress", (payload) => latest.current.onAutoProgress(payload));
     subscribe<AutoCheckinFinishedPayload>("auto-checkin-finished", (payload) => latest.current.onAutoFinished(payload));
+    // WorkBuddy 后端事件名（workbuddy_schedule.rs 的 emit 口径），同一回调。
+    subscribe<CheckinProgressPayload>("workbuddy-auto-checkin-progress", (payload) => latest.current.onAutoProgress(payload));
+    subscribe<AutoCheckinFinishedPayload>("workbuddy-auto-checkin-finished", (payload) => latest.current.onAutoFinished(payload));
     return () => {
       cancelled = true;
       unlisteners.forEach((fn) => fn());

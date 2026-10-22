@@ -1,13 +1,16 @@
-﻿import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { CheckinPage } from "../src/components/CheckinPage";
+// P4b-4：签到页唯一实现在 features/checkin（旧 components/CheckinPage 已删）。
+// 产品协议值由槽位接缝注入，这里按 TRAE 用例语义显式传入。
+import { CheckinPage } from "../src/features/checkin/CheckinPage";
 import type {
   CheckinBatchSummaryDto,
   CheckinOverviewEntryDto,
   CheckinResultDto,
   ManagedAccountsViewDto,
 } from "../src/types/account_switch";
+import { CURRENT_PRODUCT_ID } from "../src/types/product";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
@@ -180,7 +183,7 @@ describe("CheckinPage", () => {
       ledger: { date: "2026-08-23", running: true, total: 3, completed: 1, failed: 0, skipped: 0 },
     }));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     const status = await screen.findByTestId("auto-checkin-status");
     expect(status).toHaveTextContent("每日 10:00 触发");
@@ -196,7 +199,7 @@ describe("CheckinPage", () => {
       ledger: null,
     }));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     const status = await screen.findByTestId("auto-checkin-status");
     expect(status).toHaveTextContent("自动签到：已关闭");
@@ -218,7 +221,7 @@ describe("CheckinPage", () => {
       ledger: { date: "2026-08-23", running: true, total: 3, completed: 1, failed: 0, skipped: 0 },
     }));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     const status = await screen.findByTestId("auto-checkin-status");
     expect(status).toHaveTextContent("今日执行中（成功 1/3）");
@@ -236,6 +239,44 @@ describe("CheckinPage", () => {
     expect(status).not.toHaveTextContent("今日执行中");
   });
 
+  it("WorkBuddy 后端事件名（workbuddy-auto-checkin-*）同样驱动台账与结果清单", async () => {
+    // P4b-4：WB 后端推送的是 workbuddy-auto-checkin-progress/-finished
+    // （workbuddy_schedule.rs 的 emit 口径）。页面不写产品判断，两个事件名
+    // 都订阅、共用同一回调——这里验证 WB 事件名确实接到了同一套处理上。
+    const handlers = new Map<string, (event: { payload: unknown }) => void>();
+    mockListen.mockImplementation(async (event: string, cb: (event: { payload: unknown }) => void) => {
+      handlers.set(event, cb);
+      return () => undefined;
+    });
+    mockRoute("get_checkin_capability", () => realCapability);
+    mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
+    mockRoute("get_auto_checkin_settings", () => ({
+      enabled: true,
+      daily_time_hhmm: "10:00",
+      ledger: { date: "2026-08-23", running: true, total: 3, completed: 1, failed: 0, skipped: 0 },
+    }));
+
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
+
+    const status = await screen.findByTestId("auto-checkin-status");
+    await waitFor(() => expect(handlers.get("workbuddy-auto-checkin-progress")).toBeDefined());
+    await act(async () => {
+      handlers.get("workbuddy-auto-checkin-progress")?.({
+        payload: { profile_id: "profile-login-1", screen_name: "登录账号甲", outcome: "claimed", detail_code: null, completed: 2, total: 3 },
+      });
+    });
+    // 逐账号结果清单与台账实时回填（与 TRAE 事件同口径）。
+    expect(screen.getByTestId("auto-checkin-results")).toHaveTextContent("登录账号甲");
+    expect(screen.getByTestId("auto-checkin-results")).toHaveTextContent("签到成功");
+    expect(status).toHaveTextContent("今日执行中（成功 2/3）");
+
+    await waitFor(() => expect(handlers.get("workbuddy-auto-checkin-finished")).toBeDefined());
+    await act(async () => {
+      handlers.get("workbuddy-auto-checkin-finished")?.({ payload: { total: 3, completed: 3, failed: 0, skipped: 0 } });
+    });
+    expect(status).toHaveTextContent("今日已完成（成功 3/3）");
+  });
+
   it("真实模式加载总览并展示账号行：今日状态与缓存额度", async () => {
     mockRoute("get_checkin_capability", () => realCapability);
     mockRoute("get_checkin_overview", () => [
@@ -243,7 +284,7 @@ describe("CheckinPage", () => {
       entry("profile-login-2", "登录账号乙", { checked_in: false, credits: null, credits_cached_at: null, usage_remaining_credits: null, usage_cached_at: null }),
     ]);
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     expect(await screen.findByText("登录账号甲")).toBeInTheDocument();
     // U-3 两槽位徽章语言：已签/未签（签到槽位）。
@@ -273,7 +314,7 @@ describe("CheckinPage", () => {
       }),
     ]);
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     expect(await screen.findByText("登录账号乙")).toBeInTheDocument();
     // G10 签到槽：今日失败 → 红徽章「签到失败」（与账号页同义同色）。
@@ -291,7 +332,7 @@ describe("CheckinPage", () => {
     ]);
     mockRoute("run_checkin", () => runMock());
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
 
     // 取消勾选乙：出现「签到所选（1）」按钮（全选时不显示，避免按钮堆叠）。
@@ -312,7 +353,7 @@ describe("CheckinPage", () => {
     ]);
     mockRoute("run_checkin", () => summary([result("profile-login-2")]));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
 
     fireEvent.click(screen.getByRole("button", { name: /一键补签（1）/ }));
@@ -329,7 +370,7 @@ describe("CheckinPage", () => {
     ]);
     mockRoute("run_checkin", () => summary([result("profile-login-2")]));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
 
     // 已签账号的行内按钮禁用；未签账号可点。
@@ -360,7 +401,7 @@ describe("CheckinPage", () => {
         1,
       ));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
@@ -387,7 +428,7 @@ describe("CheckinPage", () => {
     ]);
     mockRoute("run_checkin", () => runDeferred);
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
@@ -434,7 +475,7 @@ describe("CheckinPage", () => {
         result("profile-login-2", { outcome: "claimed" }),
       ]));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
@@ -470,7 +511,7 @@ describe("CheckinPage", () => {
         1,
       ));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
@@ -487,11 +528,15 @@ describe("CheckinPage", () => {
       throw new Error("checkin_storage_unavailable");
     });
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
-    await waitFor(() => {
-      expect(notifyMock.error).toHaveBeenCalledWith("TRAE：本机登录存储不可用，请检查磁盘后重试。");
-    });
+    // P4b-4：读取失败由页面内错误说明卡承载（声明式视图的 error 槽），
+    // 不再走通知通道——但「必须可见、不得伪装成空账号」的语义不变且更直接。
+    const errorCard = await screen.findByTestId("checkin-error");
+    expect(errorCard).toHaveTextContent("本机登录存储不可用，请检查磁盘后重试。");
+    expect(errorCard).toHaveTextContent("重新读取");
+    // 不得退化成空态（「还没有可签到的账号」会把真实故障说成没账号）。
+    expect(screen.queryByText(/还没有可签到的账号/)).not.toBeInTheDocument();
   });
 
   it("手动批次异常通知保留 Work 来源", async () => {
@@ -499,7 +544,7 @@ describe("CheckinPage", () => {
     mockRoute("get_checkin_overview", () => [entry("profile-login-1", "登录账号甲")]);
     mockRoute("run_checkin", () => { throw new Error("unknown_checkin_failure"); });
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
 
@@ -516,7 +561,7 @@ describe("CheckinPage", () => {
 
     // P15-7：签到页统一 SOLO 单通道（旧 CN 独立签到区块已移除），
     // 迟到回执的产品归属由通知标注承载，页面内不再跨产品换装。
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
     fireEvent.click(screen.getByRole("button", { name: /一键全签/ }));
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("run_checkin", { profileIds: ["profile-login-1"] }));
@@ -534,7 +579,7 @@ describe("CheckinPage", () => {
     mockRoute("get_checkin_capability", () => realCapability);
     mockRoute("get_checkin_overview", () => []);
 
-    render(<CheckinPage active={true} onNavigate={onNavigate} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={onNavigate} />);
 
     expect(await screen.findByText(/还没有可签到的账号/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "去账号页添加" }));
@@ -545,7 +590,7 @@ describe("CheckinPage", () => {
     mockRoute("get_checkin_capability", () => fixtureCapability);
     mockRoute("get_managed_account_state", () => fixtureView());
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     expect(await screen.findByText("演示账号甲")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /全部签到（1）/ })).toBeEnabled();
@@ -561,7 +606,7 @@ describe("CheckinPage", () => {
     });
     mockRoute("get_managed_account_state", () => fixtureView());
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     expect(await screen.findByText("演示账号甲")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /全部签到/ })).toBeDisabled();
@@ -574,7 +619,7 @@ describe("CheckinPage", () => {
       return { enabled: false, transport: "disabled", real_http_enabled: false, message: "存储根不可用，真实签到未启用。" };
     });
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
 
     expect(await screen.findByTestId("checkin-unavailable")).toHaveTextContent("签到功能不可用：存储未就绪");
     expect(screen.queryByTestId("checkin-demo-banner")).not.toBeInTheDocument();
@@ -589,7 +634,7 @@ describe("CheckinPage", () => {
       ledger: null,
     }));
 
-    render(<CheckinPage active={true} onNavigate={vi.fn()} />);
+    render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
     const callsOf = (command: string) => mockInvoke.mock.calls.filter(([name]) => name === command).length;
     const overviewBefore = callsOf("get_checkin_overview");

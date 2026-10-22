@@ -39,9 +39,9 @@ import { workbuddyDisplayName } from "../utils/accountDisplay";
 /**
  * WorkBuddy 产品域页面（P17-T5 并列骨架一期）。
  *
- * 两个页面槽位组件：
- * - WorkBuddyPanel：账号页（会话健康 + 捕获入池 + 工具账号池清单）；
- * - WorkBuddyCheckinPage：签到页（直连签到状态 + 领取）。
+ * 页面槽位组件：
+ * - WorkBuddyPanel：账号页（会话健康 + 捕获入池 + 工具账号池清单）。
+ * 签到页已合并到 features/checkin/CheckinPage（P4b-2/P4b-4），本文件不再提供。
  *
  * 数据语义全部在后端组合根命令中（workbuddy_commands.rs）；本文件只做
  * 读取时机（active 才发起 IPC）、加载/错误三态与单次确认弹窗编排。
@@ -615,5 +615,3 @@ export function WorkBuddyPanel({ active }: WorkBuddyPanelProps) {
     />
   );
 }
-
-export { WorkBuddyCheckinPage } from "./workbuddy/WorkBuddyCheckinPage";

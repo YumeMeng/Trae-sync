@@ -19,7 +19,11 @@ vi.mock("../src/platform/notify", () => ({
 }));
 
 import { notify } from "../src/platform/notify";
-import { WorkBuddyCheckinPage, WorkBuddyPanel } from "../src/components/WorkBuddyPanel";
+import { WorkBuddyPanel } from "../src/components/WorkBuddyPanel";
+// P4b-4：签到页只剩一份实现（features/checkin/CheckinPage），产品协议值由
+// 槽位接缝注入；WorkBuddy 形态在此按 WORKBUDDY_PRODUCT_ID 直接渲染。
+import { CheckinPage } from "../src/features/checkin/CheckinPage";
+import { WORKBUDDY_PRODUCT_ID } from "../src/types/product";
 
 // WorkBuddy 域命令回执（脱敏形态，与真实 DTO 同构）。
 const health = {
@@ -436,10 +440,17 @@ describe("WorkBuddyPanel（P19-B2⑤ 账号页骨架消费）", () => {
   });
 });
 
-describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消费）", () => {
+/** 渲染签到页的 WorkBuddy 形态（旧 WorkBuddyCheckinPage 已删，P4b-4）。 */
+function renderWbCheckin() {
+  return render(
+    <CheckinPage productId={WORKBUDDY_PRODUCT_ID} active={true} onNavigate={() => undefined} />,
+  );
+}
+
+describe("签到页 WorkBuddy 形态（P19-B5 逐账号行 + 后端契约消费；P4b-4 迁到 features/checkin）", () => {
   it("骨架渲染：逐账号行（复选+昵称+额度/连签 meta）+ 批量按钮组 + 自动签到状态行", async () => {
     installWorkbuddyRoutes();
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     // 批量区块承载逐账号行（checkin-flow stagger 类名冻结）。
     await screen.findByTestId("checkin-run-all");
@@ -456,25 +467,30 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
     expect(screen.getByTestId("product-badge-workbuddy")).toBeInTheDocument();
   });
 
-  it("行内单签：签到按钮触发 claim_profile 并落行内结果", async () => {
+  it("行内单签：签到按钮只对该账号发起领取并落行内结果", async () => {
     installWorkbuddyRoutes();
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     const inline = await screen.findByTestId("checkin-inline-wb-uid-1");
     expect(inline).toBeEnabled();
     fireEvent.click(inline);
+    // P4b-2 合并页统一走批次通道（platform/checkin 的 runWorkBuddyCheckin）：
+    // 行内单签 = 只含该账号的一批，后端契约仍是 fail-soft 逐条回执。
     await waitFor(() => {
       expect(mockCoreInvoke.mock.calls).toContainEqual(
-        ["workbuddy_checkin_claim_profile", { profileId: "wb-uid-1" }],
+        ["workbuddy_checkin_claim_batch", { profileIds: ["wb-uid-1"] }],
       );
     });
+    // 未勾选其他账号：不得连带请求乙账号。
+    const batchCalls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === "workbuddy_checkin_claim_batch");
+    expect(batchCalls).toHaveLength(1);
     // 行内结果徽章（WB 通用档文案：签到成功）。
     await screen.findByText("签到成功");
   });
 
   it("一键全签：后端批量逐条回执（workbuddy_checkin_claim_batch）", async () => {
     installWorkbuddyRoutes();
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     fireEvent.click(await screen.findByTestId("checkin-run-all"));
     await waitFor(() => {
@@ -491,7 +507,7 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
       overviewRow("wb-uid-1", "甲账号", { today_checked_in: true }),
       overviewRow("wb-uid-2", "乙账号"),
     ] });
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     const pendingButton = await screen.findByTestId("checkin-run-pending");
     expect(pendingButton).toHaveTextContent("一键补签（1）");
@@ -512,7 +528,7 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
       }),
       overviewRow("wb-uid-2", "乙账号"),
     ] });
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     await screen.findByTestId("checkin-run-all");
     // 行徽章 fail-soft 标注（历史条已随 P19.2 删除，仅行内一处）。
@@ -524,7 +540,7 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
 
   it("批量不可中断：不渲染取消按钮（后端整体批次语义，诚实 UI）", async () => {
     installWorkbuddyRoutes();
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     await screen.findByTestId("checkin-run-all");
     expect(screen.queryByRole("button", { name: "取消未开始任务" })).not.toBeInTheDocument();
@@ -535,7 +551,7 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
       { profile_id: "wb-uid-1", screen_name: "甲账号", enabled: true },
       { profile_id: "wb-uid-2", screen_name: "乙账号", enabled: false },
     ] });
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     await screen.findByTestId("checkin-run-all");
     // 批量选择默认选中参与集（IA §1.3：wb-uid-2 被显式关闭 → 不在默认选择内）。
@@ -550,7 +566,7 @@ describe("WorkBuddyCheckinPage（P19-B5 签到页逐账号行 + 后端契约消�
       overviewRow("wb-uid-1", "甲账号", { today_checked_in: true }),
       overviewRow("wb-uid-2", "乙账号"),
     ] });
-    render(<WorkBuddyCheckinPage active={true} />);
+    renderWbCheckin();
 
     const inline = await screen.findByTestId("checkin-inline-wb-uid-1");
     expect(inline).toBeDisabled();
