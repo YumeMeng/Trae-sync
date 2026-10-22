@@ -8,7 +8,8 @@ import type { AccountActionKind, AccountActionView, AccountRowView } from "../co
  * testid = row.testId 与 action.id（来自 builder，本文件不拼）。 */
 export type AccountsRowView = AccountRowView & {
   readonly testId: string; // 行锚点（*RowTestIds 的 row，逐字沿用旧 testid）
-  readonly selectedTestId?: string; // 「使用中」chip 锚点；缺省则当前账号只经 accent 徽章表达
+  /** 「使用中」锚点 id（*RowTestIds 的 selected）：只承载旧 testid，视觉由 builder 的 accent 徽章表达。 */
+  readonly selectedTestId?: string;
 };
 /** 动作样式档：primary=主按钮 / ghost=描边 / danger=红色描边（与页头同一套）。 */
 const KIND_CLASS: Record<AccountActionKind, string> = { primary: "btn btn--primary", ghost: "btn", danger: "btn btn--danger" };
@@ -17,6 +18,12 @@ const KIND_CLASS: Record<AccountActionKind, string> = { primary: "btn btn--prima
 const badgeSlot = (row: AccountsRowView): ReactNode => row.badges.map((badge, index) => (
   <Badge key={`${badge.text}-${index}`} tone={badge.tone}>{badge.text}</Badge>
 ));
+/** 「使用中」锚点文案：取 builder 最后一个 accent 徽章的词（「使用中」/「工具内已选」），与视觉同源。 */
+const currentLabel = (row: AccountsRowView): string =>
+  [...row.badges].reverse().find((badge) => badge.tone === "accent")?.text ?? "使用中";
+/** 「使用中」不可见锚点：视觉零变化（hidden 不参与布局），只承载旧 e2e/单测依赖的 testid。 */
+const currentAnchor = (row: AccountsRowView): ReactNode => row.selectedTestId === undefined ? null
+  : <span hidden data-testid={row.selectedTestId}>{currentLabel(row)}</span>;
 /** 副标题槽：空串 = 本产品不渲染该行（诚实缺席，不占位不臆测）。 */
 const metaSlot = (row: AccountsRowView, variant: AccountView): ReactNode => row.subtitle === ""
   ? null
@@ -79,13 +86,13 @@ export function AccountsRows({ rows, view = "list", listTestId, onRowAction, onO
             key={row.id}
             account={{
               id: row.id, displayName: row.displayName, lastVerifiedAt: null,
-              isSelected: row.selectedTestId !== undefined, // 「使用中」已由 builder 编成 accent 徽章，不重复渲染
+              // 「使用中」已由 builder 编成 accent 徽章：共享行不再渲染可见 chip，锚点走隐藏元素。
+              isSelected: false,
             }}
             variant={view}
             testId={row.testId}
-            selectedTestId={row.selectedTestId}
             actionTestId={slotAction?.id ?? ""}
-            statusContent={badgeSlot(row)}
+            statusContent={<>{badgeSlot(row)}{currentAnchor(row)}</>}
             listMeta={metaSlot(row, "list")}
             cardMeta={metaSlot(row, "card")}
             listMetric={aside("list")}

@@ -34,6 +34,8 @@ export interface AccountRowView {
   readonly metrics: readonly AccountMetricView[];
   readonly actions: readonly AccountActionView[];
   readonly archived: boolean;
+  /** 本产品「使用中」账号（徽章与不可见锚点同源）：页面据此给 selectedTestId，不再渲染第二个徽章。 */
+  readonly current: boolean;
 }
 
 export type AccountDetailSectionId = "basics" | "credential" | "checkin" | "actions" | "danger" | "tech";
@@ -81,6 +83,8 @@ export interface AccountsView {
   readonly stats: readonly AccountMetricView[] | null;
   readonly filters: AccountsFiltersView | null;
   readonly rows: readonly AccountRowView[];
+  /** 账号总数（本产品口径）：rows 只是本页可见行（过滤后），计数文案必须用它而非 rows.length。 */
+  readonly totalCount: number;
   readonly listActions: readonly AccountActionView[];
   readonly empty: AccountsEmptyView;
   readonly detail: readonly DetailSectionView[];
@@ -163,6 +167,7 @@ export const ACCOUNT_TEXTS = {
   deleteConfirmLabelWorkbuddy: "确认删除", // WorkBuddyAccountDetail L406
   deleteBusyLabel: "删除中…", // AccountDetail L181 / WorkBuddyAccountDetail L407
   failureFallback: "操作未完成，请稍后重试。", // AccountDetail L91（详情操作失败兜底）
+  refreshFailureKept: "刷新未完成，正在显示上次读取到的账号信息。", // 已有数据时刷新失败：保留旧数据 + 通知（旧 G15 语义）
   notifyPrefixWorkbuddy: "WorkBuddy：", // WorkBuddyPanel L208 等（全角冒号）
 } as const;
 

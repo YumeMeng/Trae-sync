@@ -24,7 +24,7 @@ const BUILDERS: Record<string, (snapshot: AccountsSnapshot) => AccountsView> = {
 /** fail-closed 空视图：无行、无动作、无过滤，空态文案不冒充任一产品。 */
 const EMPTY_VIEW: AccountsView = {
   header: { title: ACCOUNT_TEXTS.pageTitle, badges: [], actions: [] },
-  stats: null, filters: null, rows: [], listActions: [], detail: [],
+  stats: null, filters: null, rows: [], totalCount: 0, listActions: [], detail: [],
   empty: { description: "账号信息暂不可用，请稍后重试。", actionLabel: null, testId: "account-center__empty" },
 };
 

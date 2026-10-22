@@ -3,6 +3,7 @@
  * 时钟与偏好档位由快照注入；徽章一律经 StatusBadges 的 derive* 求态；能力只读 accountCapabilitiesFor("trae_cn")。
  */
 import { deriveCheckinSlotState, deriveLoginSlotState } from "../../components/StatusBadges";
+import type { AccountSnapshot } from "../../platform/accountAdapter";
 import type { AccountProfileDto, CheckinCapabilityDto, CheckinOverviewEntryDto, TraeInstanceStateDto } from "../../types/account_switch";
 import type { TraeCnAccountDto } from "../../types/product";
 import { displayMobile, effectiveDisplayName } from "../../utils/accountDisplay";
@@ -37,6 +38,18 @@ export function traeRowTestIds(face: TraeRowFace, id: string): { readonly row: s
   if (face === "saved") return { row: `account-saved-card-${id}`, action: `account-saved-switch-${id}`, selected: `account-saved-current-${id}`, usage: "" };
   return { row: `account-card-${id}`, action: `account-switch-${id}`, selected: `account-current-${id}`, usage: `account-usage-${id}` };
 }
+/** 适配器面 → 池面两字段（仅测试注入路径）：池内账号与状态文案同源；未注入即恒 null（不猜数据）。 */
+export function traePoolFields(adapter: AccountSnapshot | undefined): Pick<TraeAccountsSnapshot, "traePool" | "poolStatusLabel"> {
+  if (adapter === undefined) return { traePool: null, poolStatusLabel: null };
+  return {
+    poolStatusLabel: adapter.statusLabel,
+    traePool: adapter.accounts.map((account): TraeCnAccountDto => ({
+      profile_id: account.id, display_name: account.displayName, avatar_url: "",
+      last_verified_at: account.lastVerifiedAt, status: account.status, is_current: account.isToolSelected,
+    })),
+  };
+}
+
 /** 数据面判定（旧 L959-1016）：适配器面 > 真实模式 > fixture 回退。 */
 export function traeRowFace(snapshot: TraeAccountsSnapshot): TraeRowFace {
   return snapshot.traePool !== null ? "pool" : snapshot.capability?.real_http_enabled === true ? "checkin" : "saved";
@@ -92,6 +105,8 @@ function checkinRow(entry: CheckinOverviewEntryDto, snapshot: TraeAccountsSnapsh
   const credits: AccountMetricView = { label: "模型积分", value: entry.usage_remaining_credits != null ? fmtCredits(entry.usage_remaining_credits) : "未查询", tone: "neutral" };
   return {
     id: entry.profile_id, displayName: effectiveDisplayName(entry), archived: false,
+    // 行「使用中」= 本次实测到的官方登录身份；页面据此给不可见锚点，不重复渲染徽章。
+    current,
     subtitle: [`最近验证：${fmtDateTime(entry.last_verified_at)}`, displayMobile(entry), tokenRemaining(entry.access_token_expires_at_unix_seconds, now)].filter(Boolean).join(" · "),
     badges: [slotBadge(deriveCheckinSlotState(entry, new Date(now * 1000))), slotBadge(loginSlot(entry, snapshot)), ...(current ? [CURRENT] : [])],
     metrics: entry.refresh_error_code != null ? [credits, { label: "上次刷新", value: "刷新失败", tone: "warn" as const }] : [credits],
@@ -105,6 +120,8 @@ function poolRow(account: TraeCnAccountDto, snapshot: TraeAccountsSnapshot): Acc
     : account.status === "expired" ? { text: "登录已过期", tone: "danger" } : PENDING;
   return {
     id: account.profile_id, displayName: account.display_name, archived: false, metrics: [],
+    // 工具账号选择 ≠ 官方切号：current 来自池内自有选择指针。
+    current: account.is_current,
     subtitle: `最近验证：${fmtDateTime(account.last_verified_at)}`,
     badges: account.is_current ? [badge, TOOL_SELECTED] : [badge],
     actions: accountCapabilitiesFor("trae_cn").toolSelection && !account.is_current
@@ -116,6 +133,7 @@ function poolRow(account: TraeCnAccountDto, snapshot: TraeAccountsSnapshot): Acc
 function savedRow(account: AccountProfileDto, snapshot: TraeAccountsSnapshot): AccountRowView {
   return {
     id: account.profile_id, displayName: account.display_name, archived: false, metrics: [], actions: [],
+    current: snapshot.savedCurrentProfileId === account.profile_id,
     subtitle: `最近验证：${fmtDateTime(account.last_verified_at)}${account.region ? ` · ${account.region.toUpperCase()}` : ""}`,
     badges: snapshot.savedCurrentProfileId === account.profile_id ? [PENDING, CURRENT] : [PENDING],
   };
@@ -170,6 +188,8 @@ export function buildTraeAccountsView(snapshot: TraeAccountsSnapshot): AccountsV
     stats: null,
     filters: filtersFor(snapshot, real, attention),
     rows,
+    // 计数口径 = 账号总数（旧骨架 entryCount）：真实面=总览条数 / 池面=池内账号数 / 回退面=存档账号数。
+    totalCount: total,
     // 批量动作全在页头（旧布局），列表层无独立动作行。
     listActions: [],
     empty: emptyFor(face, rows.length, total, snapshot.filter),

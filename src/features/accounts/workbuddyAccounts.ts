@@ -93,6 +93,8 @@ function poolRow(account: WorkBuddyAccountEntryDto, snapshot: WorkBuddyAccountsS
   const overviewRow = overviewOf(snapshot, account.profile_id);
   return {
     id: account.profile_id, displayName: workbuddyDisplayName(account), archived: account.archived,
+    // 行「使用中」= 当前客户端登录账号（health.uid 与池 account_id 同源）；页面据此给不可见锚点。
+    current,
     subtitle: metaFor(account, overviewRow),
     badges: [...(CAPS.archiveTag && account.archived ? [ARCHIVED] : []), { text: slot[0], tone: slot[1] }, ...(current ? [CURRENT] : [])],
     metrics: CAPS.creditsColumn ? [balanceMetric(overviewRow)] : [],
@@ -148,6 +150,8 @@ export function buildWorkBuddyAccountsView(snapshot: WorkBuddyAccountsSnapshot):
     stats: null,
     filters: filtersFor(snapshot),
     rows: sorted.map((account) => poolRow(account, snapshot)),
+    // 计数口径 = 池内账号数（旧骨架 entryCount={pool.length}），与排序/可见行无关。
+    totalCount: snapshot.pool.length,
     // 批量动作全在页头（旧布局），列表层无独立动作行。
     listActions: [],
     empty: EMPTY,

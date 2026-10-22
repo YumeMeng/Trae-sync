@@ -1,27 +1,23 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDownAZ, UserRound, UserPlus } from "lucide-react";
 import { EmptyState } from "../../components/shared/EmptyState";
 import { ProductBadge } from "../../components/shared/ProductBadge";
-import type { AccountRowView, AccountsView } from "./config";
+import type { AccountSnapshot } from "../../platform/accountAdapter";
+import { notify } from "../../platform/notify";
+import { ACCOUNT_TEXTS, type AccountRowView, type AccountsView } from "./config";
 import { AccountsHeader } from "./components/AccountsHeader";
 import { AccountsRows, type AccountsRowView } from "./components/AccountsRows";
 import { useAccountBatchProgress, type AccountBatchProgressMap } from "./components/useAccountBatchProgress";
-import {
-  useAccountsSnapshot, type TraeAccountsData, type WorkBuddyAccountsData,
-} from "./components/useAccountsSnapshot";
+import { useAccountsSnapshot, type AccountsData, type TraeAccountsData, type WorkBuddyAccountsData } from "./components/useAccountsSnapshot";
 import { accountsViewFor, type AccountsSnapshot } from "./registry";
-import { traeRowFace, traeRowTestIds, type TraeAccountsSnapshot } from "./traeAccounts";
+import { traePoolFields, traeRowFace, traeRowTestIds, type TraeAccountsSnapshot } from "./traeAccounts";
 import { workbuddyRowTestIds } from "./workbuddyAccounts";
 import { AccountsSkeleton } from "./AccountsSkeleton";
 
 /**
- * 账号页装配（P4c-6b-1：只做「读取 + 渲染」）。产品差异全部来自 features/accounts 的
- * 声明式配置：数据面由 useAccountsSnapshot 按产品取，视图模型由 registry.accountsViewFor
- * 查表产出，本文件零 productId 相等判断、零 invoke(。
- *
- * 本票**不处理**动作语义：切号弹层 / 登录弹层 / 凭据二次确认 / 详情页分别是 6b-2、6c、7 的
- * 范围；页头只接「纯本地刷新」，其余页头动作与行内动作分别经 onHeaderAction / onRowAction
- * 原样透出给上层编排。
+ * 账号页装配（P4c-6b-1/6b-2a：读取 + 渲染）。产品差异全部来自 features/accounts 的声明式配置：
+ * 数据面由 useAccountsSnapshot 按产品取，视图模型由 registry.accountsViewFor 查表产出，本文件零
+ * productId 相等判断、零 invoke(。动作语义（切号/登录/凭据确认/详情）归 6b-2、6c、7，本票只透出。
  */
 
 /** 会话内过滤档（G14）：仅 TRAE 真实总览面出现，页面只持值、不判断产品。 */
@@ -29,26 +25,27 @@ type PageFilter = "all" | "attention";
 /** 排序档（U-2）：WB 无「签到状态」档，builder 已裁掉该选项。 */
 type PageSort = "added" | "name" | "checkin";
 
-/** 页面自持字段：builder 是纯函数，时钟/过滤/排序/忙碌位一律由页面注入。 */
+/** 页面自持字段：builder 是纯函数，时钟/过滤/排序/忙碌位/适配器面一律由页面注入。 */
 interface PageUi {
   readonly filter: PageFilter;
   readonly sort: PageSort;
-  /** 判定时刻（Unix 秒）：凭据过期与登录槽求态用。 */
-  readonly now: number;
-  /** 纯本地刷新进行中（只重读本机缓存，不联网）。 */
-  readonly localRefresh: boolean;
+  readonly now: number; // 判定时刻（Unix 秒）：凭据过期与登录槽求态用
+  readonly localRefresh: boolean; // 纯本地刷新进行中（只重读本机缓存，不联网）
   /** 三路批量进度：某链有进度即该批量在跑（只用于算禁用）。 */
   readonly progress: AccountBatchProgressMap;
+  /** 适配器面（仅测试注入路径）：undefined = 生产路径，池面恒缺席。 */
+  readonly adapterPool?: AccountSnapshot;
 }
 
-/** 单产品的页面接缝：载荷键 / 进度协议值 / 本地刷新动作 id / 列表锚点 / 快照合成 / 行锚点。 */
+/** 单产品接缝：载荷键 / 进度协议值 / 本地刷新动作 id / 列表锚点 / 快照合成 / 行与「使用中」锚点。 */
 interface PageAdapter {
   readonly payloadKey: string;
   readonly progressId: string;
   readonly refreshLocalActionId: string;
   readonly listTestId?: string;
   readonly compose: (payload: unknown, ui: PageUi) => AccountsSnapshot;
-  readonly rowTestId: (row: AccountRowView, snapshot: AccountsSnapshot) => string;
+  /** 行锚点与「使用中」不可见锚点：视觉表达仍归 builder 的 accent 徽章，此处只承载旧 testid。 */
+  readonly testIds: (row: AccountRowView, snapshot: AccountsSnapshot) => { readonly row: string; readonly selected: string };
 }
 
 /** TRAE：数据面 + 页面字段 → builder 快照；批量忙碌位由进度链在跑推导。 */
@@ -56,13 +53,11 @@ const composeTrae = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
   productId: "trae_cn",
   trae: {
     ...(payload as TraeAccountsData),
-    filter: ui.filter,
-    sort: ui.sort,
-    nowUnixSeconds: ui.now,
+    ...traePoolFields(ui.adapterPool),
+    filter: ui.filter, sort: ui.sort, nowUnixSeconds: ui.now,
     busy: {
       // 登录 / 切号 / 工具账号选择在 6b-2 接入，本票恒空闲。
-      login: false, switching: false, toolSelection: false,
-      localRefresh: ui.localRefresh,
+      login: false, switching: false, toolSelection: false, localRefresh: ui.localRefresh,
       credits: ui.progress.credits_refresh !== undefined,
       credentialRefresh: ui.progress.credential_refresh !== undefined,
       health: ui.progress.health_check !== undefined,
@@ -75,22 +70,20 @@ const composeWorkBuddy = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
   productId: "workbuddy",
   workbuddy: {
     ...(payload as WorkBuddyAccountsData),
-    sort: ui.sort === "checkin" ? "added" : ui.sort,
-    nowUnixSeconds: ui.now,
+    sort: ui.sort === "checkin" ? "added" : ui.sort, nowUnixSeconds: ui.now,
     busy: {
       // 续期 / 健康 / 捕获 / 切号 / 登录在 6b-2 接入，本票恒空闲。
-      loading: false, renewing: false, health: false, capturing: false,
-      switching: false, preview: false, login: false,
-      refreshing: ui.localRefresh,
+      loading: false, renewing: false, health: false, capturing: false, switching: false, preview: false,
+      login: false, refreshing: ui.localRefresh,
     },
   },
 });
 
-/** TRAE 行锚点：数据面（适配器面 / 真实总览 / fixture 回退）决定前缀，逐字沿用旧 testid。 */
-const rowTestIdTrae = (row: AccountRowView, snapshot: AccountsSnapshot): string =>
-  traeRowTestIds(traeRowFace((snapshot as { readonly trae: TraeAccountsSnapshot }).trae), row.id).row;
-/** WB 行锚点只用 profile_id 前缀（积分/归档锚点归详情，本票不渲染）。 */
-const rowTestIdWorkBuddy = (row: AccountRowView): string => workbuddyRowTestIds(row.id, "").row;
+/** TRAE 锚点：数据面（适配器面 / 真实总览 / fixture 回退）决定前缀，逐字沿用旧 testid。 */
+const traeTestIds = (row: AccountRowView, snapshot: AccountsSnapshot) =>
+  traeRowTestIds(traeRowFace((snapshot as { readonly trae: TraeAccountsSnapshot }).trae), row.id);
+/** WB 锚点只用 profile_id 前缀（积分/归档锚点归详情，本票不渲染）。 */
+const wbTestIds = (row: AccountRowView) => workbuddyRowTestIds(row.id, "");
 
 /** 产品接缝表（页面唯一的产品差异入口，与 registry 的 builder 表同形）；未登记即 fail-closed。 */
 const PAGE_ADAPTERS: Record<string, PageAdapter> = {
@@ -100,16 +93,16 @@ const PAGE_ADAPTERS: Record<string, PageAdapter> = {
     progressId: "work_cn",
     refreshLocalActionId: "account-refresh-local",
     compose: composeTrae,
-    rowTestId: rowTestIdTrae,
+    testIds: traeTestIds,
   },
   workbuddy: {
     payloadKey: "workbuddy",
     progressId: "workbuddy",
     refreshLocalActionId: "workbuddy-refresh",
-    // 列表容器锚点：沿用旧 workbuddy-pool-list（builder 视图模型暂无该字段，待 6b-2 回填）。
+    // 列表容器锚点：沿用旧 workbuddy-pool-list。
     listTestId: "workbuddy-pool-list",
     compose: composeWorkBuddy,
-    rowTestId: rowTestIdWorkBuddy,
+    testIds: wbTestIds,
   },
 };
 
@@ -130,11 +123,12 @@ export interface AccountsPageProps {
   readonly onHeaderAction?: (actionId: string) => void;
   /** 行内动作（切号 / 工具账号选择）：本票只透出，不实现。 */
   readonly onRowAction?: (rowId: string, actionId: string) => void;
-  /** 适配器面数据（旧 adapter 注入路径）：本票不消费，6b-2 接入（当前数据面 traePool 恒 null）。 */
-  readonly adapterPool?: unknown;
+  /** 适配器面数据（旧 adapter 注入路径，仅测试传）：注入 TRAE 快照的 traePool / poolStatusLabel。 */
+  readonly adapterPool?: AccountSnapshot;
 }
 
-export function AccountsPage({ active, productId, onOpenDetail, onHeaderAction, onRowAction }: AccountsPageProps) {
+export function AccountsPage(props: AccountsPageProps) {
+  const { active, productId, onOpenDetail, onHeaderAction, onRowAction, adapterPool } = props;
   const adapter = PAGE_ADAPTERS[productId];
   const { snapshot: data, loading, error, refreshLocal } = useAccountsSnapshot(productId, active);
   const { progress } = useAccountBatchProgress(adapter?.progressId ?? productId);
@@ -144,14 +138,33 @@ export function AccountsPage({ active, productId, onOpenDetail, onHeaderAction, 
   const [pending, setPending] = useState<string | null>(null);
   const refreshLocalActionId = adapter?.refreshLocalActionId ?? "";
   const localRefreshBusy = pending !== null;
+  // 已成功读到的数据面（按「产品 + 可见性」作用域）：刷新失败时 hook 会清快照，页面据此继续渲染
+  // 旧数据——首次加载失败才落错误卡。载荷键缺失即别的产品的迟到快照，不认也不进保留位（不跨产品串数据）。
+  const scope = `${productId}|${active}`;
+  const payloadOf = (value: AccountsData): unknown =>
+    (value as unknown as Record<string, unknown>)[adapter?.payloadKey ?? ""];
+  const fresh: AccountsData | null = data !== null && payloadOf(data) !== undefined ? data : null;
+  const kept = useRef<{ scope: string; data: AccountsData | null }>({ scope, data: null });
+  if (kept.current.scope !== scope) kept.current = { scope, data: null };
+  if (fresh !== null && kept.current.data !== fresh) kept.current = { scope, data: fresh };
+  const keptData = kept.current.data;
+  // 刷新失败但已有快照：保留数据 + notify.error（旧 G15 语义）。只在刷新收尾后提示（进行中
+  // 的 error 不提示），且每次点击最多提示一次——notified 在发起刷新时清空，重复失败仍有反馈。
+  const notified = useRef<string | null>(null);
+  useEffect(() => {
+    if (error === null) { notified.current = null; return; }
+    if (localRefreshBusy || keptData === null || notified.current === error) return;
+    notified.current = error;
+    notify.error(error, ACCOUNT_TEXTS.refreshFailureKept);
+  }, [error, keptData, localRefreshBusy]);
 
-  // 纯本地刷新：只重读本机缓存（零网络命令）；失败同样落 hook 的 error。
+  // 纯本地刷新：只重读本机缓存（零网络命令）；失败由上面的通知路径处理，不清数据。
   const handleRefreshLocal = useCallback(() => {
     if (localRefreshBusy) return;
+    notified.current = null; // 新一轮刷新：允许同原因的失败再次提示
     setPending(refreshLocalActionId);
     void refreshLocal().finally(() => setPending(null));
   }, [localRefreshBusy, refreshLocal, refreshLocalActionId]);
-
   // 页头动作分发：本票只实现「刷新」（纯本地），其余动作原样透出给 6b-2。
   const handleHeaderAction = useCallback((actionId: string) => {
     if (actionId === "") return;
@@ -160,37 +173,35 @@ export function AccountsPage({ active, productId, onOpenDetail, onHeaderAction, 
   }, [handleRefreshLocal, onHeaderAction, refreshLocalActionId]);
 
   // 快照合成：数据面按载荷键取（表内键与载荷键一一对应），再补页面自持字段。
-  const ui: PageUi = { filter, sort, now: Math.floor(Date.now() / 1000), localRefresh: localRefreshBusy, progress };
-  const composed: AccountsSnapshot | null = data === null || adapter === undefined
+  const ui: PageUi = { filter, sort, now: Math.floor(Date.now() / 1000), localRefresh: localRefreshBusy, progress, adapterPool };
+  // 刷新失败时用保留的旧数据继续渲染（不清 snapshot）；两者皆无才落错误卡。
+  const shown: AccountsData | null = fresh ?? keptData;
+  const composed: AccountsSnapshot | null = shown === null || adapter === undefined
     ? null
-    : adapter.compose((data as unknown as Record<string, unknown>)[adapter.payloadKey], ui);
+    : adapter.compose((shown as unknown as Record<string, unknown>)[adapter.payloadKey], ui);
 
   // 视图模型：有快照即查表产出；未登记产品走 registry 的 fail-closed 空视图（不猜数据面）。
   const view: AccountsView | null = composed !== null
     ? accountsViewFor(composed)
     : adapter === undefined ? accountsViewFor({ productId } as unknown as AccountsSnapshot) : null;
 
-  // 拿不到快照（加载中 / 已清态 / 读取失败）：只渲染外壳，
-  // 读取失败给错误卡（带重试），绝不用空账号冒充读取失败。
-  if (view === null) {
-    return (
-      <AccountsSkeleton
-        productId={productId}
-        error={error}
-        onRetry={handleRefreshLocal}
-        retrying={loading}
-      />
-    );
-  }
+  // 拿不到快照（首次加载中 / 已清态 / 首次读取失败）：只渲染外壳，读取失败给错误卡
+  // （带重试），绝不用空账号冒充读取失败。
+  if (view === null) return (
+    <AccountsSkeleton productId={productId} error={error} onRetry={handleRefreshLocal} retrying={loading} />
+  );
 
   const { filters } = view;
   // 遗留档位若不在本产品选项内即回退首档，select 不出现无效值（旧控件同口径）。
-  const sortValue = filters === null ? ""
-    : filters.sortOptions.some((option) => option.key === filters.sort) ? filters.sort : filters.sortOptions[0]?.key ?? "";
-  // 行锚点由产品接缝补（builder 视图模型无 testId 字段）；未登记产品无行可渲染。
+  const sortValue = filters === null || filters.sortOptions.some((option) => option.key === filters.sort)
+    ? filters?.sort ?? "" : filters.sortOptions[0]?.key ?? "";
+  // 行锚点与「使用中」锚点由产品接缝补（builder 视图模型无 testid 字段）；视觉仍只有 accent 徽章。
   const rows: readonly AccountsRowView[] = composed === null || adapter === undefined
     ? []
-    : view.rows.map((row) => ({ ...row, testId: adapter.rowTestId(row, composed) }));
+    : view.rows.map((row) => {
+      const ids = adapter.testIds(row, composed);
+      return { ...row, testId: ids.row, selectedTestId: row.current ? ids.selected : undefined };
+    });
   // 控件行只在「有账号」时出现（旧骨架 showControls 同口径）：无行但有过滤档 = 过滤空态，
   // 仍要给用户切回「全部」的入口；其余无行即真没有账号，不给空控件行。
   const showControls = filters !== null && (rows.length > 0 || filters.active !== "all");
@@ -203,7 +214,6 @@ export function AccountsPage({ active, productId, onOpenDetail, onHeaderAction, 
         busy={pending === null ? [] : [pending]}
         onAction={handleHeaderAction}
       />
-
       <section className="account-center__profiles" aria-labelledby="account-mine-heading">
         <div className="account-center__section-heading">
           <h3 id="account-mine-heading"><UserRound size={16} aria-hidden="true" />我的账号</h3>
@@ -239,7 +249,8 @@ export function AccountsPage({ active, productId, onOpenDetail, onHeaderAction, 
               </label>
             </div>
           )}
-          <span className="section-caption">{rows.length} 个</span>
+          {/* 计数口径 = 账号总数（builder 的 totalCount），不是本页可见行数。 */}
+          <span className="section-caption">{view.totalCount} 个</span>
         </div>
 
         {rows.length > 0 ? (
