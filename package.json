@@ -10,6 +10,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
+    "guard": "node scripts/ui-guard.mjs",
+    "check": "pnpm typecheck && pnpm guard",
     "gen:commands": "node scripts/gen-command-union.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

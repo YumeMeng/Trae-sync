@@ -40,6 +40,9 @@ export interface MockScenario {
   sessionMessages?: "normal" | "bulk";
   // 指定测试场景下模拟已验收的操作；未配置的 Trae CN 写操作保持 pending。
   operationReadiness?: Partial<Record<MockProductOperationId, OperationReadiness>>;
+  // P2b：启用产品切换器（list/get/set_current_product）+ WorkBuddy 域命令桩。
+  // 缺省关闭——既有 4 个 spec 的"无切换器/未模拟命令"契约一字不动。
+  workbuddy?: boolean;
 }
 
 /**
@@ -556,6 +559,103 @@ export async function installMockBridge(
       message_count: number;
     }> = [];
 
+    // ===== P2b WorkBuddy 域 fixture（场景开关 workbuddy: true 才启用）=====
+    // 既有 4 个 spec 不传该开关：产品切换器与下列命令保持"未模拟"状态，
+    // 原有行为一字不动（未知命令照旧抛错，切换器照旧不渲染）。
+    const WB_ACCOUNTS = [
+      {
+        profile_id: "wb-profile-1",
+        account_id: "wb-uid-1",
+        screen_name: "WB 账号甲",
+        domain: "workbuddy.example",
+        access_token_expires_at_unix_seconds: NOW_LOCAL + 10 * DAY,
+        refresh_token_expires_at_unix_seconds: NOW_LOCAL + 100 * DAY,
+        minted_at_unix_seconds: NOW_LOCAL - 5 * DAY,
+        last_updated_at_unix_seconds: NOW_LOCAL - DAY,
+        display_name: "",
+        archived: false,
+        masked_phone: "133****1304",
+      },
+      {
+        profile_id: "wb-profile-2",
+        account_id: "wb-uid-2",
+        screen_name: "WB 账号乙",
+        domain: "workbuddy.example",
+        access_token_expires_at_unix_seconds: NOW_LOCAL + 4 * DAY,
+        refresh_token_expires_at_unix_seconds: NOW_LOCAL + 90 * DAY,
+        minted_at_unix_seconds: NOW_LOCAL - 3 * DAY,
+        last_updated_at_unix_seconds: NOW_LOCAL - 2 * DAY,
+        display_name: "备用号",
+        archived: false,
+        masked_phone: "",
+      },
+    ];
+    const WB_PARTICIPATION = [
+      { profile_id: "wb-profile-1", screen_name: "WB 账号甲", enabled: true },
+      { profile_id: "wb-profile-2", screen_name: "WB 账号乙", enabled: false },
+    ];
+    const WB_CHECKIN_OVERVIEW = [
+      {
+        profile_id: "wb-profile-1",
+        screen_name: "WB 账号甲",
+        today_checked_in: true,
+        streak_days: 3,
+        daily_credit: 200,
+        total_credits: 600,
+        credits_balance: 1600,
+        credits_total: 2000,
+        balance_error: null,
+        checkin_dates: ["2026-10-22"],
+        masked_phone: "133****1304",
+        error: null,
+      },
+      {
+        profile_id: "wb-profile-2",
+        screen_name: "WB 账号乙",
+        today_checked_in: false,
+        streak_days: 1,
+        daily_credit: 200,
+        total_credits: 200,
+        credits_balance: 400,
+        credits_total: 600,
+        balance_error: null,
+        checkin_dates: [],
+        masked_phone: null,
+        error: null,
+      },
+    ];
+    const WB_SESSION_HEALTH = {
+      status: "active",
+      uid: "wb-uid-1",
+      uin: "10001",
+      access_expires_at_unix_seconds: NOW_LOCAL + 10 * DAY,
+      refresh_expires_at_unix_seconds: NOW_LOCAL + 100 * DAY,
+      domain: "workbuddy.example",
+      captured_in_pool: true,
+    };
+    const WB_LIBRARY_STATS = {
+      account_count: 2,
+      session_count: 16,
+      soft_deleted_session_count: 1,
+      project_count: 4,
+      projects_dir_bytes: 32768,
+      last_active_unix_seconds: NOW_LOCAL - 3600,
+    };
+    const WB_LIBRARY_GROUPS = [
+      {
+        cwd: "C:\\work\\alpha",
+        escaped_dir: "c--work-alpha",
+        session_count: 2,
+        last_active_unix_seconds: NOW_LOCAL - 7200,
+        sessions: [
+          { session_id: "wb-s1", title: "会话甲", transport: "local", deleted: false, last_active_unix_seconds: NOW_LOCAL - 7200 },
+          { session_id: "wb-s2", title: "会话乙", transport: "cloud", deleted: false, last_active_unix_seconds: NOW_LOCAL - 9000 },
+        ],
+      },
+    ];
+    // 当前产品指针（可变）：set_current_product 写入，get_current_product 回读。
+    let currentProductId = "trae_cn";
+
     // mock invoke 实现：根据 activeScenario 返回合成数据
     async function mockInvoke(cmd: string, args?: any) {
       const scn = (window as any).__activeScenario || {};
@@ -569,6 +669,108 @@ export async function installMockBridge(
       if (cmd === "get_workspace_state") {
         if (scn.production) return PRODUCTION_WS;
         return WS;
+      }
+      // ===== P2b 产品切换器 + WorkBuddy 域命令桩（仅 workbuddy 场景启用）=====
+      // 开关关闭时保持"未模拟命令"语义（抛错），既有 spec 行为不变。
+      if (scn.workbuddy) {
+        if (cmd === "list_products") {
+          return [
+            { product_id: "trae_cn", display_name: "TRAE" },
+            { product_id: "workbuddy", display_name: "WorkBuddy" },
+          ];
+        }
+        if (cmd === "get_current_product") {
+          return {
+            product_id: currentProductId,
+            display_name: currentProductId === "workbuddy" ? "WorkBuddy" : "TRAE",
+          };
+        }
+        if (cmd === "set_current_product") {
+          // 只写指针（与后端语义一致：不动任何凭据/账号数据）。
+          currentProductId = String(args?.productId ?? "trae_cn");
+          return null;
+        }
+        // ---- WorkBuddy 账号页 ----
+        if (cmd === "get_workbuddy_session_health") return WB_SESSION_HEALTH;
+        if (cmd === "check_workbuddy_login_health") {
+          return { status: WB_SESSION_HEALTH.status, live_status: "verified" };
+        }
+        if (cmd === "list_workbuddy_accounts") return WB_ACCOUNTS;
+        if (cmd === "get_workbuddy_checkin_overview") {
+          // profileId 为空 = 全池批查；非空 = 单账号（不在池内整体报错，与后端一致）。
+          if (args?.profileId == null) return WB_CHECKIN_OVERVIEW;
+          const row = WB_CHECKIN_OVERVIEW.find((item) => item.profile_id === args.profileId);
+          if (!row) throw new Error("workbuddy_auto_checkin_account_missing");
+          return [row];
+        }
+        if (cmd === "list_workbuddy_checkin_accounts") return WB_PARTICIPATION;
+        if (cmd === "get_workbuddy_auto_checkin_status") {
+          return {
+            enabled: true,
+            daily_time_hhmm: "09:30",
+            ledger: { date: "2026-10-22", running: false, total: 2, completed: 1, failed: 0, skipped: 1 },
+            accounts: WB_PARTICIPATION,
+          };
+        }
+        // ---- WorkBuddy 总览 / 库页 ----
+        if (cmd === "get_workbuddy_library_stats") return WB_LIBRARY_STATS;
+        // includeDeleted / userId 过滤在本 fixture 中不改变结果（单组两会话，
+        // 软删行不参与本批断言）；保留入参读取以镜像命令契约。
+        if (cmd === "get_workbuddy_library_history") {
+          void args?.userId;
+          void args?.includeDeleted;
+          return WB_LIBRARY_GROUPS;
+        }
+        if (cmd === "get_workbuddy_session_messages") {
+          return {
+            session_id: String(args?.sessionId ?? ""),
+            messages: [
+              { index: 0, kind: "user", role: "user", timestamp_unix_ms: NOW_LOCAL * 1000, text: "合成提问" },
+              { index: 1, kind: "assistant", role: "assistant", timestamp_unix_ms: NOW_LOCAL * 1000 + 1, text: "合成回答" },
+            ],
+            skipped_lines: 0,
+            body_missing: false,
+          };
+        }
+        if (cmd === "get_workbuddy_library_checkup") {
+          return {
+            orphan_body_files: [],
+            missing_body_count: 0,
+            missing_body_samples: [],
+            soft_deleted_session_count: 1,
+            foreign_dirs: [],
+            cwd_merge_candidates: [],
+          };
+        }
+        if (cmd === "get_workbuddy_probe_info") {
+          return {
+            running: true,
+            process_count: 1,
+            app: "WorkBuddy",
+            version: "1.0.0-mock",
+            platform: "windows",
+            install_path: "C:\\Program Files\\WorkBuddy",
+            install_source: "common_path",
+            data_root: "C:\\Users\\fixture\\.workbuddy\\app",
+          };
+        }
+        // ---- WorkBuddy 备份链 ----
+        if (cmd === "list_workbuddy_backups") {
+          return { backup_dir: "C:\\TRAE\\storage\\workbuddy-backups", backups: [] };
+        }
+        // ---- 写命令（本批 spec 不触发，保留桩以镜像命令契约）----
+        if (cmd === "capture_workbuddy_account") return WB_ACCOUNTS[0];
+        if (cmd === "refresh_workbuddy_account") {
+          return {
+            renewed: false,
+            access_expires_at_unix_seconds: NOW_LOCAL + 10 * DAY,
+            refresh_expires_at_unix_seconds: NOW_LOCAL + 100 * DAY,
+          };
+        }
+        if (cmd === "set_workbuddy_account_display_name") return WB_ACCOUNTS[0];
+        if (cmd === "set_workbuddy_account_archived") return WB_ACCOUNTS[0];
+        if (cmd === "set_workbuddy_account_auto_checkin") return null;
+        if (cmd === "set_workbuddy_auto_checkin_settings") return null;
       }
       if (cmd === "get_product_identity_state") {
         return [
@@ -1229,6 +1431,16 @@ export async function installMockBridge(
       },
       // 其他可能被 @tauri-apps/api 调用的入口
       convertFileSrc: (p: string) => p,
+    };
+    // 事件退订入口（P2b）：@tauri-apps/api/event 的 _unlisten 直接调用
+    // window.__TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener；缺这个全局时
+    // 组件卸载/产品切换触发的 unlisten 会抛 TypeError（console error）。
+    // 与官方 @tauri-apps/api/mocks 同形：按 id 摘掉回调即可，不影响命令返回。
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+      unregisterListener: (event: string, eventId: number) => {
+        void event;
+        tauriEventCallbacks.delete(eventId);
+      },
     };
   },
   { scenario },

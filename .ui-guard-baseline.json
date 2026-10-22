@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "generatedBy": "scripts/ui-guard.mjs --update-baseline",
+  "note": "UI-CHARTER §3/§4 债务基线（按「文件 + 规则」计数）。债务只允许收敛；新增违规必须修掉或按宪章 §8 登记例外，禁止重写基线掩盖。",
+  "totalViolations": 13,
+  "entries": [
+    {
+      "file": "src/styles/accounts.css",
+      "rule": "literal-color",
+      "count": 4
+    },
+    {
+      "file": "src/styles/environment.css",
+      "rule": "literal-color",
+      "count": 3
+    },
+    {
+      "file": "src/styles/history.css",
+      "rule": "literal-color",
+      "count": 5
+    },
+    {
+      "file": "src/styles/workbench.css",
+      "rule": "literal-color",
+      "count": 1
+    }
+  ]
+}
