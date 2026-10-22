@@ -3,6 +3,7 @@ import type { CheckinSnapshot } from "../../platform/checkin";
 import type { CheckinOverviewEntryDto } from "../../types/account_switch";
 import { effectiveDisplayName } from "../../utils/accountDisplay";
 import {
+  autoFor,
   autoStatusLine,
   EMPTY_VIEW,
   formatCreditsValue,
@@ -81,7 +82,7 @@ export function traeCheckinView(
 
   // 常驻状态行只保留两类：自动签到台账 + 演示模式标识 / 存储未就绪异常态。
   const statuses: CheckinStatusView[] = [];
-  const autoLine = autoStatusLine(auto, "auto-checkin-status");
+  const autoLine = autoStatusLine(autoFor(input, auto), "auto-checkin-status");
   if (autoLine !== null) statuses.push(autoLine);
   if (fixture) statuses.push({ testId: "checkin-demo-banner", text: "演示模式", tone: "info" });
   if (capability !== null && !fixture && !capability.enabled) {

@@ -24,6 +24,8 @@ export interface CheckinRowsProps {
   busy: boolean;
   /** 当前执行到的行（进度游标；null = 不在执行）。 */
   cursorId: string | null;
+  /** 账号间错峰剩余秒数（profileId → 秒；checkin-phase 的 inter_wait 事件驱动）。 */
+  waits: Record<string, number>;
   results: Record<string, { outcome: string; detail_code: string | null }>;
   onToggle: (profileId: string) => void;
   onInlineRun: (profileId: string) => void;
@@ -34,6 +36,7 @@ export function CheckinRows({
   selection,
   busy,
   cursorId,
+  waits,
   results,
   onToggle,
   onInlineRun,
@@ -64,13 +67,16 @@ export function CheckinRows({
             />
           );
         }
-        // 演进式阶段：空闲 / 已出结果 / 当前执行行 / 排队。
+        // 演进式阶段：空闲 / 已出结果 / 当前执行行（错峰等待或执行中）/ 排队。
+        // 错峰等待：后端推送 inter_wait 后该行显示「N 秒后开始」，归零由倒计时接管。
+        const waitSecs = waits[row.profileId] ?? null;
+        const inWait = row.profileId === cursorId && result === null && waitSecs !== null;
         const phase = !busy
           ? "idle"
           : result !== null
             ? "done"
             : row.profileId === cursorId
-              ? "running"
+              ? (inWait ? "inter_wait" : "running")
               : "queued";
         return (
           <CheckinFlowRow
@@ -85,7 +91,7 @@ export function CheckinRows({
             disabled={busy}
             phase={phase}
             result={result}
-            waitSecs={null}
+            waitSecs={inWait ? waitSecs : null}
             onInlineCheckin={() => onInlineRun(row.profileId)}
             inlineEnabled={
               view.columns.inlineAction && row.error === null && row.checkedIn !== true

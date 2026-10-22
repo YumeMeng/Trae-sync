@@ -21,9 +21,12 @@ import {
 import { MasterLibraryDetail } from "../../pages/MasterLibraryDetail";
 import { WorkBuddyLibraryPage } from "../../pages/WorkBuddyLibraryPage";
 import { AccountWorkbench } from "../../components/AccountWorkbench";
-import { CheckinPage } from "../../components/CheckinPage";
+import {
+  CheckinPage,
+  type CheckinPageProps,
+} from "../../features/checkin/CheckinPage";
 import { EnvironmentPage } from "../../components/EnvironmentPage";
-import { WorkBuddyPanel, WorkBuddyCheckinPage } from "../../components/WorkBuddyPanel";
+import { WorkBuddyPanel } from "../../components/WorkBuddyPanel";
 import { WorkBuddyEnvironmentPage } from "../../components/WorkBuddyEnvironmentPage";
 import { TraeSettingsVariant } from "../../components/settings/TraeSettingsVariant";
 import { WorkBuddySettingsVariant } from "../../components/settings/WorkBuddySettingsVariant";
@@ -50,6 +53,16 @@ const WorkBuddyOverviewSlot = (props: OverviewPageProps) => (
   <OverviewPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
 );
 
+// P4b-3：checkin 也已合并为一份实现。与 overview 同一形态——两个槽位在接缝内
+// 绑定产品协议值后指向同一组件，页面内零产品判断（差异全在 features/checkin
+// 的声明式配置）。两个包装组件类型不同，切产品仍会重挂载重拉数据。
+const TraeCheckinSlot = (props: CheckinPageProps) => (
+  <CheckinPage {...props} productId={CURRENT_PRODUCT_ID} />
+);
+const WorkBuddyCheckinSlot = (props: CheckinPageProps) => (
+  <CheckinPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
+);
+
 /**
  * 六区块 × 两产品的实现登记表（settings 也登记：其 WB 变体曾是整页早返回）。
  * 只登记、不判断：产品选择逻辑全部在 resolveSection 一处。
@@ -58,7 +71,8 @@ export const SECTION_SLOTS: Record<SectionKey, SectionSlot> = {
   // P4a：两产品指向同一份总览实现（迁移完成的正常形态）。
   overview: { trae: TraeOverviewSlot, workbuddy: WorkBuddyOverviewSlot },
   accounts: { trae: AccountWorkbench, workbuddy: WorkBuddyPanel },
-  checkin: { trae: CheckinPage, workbuddy: WorkBuddyCheckinPage },
+  // P4b-3：两产品指向同一份签到实现（迁移完成的正常形态）。
+  checkin: { trae: TraeCheckinSlot, workbuddy: WorkBuddyCheckinSlot },
   environment: { trae: EnvironmentPage, workbuddy: WorkBuddyEnvironmentPage },
   "master-library": { trae: MasterLibraryDetail, workbuddy: WorkBuddyLibraryPage },
   settings: { trae: TraeSettingsVariant, workbuddy: WorkBuddySettingsVariant },

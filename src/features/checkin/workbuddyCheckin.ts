@@ -2,6 +2,7 @@ import { deriveCheckinSlotState } from "../../components/StatusBadges";
 import type { CheckinSnapshot } from "../../platform/checkin";
 import type { WorkBuddyCheckinAccountStatusDto } from "../../types/product";
 import {
+  autoFor,
   autoStatusLine,
   EMPTY_VIEW,
   type CheckinActionView,
@@ -58,7 +59,7 @@ export function workbuddyCheckinView(
   const selectedCount = input.selection.length;
 
   const statuses: CheckinStatusView[] = [];
-  const autoLine = autoStatusLine(auto, "workbuddy-auto-checkin-meta");
+  const autoLine = autoStatusLine(autoFor(input, auto), "workbuddy-auto-checkin-meta");
   if (autoLine !== null) statuses.push(autoLine);
 
   const showSelectedRun = selectedCount > 0 && selectedCount < rows.length;

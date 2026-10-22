@@ -141,10 +141,53 @@ export const EMPTY_VIEW: CheckinView = {
   },
 };
 
+/**
+ * 通知文案登记表（P4b-3）：页面持有执行状态（勾选/批次/事件）时需要
+ * 在产品差异之外独立取文案——builder 与页面共用同一份事实，不各写一遍。
+ */
+const VIEW_TEXTS: Record<string, CheckinTexts> = {
+  [CURRENT_PRODUCT_ID]: {
+    notificationPrefix: "TRAE",
+    runSuccess: "签到流程已完成。",
+    runPartial: "部分签到未完成，请查看逐账号结果。",
+    runFailure: "签到未完成，请稍后重试。",
+  },
+  workbuddy: {
+    notificationPrefix: "WorkBuddy",
+    runSuccess: "签到批次完成（已签账号幂等跳过，结果见各行）。",
+    runPartial: "部分签到未完成，详见各行结果与通知。",
+    runFailure: "签到未完成，请稍后重试。",
+  },
+};
+
+/** 按产品取通知文案（未登记产品回退首个登记项，与视图登记表同方向）。 */
+export function checkinTextsFor(productId: string): CheckinTexts {
+  return VIEW_TEXTS[productId] ?? VIEW_TEXTS[CURRENT_PRODUCT_ID];
+}
+
 /** 页面渲染输入：勾选集与执行中由页面持有，视图由此求得（纯映射）。 */
 export interface CheckinViewInput {
   readonly selection: readonly string[];
   readonly busy: boolean;
+  /**
+   * 自动签到状态覆盖（P4b-3）：事件回填后的台账优先于快照值。
+   * undefined = 尚未接管（用快照），null = 本产品无自动签到数据。
+   */
+  readonly autoOverride?: CheckinAutoStatusView | null;
+}
+
+/** 快照 → 自动签到状态（页面首帧基线；无数据产品返回 null）。 */
+export function autoStatusOf(snapshot: CheckinSnapshot): CheckinAutoStatusView | null {
+  if (snapshot.kind === "trae") {
+    const auto = snapshot.trae.auto;
+    return auto === null
+      ? null
+      : { enabled: auto.enabled, daily_time_hhmm: auto.daily_time_hhmm, ledger: auto.ledger };
+  }
+  const auto = snapshot.workbuddy.auto;
+  return auto === null
+    ? null
+    : { enabled: auto.enabled, daily_time_hhmm: auto.daily_time_hhmm, ledger: auto.ledger };
 }
 
 // ===== 状态文案映射（两产品同一套词，差异只在测试锚点） =====
@@ -200,6 +243,16 @@ const VIEW_BUILDERS: Record<string, ViewBuilder> = {
   [CURRENT_PRODUCT_ID]: traeCheckinView,
   workbuddy: workbuddyCheckinView,
 };
+/**
+ * 状态行取值（P4b-3）：事件回填值优先（autoOverride 已接管时），
+ * 否则用快照里的自动签到状态。builder 各自调用，页面不重复判断。
+ */
+export function autoFor(
+  input: CheckinViewInput,
+  snapshotAuto: CheckinAutoStatusView | null,
+): CheckinAutoStatusView | null {
+  return input.autoOverride === undefined ? snapshotAuto : input.autoOverride;
+}
 
 const DEFAULT_BUILDER: ViewBuilder = VIEW_BUILDERS[CURRENT_PRODUCT_ID];
 
