@@ -1,3 +1,4 @@
+import { Fragment, type ReactNode } from "react";
 import { ArrowLeft, Cpu, RefreshCw } from "lucide-react";
 import { Badge } from "../../../ui/Badge";
 import { SectionHeader } from "../../../ui/SectionHeader";
@@ -18,6 +19,17 @@ export interface AccountDetailPageProps {
   onBack(): void;
   /** 分区内动作统一出口：动作 id 原样透出，语义归页面。 */
   onAction(id: string): void;
+  /**
+   * 登录设备插槽（P4c-7c-1）：旧 AccountDetail 把 RemoteDevicesPanel 内嵌在
+   * 「操作区之后、危险区之前」（L488-497），本渲染器同样插在该位置。
+   * 缺省 = 本产品无设备能力（WB devices=false），不占位也不臆造。
+   */
+  devicesSlot?: ReactNode;
+  /**
+   * 弹层插槽（P4c-7c-1）：详情页的二次确认弹层必须渲染在 region 内部
+   * （旧 AccountDetail L532-543 同位置），e2e 以「账号详情」region 为作用域取弹层。
+   */
+  dialogsSlot?: ReactNode;
 }
 
 /** 动作色档：与页头同一套按钮族（primary / 次要描边 / 危险）。 */
@@ -175,9 +187,12 @@ function SectionBlock({ section, busy, onAction }: SectionBlockProps) {
 }
 
 /** 详情页装配：页头（返回 + 标题 + 徽章组）+ 按 sections[] 顺序渲染分区。 */
-export function AccountDetailPage({ view, busy, onBack, onAction }: AccountDetailPageProps) {
+export function AccountDetailPage({ view, busy, onBack, onAction, devicesSlot, dialogsSlot }: AccountDetailPageProps) {
   // 忙碌位优先级：页面显式传入 > builder 镜像的 view.busy > 空闲（不猜进行中的动作）。
   const running = busy ?? view.busy ?? [];
+  // 设备插槽落位：危险区之前（旧布局 L488-497）；无危险区则垫在分区末尾。
+  const dangerAt = view.sections.findIndex((section) => section.id === "danger");
+  const devicesAt = devicesSlot === undefined ? -1 : dangerAt < 0 ? view.sections.length : dangerAt;
   return (
     <section className="account-detail" role="region" aria-label="账号详情">
       <header className="page-header">
@@ -197,9 +212,14 @@ export function AccountDetailPage({ view, busy, onBack, onAction }: AccountDetai
           ))}
         </div>
       </header>
-      {view.sections.map((section) => (
-        <SectionBlock key={section.id} section={section} busy={running} onAction={onAction} />
+      {view.sections.map((section, index) => (
+        <Fragment key={section.id}>
+          {index === devicesAt && devicesSlot}
+          <SectionBlock section={section} busy={running} onAction={onAction} />
+        </Fragment>
       ))}
+      {devicesAt === view.sections.length && devicesSlot}
+      {dialogsSlot}
     </section>
   );
 }

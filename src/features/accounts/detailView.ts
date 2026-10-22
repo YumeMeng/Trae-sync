@@ -144,6 +144,11 @@ const BUILDERS: Record<string, (input: DetailViewInput) => DetailViewModel> = {
   },
   workbuddy: (input) => workbuddyDetail(accountCapabilitiesFor(input.productId), payloadOf<WorkBuddyDetailSnapshot>(input.snapshot, "workbuddy"), input.row),
 };
+/** 单账号「刷新登录凭据」动作 id（P4c-7c-1 页面接线用）：两产品同语义，逐字沿用旧 testid。 */
+export const DETAIL_CREDENTIAL_REFRESH_ACTIONS: readonly string[] = [
+  "account-detail-refresh-credentials", // 旧 AccountDetail L455
+  "workbuddy-detail-refresh-credentials", // WB 详情的前瞻 id（当前 builder 未产出，页面按 id 直连）
+];
 /** 快照 + 行 → 详情视图模型（纯函数）；未登记产品 fail-closed：只有行标题与徽章，无分区无动作。 */
 export function buildDetailView(input: DetailViewInput): DetailViewModel {
   return BUILDERS[input.productId]?.(input) ?? { header: { title: input.row.displayName, badges: input.row.badges }, sections: [] };

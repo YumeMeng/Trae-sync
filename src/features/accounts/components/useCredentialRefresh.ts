@@ -25,6 +25,12 @@ export interface CredentialRefreshInput {
   readonly targets: () => readonly CredentialRefreshTarget[];
   /** 成功后重读本机缓存（不联网）。 */
   readonly onRefreshed?: () => Promise<void>;
+  /**
+   * 单账号路径的成功回执（P4c-7c-1）：非空时成功只发该句 notify.success
+   * （旧 AccountDetail L201 逐字），缺省走批量摘要 notify.summary。
+   * 失败仍逐条给原因——不把失败压平成成功。
+   */
+  readonly successMessage?: string;
 }
 
 export interface CredentialRefreshResult {
@@ -70,7 +76,14 @@ export function useCredentialRefresh(input: CredentialRefreshInput): CredentialR
         displayName: (nameOf.get(item.profile_id) ?? item.screen_name) || "该账号",
         reason: safeUiErrorMessage(item.error_code, "登录凭据刷新未完成，请稍后重试。"),
       }));
-      notify.summary("凭据刷新完成", issues, results.filter((item) => item.refreshed).length);
+      const single = inputRef.current.successMessage;
+      if (single !== undefined) {
+        // 单账号路径：全部换发成功只发一句成功回执；失败仍按原因逐条报（不压平）。
+        if (issues.length === 0) notify.success(single);
+        else notify.error(issues[0].reason);
+      } else {
+        notify.summary("凭据刷新完成", issues, results.filter((item) => item.refreshed).length);
+      }
       await onRefreshed?.();
       return true;
     } catch (reason: unknown) {

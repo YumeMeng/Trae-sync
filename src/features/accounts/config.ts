@@ -167,6 +167,7 @@ export const ACCOUNT_TEXTS = {
   deleteConfirmLabelWorkbuddy: "确认删除", // WorkBuddyAccountDetail L406
   deleteBusyLabel: "删除中…", // AccountDetail L181 / WorkBuddyAccountDetail L407
   failureFallback: "操作未完成，请稍后重试。", // AccountDetail L91（详情操作失败兜底）
+  credentialRefreshed: "登录凭据已更新，无需重新登录。", // AccountDetail L201（详情单账号换发成功回执）
   refreshFailureKept: "刷新未完成，正在显示上次读取到的账号信息。", // 已有数据时刷新失败：保留旧数据 + 通知（旧 G15 语义）
   notifyPrefixWorkbuddy: "WorkBuddy：", // WorkBuddyPanel L208 等（全角冒号）
 } as const;
