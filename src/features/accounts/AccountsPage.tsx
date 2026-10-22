@@ -1,14 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowDownAZ, UserRound, UserPlus } from "lucide-react";
+import { useCallback, useState } from "react";
+import { UserRound, UserPlus } from "lucide-react";
 import { EmptyState } from "../../components/shared/EmptyState";
 import { ProductBadge } from "../../components/shared/ProductBadge";
 import type { AccountSnapshot } from "../../platform/accountAdapter";
-import { notify } from "../../platform/notify";
-import { ACCOUNT_TEXTS, type AccountRowView, type AccountsView } from "./config";
+import type { AccountRowView, AccountsView } from "./config";
 import { AccountsHeader } from "./components/AccountsHeader";
 import { AccountsRows, type AccountsRowView } from "./components/AccountsRows";
+import { AccountsListControls } from "./components/AccountsListControls";
+import { useRetainedAccountsData } from "./components/useRetainedAccountsData";
 import { useAccountBatchProgress, type AccountBatchProgressMap } from "./components/useAccountBatchProgress";
-import { useAccountsSnapshot, type AccountsData, type TraeAccountsData, type WorkBuddyAccountsData } from "./components/useAccountsSnapshot";
+import { CredentialRefreshDialog } from "./components/CredentialRefreshDialog";
+import { useCredentialRefresh, type CredentialRefreshTarget } from "./components/useCredentialRefresh";
+import { refreshCheckinCredentials } from "../../platform/accounts";
+import type { CredentialRefreshEntryDto } from "../../types/account_switch";
+import { effectiveDisplayName } from "../../utils/accountDisplay";
+import { useAccountsSnapshot, type TraeAccountsData, type WorkBuddyAccountsData } from "./components/useAccountsSnapshot";
 import { accountsViewFor, type AccountsSnapshot } from "./registry";
 import { traePoolFields, traeRowFace, traeRowTestIds, type TraeAccountsSnapshot } from "./traeAccounts";
 import { workbuddyRowTestIds } from "./workbuddyAccounts";
@@ -33,6 +39,8 @@ interface PageUi {
   readonly localRefresh: boolean; // 纯本地刷新进行中（只重读本机缓存，不联网）
   /** 三路批量进度：某链有进度即该批量在跑（只用于算禁用）。 */
   readonly progress: AccountBatchProgressMap;
+  /** 批量刷新凭据的二次确认执行中（入口在页头；与进度事件同源，任一为真即禁用）。 */
+  readonly credentialBusy: boolean;
   /** 适配器面（仅测试注入路径）：undefined = 生产路径，池面恒缺席。 */
   readonly adapterPool?: AccountSnapshot;
 }
@@ -43,6 +51,12 @@ interface PageAdapter {
   readonly progressId: string;
   readonly refreshLocalActionId: string;
   readonly listTestId?: string;
+  /** 批量刷新凭据入口（页头动作 id + 命令 + 目标解析）；缺省即本产品不提供（fail-closed）。 */
+  readonly credentialRefresh?: {
+    readonly actionId: string;
+    readonly refresh: (profileIds: readonly string[]) => Promise<readonly CredentialRefreshEntryDto[]>;
+    readonly targets: (payload: unknown) => readonly CredentialRefreshTarget[];
+  };
   readonly compose: (payload: unknown, ui: PageUi) => AccountsSnapshot;
   /** 行锚点与「使用中」不可见锚点：视觉表达仍归 builder 的 accent 徽章，此处只承载旧 testid。 */
   readonly testIds: (row: AccountRowView, snapshot: AccountsSnapshot) => { readonly row: string; readonly selected: string };
@@ -59,7 +73,7 @@ const composeTrae = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
       // 登录 / 切号 / 工具账号选择在 6b-2 接入，本票恒空闲。
       login: false, switching: false, toolSelection: false, localRefresh: ui.localRefresh,
       credits: ui.progress.credits_refresh !== undefined,
-      credentialRefresh: ui.progress.credential_refresh !== undefined,
+      credentialRefresh: ui.progress.credential_refresh !== undefined || ui.credentialBusy,
       health: ui.progress.health_check !== undefined,
     },
   },
@@ -92,6 +106,13 @@ const PAGE_ADAPTERS: Record<string, PageAdapter> = {
     // 账号域批量事件协议值沿用 "work_cn"（ADR-0035：链路标识，不是产品切换概念）。
     progressId: "work_cn",
     refreshLocalActionId: "account-refresh-local",
+    // 批量刷新凭据：真实总览面才给入口（builder 同一门禁），目标即总览全部账号。
+    credentialRefresh: {
+      actionId: "account-refresh-credentials",
+      refresh: (profileIds) => refreshCheckinCredentials({ profileIds }),
+      targets: (payload) => (payload as TraeAccountsData).overview
+        .map((entry) => ({ profileId: entry.profile_id, displayName: effectiveDisplayName(entry) })),
+    },
     compose: composeTrae,
     testIds: traeTestIds,
   },
@@ -138,44 +159,43 @@ export function AccountsPage(props: AccountsPageProps) {
   const [pending, setPending] = useState<string | null>(null);
   const refreshLocalActionId = adapter?.refreshLocalActionId ?? "";
   const localRefreshBusy = pending !== null;
-  // 已成功读到的数据面（按「产品 + 可见性」作用域）：刷新失败时 hook 会清快照，页面据此继续渲染
-  // 旧数据——首次加载失败才落错误卡。载荷键缺失即别的产品的迟到快照，不认也不进保留位（不跨产品串数据）。
-  const scope = `${productId}|${active}`;
-  const payloadOf = (value: AccountsData): unknown =>
-    (value as unknown as Record<string, unknown>)[adapter?.payloadKey ?? ""];
-  const fresh: AccountsData | null = data !== null && payloadOf(data) !== undefined ? data : null;
-  const kept = useRef<{ scope: string; data: AccountsData | null }>({ scope, data: null });
-  if (kept.current.scope !== scope) kept.current = { scope, data: null };
-  if (fresh !== null && kept.current.data !== fresh) kept.current = { scope, data: fresh };
-  const keptData = kept.current.data;
-  // 刷新失败但已有快照：保留数据 + notify.error（旧 G15 语义）。只在刷新收尾后提示（进行中
-  // 的 error 不提示），且每次点击最多提示一次——notified 在发起刷新时清空，重复失败仍有反馈。
-  const notified = useRef<string | null>(null);
-  useEffect(() => {
-    if (error === null) { notified.current = null; return; }
-    if (localRefreshBusy || keptData === null || notified.current === error) return;
-    notified.current = error;
-    notify.error(error, ACCOUNT_TEXTS.refreshFailureKept);
-  }, [error, keptData, localRefreshBusy]);
+  // 数据面保留位：刷新失败时继续渲染上次读到的数据（首次加载失败才落错误卡）。
+  const { shown } = useRetainedAccountsData(
+    data, adapter?.payloadKey ?? "", `${productId}|${active}`, error, localRefreshBusy,
+  );
 
-  // 纯本地刷新：只重读本机缓存（零网络命令）；失败由上面的通知路径处理，不清数据。
+  // 纯本地刷新：只重读本机缓存（零网络命令）；失败由保留位的通知路径处理，不清数据。
   const handleRefreshLocal = useCallback(() => {
     if (localRefreshBusy) return;
-    notified.current = null; // 新一轮刷新：允许同原因的失败再次提示
     setPending(refreshLocalActionId);
     void refreshLocal().finally(() => setPending(null));
   }, [localRefreshBusy, refreshLocal, refreshLocalActionId]);
-  // 页头动作分发：本票只实现「刷新」（纯本地），其余动作原样透出给 6b-2。
+  // 批量刷新凭据：入口只开二次确认弹层，确认后换发全部账号并重读缓存（旧 L680-729 同契约）。
+  // 目标在确认时才解析（用最新快照），命令与入口 id 来自产品接缝表，缺省即不提供该入口。
+  const credential = adapter?.credentialRefresh;
+  const credentialRefresh = useCredentialRefresh({
+    refresh: credential?.refresh,
+    targets: () => credential === undefined || adapter === undefined || shown === null
+      ? [] : credential.targets((shown as unknown as Record<string, unknown>)[adapter.payloadKey]),
+    onRefreshed: refreshLocal,
+  });
+  // 换发进行中：二次确认执行中，或进度事件链在跑（两者同源表达，任一为真即禁用页头按钮）。
+  const credentialConfirmBusy = credentialRefresh.busy || progress.credential_refresh !== undefined;
+
+  // 快照合成：数据面按载荷键取（表内键与载荷键一一对应），再补页面自持字段。
+  const ui: PageUi = {
+    filter, sort, now: Math.floor(Date.now() / 1000), localRefresh: localRefreshBusy,
+    progress, credentialBusy: credentialConfirmBusy, adapterPool,
+  };
+
+  // 页头动作分发：刷新（纯本地）与批量刷新凭据在本页执行，其余动作原样透出给后续票。
   const handleHeaderAction = useCallback((actionId: string) => {
     if (actionId === "") return;
     if (actionId === refreshLocalActionId) { handleRefreshLocal(); return; }
+    if (actionId === credential?.actionId) { credentialRefresh.request(); return; }
     onHeaderAction?.(actionId);
-  }, [handleRefreshLocal, onHeaderAction, refreshLocalActionId]);
+  }, [credential?.actionId, credentialRefresh, handleRefreshLocal, onHeaderAction, refreshLocalActionId]);
 
-  // 快照合成：数据面按载荷键取（表内键与载荷键一一对应），再补页面自持字段。
-  const ui: PageUi = { filter, sort, now: Math.floor(Date.now() / 1000), localRefresh: localRefreshBusy, progress, adapterPool };
-  // 刷新失败时用保留的旧数据继续渲染（不清 snapshot）；两者皆无才落错误卡。
-  const shown: AccountsData | null = fresh ?? keptData;
   const composed: AccountsSnapshot | null = shown === null || adapter === undefined
     ? null
     : adapter.compose((shown as unknown as Record<string, unknown>)[adapter.payloadKey], ui);
@@ -211,43 +231,19 @@ export function AccountsPage(props: AccountsPageProps) {
       <AccountsHeader
         view={view.header}
         productBadge={<ProductBadge productId={productId} />}
-        busy={pending === null ? [] : [pending]}
+        busy={credentialConfirmBusy ? [credential?.actionId ?? ""] : pending === null ? [] : [pending]}
         onAction={handleHeaderAction}
       />
       <section className="account-center__profiles" aria-labelledby="account-mine-heading">
         <div className="account-center__section-heading">
           <h3 id="account-mine-heading"><UserRound size={16} aria-hidden="true" />我的账号</h3>
           {showControls && filters !== null && (
-            <div className="account-center__list-controls">
-              {/* 过滤档：选项、文案、计数与 testid 键全部来自 builder（testid = account-filter-<key>）。 */}
-              {filters.options.length > 0 && (
-                <div className="seg-control" role="group" aria-label="账号过滤">
-                  {filters.options.map((option) => (
-                    <button
-                      key={option.key}
-                      type="button"
-                      className={`seg-control__item${filters.active === option.key ? " seg-control__item--active" : ""}`}
-                      aria-pressed={filters.active === option.key}
-                      data-testid={`account-filter-${option.key}`}
-                      onClick={() => setFilter(option.key as PageFilter)}
-                    >
-                      {option.label}
-                      {option.count !== null && option.count > 0 && <span className="seg-control__count">{option.count}</span>}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {/* 排序档：只渲染 builder 给本产品的选项（WB 无「签到状态」）。 */}
-              <label className="account-center__sort-field">
-                <ArrowDownAZ size={14} aria-hidden="true" />
-                <span className="sr-only">排序方式</span>
-                <select value={sortValue} data-testid="account-sort" onChange={(event) => setSort(event.target.value as PageSort)}>
-                  {filters.sortOptions.map((option) => (
-                    <option key={option.key} value={option.key}>{option.label}</option>
-                  ))}
-                </select>
-              </label>
-            </div>
+            <AccountsListControls
+              filters={filters}
+              sortValue={sortValue}
+              onFilterChange={(key) => setFilter(key as PageFilter)}
+              onSortChange={(key) => setSort(key as PageSort)}
+            />
           )}
           {/* 计数口径 = 账号总数（builder 的 totalCount），不是本页可见行数。 */}
           <span className="section-caption">{view.totalCount} 个</span>
@@ -275,6 +271,15 @@ export function AccountsPage(props: AccountsPageProps) {
           />
         )}
       </section>
+      {/* 批量刷新凭据二次确认：仅入口存在且有目标时挂载（挂载即打开，关闭即卸载）。 */}
+      {credentialRefresh.open && credential !== undefined && (
+        <CredentialRefreshDialog
+          count={view.totalCount}
+          busy={credentialConfirmBusy}
+          onCancel={credentialRefresh.cancel}
+          onConfirm={() => void credentialRefresh.confirm()}
+        />
+      )}
     </section>
   );
 }

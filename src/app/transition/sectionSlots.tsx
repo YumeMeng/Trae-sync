@@ -20,7 +20,10 @@ import {
 } from "../../features/overview/OverviewPage";
 import { MasterLibraryDetail } from "../../pages/MasterLibraryDetail";
 import { WorkBuddyLibraryPage } from "../../pages/WorkBuddyLibraryPage";
-import { AccountWorkbench } from "../../components/AccountWorkbench";
+import {
+  AccountsPage,
+  type AccountsPageProps,
+} from "../../features/accounts/AccountsPage";
 import {
   CheckinPage,
   type CheckinPageProps,
@@ -63,6 +66,14 @@ const WorkBuddyCheckinSlot = (props: CheckinPageProps) => (
   <CheckinPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
 );
 
+// P4c-6c-1：accounts 的 TRAE 槽位切到合并页（首次真接线）。与 overview / checkin
+// 同一形态：接缝内绑定产品协议值，页面内零产品判断。App 只传 active，故这里
+// 不额外映射跳转/动作回调——onOpenDetail / onHeaderAction / onRowAction 缺省即
+// 不执行（详情页与批量动作分别归 P4c-7 / 6b-2，本票不顺手做）。
+const TraeAccountsSlot = (props: AccountsPageProps) => (
+  <AccountsPage {...props} productId={CURRENT_PRODUCT_ID} />
+);
+
 /**
  * 六区块 × 两产品的实现登记表（settings 也登记：其 WB 变体曾是整页早返回）。
  * 只登记、不判断：产品选择逻辑全部在 resolveSection 一处。
@@ -70,7 +81,8 @@ const WorkBuddyCheckinSlot = (props: CheckinPageProps) => (
 export const SECTION_SLOTS: Record<SectionKey, SectionSlot> = {
   // P4a：两产品指向同一份总览实现（迁移完成的正常形态）。
   overview: { trae: TraeOverviewSlot, workbuddy: WorkBuddyOverviewSlot },
-  accounts: { trae: AccountWorkbench, workbuddy: WorkBuddyPanel },
+  // P4c-6c-1：TRAE 已切合并页；workbuddy 仍用旧 WorkBuddyPanel（未迁移）。
+  accounts: { trae: TraeAccountsSlot, workbuddy: WorkBuddyPanel },
   // P4b-3：两产品指向同一份签到实现（迁移完成的正常形态）。
   checkin: { trae: TraeCheckinSlot, workbuddy: WorkBuddyCheckinSlot },
   environment: { trae: EnvironmentPage, workbuddy: WorkBuddyEnvironmentPage },
