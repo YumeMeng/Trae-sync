@@ -13,13 +13,14 @@
 import { test, expect, type Page } from "@playwright/test";
 import { installMockBridge } from "./mock-bridge";
 
-// 产品切换：标题栏原生 select 写入后端指针 → App 重读 → 槽位重挂载。
+// 产品切换：标题栏原生 select 写入后端后端指针 → App 重读 → 槽位重挂载。
+// P4a：总览标题已统一为「总览」（产品名只在标题栏），故切换完成的可见证据
+// 改为 WorkBuddy 数据面的统计卡——它只在 WB 数据面出现，比标题更精确。
 async function switchToWorkBuddy(page: Page) {
   const switcher = page.getByTestId("product-switcher");
   await expect(switcher).toBeVisible();
   await switcher.selectOption("workbuddy");
-  // 切换完成的可见证据：总览问候语改为 WorkBuddy 工作台。
-  await expect(page.getByRole("heading", { level: 1, name: /WorkBuddy 工作台$/ })).toBeVisible();
+  await expect(page.getByTestId("wb-overview-checkin")).toBeVisible();
 }
 
 // console error 采集：Playwright 的 console 事件按页收集，断言前统一取出。

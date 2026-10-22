@@ -209,9 +209,9 @@ test.describe("桌面尺寸与滚动验收", () => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
 
-    // 产品切换器已随单产品塌缩移除；问候语固定单产品展示名。
+    // 产品切换器已随单产品塌缩移除；P4a 合并页标题统一「总览」（产品名在标题栏）。
     await expect(page.getByRole("combobox", { name: "当前产品" })).toHaveCount(0);
-    await expect(page.getByRole("heading", { level: 1, name: /TRAE 工作台$/ })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "总览" })).toBeVisible();
 
     // P15-10（ADR-0035）：单产品五页全开放；账号 region 是完整账号事务工作台。
     await page.getByTestId("navigation-accounts").click();

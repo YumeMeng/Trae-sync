@@ -13,9 +13,11 @@
 // 六页全部迁完时本文件整份删除（届时 app 层不再有任何产品整页分支）。
 import type { ComponentType } from "react";
 import type { SectionKey } from "../../platform/productRegistry";
-import { WORKBUDDY_PRODUCT_ID } from "../../types/product";
-import { OverviewPage } from "../../pages/OverviewPage";
-import { WorkBuddyOverviewPage } from "../../pages/WorkBuddyOverviewPage";
+import { CURRENT_PRODUCT_ID, WORKBUDDY_PRODUCT_ID } from "../../types/product";
+import {
+  OverviewPage,
+  type OverviewPageProps,
+} from "../../features/overview/OverviewPage";
 import { MasterLibraryDetail } from "../../pages/MasterLibraryDetail";
 import { WorkBuddyLibraryPage } from "../../pages/WorkBuddyLibraryPage";
 import { AccountWorkbench } from "../../components/AccountWorkbench";
@@ -37,12 +39,24 @@ export interface SectionSlot {
   workbuddy: ComponentType<any>;
 }
 
+// P4a：overview 已合并为一份实现。两个槽位在接缝内各自绑定产品协议值后指向
+// 同一组件——页面内零产品判断（差异全在 features/overview 的声明式配置），
+// 而「切产品即重挂载重拉数据」的既有契约保持不变（两个包装组件类型不同）。
+// 产品绑定只能发生在接缝里，这是 E-01 登记的唯一允许位置。
+const TraeOverviewSlot = (props: OverviewPageProps) => (
+  <OverviewPage {...props} productId={CURRENT_PRODUCT_ID} />
+);
+const WorkBuddyOverviewSlot = (props: OverviewPageProps) => (
+  <OverviewPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
+);
+
 /**
  * 六区块 × 两产品的实现登记表（settings 也登记：其 WB 变体曾是整页早返回）。
  * 只登记、不判断：产品选择逻辑全部在 resolveSection 一处。
  */
 export const SECTION_SLOTS: Record<SectionKey, SectionSlot> = {
-  overview: { trae: OverviewPage, workbuddy: WorkBuddyOverviewPage },
+  // P4a：两产品指向同一份总览实现（迁移完成的正常形态）。
+  overview: { trae: TraeOverviewSlot, workbuddy: WorkBuddyOverviewSlot },
   accounts: { trae: AccountWorkbench, workbuddy: WorkBuddyPanel },
   checkin: { trae: CheckinPage, workbuddy: WorkBuddyCheckinPage },
   environment: { trae: EnvironmentPage, workbuddy: WorkBuddyEnvironmentPage },

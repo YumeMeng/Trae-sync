@@ -1,13 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { OverviewPage } from "../src/pages/OverviewPage";
+import { OverviewPage } from "../src/features/overview/OverviewPage";
 import type { WorkspaceStateDto } from "../src/types/workspace";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
 
 // ============================================================================
-// OverviewPage（P15-10 单产品塌缩后）：
-// 问候语取单产品展示名「TRAE」（注册表 PRODUCT_DISPLAY_NAME）；
-// 总览恒 ready：证据带 + 签到摘要 + 主库统计正常渲染。
+// OverviewPage（P4a 合并页）：标题统一为「总览」（问候语已删，产品名在标题栏）；
+// 总览恒 ready：证据带 + 摘要条（主库统计）正常渲染。
 // ============================================================================
 
 // P13-5：共享 fakeInvoke 路由器（迁移模式见 tests/helpers/fakeInvoke.ts 头注释）。
@@ -75,7 +74,7 @@ function setupReadyMocks() {
   }));
 }
 
-describe("OverviewPage 单产品塌缩", () => {
+describe("OverviewPage 合并页（P4a）", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // 等价于原 vi.fn() 空实现：清历史 + 重装按路由表分发的实现。
@@ -83,18 +82,32 @@ describe("OverviewPage 单产品塌缩", () => {
     installFakeInvoke();
   });
 
-  it("问候语固定为单产品展示名「TRAE 工作台」，零 Work CN 表述", () => {
+  it("标题统一为「总览」：无问候语、不重复产品名", () => {
     setupReadyMocks();
-    render(<OverviewPage state={workspaceState()} active onNavigate={() => undefined} />);
+    render(
+      <OverviewPage
+        state={workspaceState()}
+        active
+        productId="trae_cn"
+        onNavigate={() => undefined}
+      />,
+    );
     const heading = screen.getByRole("heading", { level: 1 });
-    // 时段词（早上好/下午好等）随真实时间变化，断言产品名后缀稳定存在。
-    expect(heading).toHaveTextContent(/，这里是你的 TRAE 工作台$/);
+    expect(heading).toHaveTextContent(/^总览$/);
+    expect(heading).not.toHaveTextContent("工作台");
     expect(heading).not.toHaveTextContent("Work CN");
   });
 
   it("ready 形态：无 pending/absent 说明卡，证据带与统计卡正常", async () => {
     setupReadyMocks();
-    render(<OverviewPage state={workspaceState()} active onNavigate={() => undefined} />);
+    render(
+      <OverviewPage
+        state={workspaceState()}
+        active
+        productId="trae_cn"
+        onNavigate={() => undefined}
+      />,
+    );
     expect(screen.queryByTestId("capability-pending")).not.toBeInTheDocument();
     expect(screen.queryByTestId("capability-absent")).not.toBeInTheDocument();
     expect(await screen.findByTestId("current-account-context")).toBeInTheDocument();

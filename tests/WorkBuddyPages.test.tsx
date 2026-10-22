@@ -17,7 +17,7 @@ vi.mock("../src/platform/notify", () => ({
   },
 }));
 
-import { WorkBuddyOverviewPage } from "../src/pages/WorkBuddyOverviewPage";
+import { OverviewPage } from "../src/features/overview/OverviewPage";
 import type { AppPage } from "../src/components/NavigationRail";
 
 /** P19-B3 库统计回执（serde 命名与 workbuddy_library.rs 同构）。 */
@@ -63,11 +63,17 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
-describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
+describe("总览页 WorkBuddy 数据面（P4a 合并页）", () => {
   it("渲染：签到与账号统计卡（账号/今日已签/余额+累计两行）+ 会话统计卡 + 主操作", async () => {
     installOverviewRoutes();
     const pages: AppPage[] = [];
-    render(<WorkBuddyOverviewPage active={true} onNavigate={(page) => pages.push(page)} />);
+    render(
+      <OverviewPage
+        active={true}
+        productId="workbuddy"
+        onNavigate={(page: AppPage) => pages.push(page)}
+      />,
+    );
 
     // 签到与账号卡：账号 2、今日已签 1/2；P19.2③ 拆两行——积分余额 720
     //（credits_balance 420+300）+ 本期签到累计 1200（total_credits 700+500）。
@@ -93,7 +99,7 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
     installOverviewRoutes({ failStats: true });
     mockRoute("list_workbuddy_checkin_accounts", () => Promise.reject(new Error("down")));
     mockRoute("get_workbuddy_checkin_overview", () => Promise.reject(new Error("down")));
-    render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
+    render(<OverviewPage active={true} productId="workbuddy" onNavigate={() => undefined} />);
 
     await waitFor(() => {
       expect(screen.getByTestId("wb-overview-library-hint")).toBeInTheDocument();
@@ -110,7 +116,7 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
       errorRow("wb-uid-1", "甲账号"),
       errorRow("wb-uid-2", "乙账号"),
     ]);
-    render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
+    render(<OverviewPage active={true} productId="workbuddy" onNavigate={() => undefined} />);
 
     const unknown = await screen.findByTestId("wb-overview-credits-unknown");
     // P19.2⑤：占位注明失败账号计数（balance_error 汇总口径）。
@@ -136,7 +142,7 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
       creditsRow("wb-uid-1", "甲账号", 700, 420),
       errorRow("wb-uid-2", "乙账号"),
     ]);
-    render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
+    render(<OverviewPage active={true} productId="workbuddy" onNavigate={() => undefined} />);
 
     await screen.findByTestId("wb-overview-checkin");
     // 余额/累计合计只含获取成功的账号；注明 N/M。
@@ -151,7 +157,7 @@ describe("WorkBuddyOverviewPage（P19-B6 总览工作台模板）", () => {
       { ...creditsRow("wb-uid-1", "甲账号", 700, 420), credits_balance: null, credits_total: null },
       { ...creditsRow("wb-uid-2", "乙账号", 500, 300), credits_balance: null, credits_total: null },
     ]);
-    render(<WorkBuddyOverviewPage active={true} onNavigate={() => undefined} />);
+    render(<OverviewPage active={true} productId="workbuddy" onNavigate={() => undefined} />);
 
     await screen.findByTestId("wb-overview-checkin");
     // 余额全 null（error 仍空）→ 余额行占位化（合计无从谈起），不显示 0。

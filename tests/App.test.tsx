@@ -378,10 +378,10 @@ describe("应用工作区入口", () => {
       expect(screen.getByTestId(`navigation-${page}`)).toBeInTheDocument();
     }
 
-    // overview = ready：问候语固定单产品展示名，证据带与统计卡正常。
+    // overview = ready：P4a 合并页标题统一「总览」（产品名在标题栏），证据带与统计卡正常。
     const overviewRegion = screen.getByRole("region", { name: "总览" });
     expect(
-      within(overviewRegion).getByRole("heading", { level: 1, name: /TRAE 工作台$/ }),
+      within(overviewRegion).getByRole("heading", { level: 1, name: "总览" }),
     ).toBeInTheDocument();
     expect(within(overviewRegion).queryByTestId("capability-pending")).not.toBeInTheDocument();
     expect(within(overviewRegion).getByTestId("current-account-context")).toBeVisible();

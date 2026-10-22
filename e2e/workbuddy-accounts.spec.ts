@@ -13,7 +13,7 @@ async function switchToWorkBuddy(page: Page) {
   const switcher = page.getByTestId("product-switcher");
   await expect(switcher).toBeVisible();
   await switcher.selectOption("workbuddy");
-  await expect(page.getByRole("heading", { level: 1, name: /WorkBuddy 工作台$/ })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "总览" })).toBeVisible();
 }
 
 test.describe("P2b WorkBuddy 账号页冒烟", () => {
