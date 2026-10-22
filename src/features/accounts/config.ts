@@ -173,3 +173,29 @@ export const ACCOUNT_TEXTS = {
 
 /** 文案键类型（builder 取文案时获得字面量补全）。 */
 export type AccountTextKey = keyof typeof ACCOUNT_TEXTS;
+
+// ===== 详情页视图模型（P4c-7a）：字段 / 动作 / 整体；六区声明复用上方 DetailSectionView =====
+
+/** 详情字段渲染附加信息：tone 只表达需处理程度（不提供成功绿）；hint 非空即给悬浮/行内说明。 */
+export interface DetailFieldView {
+  readonly label: string;
+  readonly value: string;
+  readonly tone?: "neutral" | "warn" | "danger";
+  readonly hint?: string;
+}
+
+/** 详情动作：disabledReason 非空即禁用并给悬浮说明（与页头动作的 disabled.reason 同一口径）。 */
+export interface DetailActionView {
+  readonly id: string;
+  readonly label: string;
+  readonly kind: AccountActionKind;
+  readonly disabledReason?: string;
+}
+
+/** 详情页视图模型：页头 + 六区（basics→credential→checkin→actions→danger→tech，缺省不出现）。 */
+export interface DetailViewModel {
+  readonly header: { readonly title: string; readonly subtitle?: string; readonly badges: readonly AccountBadgeView[] };
+  readonly sections: readonly DetailSectionView[];
+  /** 进行中的动作 id：按钮只加忙碌态，文案覆盖由 builder 的 label 决定。 */
+  readonly busy?: readonly string[];
+}
