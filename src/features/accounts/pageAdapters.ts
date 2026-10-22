@@ -28,6 +28,9 @@ export interface PageUi {
   readonly progress: AccountBatchProgressMap;
   /** 批量刷新凭据的二次确认执行中（入口在页头；与进度事件同源，任一为真即禁用）。 */
   readonly credentialBusy: boolean;
+  /** 页头批量动作在跑（P4c-6b-2b）：无进度事件的产品（WB）只有这一路可表达忙碌。 */
+  readonly creditsBusy: boolean;
+  readonly healthBusy: boolean;
   /** 适配器面（仅测试注入路径）：undefined = 生产路径，池面恒缺席。 */
   readonly adapterPool?: AccountSnapshot;
 }
@@ -68,9 +71,10 @@ const composeTrae = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
     busy: {
       // 登录 / 切号 / 工具账号选择在 6b-2 接入，本票恒空闲。
       login: false, switching: false, toolSelection: false, localRefresh: ui.localRefresh,
-      credits: ui.progress.credits_refresh !== undefined,
+      // 额度/健康检测：进度事件与动作忙碌位同源（TRAE 两路都有，任一为真即禁用）。
+      credits: ui.progress.credits_refresh !== undefined || ui.creditsBusy,
       credentialRefresh: ui.progress.credential_refresh !== undefined || ui.credentialBusy,
-      health: ui.progress.health_check !== undefined,
+      health: ui.progress.health_check !== undefined || ui.healthBusy,
     },
   },
 });
