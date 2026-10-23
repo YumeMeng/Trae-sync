@@ -179,7 +179,9 @@ export function buildTraeLibraryView(snapshot: TraeLibrarySnapshot): TraeLibrary
   const canArchive = base !== "none" && ops.states.get(ARCHIVE_OP) === "ready"; // L185
   const canWorkMerge = full && ops.states.get(WORK_MERGE_OP) === "ready"; // L186
   const canDelete = full && ops.states.get(DELETE_OP) === "ready"; // L187
-  const canCnMerge = ops.states.get(CN_MERGE_OP) === "ready"; // L188
+  const canCnMerge = ops.states.get(CN_MERGE_OP) === "ready";
+  // 选择入口可见性（L230-232）：归档视图看 归档/删除，正常视图看 归档/合并/删除；全不可写即无入口。
+  const canSelect = snapshot.archiveView ? canArchive || canDelete : canArchive || canWorkMerge || canDelete; // L188
   const draft = snapshot.archiveDraft, keyword = snapshot.searchText.trim(), tree = history !== null ? treeOf(history, snapshot, canArchive, canCnMerge) : [];
   // 选择摘要口径（L838-848）：当前视图的可见会话（含已归档、不含已删除），与搜索无关。
   const visible = history === null ? [] : snapshot.archiveView ? archivedSessionsOf(history.sessions, draft) : liveSessionsOf(history.sessions, draft);
@@ -214,6 +216,7 @@ export function buildTraeLibraryView(snapshot: TraeLibrarySnapshot): TraeLibrary
       ? { testId: "library-search-input", placeholder: LIBRARY_TEXTS.searchPlaceholder, ariaLabel: LIBRARY_TEXTS.searchAria, value: snapshot.searchText } : null, // L1520-1527
     tree, treeEmpty, viewer: history !== null ? viewerOf(snapshot, history) : null,
     batchBar: batchBarOf(snapshot, canArchive, canWorkMerge, canDelete, selected, mergeTargets), draftBar: draftBarOf(snapshot, canArchive),
+    selectionEntry: canSelect ? { label: LIBRARY_TEXTS.select, cancelLabel: LIBRARY_TEXTS.cancel } : null, // L1684-1701（锚由展示层持有）
     checkup: null, plugins: null, // §2-11 A 库页无体检（G18 在环境页）；§2-12 插件 tab 由 P4e-8 的 usePluginWorkbench 产出
     info: infoOf(snapshot), notices, texts: LIBRARY_VIEW_TEXTS.trae_cn,
   };

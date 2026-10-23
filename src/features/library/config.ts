@@ -93,6 +93,8 @@ export interface LibraryView {
   readonly search: { readonly testId: string; readonly placeholder: string; readonly ariaLabel: string; readonly value: string } | null;
   readonly tree: readonly ProjectNodeView[]; readonly treeEmpty: string; readonly viewer: ViewerPaneView | null;
   readonly batchBar: { readonly testId: string; readonly ariaLabel: string; readonly summary: string; readonly actions: readonly LibraryActionView[] } | null;
+  /** 选择入口（左栏底部「选择/取消」）：null = 该产品无此入口（WB 逐会话复选常显，不用开关）。 */
+  readonly selectionEntry: { readonly label: string; readonly cancelLabel: string } | null;
   readonly draftBar: {
     readonly testId: string; readonly ariaLabel: string; readonly summary: string;
     readonly discard: LibraryActionView; readonly apply: LibraryActionView;
