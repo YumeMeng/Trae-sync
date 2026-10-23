@@ -168,6 +168,9 @@ export const ACCOUNT_TEXTS = {
   deleteBusyLabel: "删除中…", // AccountDetail L181 / WorkBuddyAccountDetail L407
   failureFallback: "操作未完成，请稍后重试。", // AccountDetail L91（详情操作失败兜底）
   credentialRefreshed: "登录凭据已更新，无需重新登录。", // AccountDetail L201（详情单账号换发成功回执）
+  checkinClaimed: "签到成功，奖励已发放。", // AccountDetail L227（签到 claimed 回执）
+  checkinAlready: "今日已签到，无需重复领取。", // AccountDetail L229（already_checked_in 回执）
+  deviceReset: "签到设备已重置，下次签到将使用新设备。", // AccountDetail L207（重置设备成功回执）
   refreshFailureKept: "刷新未完成，正在显示上次读取到的账号信息。", // 已有数据时刷新失败：保留旧数据 + 通知（旧 G15 语义）
   notifyPrefixWorkbuddy: "WorkBuddy：", // WorkBuddyPanel L208 等（全角冒号）
   switchBusyLabel: "切换中…", // 旧 AccountCard 的 actionBusyLabel 缺省（SharedAccountEntry L73）

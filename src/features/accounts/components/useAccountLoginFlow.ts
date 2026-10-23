@@ -31,19 +31,32 @@ export interface AccountLoginFlow {
   readonly dialog: AccountLoginDialogProps | null;
   /** 页头动作分发：true = 已由本流程处理（打开弹层），调用方不再透出。 */
   readonly handle: (actionId: string) => boolean;
+  /**
+   * 直接打开登录弹层（P4c-6b-2e-1 详情「重新登录」）：旧 AccountDetail 的 onRelogin =
+   * AccountCenterTrae L898 handleLogin(false)，与页头「添加账号」同一条 OAuth 流程，
+   * 故复用同一弹层而非另起一套；false = 本产品未登记登录（动作原样透出）。
+   */
+  readonly open: () => boolean;
 }
 
 export function useAccountLoginFlow(wiring: PageLogin | null, onSettled: () => Promise<void>): AccountLoginFlow {
   const { beginLogin, completeLogin, cancelLogin, attempt, phase, loginUrl } = useAccountLogin(
     wiring?.commands ?? UNAVAILABLE_LOGIN_COMMANDS,
   );
-  // open = 用户打开意图；仍在进行中的 attempt 也保持挂载（取消太晚进入收尾时弹层不消失）。
-  const [open, setOpen] = useState(false);
+  // openIntent = 用户打开意图；仍在进行中的 attempt 也保持挂载（取消太晚进入收尾时弹层不消失）。
+  const [openIntent, setOpen] = useState(false);
   const [systemBrowser, setSystemBrowser] = useState(false);
-  const mounted = open || attempt !== null || phase !== "idle";
+  const mounted = openIntent || attempt !== null || phase !== "idle";
 
   const handle = useCallback((actionId: string): boolean => {
     if (wiring === null || actionId !== wiring.actionId) return false;
+    setOpen(true);
+    return true;
+  }, [wiring]);
+
+  // 详情「重新登录」入口：与页头同一弹层（旧 onRelogin 就是 handleLogin(false)）。
+  const openDialog = useCallback((): boolean => {
+    if (wiring === null) return false;
     setOpen(true);
     return true;
   }, [wiring]);
@@ -80,5 +93,5 @@ export function useAccountLoginFlow(wiring: PageLogin | null, onSettled: () => P
     onCancel: cancel,
   };
 
-  return { busy: attempt !== null || phase !== "idle", dialog, handle };
+  return { busy: attempt !== null || phase !== "idle", dialog, handle, open: openDialog };
 }

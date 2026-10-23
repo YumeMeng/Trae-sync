@@ -14,9 +14,15 @@ export interface DetailDangerActionProps {
   readonly hint: string | null;
   readonly busy: boolean;
   readonly onAction: (id: string) => void;
+  /**
+   * 确认弹层文案覆盖（P4c-6b-2e-1）：旧实现的二次确认正文不是危险区 hint 本身，
+   * 而是逐字更具体的「确定删除账号“X”吗？…」。缺省 = 沿用 action.label + hint
+   * （既有测试与未接线路径一字不改）。
+   */
+  readonly confirm?: { readonly title: string; readonly lines: readonly string[]; readonly confirmLabel: string; readonly busyLabel?: string };
 }
 
-export function DetailDangerAction({ action, hint, busy, onAction }: DetailDangerActionProps) {
+export function DetailDangerAction({ action, hint, busy, onAction, confirm }: DetailDangerActionProps) {
   // 弹层开合是纯本地 UI 状态（唯一 hook）：不承载数据，也不跨分区共享。
   const [open, setOpen] = useState(false);
   const disabled = action.disabledReason !== undefined || busy;
@@ -35,9 +41,10 @@ export function DetailDangerAction({ action, hint, busy, onAction }: DetailDange
       </button>
       {open && (
         <ConfirmDialog
-          title={action.label}
-          lines={hint === null ? undefined : [hint]}
-          confirmLabel={action.label}
+          title={confirm?.title ?? action.label}
+          lines={confirm?.lines ?? (hint === null ? undefined : [hint])}
+          confirmLabel={confirm?.confirmLabel ?? action.label}
+          busyLabel={confirm?.busyLabel}
           busy={busy}
           danger
           onCancel={() => setOpen(false)}

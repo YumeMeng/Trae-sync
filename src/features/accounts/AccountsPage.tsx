@@ -2,14 +2,13 @@ import { useCallback, useState } from "react";
 import { UserRound, UserPlus } from "lucide-react";
 import { EmptyState } from "../../components/shared/EmptyState";
 import { ProductBadge } from "../../components/shared/ProductBadge";
-import { RemoteDevicesPanel } from "../../components/RemoteDevicesPanel";
 import type { AccountSnapshot } from "../../platform/accountAdapter";
 import type { AccountRowView, AccountsView } from "./config";
 import { ACCOUNT_TEXTS } from "./config";
 import { AccountsHeader } from "./components/AccountsHeader";
 import { AccountsRows, type AccountsRowView } from "./components/AccountsRows";
 import { AccountsListControls } from "./components/AccountsListControls";
-import { AccountDetailPage } from "./components/AccountDetailPage";
+import { DetailViewSlot } from "./components/DetailViewSlot";
 import { CredentialRefreshDialog } from "./components/CredentialRefreshDialog";
 import { DetailCredentialRefreshDialog } from "./components/DetailCredentialRefreshDialog";
 import { useRetainedAccountsData } from "./components/useRetainedAccountsData";
@@ -19,8 +18,10 @@ import { useAccountsSnapshot } from "./components/useAccountsSnapshot";
 import { useHeaderBatchActions } from "./components/useHeaderBatchActions";
 import { useAccountLoginFlow } from "./components/useAccountLoginFlow";
 import { useRowActions } from "./components/useRowActions";
+import { useDetailActions } from "./components/useDetailActions";
 import { AccountLoginDialog } from "./components/AccountLoginDialog";
 import { actionWiringFor } from "./actionCommands";
+import { detailActionsFor } from "./detailActionCommands";
 import { accountsViewFor, type AccountsSnapshot } from "./registry";
 import { buildDetailView, DETAIL_CREDENTIAL_REFRESH_ACTIONS } from "./detailView";
 import { detailSnapshotFor } from "./detailSnapshot";
@@ -28,10 +29,9 @@ import { PAGE_ADAPTERS, addActionIdOf, type PageUi } from "./pageAdapters";
 import { AccountsSkeleton } from "./AccountsSkeleton";
 
 /**
- * 账号页装配（P4c-6b/6c/7c-1：读取 + 渲染 + 详情接线）。产品差异全部来自声明式配置：
- * 数据面由 useAccountsSnapshot 按产品取，列表视图由 registry.accountsViewFor 查表产出，
- * 产品接缝（载荷键/命令/锚点/设备绑定）在 pageAdapters，详情视图由 detailView 的 builder 产出。
- * 本文件零 productId 相等判断、零 invoke(。
+ * 账号页装配（P4c-6b/6c/7c-1/6b-2e-1：读取 + 渲染 + 详情接线）。产品差异全部来自声明式配置：
+ * 数据面 useAccountsSnapshot、列表 registry.accountsViewFor、接缝 pageAdapters + detailActionCommands、
+ * 详情视图 detailView 的 builder。本文件零 productId 相等判断、零 invoke(。
  */
 
 /** 会话内过滤档（G14）：仅 TRAE 真实总览面出现，页面只持值、不判断产品。 */
@@ -63,8 +63,7 @@ export function AccountsPage(props: AccountsPageProps) {
   const { progress, reset: progressReset } = useAccountBatchProgress(adapter?.progressId ?? productId);
   const [filter, setFilter] = useState<PageFilter>("all");
   const [sort, setSort] = useState<PageSort>("added");
-  // 正在执行的页头动作 id（非空即本地刷新在跑：页头转圈 + 禁用）。
-  const [pending, setPending] = useState<string | null>(null);
+  const [pending, setPending] = useState<string | null>(null); // 非空即本地刷新在跑（页头转圈 + 禁用）
   // 详情选择（P4c-7c-1）：非空即渲染详情视图；返回列表 = 清空（旧骨架 selectedProfileId 同法）。
   const [selectedRowId, setSelectedRowId] = useState("");
   const refreshLocalActionId = adapter?.refreshLocalActionId ?? "";
@@ -91,8 +90,7 @@ export function AccountsPage(props: AccountsPageProps) {
     wiring, targets: () => wiring?.targets(selectedRowId) ?? [], onSettled: refreshLocal, resetProgress: progressReset,
   });
 
-  // 批量刷新凭据：入口只开二次确认弹层，确认后换发全部账号并重读缓存（旧 L680-729 同契约）。
-  // 目标在确认时才解析（用最新快照），命令与入口 id 来自产品接缝表，缺省即不提供该入口。
+  // 批量刷新凭据（旧 L680-729 同契约）：入口只开二次确认弹层，目标确认时才解析；缺省即无入口。
   const credential = adapter?.credentialRefresh;
   const listCredential = useCredentialRefresh({
     refresh: credential?.refresh,
@@ -103,8 +101,7 @@ export function AccountsPage(props: AccountsPageProps) {
   // 换发进行中：二次确认执行中，或进度事件链在跑（两者同源表达，任一为真即禁用页头按钮）。
   const credentialConfirmBusy = listCredential.busy || progress.credential_refresh !== undefined;
 
-  // 添加账号 / 登录（P4c-6b-2c）：接缝登记了登录才挂弹层；成功后重读本机缓存（旧
-  // refreshOverview 同法），失败/取消的三类收尾提示全在 useAccountLogin 内，页面不重复通知。
+  // 添加账号 / 登录（P4c-6b-2c）：接缝登记登录才挂弹层；成功重读缓存，失败/取消提示在 hook 内。
   const login = useAccountLoginFlow(adapter?.login ?? null, refreshLocal);
 
   // 行内切号（P4c-6b-2d）：接缝登记哪种形态就跑哪种；行目标按合成数据面解析（含适配器池面）。
@@ -128,8 +125,7 @@ export function AccountsPage(props: AccountsPageProps) {
     ? null
     : detailSnapshotFor({ productId, payload, rowId: selectedRowId, nowUnixSeconds: now, adapterPool });
 
-  // 详情单账号刷新凭据（P4c-7c-1）：同一 hook 的单账号路径，命令同源、目标只有当前行；
-  // 成功回执逐字沿用旧 AccountDetail（走 successMessage 而非批量摘要）。
+  // 详情单账号刷新凭据（P4c-7c-1）：同一 hook 的单账号路径，成功回执逐字沿用旧 AccountDetail。
   const detailCredential = useCredentialRefresh({
     refresh: credential?.refresh,
     targets: (): readonly CredentialRefreshTarget[] => {
@@ -141,10 +137,17 @@ export function AccountsPage(props: AccountsPageProps) {
     onRefreshed: refreshLocal,
     successMessage: ACCOUNT_TEXTS.credentialRefreshed,
   });
-  const detailBusy = detailCredential.busy ? DETAIL_CREDENTIAL_REFRESH_ACTIONS : []; // 单账号换发进行中
+  // 详情动作接线（P4c-6b-2e-1）：额度 / 签到 / 重登 / 重置设备 / 删除；命令与文案按产品查表，
+  // 未登记命令的动作原样透出（fail-closed）。重新登录复用 6b-2c 登录弹层（旧 onRelogin 同一条流程）。
+  const detailActions = useDetailActions({
+    seam: detailActionsFor(productId) ?? undefined, rowId: selectedRowId, readPayload: () => payload,
+    onSettled: refreshLocal, onClose: () => setSelectedRowId(""), onRelogin: () => login.open(),
+    reloginBusy: login.busy,
+  });
+  // 详情忙碌位：单账号换发 + 五类详情动作各自表达，只影响被点的按钮。
+  const detailBusy = [...(detailCredential.busy ? DETAIL_CREDENTIAL_REFRESH_ACTIONS : []), ...detailActions.busy];
 
-  // 页头忙碌位（AccountsHeader 的 busy 契约：给 id 即转圈，禁用原因仍由 builder 算）：
-  // 本地刷新 / 批量凭据刷新 / 额度刷新 / 健康检测各自独立表达，互不冒充。
+  // 页头忙碌位（给 id 即转圈，禁用原因仍由 builder 算）：四路各自独立表达，互不冒充。
   const headerBusy = [
     ...(pending === null ? [] : [pending]),
     ...(credentialConfirmBusy ? [credential?.actionId ?? ""] : []),
@@ -164,44 +167,39 @@ export function AccountsPage(props: AccountsPageProps) {
     onHeaderAction?.(actionId);
   }, [batch.handle, credential?.actionId, handleRefreshLocal, listCredential, login, onHeaderAction, refreshLocalActionId]);
 
-  // 详情动作分发：凭据刷新在本页执行，其余透出给观察者。
+  // 详情动作分发（P4c-6b-2e-1）：凭据刷新与五类详情动作在本页执行，其余透出给观察者。
   const handleDetailAction = useCallback((actionId: string) => {
     if (actionId === "") return;
     if (DETAIL_CREDENTIAL_REFRESH_ACTIONS.includes(actionId)) { detailCredential.request(); return; }
+    detailActions.handle(actionId);
+    // 透出契约不丢：动作 id 仍回给外部观察者（与页头/行内动作同一口径）。
     onDetailAction?.(selectedRowId, actionId);
-  }, [detailCredential, onDetailAction, selectedRowId]);
+  }, [detailActions, detailCredential, onDetailAction, selectedRowId]);
 
   // 详情视图：装配成功才渲染（行被删 / 数据面换产品即回列表，不展示陈旧详情）。
   if (detailSnapshot !== null && adapter !== undefined) {
     const view = accountsViewFor(composed as AccountsSnapshot);
     const row: AccountRowView | undefined = view.rows.find((item) => item.id === selectedRowId);
     if (row !== undefined) {
-      const detailView = buildDetailView({ productId, row, snapshot: detailSnapshot });
-      // 登录设备插槽（P4c-7c-1）：按接缝登记的产品绑定注入，缺省即不挂（WB devices=false）。
-      const devices = adapter.devices;
+      // 弹层槽：凭据刷新确认 + 重置设备二次确认（删除的确认由危险区动作自持，不在此叠层）。
       return (
-        <AccountDetailPage
-          view={detailView}
+        <DetailViewSlot
+          view={buildDetailView({ productId, row, snapshot: detailSnapshot })}
           busy={detailBusy}
           onBack={() => setSelectedRowId("")}
           onAction={handleDetailAction}
-          devicesSlot={devices === undefined ? undefined : (
-            <RemoteDevicesPanel
-              productId={devices.productId}
-              productName={devices.productName}
-              profileId={selectedRowId}
-              accountLabel={detailView.header.title}
-              onSignedOut={() => void refreshLocal()}
-            />
-          )}
-          dialogsSlot={detailCredential.open ? (
-            <DetailCredentialRefreshDialog
-              accountName={row.displayName}
-              busy={detailCredential.busy}
-              onCancel={detailCredential.cancel}
-              onConfirm={() => void detailCredential.confirm()}
-            />
-          ) : null}
+          dangerConfirm={detailActions.dangerConfirm}
+          devices={adapter.devices}
+          profileId={selectedRowId}
+          onSignedOut={() => void refreshLocal()}
+          dialogs={<>
+            {/* 登录弹层（详情「重新登录」复用 6b-2c 流程，旧 onRelogin 同一条 OAuth 链路）。 */}
+            {login.dialog !== null && <AccountLoginDialog {...login.dialog} />}
+            {detailCredential.open && <DetailCredentialRefreshDialog accountName={row.displayName}
+              busy={detailCredential.busy} onCancel={detailCredential.cancel}
+              onConfirm={() => void detailCredential.confirm()} />}
+            {detailActions.dialogs}
+          </>}
         />
       );
     }

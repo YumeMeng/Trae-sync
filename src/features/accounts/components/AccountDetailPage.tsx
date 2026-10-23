@@ -30,6 +30,19 @@ export interface AccountDetailPageProps {
    * （旧 AccountDetail L532-543 同位置），e2e 以「账号详情」region 为作用域取弹层。
    */
   dialogsSlot?: ReactNode;
+  /**
+   * 危险动作的确认文案（P4c-6b-2e-1）：旧实现的删除确认正文是逐字的「确定删除账号“X”吗？…」，
+   * 不是危险区 hint 本身。缺省 = 沿用 action.label + hint（未接线路径与既有测试一字不改）。
+   */
+  dangerConfirm?: (actionId: string) => DangerConfirmCopy | null;
+}
+
+/** 危险动作确认文案（与 shared/ConfirmDialog 的入参同形，只读展示，不含执行语义）。 */
+export interface DangerConfirmCopy {
+  readonly title: string;
+  readonly lines: readonly string[];
+  readonly confirmLabel: string;
+  readonly busyLabel?: string;
 }
 
 /** 动作色档：与页头同一套按钮族（primary / 次要描边 / 危险）。 */
@@ -122,10 +135,11 @@ interface SectionBlockProps {
   readonly section: DetailSectionView;
   readonly busy: readonly string[];
   readonly onAction: (id: string) => void;
+  readonly dangerConfirm?: (actionId: string) => DangerConfirmCopy | null;
 }
 
 /** 单个分区：字段表 + 动作组 + 可选说明；tech / danger 两个特例在此分流。 */
-function SectionBlock({ section, busy, onAction }: SectionBlockProps) {
+function SectionBlock({ section, busy, onAction, dangerConfirm }: SectionBlockProps) {
   const fields = section.fields.filter(isRenderable);
   const facts = fields.length === 0 ? null : (
     <dl className="account-detail__facts">
@@ -161,6 +175,7 @@ function SectionBlock({ section, busy, onAction }: SectionBlockProps) {
                 hint={section.hint}
                 busy={busy.includes(action.id)}
                 onAction={onAction}
+                confirm={dangerConfirm?.(action.id) ?? undefined}
               />
             ))}
           </div>
@@ -187,7 +202,7 @@ function SectionBlock({ section, busy, onAction }: SectionBlockProps) {
 }
 
 /** 详情页装配：页头（返回 + 标题 + 徽章组）+ 按 sections[] 顺序渲染分区。 */
-export function AccountDetailPage({ view, busy, onBack, onAction, devicesSlot, dialogsSlot }: AccountDetailPageProps) {
+export function AccountDetailPage({ view, busy, onBack, onAction, devicesSlot, dialogsSlot, dangerConfirm }: AccountDetailPageProps) {
   // 忙碌位优先级：页面显式传入 > builder 镜像的 view.busy > 空闲（不猜进行中的动作）。
   const running = busy ?? view.busy ?? [];
   // 设备插槽落位：危险区之前（旧布局 L488-497）；无危险区则垫在分区末尾。
@@ -215,7 +230,7 @@ export function AccountDetailPage({ view, busy, onBack, onAction, devicesSlot, d
       {view.sections.map((section, index) => (
         <Fragment key={section.id}>
           {index === devicesAt && devicesSlot}
-          <SectionBlock section={section} busy={running} onAction={onAction} />
+          <SectionBlock section={section} busy={running} onAction={onAction} dangerConfirm={dangerConfirm} />
         </Fragment>
       ))}
       {devicesAt === view.sections.length && devicesSlot}
