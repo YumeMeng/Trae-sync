@@ -29,7 +29,6 @@ import {
   type CheckinPageProps,
 } from "../../features/checkin/CheckinPage";
 import { EnvironmentPage } from "../../components/EnvironmentPage";
-import { WorkBuddyPanel } from "../../components/WorkBuddyPanel";
 import { WorkBuddyEnvironmentPage } from "../../components/WorkBuddyEnvironmentPage";
 import { TraeSettingsVariant } from "../../components/settings/TraeSettingsVariant";
 import { WorkBuddySettingsVariant } from "../../components/settings/WorkBuddySettingsVariant";
@@ -73,6 +72,11 @@ const WorkBuddyCheckinSlot = (props: CheckinPageProps) => (
 const TraeAccountsSlot = (props: AccountsPageProps) => (
   <AccountsPage {...props} productId={CURRENT_PRODUCT_ID} />
 );
+// P4c-9b-2：accounts 的 WorkBuddy 槽位也切到合并页（账号页收官）。与上者同构：
+// 接缝内绑定 WB 协议值，页面内零产品判断；旧 WorkBuddyPanel 随之删除。
+const WorkBuddyAccountsSlot = (props: AccountsPageProps) => (
+  <AccountsPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
+);
 
 /**
  * 六区块 × 两产品的实现登记表（settings 也登记：其 WB 变体曾是整页早返回）。
@@ -81,8 +85,8 @@ const TraeAccountsSlot = (props: AccountsPageProps) => (
 export const SECTION_SLOTS: Record<SectionKey, SectionSlot> = {
   // P4a：两产品指向同一份总览实现（迁移完成的正常形态）。
   overview: { trae: TraeOverviewSlot, workbuddy: WorkBuddyOverviewSlot },
-  // P4c-6c-1：TRAE 已切合并页；workbuddy 仍用旧 WorkBuddyPanel（未迁移）。
-  accounts: { trae: TraeAccountsSlot, workbuddy: WorkBuddyPanel },
+  // P4c-6c-1 / P4c-9b-2：两产品都指向同一份账号页实现（迁移完成的正常形态）。
+  accounts: { trae: TraeAccountsSlot, workbuddy: WorkBuddyAccountsSlot },
   // P4b-3：两产品指向同一份签到实现（迁移完成的正常形态）。
   checkin: { trae: TraeCheckinSlot, workbuddy: WorkBuddyCheckinSlot },
   environment: { trae: EnvironmentPage, workbuddy: WorkBuddyEnvironmentPage },

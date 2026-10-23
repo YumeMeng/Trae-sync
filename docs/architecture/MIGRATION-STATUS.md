@@ -34,15 +34,12 @@ src/features/accounts/
 src/platform/accounts.ts      229 行  26 条命令
 ```
 
-## 账号页剩余票
+## 账号页：已完成（P4c-9b-2）
 
-| 票 | 内容 |
-|---|---|
-| P4c-6b-2b | 页头批量动作接线：刷新额度 / 健康检测（useAccountActions 注入命令） |
-| P4c-6b-2c | 添加账号 / 登录流程（useAccountLogin + 登录弹层） |
-| P4c-6b-2d | 行内切号（复用 MasterSwitchDialog）+ 工具账号选择 |
-| P4c-6b-2e | 详情动作：单账号签到 / 重新登录 / 重置设备 / 删除 / 备注名 / 手机号补录 |
-| P4c-9 | 删旧：AccountCenterTrae(1328) / AccountDetail(522) / AdapterAccountDetail(134) / WorkBuddyAccountDetail(424) / WorkBuddyPanel(593) / AccountWorkbench + 旧测试（AccountCenter 67、WorkBuddyPanel 26 等） |
+- TRAE 与 WorkBuddy **共用** `features/accounts/AccountsPage`，槽位只绑定 productId
+- 旧实现全部删除（累计约 6,675 行）：AccountCenterTrae 1528 / AccountDetail 576 / AdapterAccountDetail 148 / AccountWorkbench 17 / WorkBuddyPanel 617 / WorkBuddyAccountDetail 444 + 5 个旧测试文件
+- 当前基线：**410 单测 / 41 e2e / guard 新增 0**
+- 遗留：K-06 缺口 5（WB 档案四写操作的命令级断言缺位，建议一票补齐）
 
 ## 之后
 

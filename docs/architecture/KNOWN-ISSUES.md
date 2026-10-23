@@ -74,3 +74,48 @@
 - **残留差异（有意不补）**：旧实现在「忙碌但尚未收到首批事件」时另有一条回退文案
   （「正在查询最新额度…」「正在刷新登录凭据，不会打开新的 OAuth 登录…」「正在检测账号健康度…」）。
   合并页此时不渲染任何文案（页头按钮本身在转圈）。要不要补属独立小票，不影响逐账号反馈。
+
+## K-06 WB 槽位切到合并页后的表现差异与未覆盖项（P4c-9b-2 删除旧实现时确认，2026-10-23）
+
+`sectionSlots.accounts.workbuddy` 于 P4c-9b-2 切到 `AccountsPage`（`productId=WORKBUDDY_PRODUCT_ID`），
+旧 `WorkBuddyPanel`（617 行）/ `WorkBuddyAccountDetail`（444 行）与 `tests/WorkBuddyPanel.test.tsx`（774 行 / 30 例）
+随之删除。以下为逐条核对旧 30 例后确认的**表现差异**与**覆盖缺口**。
+
+1. **列表/卡片双视图切换（U-2）**：与 K-03 差异 1 同因——WB 旧页有分段控件并在
+   `accounts.workbuddy.view` 记忆偏好，合并页只渲染宽行、不读写该偏好。
+   - 判定：可放弃（同 K-03 差异 1，合并页目标是单一排布）。WB 的排序档（`added` / `name`）
+     仍保留且行为一致（`tests/accountsPage.test.tsx`「WB 池面：无过滤档，排序档仅添加顺序与名称」）。
+   - 副作用：旧偏好 key `accounts.workbuddy.view` 不再被读取，属惰性残留（不清理，无功能影响）。
+2. **WB 行锚点的可见「使用中」chip → accent 徽章 + 隐藏锚点**：旧行渲染可见 chip，合并页由
+   `AccountsRows` 统一为徽章（视觉由 `ui/Badge` 表达）+ `workbuddy-pool-current-*` 隐藏锚点承载旧 testid。
+   - 判定：可放弃（与 K-03 差异 2 同一族收敛方向）；锚点与语义零变化，e2e/单测照旧可用。
+3. **详情页容器锚点改名**：旧详情自带 `workbuddy-account-detail` / `workbuddy-account-detail-back`；
+   合并页统一为 `role=region aria-label="账号详情"` + `account-detail-back`。
+   - 判定：可放弃（同一页面不该因产品换锚点，与 K-03 差异 3 同口径）。e2e 已按新锚点更新。
+4. **详情页字段/动作锚点逐字保留**：`workbuddy-detail-status` / `-credits` / `-alias` /
+   `-archived-toggle` / `-participation-toggle` / `-purge` 等 20 余个 testid 与文案全部沿用旧实现
+   （`detailView.ts` 逐字对照旧 `WorkBuddyAccountDetail`），由 `tests/accountsDetailView.test.ts` 锁定。
+
+### 覆盖缺口（未补，逐条给出理由）
+
+5. **WB 档案管理的命令级渲染断言（备注名 / 归档 / 参与开关 / 删除）**：旧 30 例中有 4 例断言
+   「点保存 → 发出 `set_workbuddy_account_display_name` / `set_workbuddy_account_archived` /
+   `set_workbuddy_account_auto_checkin` / `purge_workbuddy_accounts` 且参数形状正确」。
+   合并页这条链的实现是 `detailActionCommands`（命令与文案逐字搬自旧实现）+ `useDetailFieldEdits` /
+   `useDetailActions`（通用分发，TRAE 面同一条代码路径），但**WB 分支的端到端渲染断言目前缺位**：
+   `tests/accountsDetailView.test.ts` 只锁 builder 产出的字段/动作 id 与文案，不点按钮、不断言命令参数。
+   - 判定：**真实缺口，不可放弃**（这四条是写操作）。补它需要一条 WB 详情页的命令级用例，
+     属独立小票（本票边界为「切槽位 + 删旧实现」，不新增详情页测试面）。
+   - 缓解：命令参数形状与文案在 `detailActionCommands.ts` 中逐字对照旧实现，且 TRAE 面已用同一条
+     分发路径验证过（`tests/accountsPage.test.tsx` / `accountsDetailView.test.ts`）。
+6. **WB 详情「参与开关不可读取」中性态**：旧页在 `list_workbuddy_checkin_accounts` 失败时渲染
+   「参与状态暂时不可读取，请返回后重试。」（`workbuddy-detail-participation-unknown`）。
+   合并页 builder 保留了该分支，但**无渲染断言**。
+   - 判定：可放弃（纯展示分支，无写操作；builder 分支存在且由 `detailView.ts` 的 `wbParticipation` 保证）。
+7. **WB 登录四个专码的渲染断言**（`already_in_progress` / `poll_timeout` / `auth_url_untrusted` /
+   `real_mode_required`）：旧 30 例只覆盖 `already_in_progress` 一例。合并页的码 → 人话映射在
+   `poolActionCommands.ts` 的 `loginErrorText`（逐字搬自旧 `workbuddyLoginErrorText`），
+   而 `tests/accountsPagePoolActions.test.tsx` 覆盖了 begin/complete/cancel/acceptance/取消五条主路径，
+   **未单独断言这四个专码**。
+   - 判定：可放弃（映射表是纯函数且逐字对照旧实现；主路径已有 11 例护栏）。若要补，最省的方式是
+     给 `loginErrorText` 加纯函数用例。

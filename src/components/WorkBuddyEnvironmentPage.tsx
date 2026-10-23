@@ -9,7 +9,7 @@ import {
 } from "../platform/workbuddyAdapter";
 import { EmptyState } from "./shared/EmptyState";
 import { ProductBadge } from "./shared/ProductBadge";
-import { InfoRow } from "./WorkBuddyPanel";
+import { InfoRow } from "./workbuddy/InfoRow";
 import { notify } from "../platform/notify";
 import { safeUiErrorMessage } from "../utils/safeUiError";
 

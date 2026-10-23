@@ -40,18 +40,20 @@ test.describe("P2b WorkBuddy 账号页冒烟", () => {
     await expect(firstRow).toContainText("WB 账号甲");
     await expect(page.getByTestId("workbuddy-pool-card-wb-profile-2")).toContainText("备用号");
 
-    // 存在账号行 → 点进详情（既有 testid workbuddy-account-detail）→ 返回列表。
+    // 存在账号行 → 点进详情 → 返回列表（P4c-9b-2：WB 槽位切到合并页后，
+    // 详情由通用 AccountDetailPage 承载，容器锚点统一为「账号详情」region，
+    // 返回锚点统一为 account-detail-back；旧 workbuddy-account-detail* 随旧组件删除）。
     await firstRow.click();
-    const detail = page.getByTestId("workbuddy-account-detail");
+    const detail = page.getByRole("region", { name: "账号详情", exact: true });
     await expect(detail).toBeVisible();
-    // 详情页仍属账号 region 语义（role=region + aria-label="账号详情"）。
-    await expect(page.getByRole("region", { name: "账号详情" })).toBeVisible();
     await expect(detail).toContainText("基础信息");
     await expect(detail).toContainText("签到与积分");
+    // WB 详情的能力裁剪仍在：无登录设备面板（devices=false）。
+    await expect(detail.getByTestId("workbuddy-detail-status")).toBeVisible();
 
-    await page.getByTestId("workbuddy-account-detail-back").click();
+    await page.getByTestId("account-detail-back").click();
     await expect(page.getByTestId("workbuddy-pool-list")).toBeVisible();
-    await expect(page.getByTestId("workbuddy-account-detail")).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "账号详情", exact: true })).toHaveCount(0);
 
     expect(consoleErrors, "WorkBuddy 账号页出现 console error：" + consoleErrors.join(" | ")).toHaveLength(0);
   });
