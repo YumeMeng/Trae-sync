@@ -7,7 +7,7 @@
 import type { MasterHistoryDto, MasterSessionEntryDto, RelayLedgerEntryDto, TraeCnForeignProjectDto } from "../../types/history";
 import type { MasterBackupChainDto, MasterLibraryStatsDto, MasterVerificationDto } from "../../types/masterLibrary";
 import type { ProductOperationSnapshotDto } from "../../types/product";
-import { LIBRARY_TEXTS, LIBRARY_VIEW_TEXTS, fillLibraryText, libraryCapabilitiesFor, type LibraryActionKind, type LibraryActionView, type LibraryInfoItemView, type LibraryInfoView, type LibraryStatView, type LibraryTabId, type LibraryView, type MessageView, type ProjectNodeView, type ViewerPaneView } from "./config";
+import { LIBRARY_TEXTS, LIBRARY_VIEW_TEXTS, fillLibraryText, libraryCapabilitiesFor, type ArchiveChromeView, type ArchiveRecoveryView, type LibraryActionKind, type LibraryActionView, type LibraryInfoItemView, type LibraryInfoView, type LibraryStatView, type LibraryTabId, type LibraryView, type MessageView, type ProjectNodeView, type ViewerPaneView } from "./config";
 import { archivedSessionsOf, buildArchiveSessionTree, buildSessionTree, countTreeSessions, liveSessionsOf, type SessionTreeDraft } from "./sessionTree";
 import { buildViewerPane, formatRelativeTime, type ViewerPaneSource } from "./relayLegs";
 /** 只读库实例 id（与 platform/productRegistry 的 TRAE_CN_LIBRARY_ID 同值；本文件不引 UI 侧依赖）；下行为写操作 id 字面量。 */
@@ -39,24 +39,33 @@ export interface TraeLibrarySnapshot {
   readonly viewer: TraeViewerSource | null; // null = 右栏空态引导
   readonly viewerTab: "messages" | "relay"; readonly busy: boolean; // 查看器 tab / 批量忙碌态（只用于算 disabled）
   readonly loadError: string | null; // 读取失败原因（页面兜底句已在页面侧映射）
-  readonly archiveRecovery: string | null; readonly draftStorageError: string | null; // L1532 恢复提示条 / L1552 草稿存储告警
+  readonly archiveRecovery: ArchiveRecoveryView | null; readonly draftStorageError: string | null; // L1532 恢复提示条 / L1552 草稿存储告警
   readonly now: Date; // 纯函数不读时钟
 }
 /** 动作行（页头/批量栏/草稿条共用）：testId 逐字沿用旧锚点，hint 即旧 title。 */
 const action = (id: string, label: string, kind: LibraryActionKind, testId: string, hint: string | null = null, disabledReason: string | null = null, busyLabel: string | null = null): LibraryActionView =>
   ({ id, label, kind, testId, hint, disabledReason, busyLabel });
 /** 写能力派生（L76-82 原样）：只读库=归档/恢复；master/env-* 全开；其余纯只读；只读标志只能降级。 */
-const writeCapabilityOf = (libraryId: string, readOnly: boolean): "full" | "archive-only" | "none" => {
+export function traeWriteCapabilityOf(libraryId: string, readOnly: boolean): "full" | "archive-only" | "none" {
   const derived = libraryId === "master" || libraryId.startsWith("env-") ? "full" : libraryId === CN_LIBRARY_ID ? "archive-only" : "none";
   return readOnly && derived === "full" ? "none" : derived;
-};
+}
 /** 操作就绪表（L171-188）：库 id + 产品协议值双匹配才认快照；错库一律按未就绪（fail-closed）。 */
-function operationStatesOf(snapshot: TraeLibrarySnapshot): { readonly matched: boolean; readonly states: ReadonlyMap<string, string>; readonly reasons: ReadonlyMap<string, string> } {
-  const ops = snapshot.operations, productId = snapshot.libraryId === CN_LIBRARY_ID ? CN_LIBRARY_ID : "work_cn";
-  const matched = ops !== null && ops.product_id === productId && ops.library_id === snapshot.libraryId;
+export function traeOperationStatesOf(libraryId: string, operations: ProductOperationSnapshotDto | null): { readonly matched: boolean; readonly states: ReadonlyMap<string, string>; readonly reasons: ReadonlyMap<string, string> } {
+  const productId = libraryId === CN_LIBRARY_ID ? CN_LIBRARY_ID : "work_cn";
+  const matched = operations !== null && operations.product_id === productId && operations.library_id === libraryId;
   const states = new Map<string, string>(), reasons = new Map<string, string>();
-  for (const op of ops && matched ? ops.operations : []) { states.set(op.operation_id, op.state); reasons.set(op.operation_id, op.reason); }
+  for (const op of operations && matched ? operations.operations : []) { states.set(op.operation_id, op.state); reasons.set(op.operation_id, op.reason); }
   return { matched, states, reasons };
+}
+/** 写门禁四态（页面与 builder 共用，避免两处各算一遍）：归档 / 项目归并 / 删除 / CN 跨账号归并。 */
+export interface TraeWriteGates { readonly canArchive: boolean; readonly canWorkMerge: boolean; readonly canDelete: boolean; readonly canCnMerge: boolean }
+export function traeWriteGatesOf(libraryId: string, readOnly: boolean, operations: ProductOperationSnapshotDto | null): TraeWriteGates {
+  const base = traeWriteCapabilityOf(libraryId, readOnly), full = base === "full", states = traeOperationStatesOf(libraryId, operations).states;
+  return { canArchive: base !== "none" && states.get(ARCHIVE_OP) === "ready", // L185
+    canWorkMerge: full && states.get(WORK_MERGE_OP) === "ready", // L186
+    canDelete: full && states.get(DELETE_OP) === "ready", // L187
+    canCnMerge: states.get(CN_MERGE_OP) === "ready" };
 }
 /** 写门禁提示（L195-219）：未匹配 = 产品未知句；有 pending 项 = 「A、B暂不可用。原因」。 */
 function gateNoticeOf(ops: { readonly matched: boolean; readonly states: ReadonlyMap<string, string>; readonly reasons: ReadonlyMap<string, string> },
@@ -123,15 +132,33 @@ function batchBarOf(snapshot: TraeLibrarySnapshot, canArchive: boolean, canWorkM
     summary: fillLibraryText(LIBRARY_TEXTS.selectionSummary, { sessions: snapshot.selectedSessionIds.length, projects: snapshot.selectedProjectIds.length }),
     actions: list.filter((item): item is LibraryActionView => item !== null) };
 }
-/** 归档草稿条（L1851-1882）：草稿有变更才浮出；放弃/应用两动作，应用受写门禁约束。 */
+/** 归档草稿条（L1851-1882）：草稿有变更才浮出；放弃/应用两动作，应用受写门禁与待核对恢复态双重约束。 */
 function draftBarOf(snapshot: TraeLibrarySnapshot, canArchive: boolean): LibraryView["draftBar"] {
-  const draft = snapshot.archiveDraft, busy = snapshot.busy;
+  const draft = snapshot.archiveDraft, busy = snapshot.busy, recovery = snapshot.archiveRecovery?.kind ?? null;
   if (draft.archiveSessionIds.length === 0 && draft.restoreSessionIds.length === 0) return null;
+  // 提交结果待核对两态不得再次应用（L1875 / L926：先刷新核对再决定）。
+  const blocked = recovery === "commit-unknown" || recovery === "committed-attention";
+  const applyBlocked = busy ? LIBRARY_TEXTS.busyShort : !canArchive ? LIBRARY_TEXTS.gateUnknown : blocked ? LIBRARY_TEXTS.draftApplyBlocked : null;
   return { testId: "archive-draft-bar", ariaLabel: LIBRARY_TEXTS.regionDraft,
     summary: fillLibraryText(LIBRARY_TEXTS.draftSummary, { archive: draft.archiveSessionIds.length, restore: draft.restoreSessionIds.length }),
     discard: action("draft-discard", LIBRARY_TEXTS.draftDiscard, "ghost", "archive-draft-discard", null, busy ? LIBRARY_TEXTS.busyShort : null), // L1867
-    apply: action("draft-apply", LIBRARY_TEXTS.draftApply, "primary", "archive-draft-apply", null,
-      busy ? LIBRARY_TEXTS.busyShort : canArchive ? null : LIBRARY_TEXTS.gateUnknown, LIBRARY_TEXTS.draftApplying) }; // L1876-1879
+    apply: action("draft-apply", LIBRARY_TEXTS.draftApply, "primary", "archive-draft-apply", null, applyBlocked, LIBRARY_TEXTS.draftApplying) }; // L1876-1879
+}
+/** 归档动作区（L1506-1557 / L1668-1683 / L1884-1901）：入口、返回、恢复条、草稿告警、Work 应用前确认。
+ * 只读库（Trae CN）无「关闭客户端」确认（旧 L760 守卫）；入口与返回互斥（归档视图不显示入口）。 */
+function archiveChromeOf(snapshot: TraeLibrarySnapshot, canArchive: boolean, archivedCount: number): ArchiveChromeView {
+  const recovery = snapshot.archiveRecovery;
+  return {
+    view: snapshot.archiveView, canArchive,
+    entry: snapshot.archiveView || archivedCount === 0 ? null : { count: archivedCount,
+      action: action("archive-entry", LIBRARY_TEXTS.archivedEntry, "ghost", "library-archive-entry") }, // L1672-1683
+    back: snapshot.archiveView ? action("archive-back", LIBRARY_TEXTS.backToTree, "ghost", "library-archive-back") : null, // L1507-1515
+    recovery,
+    retryLabel: recovery === null ? null : recovery.kind === "relaunch" ? LIBRARY_TEXTS.retryLaunch : LIBRARY_TEXTS.refreshHistory, // L1541-1545
+    draftError: snapshot.draftStorageError, // L1549-1557
+    confirm: snapshot.readOnly ? null : { title: LIBRARY_TEXTS.workArchiveTitle, confirmLabel: LIBRARY_TEXTS.workArchiveConfirm,
+      lines: [LIBRARY_TEXTS.workArchiveLine1, LIBRARY_TEXTS.workArchiveLine2, LIBRARY_TEXTS.workArchiveLine3], testId: "work-archive-confirm" }, // L1884-1901
+  };
 }
 /** 库路径展示（D321-324）：只取末两段，完整路径在悬浮提示（界面表达纪律）。 */
 const dataDirTail = (path: string): string => { const segments = path.split(/[\\/]/).filter(Boolean); return segments.length > 1 ? segments.slice(-2).join("\\") : path; };
@@ -175,16 +202,14 @@ function infoOf(snapshot: TraeLibrarySnapshot): LibraryInfoView {
 /** 快照 → 库视图（纯函数：同一快照恒得同一视图）。 */
 export function buildTraeLibraryView(snapshot: TraeLibrarySnapshot): TraeLibraryView {
   const caps = libraryCapabilitiesFor("trae_cn"), history = snapshot.history !== null && snapshot.history.status === "ready" ? snapshot.history : null;
-  const ops = operationStatesOf(snapshot), base = writeCapabilityOf(snapshot.libraryId, snapshot.readOnly), full = base === "full";
-  const canArchive = base !== "none" && ops.states.get(ARCHIVE_OP) === "ready"; // L185
-  const canWorkMerge = full && ops.states.get(WORK_MERGE_OP) === "ready"; // L186
-  const canDelete = full && ops.states.get(DELETE_OP) === "ready"; // L187
-  const canCnMerge = ops.states.get(CN_MERGE_OP) === "ready";
+  const ops = traeOperationStatesOf(snapshot.libraryId, snapshot.operations), full = traeWriteCapabilityOf(snapshot.libraryId, snapshot.readOnly) === "full";
+  const { canArchive, canWorkMerge, canDelete, canCnMerge } = traeWriteGatesOf(snapshot.libraryId, snapshot.readOnly, snapshot.operations); // L185-188
   // 选择入口可见性（L230-232）：归档视图看 归档/删除，正常视图看 归档/合并/删除；全不可写即无入口。
   const canSelect = snapshot.archiveView ? canArchive || canDelete : canArchive || canWorkMerge || canDelete; // L188
   const draft = snapshot.archiveDraft, keyword = snapshot.searchText.trim(), tree = history !== null ? treeOf(history, snapshot, canArchive, canCnMerge) : [];
   // 选择摘要口径（L838-848）：当前视图的可见会话（含已归档、不含已删除），与搜索无关。
-  const visible = history === null ? [] : snapshot.archiveView ? archivedSessionsOf(history.sessions, draft) : liveSessionsOf(history.sessions, draft);
+  const archivedAll = history === null ? [] : archivedSessionsOf(history.sessions, draft); // 入口计数（L1672：不分视图）
+  const visible = history === null ? [] : snapshot.archiveView ? archivedAll : liveSessionsOf(history.sessions, draft);
   const selected = visible.filter((session) => snapshot.selectedSessionIds.includes(session.session_id) || snapshot.selectedProjectIds.includes(session.project_id)).length;
   const mergeTargets = snapshot.selectedProjectIds.filter((id) => history !== null && history.projects.some((project) => project.project_id === id && project.name.trim() !== "")).length;
   const lib = snapshot.libraryTitle, failure = fillLibraryText(LIBRARY_TEXTS.loadFailure, { lib }), status = snapshot.history?.status ?? null;
@@ -216,6 +241,7 @@ export function buildTraeLibraryView(snapshot: TraeLibrarySnapshot): TraeLibrary
       ? { testId: "library-search-input", placeholder: LIBRARY_TEXTS.searchPlaceholder, ariaLabel: LIBRARY_TEXTS.searchAria, value: snapshot.searchText } : null, // L1520-1527
     tree, treeEmpty, viewer: history !== null ? viewerOf(snapshot, history) : null,
     batchBar: batchBarOf(snapshot, canArchive, canWorkMerge, canDelete, selected, mergeTargets), draftBar: draftBarOf(snapshot, canArchive),
+    archive: archiveChromeOf(snapshot, canArchive, archivedAll.length),
     selectionEntry: canSelect ? { label: LIBRARY_TEXTS.select, cancelLabel: LIBRARY_TEXTS.cancel } : null, // L1684-1701（锚由展示层持有）
     checkup: null, plugins: null, // §2-11 A 库页无体检（G18 在环境页）；§2-12 插件 tab 由 P4e-8 的 usePluginWorkbench 产出
     info: infoOf(snapshot), notices, texts: LIBRARY_VIEW_TEXTS.trae_cn,

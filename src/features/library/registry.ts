@@ -26,7 +26,7 @@ const EMPTY_VIEW: LibraryView = {
   empty: { title: "库信息暂不可用，请稍后重试。", hint: "", actionLabel: null },
   stats: null, filter: null, includeDeleted: null, search: null,
   tree: [], treeEmpty: "库信息暂不可用，请稍后重试。", viewer: null,
-  batchBar: null, selectionEntry: null, draftBar: null, checkup: null, plugins: null, info: null,
+  batchBar: null, selectionEntry: null, draftBar: null, archive: null, checkup: null, plugins: null, info: null,
   notices: [], texts: LIBRARY_VIEW_TEXTS.trae_cn,
 };
 

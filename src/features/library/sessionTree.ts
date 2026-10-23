@@ -171,7 +171,7 @@ export function buildSessionTree(input: SessionTreeInput): readonly ProjectNodeV
         kind: "foreign", title: project.name?.trim() || LIBRARY_TEXTS.unlinkedGroup, // L1376
         titleAttr: project.absolute_path?.trim() || null, // L1369
         meta: String(project.session_count), expanded: false, selected: false, selectable: false, sessions: [], children: [],
-        actions: input.foreignMergeReady ? [{ id: "foreign-merge", label: LIBRARY_TEXTS.foreignMerge, kind: "ghost",
+        actions: input.foreignMergeReady ? [{ id: `foreign-merge-${project.project_id}`, label: LIBRARY_TEXTS.foreignMerge, kind: "ghost",
           testId: `library-merge-entry-${project.project_id}`, hint: `把这些会话归并到当前账号（共 ${project.message_count} 条消息）`,
           disabledReason: null, busyLabel: null }] : [] })) }); // L1384：旧 title 原文
   }
@@ -207,12 +207,13 @@ export function buildArchiveSessionTree(input: ArchiveTreeInput): readonly Proje
     meta: "", expanded: true, selected: false, selectable: false, actions: [], sessions: [], // 旧模式头只有文案（L1567）
     children: [...groups.entries()].map(([projectId, sessions]) => {
       const selectableIds = projectId === UNLINKED_GROUP_ID ? unlinkedIds : [projectId]; // L1569-1570
-      return projectNodeOf({ id: projectId, kind: projectId === UNLINKED_GROUP_ID ? "unlinked" : "named",
+      return { ...projectNodeOf({ id: projectId, kind: projectId === UNLINKED_GROUP_ID ? "unlinked" : "named",
         testId: `library-archive-project-${projectId}`, title: projectNameOf(input.projects, projectId), // L1619
         titleAttr: null, expanded: !collapsed.has(`${mode}\u0000${projectId}`), // L1571-1572
         selected: selectableIds.length > 0 && selectableIds.every((id) => selectedProjects.has(id)), // L1573-1575
         selectable: input.selectMode,
-        sessions: sessions.map((session) => sessionRowOf(session, selectedSessions.has(session.session_id), true, null, input.relativeTime)) });
+        sessions: sessions.map((session) => sessionRowOf(session, selectedSessions.has(session.session_id), true, null, input.relativeTime)) }),
+        collapseKey: `${mode}\u0000${projectId}` }; // 折叠键随节点下传（页面据此切换，不重算键）
     }),
   }));
 }

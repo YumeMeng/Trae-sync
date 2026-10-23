@@ -28,6 +28,8 @@ export interface ProjectNodeView {
   readonly id: string; readonly testId: string; readonly kind: ProjectNodeKind; readonly title: string; readonly titleAttr: string | null;
   readonly meta: string; readonly expanded: boolean; readonly selected: boolean; readonly selectable: boolean;
   readonly actions: readonly LibraryActionView[]; readonly sessions: readonly SessionRowView[]; readonly children: readonly ProjectNodeView[];
+  /** 归档视图折叠键「模式\u0000项目」（L1571-1572）；缺省 = 该节点不在归档视图，展开态由页面本地集合管。 */
+  readonly collapseKey?: string;
 }
 /** 消息：user 按归属腿着色（accountName + colorIndex），assistant 中性色，trace=任务轨迹摘要行。 */
 export interface MessageView { readonly id: string; readonly testId: string; readonly role: "user" | "assistant" | "trace"; readonly text: string; readonly accountName: string | null; readonly colorIndex: number; readonly stepCount: number | null; }
@@ -82,6 +84,30 @@ export interface BackupCompareView {
 export interface LibraryInfoView { readonly testId: string; readonly items: readonly LibraryInfoItemView[]; readonly counts: readonly LibraryStatView[]; readonly backup: BackupCompareView | null; }
 /** 页面级兜底文案（builder 与弹层共用同一份事实，不各写一遍）。 */
 export interface LibraryViewTexts { readonly receiptPrefix: string; readonly actionFailure: string; readonly refreshFailed: string; readonly readonlyBadge: string; }
+/** 归档收尾的四种需就地恢复形态（旧 L149-152 / L958-980）：relaunch=实例未启动、refresh=列表刷新失败、
+ *  commit-unknown=提交结果无法确认、committed-attention=已提交但写后校验未通过。 */
+export type ArchiveRecoveryKind = "relaunch" | "refresh" | "commit-unknown" | "committed-attention";
+/** 恢复条（带一句原因 + 重试按钮）：文案由动作侧按后端回执填好，builder 只透传与选按钮词。 */
+export interface ArchiveRecoveryView { readonly kind: ArchiveRecoveryKind; readonly message: string }
+/** 归档页头/页内动作区（旧 L1506-1557、L1668-1683）：入口、返回、恢复条与草稿存储告警；WB 整块为 null。 */
+export interface ArchiveChromeView {
+  /** 当前是否归档视图（模式 → 项目 → 会话，树灰显）。 */
+  readonly view: boolean;
+  /** 归档/恢复写门禁（操作就绪 + 写能力）；false 时草稿不加载、应用按钮禁用。 */
+  readonly canArchive: boolean;
+  /** 「已归档 N」入口（仅在正常视图且确有归档会话时给）。 */
+  readonly entry: { readonly action: LibraryActionView; readonly count: number } | null;
+  /** 归档视图「返回对话列表」（仅在归档视图给）。 */
+  readonly back: LibraryActionView | null;
+  /** 需就地恢复的异常收尾（实例未启动 / 列表刷新失败 / 提交结果待核对）。 */
+  readonly recovery: ArchiveRecoveryView | null;
+  /** 恢复条按钮词（relaunch → 重试启动；其余 → 刷新历史列表）。 */
+  readonly retryLabel: string | null;
+  /** 草稿持久化双重失败告警（旧 L1549-1557）。 */
+  readonly draftError: string | null;
+  /** Work 库应用前的关闭客户端确认单（CN 只读库无此单；null = 直接应用）。 */
+  readonly confirm: { readonly title: string; readonly lines: readonly string[]; readonly confirmLabel: string; readonly testId: string } | null;
+}
 /** 库页视图模型：页面唯一渲染输入（零产品判断；差异全部由 builder + 能力表给出）。 */
 export interface LibraryView {
   readonly productId: string; readonly libraryId: string;
@@ -99,6 +125,8 @@ export interface LibraryView {
     readonly testId: string; readonly ariaLabel: string; readonly summary: string;
     readonly discard: LibraryActionView; readonly apply: LibraryActionView;
   } | null;
+  /** 归档动作区（入口 / 返回 / 恢复条 / 草稿告警 / 应用前确认）：null = 该产品无归档（WB）。 */
+  readonly archive: ArchiveChromeView | null;
   readonly checkup: CheckupView | null; readonly plugins: PluginTabView | null; readonly info: LibraryInfoView | null;
   readonly notices: readonly string[]; readonly texts: LibraryViewTexts;
 }
@@ -170,7 +198,12 @@ export const LIBRARY_TEXTS = {
   gateUnknown: "暂时无法确认当前库的操作状态，写操作暂不可用。", gatePending: "{operations}暂不可用。{reason}", gateUnknownCn: "暂时无法确认 Trae CN 的操作状态，写操作暂不可用。", gateArchiveLabel: "归档与恢复", gateMergeLabel: "项目归并", gateDeleteLabel: "删除",
   draftQueuedArchive: "已加入待归档设置，共 {count} 个会话。完成选择后点击“应用归档设置”。", draftQueuedRestore: "已加入待恢复设置，共 {count} 个会话。完成选择后点击“应用归档设置”。", applyRelaunchFailed: "主库已更新（归档 {archived} 个、恢复 {restored} 个），实例尚未启动，请重试启动。", applyCnDone: "已应用归档设置：归档 {archived} 个、恢复 {restored} 个会话。TRAE CN 客户端未由此操作启动，需要查看时请手动启动。",
   applyDone: "已应用归档设置：归档 {archived} 个、恢复 {restored} 个会话。", commitUnknown: "提交结果无法确认。先刷新历史列表并核对状态，再决定是否重新应用；本批次不会自动重试。", committedAttention: "归档操作已提交，但写后校验未通过。先刷新历史列表检查结果，不要重新应用本批次。", draftKept: "归档设置未提交，草稿仍保留。", draftClearedSubmitted: "已清除本地归档草稿；归档操作已经提交，请以历史列表当前状态为准。",
-  draftClearedCheck: "已清除本地归档草稿；请以刷新后的历史列表确认数据库状态。", draftDiscarded: "已放弃未提交的归档设置，主库没有变化。",
+  draftClearedCheck: "已清除本地归档草稿；请以刷新后的历史列表确认数据库状态。", draftDiscarded: "已放弃未提交的归档设置，主库没有变化。", draftApplyBlocked: "先按上方提示刷新并核对归档状态，再决定是否应用。",
+  // 归档恢复条（L958-1028）：需就地重试的四种收尾与重试回执
+  applyRefreshFailedSuffix: " 历史列表刷新失败，请手动刷新。", recoveryRetryRefreshFailed: "历史列表刷新失败，请先刷新并核对归档状态。",
+  recoveryRetryRelaunchOk: "主库实例已重新启动，历史列表已刷新。", recoveryRetryRefreshOk: "历史列表已刷新。",
+  recoveryRetryCommittedOk: "历史列表已刷新；归档操作已经提交，请核对当前状态后再继续。", recoveryRetryUnknownOk: "历史列表已刷新；请核对当前状态后再决定是否重新应用保留的草稿。",
+  recoveryRelaunchFailed: "实例仍未启动，请稍后重试。", recoveryRefreshFailed: "历史列表刷新失败，请稍后重试。",
   // 回执 / 刷新失败 / 归并进度（L726-1178、L2525-2535）
   deleteReceipt: "已删除 {count} 个会话。", mergeReceipt: "已把 {moved} 个会话并入「{target}」，清理 {removed} 个空分组。", cnMergeReceipt: "已把 {moved} 个会话归并到当前账号（共 {messages} 条消息）", cnMergeReceiptCleanup: "，并清理 {removed} 个空项目。", actionFailure: "操作未完成，请稍后重试。", refreshFailedAfterAction: "操作已完成，但列表刷新失败，请手动刷新。",
   mergePreviewFailure: "归并预览暂时不可用，请稍后重试。", cnMergeFailure: "归并未完成，数据保持操作前状态；请稍后重试。", mergeRefreshFailed: "归并已完成，但项目列表刷新失败，请手动刷新。", stageBackingUp: "正在备份数据…", stageMapping: "正在整理（{current}/{total}）…", stageExecuting: "正在归并：{label}…", stageVerifying: "正在校验（{current}/{total}）…", stageDone: "完成",

@@ -9,21 +9,19 @@ import { LibraryActionButton } from "./LibraryShell";
  * 文案、锚点、禁用理由、动作次序全部取自视图（本层不拼句、不判断产品、不重算计数）；动作只回调 onAction(actionId)。
  * 形态差异（浮动栏 / 页内动作行）由调用方给的 selectMode 决定：G22 选择模式浮出浮动栏，WB 逐会话复选的页内动作行常驻。
  */
-export interface LibrarySelectToggleProps {
+export interface LibrarySelectButtonProps {
   readonly selectMode: boolean;
   readonly label: string; // 未选择态文案（视图给「选择」）
   readonly cancelLabel: string; // 选择态文案（视图给「取消」）
   readonly onToggle: () => void;
 }
-/** 底部选择入口：选择 ↔ 取消（L1684-1701：图标 + 文案 + 锚）。 */
-export function LibrarySelectToggle({ selectMode, label, cancelLabel, onToggle }: LibrarySelectToggleProps) {
+/** 选择入口按钮本体（不带容器）：底部固定区里与「已归档」入口同排时由调用方包一层 lib-foot。 */
+export function LibrarySelectButton({ selectMode, label, cancelLabel, onToggle }: LibrarySelectButtonProps) {
   return (
-    <div className="lib-foot">
-      <button className="btn btn--quiet lib-select-btn" type="button" onClick={onToggle} data-testid="library-select-mode">
-        {selectMode ? <X size={15} aria-hidden="true" /> : <ListChecks size={15} aria-hidden="true" />}
-        {selectMode ? cancelLabel : label}
-      </button>
-    </div>
+    <button className="btn btn--quiet lib-select-btn" type="button" onClick={onToggle} data-testid="library-select-mode">
+      {selectMode ? <X size={15} aria-hidden="true" /> : <ListChecks size={15} aria-hidden="true" />}
+      {selectMode ? cancelLabel : label}
+    </button>
   );
 }
 

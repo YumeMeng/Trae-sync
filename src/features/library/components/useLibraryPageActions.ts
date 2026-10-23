@@ -1,8 +1,8 @@
 import { useCallback, useRef, useState } from "react";
 import type { LibraryView } from "../config";
 import type { LibraryDeleteDialogView } from "./LibraryDeleteDialogs";
-import {
-  useLibraryDeleteActions, type DeleteTargetView, type LibraryDeleteBusy, type WbDeleteSelection,
+import type {
+  DeleteTargetView, LibraryDeleteActionsResult, LibraryDeleteBusy, WbDeleteSelection,
 } from "./useLibraryDeleteActions";
 import type { LibrarySelection } from "./useLibrarySelection";
 
@@ -26,9 +26,11 @@ export interface LibraryPageActionsInput {
    * 两个选择集合都要传：TRAE 勾项目时其下已归档会话也在删除范围内（旧 L850-860），只按会话 id 取会漏。
    */
   readonly targets: (sessionIds: readonly string[], projectIds: readonly string[]) => readonly DeleteTargetView[];
-  readonly refresh: (options?: { readonly force?: boolean }) => Promise<{ readonly ok: boolean; readonly error?: string }>;
-  /** WB 写后重跑体检（旁路）；缺省不跑。 */
-  readonly refreshCheckup?: () => Promise<unknown>;
+  /**
+   * 删除/归档动作实例：由页面持有一份（归档编排要用同一个实例的 applyArchive 与忙碌位），
+   * 本 hook 只接线不新建，避免两条链各持一套忙碌位与弹层。
+   */
+  readonly del: LibraryDeleteActionsResult;
   /** 删除成功后通知页面（关闭被删会话的查看器）。 */
   readonly onDeleted: (ids: readonly string[]) => void;
 }
@@ -46,7 +48,7 @@ const NO_TARGETS: readonly DeleteTargetView[] = []; // 未登记产品：无删�
 export function useLibraryPageActions(input: LibraryPageActionsInput): LibraryPageActionsResult {
   const latest = useRef(input); latest.current = input; // 入参经 ref 取最新值：动作身份稳定
   const [dialog, setDialog] = useState<LibraryDeleteDialogView | null>(null);
-  const del = useLibraryDeleteActions({ refresh: input.refresh, ...(input.refreshCheckup === undefined ? {} : { refreshCheckup: input.refreshCheckup }) });
+  const del = input.del;
   const targetsOf = useCallback((): readonly DeleteTargetView[] => {
     const current = latest.current;
     if (current.view === null) return NO_TARGETS;

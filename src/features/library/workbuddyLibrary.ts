@@ -182,7 +182,7 @@ export function buildWorkBuddyLibraryView(snapshot: WorkBuddyLibrarySnapshot): W
     tree: treeOf(snapshot), treeEmpty: emptyTree ? LIBRARY_TEXTS.wbEmptyGroups : "",
     viewer: viewerOf(snapshot), batchBar: batchBarOf(snapshot),
     selectionEntry: null, // WB 逐会话复选常显（§2-3 B）：无「选择模式」开关，动作行常驻
-    draftBar: null, // §2-7 A：WB 无归档（软删是删除语义，不是归档）
+    draftBar: null, archive: null, // §2-7 A：WB 无归档（软删是删除语义，不是归档）
     checkup: checkupOf(snapshot), plugins: null, info: null, // §2-12 / §2-13 A：WB 无插件 tab、无库信息 tab（统计卡承担）
     notices: [], texts: LIBRARY_VIEW_TEXTS.workbuddy, // WB 回执前缀「WorkBuddy：」
   };
