@@ -186,3 +186,11 @@ P4d-8b-2b 修复 K-07 项 4 时补 2 例（收编 / 清理的「成功但重读�
 - 现象：旧库面板的消息轨迹行有 thoughts 展开列表（旧 LibrarySessionsPanel L2207-2213），P4e-3b 的 MessageView 未包含该字段，纯派生层不搬。
 - 约定：装配层（P4e-7/8）必须从 SessionMessageDto 取 thoughts 并渲染，或在 P4e-7 扩 config 字段；**不许当作无此功能**。
 - 归属：P4e-7/8 接线时闭环，届时删除本条。
+
+
+## K-09 WB 库页会话时间格式变化（2026-10-24 决定并接受）
+
+- 旧：`toLocaleDateString()` 只到日，随宿主 locale 漂移（同一版本不同机器显示不同）。
+- 新：复用 `formatSessionTime`（注入 now），显示「10月24日 03:00」，null 仍为「—」。
+- 决定：**接受新格式**——旧格式的 locale 漂移本身就是缺陷；新格式确定、可测、可断言。
+- 影响面：仅 WB 库页会话行时间；TRAE 侧本就用 formatSessionTime。
