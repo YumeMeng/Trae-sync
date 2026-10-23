@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
-import { AccountCenter } from "../src/components/product/trae/AccountCenterTrae";
+import { AccountsPage } from "../src/features/accounts/AccountsPage";
 import { accountAdapterFor, createTraeCnAccountAdapter } from "../src/platform/accountAdapter";
 import { CURRENT_PRODUCT_ID } from "../src/types/product";
 import { installFakeInvoke, mockRoute, resetRoutes } from "./helpers/fakeInvoke";
@@ -10,8 +10,24 @@ vi.mock("@tauri-apps/api/core", async () => {
   const fake = await import("./helpers/fakeInvoke");
   return { invoke: fake.mockCoreInvoke };
 });
+// P4c-9a：合并页订阅批量进度事件；jsdom 无 Tauri IPC，listen 给空退订函数即可。
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => undefined) }));
 
 const mockInvoke = vi.mocked(invoke);
+
+/** 合并页 TRAE 读取四命令桩（池面测试只需它们不抛错；行数据全部来自 adapterPool）。 */
+function installTraeReadRoutes(): void {
+  mockRoute("get_checkin_capability", () => ({ enabled: true, transport: "fixture", real_http_enabled: false, message: "" }));
+  mockRoute("get_checkin_overview", () => []);
+  mockRoute("get_environment_state", () => ({
+    env_id: "master", current_profile_id: null, current_account_name: null, running: false,
+    observed_profile_id: null, data_dir: "C:\\data\\master",
+    login_state: "logged_out", created_at_unix_seconds: 1750000000 }));
+  mockRoute("get_managed_account_state", () => ({
+    saved_accounts: [], switch_state: null, handoff_intent: null, history_is_separate: true,
+    current_account: { profile_id: null, display_name: null, region: null, data_location_id: null, verification_state: "unknown", observed_at: null, reason: null },
+    recent_verification: { verification_state: "unknown", checked_at: null, reason: null } }));
+}
 
 describe("账号适配器与共享工作台", () => {
   beforeEach(() => {
@@ -111,15 +127,20 @@ describe("账号适配器与共享工作台", () => {
   });
 
   it("适配器路径使用同一账号工作台，并隐藏 Work 专有操作（凭据刷新随融合版续期语义移除）", async () => {
-    render(<AccountCenter active adapter={createTraeCnAccountAdapter()} />);
+    // P4c-9a：旧 AccountCenterTrae 已删除，适配器面改由合并页的 adapterPool 注入口承载
+    // （K-02：适配器池只在测试注入路径存在）。合并页的 TRAE 读取四命令同样需要桩。
+    installTraeReadRoutes();
+    const adapter = createTraeCnAccountAdapter();
+    const pool = await adapter.loadSnapshot();
+    render(<AccountsPage active={true} productId="trae_cn" adapterPool={pool} />);
 
-    expect(await screen.findByRole("region", { name: "TRAE 账号" })).toBeInTheDocument();
-    // P4c-QA-1：region 外壳与页头在首次渲染即有，账号行是异步 loadSnapshot
-    // 到位后才出现——此处必须等账号行本身（findByText），不能在外壳出现后
-    // 立刻同步 getByText，否则全量并行满载时会读到「正在读取账号信息…」。
-    expect(await screen.findByText("CN 主账号")).toBeInTheDocument();
-    expect(screen.getByText("CN 备用账号")).toBeInTheDocument();
-    expect(await screen.findByTestId("account-health-check")).toBeInTheDocument();
+    // 合并页 region 文案统一「账号」（旧适配器面曾写「TRAE 账号」，差异记 K-03）。
+    // 账号行异步到位：必须等行本身，不能拿外壳出现当数据就绪（P4c-QA-1 纪律）。
+    expect(await screen.findByTestId("account-adapter-card-cn-backup")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: /^账号$/ })).toBeInTheDocument();
+    expect(screen.getByTestId("account-adapter-card-cn-main")).toBeInTheDocument();
+    // 池面页头：本地刷新 + 健康检测在册；Work 专有的额度/凭据批量入口不出现。
+    expect(screen.getByTestId("account-health-check")).toBeInTheDocument();
     expect(screen.queryByTestId("account-refresh-credits")).not.toBeInTheDocument();
     // P15-7（ADR-0035 决策 7）：登录代次由融合版客户端自动续期，
     // 凭据刷新是 Work 签到档案专有操作，融合版账号页不出现该入口。
@@ -128,17 +149,11 @@ describe("账号适配器与共享工作台", () => {
     const card = screen.getByTestId("account-adapter-card-cn-backup");
     expect(card.querySelector(".account-item__main")).not.toBeNull();
     expect(card.querySelector(".account-item__side")).not.toBeNull();
-    expect(card.querySelector(".slot-badge")).not.toBeNull();
+    // 徽章文案由 builder 给（旧 .slot-badge 类 → 统一 Badge 族，差异记 K-03）：
+    // active = 登录有效；unknown = 状态待验证（不臆测成有效）。
+    expect(card).toHaveTextContent("状态待验证");
     expect(card).toHaveTextContent("设为工具当前账号");
-    // CN 没有详情能力时保持静态条目，不能让悬停样式制造假的可点击暗示。
-    expect(card).not.toHaveClass("account-card--clickable");
-
-    fireEvent.click(screen.getByTestId("account-health-check"));
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("check_trae_cn_account_health", {
-        profileIds: ["cn-main", "cn-backup"],
-      });
-    });
+    expect(screen.getByTestId("account-adapter-card-cn-main")).toHaveTextContent("登录有效");
 
     fireEvent.click(screen.getByTestId("account-adapter-tool-select"));
     await waitFor(() => {
