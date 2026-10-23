@@ -46,8 +46,9 @@ src/platform/accounts.ts      229 行  26 条命令
 - P4d-1 ✅ platform/environment.ts（24 条命令）+ environmentPlugins.ts（4 条）
 - P4d-2 ✅ config.ts（16 类型 / 16 字段能力表 / 220 条文案，含两处已知前后端不一致，隔离在 ENV_KNOWN_COPY_MISMATCHES）
 - P4d-3 ✅ traeEnvironment.ts（200 行）+ registry.ts（26 行），口径原样搬入、61 个 testid 登记
-- P4d-4 ⏳ workbuddyEnvironment.ts + registry 补一行
-- P4d-5 数据 hook ×2 / P4d-6 动作 hook ×3 / P4d-7 展示组件 ×5 / P4d-8 弹层+接线+删旧
+- P4d-4 ✅ workbuddyEnvironment.ts（两卡扩展）+ registry 补 workbuddy
+- P4d-5 ✅ 数据 hook ×2（快照代次守卫 / 忙碌位与收编进度校验）
+- P4d-6 动作 hook（6a 启停/修复/捕获 · 6b 收编/清理） / P4d-7 展示组件 ×5 / P4d-8 弹层+接线+删旧
 - 关键风险：收编/清理编排（关实例→单事务→重启 + env_id 过滤 + 三个冲突错误码）不可简化
 
 ## 之后
