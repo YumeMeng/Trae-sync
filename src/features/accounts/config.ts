@@ -204,6 +204,30 @@ export interface DetailFieldView {
   readonly value: string;
   readonly tone?: "neutral" | "warn" | "danger";
   readonly hint?: string;
+  /** 行内编辑（P4c-6b-2e-2）：非空即该字段点击进入编辑态；保存动作 id = 字段 id + "-save"。 */
+  readonly edit?: DetailFieldEditView;
+  /** 开关字段（P4c-6b-2e-2）：非空即渲染成 checkbox，on = 权威开关态（乐观翻转由页面覆盖）。 */
+  readonly toggle?: DetailFieldToggleView;
+}
+
+/** 行内编辑描述：草稿初值与占位一律由 builder 给（旧实现以档案原值为准，不回退展示名）。 */
+export interface DetailFieldEditView {
+  readonly kind: "text" | "tel";
+  readonly maxLength: number;
+  /** 进入编辑态时的初始草稿（保存空串 = 清除，回退服务端值）。 */
+  readonly draft: string;
+  /** 输入框占位（备注名 = 服务端名；手机号 = 脱敏号）。 */
+  readonly placeholder: string;
+}
+
+/**
+ * 开关字段描述：on = 后端权威态，onLabel/offLabel = 两态文案（乐观翻转时据此换词，
+ * 不从 value 反推）；value 仍由 builder 按 on 取同一份文案，展示契约不变。
+ */
+export interface DetailFieldToggleView {
+  readonly on: boolean;
+  readonly onLabel: string;
+  readonly offLabel: string;
 }
 
 /** 详情动作：disabledReason 非空即禁用并给悬浮说明（与页头动作的 disabled.reason 同一口径）。 */

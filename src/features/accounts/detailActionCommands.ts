@@ -1,5 +1,10 @@
-import { resetCheckinDevice, removeCheckinAccount, refreshCheckinCredits, runAccountCheckin } from "../../platform/accounts";
-import { purgeWorkBuddyAccounts } from "../../platform/workbuddyAdapter";
+import {
+  readCheckinOverview, refreshCheckinCredits, removeCheckinAccount, resetCheckinDevice, runAccountCheckin,
+  setAccountAutoCheckin, setAccountDisplayName, setAccountMobile,
+} from "../../platform/accounts";
+import {
+  purgeWorkBuddyAccounts, setWorkBuddyAccountArchived, setWorkBuddyAccountAutoCheckin, setWorkBuddyAccountDisplayName,
+} from "../../platform/workbuddyAdapter";
 import type { CheckinBatchSummaryDto, CreditsRefreshEntryDto } from "../../types/account_switch";
 import type { WorkBuddyAccountEntryDto } from "../../types/product";
 import { effectiveDisplayName, workbuddyDisplayName } from "../../utils/accountDisplay";
@@ -65,7 +70,34 @@ export interface DetailRemoveAction {
   readonly confirm?: (target: DetailActionTarget) => DetailConfirmCopy;
 }
 
-/** 产品接缝：目标解析 + 五类动作登记（各自的 id 与命令成对给出）。 */
+/** 行内文本编辑（备注名 / 手机号补录）：value 已 trim，空串 = 清除（回退服务端值）。 */
+export interface DetailTextEditAction {
+  readonly id: string;
+  readonly run: (target: DetailActionTarget, value: string) => Promise<void>;
+  /** 保存非空值的成功回执（旧实现逐字）。 */
+  readonly savedCopy: string;
+  /** 保存空串（清除）的成功回执（旧实现逐字）。 */
+  readonly clearedCopy: string;
+  /** 失败文案前缀（旧 WB 带「WorkBuddy：」）；缺省走通用兜底。 */
+  readonly failurePrefix?: string;
+  /** 失败文案中段（旧 WB 逐字「备注名保存失败——」）；缺省只拼前缀 + 原因。 */
+  readonly failureLabel?: string;
+  readonly failureFallback?: string;
+}
+
+/** 开关型字段（自动签到参与 / 归档）：enabled = 目标态（非当前态）。 */
+export interface DetailToggleAction {
+  readonly id: string;
+  readonly run: (target: DetailActionTarget, enabled: boolean) => Promise<void>;
+  readonly onCopy: string;
+  readonly offCopy: string;
+  readonly failurePrefix?: string;
+  /** 失败文案中段（旧 WB 逐字「归档设置失败——」/「参与状态保存失败——」）。 */
+  readonly failureLabel?: string;
+  readonly failureFallback?: string;
+}
+
+/** 产品接缝：目标解析 + 各类动作登记（各自的 id 与命令成对给出）。 */
 export interface PageDetailActions {
   readonly targetOf: (payload: unknown, rowId: string) => DetailActionTarget | null;
   readonly refreshCredits?: DetailRefreshCreditsAction;
@@ -74,6 +106,29 @@ export interface PageDetailActions {
   readonly relogin?: string;
   readonly resetDevice?: DetailResetDeviceAction;
   readonly remove?: DetailRemoveAction;
+  /** 备注名行内编辑（P4c-6b-2e-2）；缺省 = 该字段只读。 */
+  readonly displayName?: DetailTextEditAction;
+  /** 手机号补录（P4c-6b-2e-2，G11）；缺省 = 本产品无补录能力（WB）。 */
+  readonly mobile?: DetailTextEditAction;
+  /** 自动签到参与开关；缺省 = 该字段只读。 */
+  readonly autoCheckin?: DetailToggleAction;
+  /** 归档开关（仅 WB）；缺省 = 无归档能力。 */
+  readonly archive?: DetailToggleAction;
+  /**
+   * 登录后手机号补录引导（G11）：resolve 重读本机账号总览判定「该账号是否缺完整手机号」
+   * （null = 已补录过 / 账号不在总览，均不打扰），save 复用 set_account_mobile。
+   * 缺省 = 本产品不做补录（WB，能力表 mobileBackfill=false）。
+   */
+  readonly mobileBackfill?: {
+    readonly resolve: (profileId: string) => Promise<MobileBackfillTarget | null>;
+    readonly save: (profileId: string, mobile: string) => Promise<void>;
+  };
+}
+
+/** 补录弹层入参（展示名 + 服务端脱敏号，逐字旧 AccountCenterTrae L482-486）。 */
+export interface MobileBackfillTarget {
+  readonly name: string;
+  readonly masked: string;
 }
 
 /** TRAE 目标（旧 AccountDetail 的 entry）：备注名优先，服务端名进确认文案。 */
@@ -95,9 +150,37 @@ const workbuddyTarget = (payload: unknown, rowId: string): DetailActionTarget | 
   };
 };
 
-/** TRAE 五类动作（旧 testid 逐字）：额度 / 签到 / 重登 / 重置设备 / 删除。 */
+/** TRAE 动作（旧 testid 逐字）：额度 / 签到 / 重登 / 重置设备 / 删除 + 行内编辑与开关。 */
 const traeDetailActions = (): PageDetailActions => ({
   targetOf: traeTarget,
+  // U-1 备注名（旧 AccountDetail L97-106）：trim 后空 = 清除，回退服务端名。
+  displayName: {
+    id: "account-detail-alias",
+    run: (target, value) => setAccountDisplayName({ profileId: target.profileId, displayName: value === "" ? null : value }),
+    savedCopy: "备注名已保存。", clearedCopy: "备注名已清除，恢复服务端名称。",
+  },
+  // G11 手机号补录（旧 AccountCenterTrae L505-525）：空串 = 清除（回退脱敏号）。
+  mobile: {
+    id: "account-detail-mobile",
+    run: (target, value) => setAccountMobile({ profileId: target.profileId, mobile: value === "" ? null : value }),
+    savedCopy: "手机号已保存。", clearedCopy: "已清除补录的手机号，恢复显示脱敏号。",
+  },
+  // G11 登录后补录引导（旧 L478-487）：重读总览再判定，已补录过的账号重复登录不再打扰。
+  mobileBackfill: {
+    resolve: async (profileId) => {
+      const entries = await readCheckinOverview();
+      const entry = entries.find((item) => item.profile_id === profileId);
+      if (entry === undefined || entry.mobile_full) return null;
+      return { name: effectiveDisplayName(entry), masked: entry.masked_mobile };
+    },
+    save: (profileId, mobile) => setAccountMobile({ profileId, mobile }),
+  },
+  // 自动签到参与（旧 AccountDetail L435-442）：只影响自动批次，手动签到不受限。
+  autoCheckin: {
+    id: "auto-checkin-account-toggle",
+    run: (target, enabled) => setAccountAutoCheckin({ profileId: target.profileId, enabled }),
+    onCopy: "已加入每日自动签到。", offCopy: "已退出每日自动签到。",
+  },
   refreshCredits: { id: "account-detail-refresh-credits", run: (profileId) => refreshCheckinCredits({ profileIds: [profileId] }) },
   checkin: { id: "account-detail-checkin", run: (profileId) => runAccountCheckin({ profileIds: [profileId] }) },
   relogin: "account-detail-relogin",
@@ -131,9 +214,31 @@ const traeDetailActions = (): PageDetailActions => ({
   },
 });
 
-/** WB 已登记动作：删除（旧 WorkBuddyAccountDetail L131-157 回执与文案逐字）。 */
+/** WB 已登记动作：备注名 / 归档 / 参与开关 / 删除（旧 WorkBuddyAccountDetail 回执与文案逐字）。 */
 const workbuddyDetailActions = (): PageDetailActions => ({
   targetOf: workbuddyTarget,
+  // P19.2④ 备注名（旧 L80-94）：trim 后空 = 清除，回退捕获昵称；失败带「WorkBuddy：」前缀。
+  displayName: {
+    id: "workbuddy-detail-alias",
+    run: async (target, value) => { await setWorkBuddyAccountDisplayName(target.accountId ?? target.profileId, value); },
+    savedCopy: "备注名已保存。", clearedCopy: "备注名已清除，恢复捕获昵称。",
+    failurePrefix: ACCOUNT_TEXTS.notifyPrefixWorkbuddy, failureLabel: "备注名保存失败——", failureFallback: "请稍后重试。",
+  },
+  // P19.2④ 归档（旧 L96-109）：只影响列表标注，不自动退出签到参与集。
+  archive: {
+    id: "workbuddy-detail-archived-toggle",
+    run: async (target, archived) => { await setWorkBuddyAccountArchived(target.accountId ?? target.profileId, archived); },
+    onCopy: "账号已归档。", offCopy: "账号已取消归档。",
+    failurePrefix: ACCOUNT_TEXTS.notifyPrefixWorkbuddy, failureLabel: "归档设置失败——", failureFallback: "请稍后重试。",
+  },
+  // 参与开关（旧 L111-129）：显式写后端 touched+enabled（opt-out 永久尊重，B5 契约）。
+  autoCheckin: {
+    id: "workbuddy-detail-participation-toggle",
+    run: (target, enabled) => setWorkBuddyAccountAutoCheckin(target.profileId, enabled),
+    onCopy: `${ACCOUNT_TEXTS.notifyPrefixWorkbuddy}已加入每日自动签到。`,
+    offCopy: `${ACCOUNT_TEXTS.notifyPrefixWorkbuddy}已退出每日自动签到（仍可手动签到）。`,
+    failurePrefix: ACCOUNT_TEXTS.notifyPrefixWorkbuddy, failureLabel: "参与状态保存失败——", failureFallback: "请稍后重试。",
+  },
   remove: {
     id: "workbuddy-detail-purge",
     // 旧 L399-406 逐字：删除确认正文四行 + 「确认删除」。

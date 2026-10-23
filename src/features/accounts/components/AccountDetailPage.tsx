@@ -4,12 +4,16 @@ import { Badge } from "../../../ui/Badge";
 import { SectionHeader } from "../../../ui/SectionHeader";
 import type { AccountActionKind, AccountDetailFieldView, DetailActionView, DetailFieldView, DetailSectionView, DetailViewModel } from "../config";
 import { DetailDangerAction } from "./DetailDangerAction";
+import { DetailEditableField } from "./DetailEditableField";
 
 /**
  * 账号详情页（P4c-7b，纯新增、未接线）：**一个**通用渲染器覆盖两产品的全部详情。
  * 分区顺序、标题、字段、动作、testid 全部来自 buildDetailView 产出的 DetailViewModel：
  * 本文件不拼 testid、不自创文案、不判断 productId、不读数据、不发命令。
  * 三种特例（tech 折叠 / danger 二次确认 / checkin 开关）只在渲染层分支，数据面零差异。
+ *
+ * P4c-6b-2e-2 增：行内编辑字段（field.edit 非空）与开关字段（field.toggle 非空）两种渲染分支；
+ * 编辑与开关的保存出口只有 onFieldSave / onFieldToggle（由页面注入，命令仍在接缝表）。
  */
 export interface AccountDetailPageProps {
   view: DetailViewModel;
@@ -19,6 +23,17 @@ export interface AccountDetailPageProps {
   onBack(): void;
   /** 分区内动作统一出口：动作 id 原样透出，语义归页面。 */
   onAction(id: string): void;
+  /**
+   * 行内编辑保存出口（P4c-6b-2e-2）：fieldId + trim 后的草稿；true = 成功退出编辑态。
+   * 缺省 = 本产品未登记该字段命令，保存恒 false（字段保持只读展示，不臆造写入）。
+   */
+  onFieldSave?: (fieldId: string, value: string) => Promise<boolean>;
+  /**
+   * 开关字段翻转出口（P4c-6b-2e-2）：fieldId + 目标态；缺省 = 未登记命令，开关禁用。
+   */
+  onFieldToggle?: (fieldId: string, next: boolean) => void;
+  /** 开关字段的乐观覆盖态（字段 id → 目标态）；未覆盖即用 builder 的权威态。 */
+  toggleOverrides?: Readonly<Record<string, boolean>>;
   /**
    * 登录设备插槽（P4c-7c-1）：旧 AccountDetail 把 RemoteDevicesPanel 内嵌在
    * 「操作区之后、危险区之前」（L488-497），本渲染器同样插在该位置。
@@ -57,26 +72,23 @@ const TONE_CLASS: Record<"neutral" | "warn" | "danger", string | undefined> = {
   warn: "account-detail__fact-warn",
   danger: "workbench__error",
 };
-/** 开关态从声明文案读（builder 两产品同词表）：开态以「参与每日」起头，其余按关态。 */
-const SWITCH_ON_PREFIX = "参与每日";
-const switchOn = (value: string): boolean => value.startsWith(SWITCH_ON_PREFIX);
-/** 字段值收窄：value=null = 本产品不渲染该行（config 契约）；tone/hint 是可选附加信息。 */
+/** 字段值收窄：value=null = 本产品不渲染该行（config 契约）；tone/hint/edit/toggle 是可选附加信息。 */
 type RenderableField = AccountDetailFieldView & Partial<DetailFieldView> & { readonly value: string };
 const isRenderable = (field: AccountDetailFieldView): field is RenderableField => field.value !== null;
-/** 特例 3 的判定：checkin 区内 id 以 -toggle 结尾且无警示 tone 的字段 = 开关型动作。 */
-const isSwitchField = (sectionId: DetailSectionView["id"], field: RenderableField): boolean =>
-  sectionId === "checkin" && field.id.endsWith("-toggle") && field.tone === undefined;
 
 interface FieldRowProps {
   readonly field: RenderableField;
-  readonly sectionId: DetailSectionView["id"];
   readonly busy: readonly string[];
-  readonly onAction: (id: string) => void;
+  readonly onFieldSave: (fieldId: string, value: string) => Promise<boolean>;
+  readonly onFieldToggle: (fieldId: string, next: boolean) => void;
+  readonly overrides: Readonly<Record<string, boolean>>;
 }
 
-/** 字段行：label + 字符串 value；tone 只改文字色，hint 进悬浮说明，开关型字段渲染成开关。 */
-function FieldRow({ field, sectionId, busy, onAction }: FieldRowProps) {
-  if (isSwitchField(sectionId, field)) {
+/** 字段行三种形态：开关（toggle）/ 行内编辑（edit）/ 只读文本；保存出口一律是页面注入的回调。 */
+function FieldRow({ field, busy, onFieldSave, onFieldToggle, overrides }: FieldRowProps) {
+  // 开关字段（P4c-6b-2e-2）：on = 乐观覆盖优先，否则 builder 权威态；文案由 onLabel/offLabel 换。
+  if (field.toggle !== undefined) {
+    const on = overrides[field.id] ?? field.toggle.on;
     return (
       <div className="account-detail__fact">
         <dt>{field.label}</dt>
@@ -85,16 +97,29 @@ function FieldRow({ field, sectionId, busy, onAction }: FieldRowProps) {
           <label className="account-center__profile-select" data-testid={field.id}>
             <input
               type="checkbox"
-              checked={switchOn(field.value)}
+              checked={on}
               disabled={busy.includes(field.id)}
-              onChange={() => onAction(field.id)}
+              onChange={() => onFieldToggle(field.id, !on)}
             />
             <span className="account-center__profile-copy">
-              <strong>{field.value}</strong>
+              <strong>{on ? field.toggle.onLabel : field.toggle.offLabel}</strong>
             </span>
           </label>
         </dd>
       </div>
+    );
+  }
+  // 行内编辑字段：展示态点行进入编辑态（DetailEditableField 自持草稿与编辑态）。
+  if (field.edit !== undefined) {
+    return (
+      <DetailEditableField
+        id={field.id}
+        label={field.label}
+        value={field.value}
+        edit={field.edit}
+        busy={busy.includes(field.id)}
+        onSave={(value) => onFieldSave(field.id, value)}
+      />
     );
   }
   return (
@@ -135,16 +160,24 @@ interface SectionBlockProps {
   readonly section: DetailSectionView;
   readonly busy: readonly string[];
   readonly onAction: (id: string) => void;
+  readonly onFieldSave: (fieldId: string, value: string) => Promise<boolean>;
+  readonly onFieldToggle: (fieldId: string, next: boolean) => void;
+  readonly overrides: Readonly<Record<string, boolean>>;
   readonly dangerConfirm?: (actionId: string) => DangerConfirmCopy | null;
 }
 
 /** 单个分区：字段表 + 动作组 + 可选说明；tech / danger 两个特例在此分流。 */
-function SectionBlock({ section, busy, onAction, dangerConfirm }: SectionBlockProps) {
+function SectionBlock({ section, busy, onAction, onFieldSave, onFieldToggle, overrides, dangerConfirm }: SectionBlockProps) {
   const fields = section.fields.filter(isRenderable);
+  // 行内编辑字段的保存按钮由 DetailEditableField 自持（编辑态才出现，testid = 字段 id + "-save"）；
+  // 分区动作里同 id 的保存动作据此过滤，避免 DOM 里出现两个同锚点按钮。
+  const editSaveIds = new Set(fields.filter((field) => field.edit !== undefined).map((field) => `${field.id}-save`));
+  const actions = section.actions.filter((action) => !editSaveIds.has(action.id));
   const facts = fields.length === 0 ? null : (
     <dl className="account-detail__facts">
       {fields.map((field) => (
-        <FieldRow key={field.id} field={field} sectionId={section.id} busy={busy} onAction={onAction} />
+        <FieldRow key={field.id} field={field} busy={busy}
+          onFieldSave={onFieldSave} onFieldToggle={onFieldToggle} overrides={overrides} />
       ))}
     </dl>
   );
@@ -185,13 +218,14 @@ function SectionBlock({ section, busy, onAction, dangerConfirm }: SectionBlockPr
     );
   }
   // 常规分区（basics / credential / checkin / actions）：标题 + 字段 + 动作 + 说明。
+  // 行内编辑字段的保存按钮由 DetailEditableField 自持（编辑态才出现），故此处动作组只渲染其余动作。
   return (
     <section className="account-detail__section">
       <SectionHeader title={section.title} className="account-detail__section-heading" />
       {facts}
-      {section.actions.length > 0 && (
+      {actions.length > 0 && (
         <div className="account-detail__actions">
-          {section.actions.map((action) => (
+          {actions.map((action) => (
             <ActionRow key={action.id} action={action} running={busy.includes(action.id)} onAction={onAction} />
           ))}
         </div>
@@ -202,9 +236,15 @@ function SectionBlock({ section, busy, onAction, dangerConfirm }: SectionBlockPr
 }
 
 /** 详情页装配：页头（返回 + 标题 + 徽章组）+ 按 sections[] 顺序渲染分区。 */
-export function AccountDetailPage({ view, busy, onBack, onAction, devicesSlot, dialogsSlot, dangerConfirm }: AccountDetailPageProps) {
+export function AccountDetailPage({
+  view, busy, onBack, onAction, onFieldSave, onFieldToggle, toggleOverrides, devicesSlot, dialogsSlot, dangerConfirm,
+}: AccountDetailPageProps) {
   // 忙碌位优先级：页面显式传入 > builder 镜像的 view.busy > 空闲（不猜进行中的动作）。
   const running = busy ?? view.busy ?? [];
+  // 未接线路径（未传保存出口）：保存恒 false —— 字段保持只读展示，不假装写入成功。
+  const saveField = onFieldSave ?? (() => Promise.resolve(false));
+  const toggleField = onFieldToggle ?? (() => undefined);
+  const overrides = toggleOverrides ?? {};
   // 设备插槽落位：危险区之前（旧布局 L488-497）；无危险区则垫在分区末尾。
   const dangerAt = view.sections.findIndex((section) => section.id === "danger");
   const devicesAt = devicesSlot === undefined ? -1 : dangerAt < 0 ? view.sections.length : dangerAt;
@@ -230,7 +270,8 @@ export function AccountDetailPage({ view, busy, onBack, onAction, devicesSlot, d
       {view.sections.map((section, index) => (
         <Fragment key={section.id}>
           {index === devicesAt && devicesSlot}
-          <SectionBlock section={section} busy={running} onAction={onAction} dangerConfirm={dangerConfirm} />
+          <SectionBlock section={section} busy={running} onAction={onAction} onFieldSave={saveField}
+            onFieldToggle={toggleField} overrides={overrides} dangerConfirm={dangerConfirm} />
         </Fragment>
       ))}
       {devicesAt === view.sections.length && devicesSlot}

@@ -1,5 +1,8 @@
-import { useCallback, useState } from "react";
+import { createElement, useCallback, useRef, useState } from "react";
+import { notify } from "../../../platform/notify";
+import { safeUiErrorMessage } from "../../../utils/safeUiError";
 import type { AccountLoginDialogProps } from "./AccountLoginDialog";
+import { MobileBackfillDialog } from "./MobileBackfillDialog";
 import { useAccountLogin, type AccountLoginCommands, type AccountLoginReceipt } from "./useAccountLogin";
 
 /**
@@ -24,11 +27,19 @@ export interface PageLogin {
 const unsupported = (): Promise<never> => Promise.reject("login_unsupported");
 const UNAVAILABLE_LOGIN_COMMANDS: AccountLoginCommands = { begin: unsupported, complete: unsupported, cancel: unsupported };
 
+/** 登录后手机号补录接缝（G11）：resolve 判定缺号账号（null = 不打扰），save 复用 set_account_mobile。 */
+export interface LoginMobileBackfill {
+  readonly resolve: (profileId: string) => Promise<{ readonly name: string; readonly masked: string } | null>;
+  readonly save: (profileId: string, mobile: string) => Promise<void>;
+}
+
 export interface AccountLoginFlow {
   /** 等待浏览器授权中（builder 的 busy.login：页头按钮禁用与「等待浏览器登录完成…」）。 */
   readonly busy: boolean;
   /** 弹层属性；null = 不挂载（未登记接缝，或本轮已收尾）。 */
   readonly dialog: AccountLoginDialogProps | null;
+  /** 手机号补录弹层（G11）；null = 不挂载（未登记补录接缝，或本轮未触发/已收尾）。 */
+  readonly backfill: React.ReactNode;
   /** 页头动作分发：true = 已由本流程处理（打开弹层），调用方不再透出。 */
   readonly handle: (actionId: string) => boolean;
   /**
@@ -39,7 +50,19 @@ export interface AccountLoginFlow {
   readonly open: () => boolean;
 }
 
-export function useAccountLoginFlow(wiring: PageLogin | null, onSettled: () => Promise<void>): AccountLoginFlow {
+/** 登录流程入参：接缝 + 成功后重读缓存 + 可选补录接缝（G11）。 */
+export interface AccountLoginFlowInput {
+  readonly wiring: PageLogin | null;
+  readonly onSettled: () => Promise<void>;
+  /** 补录接缝；缺省 = 本产品不做补录（WB 能力表 mobileBackfill=false），弹层永不出现。 */
+  readonly backfill?: LoginMobileBackfill;
+}
+
+export function useAccountLoginFlow(input: AccountLoginFlowInput): AccountLoginFlow {
+  const { wiring, onSettled } = input;
+  // 入参经 ref 取最新值：complete/cancel 保持稳定身份，补录判定在渲染期读最新数据面。
+  const inputRef = useRef(input);
+  inputRef.current = input;
   const { beginLogin, completeLogin, cancelLogin, attempt, phase, loginUrl } = useAccountLogin(
     wiring?.commands ?? UNAVAILABLE_LOGIN_COMMANDS,
   );
@@ -64,16 +87,58 @@ export function useAccountLoginFlow(wiring: PageLogin | null, onSettled: () => P
   // 「打开浏览器」= 发起登录（后端 begin 即拉起所选浏览器）；失败由 hook 通知，弹层留在原地可重试。
   const openBrowser = useCallback(() => { void beginLogin(systemBrowser); }, [beginLogin, systemBrowser]);
 
-  // 「我已完成登录」：等回调 → 成功即重读本机缓存（旧 L468 refreshOverview 同法）。
+  // 手机号补录弹层（G11）：目标账号 + 展示名 + 脱敏号；null = 不挂载。
+  const [prompt, setPrompt] = useState<{ readonly profileId: string; readonly name: string; readonly masked: string } | null>(null);
+  const [promptBusy, setPromptBusy] = useState(false);
+  const [promptError, setPromptError] = useState<string | null>(null);
+
+  // 「我已完成登录」：等回调 → 成功即重读本机缓存（旧 L468 refreshOverview 同法）→ 缺号引导补录。
   // 失败/取消的提示语义全在 hook 内，此处只负责收尾关层（取消太晚时 attempt 仍在，
   // 弹层按 attempt 继续挂载并展示 settling，不会因为关层而丢掉真实结果）。
   const complete = useCallback(() => {
     void (async () => {
       const receipt: AccountLoginReceipt | null = await completeLogin();
       setOpen(false);
-      if (receipt !== null) await onSettled();
+      if (receipt === null) return;
+      await onSettled();
+      // 补录触发条件（旧 L478-487）：回执没带完整手机号，且重读后的总览确认该账号仍未补录。
+      if (receipt.mobile_full) return;
+      const seam = inputRef.current.backfill;
+      if (seam === undefined) return;
+      const target = await seam.resolve(receipt.profile_id);
+      if (target === null) return;
+      setPromptError(null);
+      setPrompt({ profileId: receipt.profile_id, name: target.name, masked: target.masked });
     })();
   }, [completeLogin, onSettled]);
+
+  // 补录保存（旧 L553-574）：成功后关层；失败保留弹层与输入，映射后文案就地展示。
+  const saveBackfill = useCallback((value: string) => {
+    const current = prompt;
+    const seam = inputRef.current.backfill;
+    if (current === null || seam === undefined || promptBusy) return;
+    setPromptBusy(true);
+    setPromptError(null);
+    void (async () => {
+      try {
+        await seam.save(current.profileId, value.trim());
+        await inputRef.current.onSettled();
+        setPrompt(null);
+        notify.success("手机号已补全，账号列表与详情页都会显示完整号码。");
+      } catch (reason: unknown) {
+        setPromptError(safeUiErrorMessage(reason, "手机号保存失败，请稍后重试。"));
+      } finally {
+        setPromptBusy(false);
+      }
+    })();
+  }, [prompt, promptBusy]);
+
+  // 跳过（旧 L846-858）：只关层，不写任何数据。
+  const skipBackfill = useCallback(() => {
+    if (promptBusy) return;
+    setPrompt(null);
+    setPromptError(null);
+  }, [promptBusy]);
 
   // 取消：先收起意图；若取消太晚（attempt 仍在收尾），弹层按 attempt 继续挂载并展示 settling。
   const cancel = useCallback(() => {
@@ -93,5 +158,11 @@ export function useAccountLoginFlow(wiring: PageLogin | null, onSettled: () => P
     onCancel: cancel,
   };
 
-  return { busy: attempt !== null || phase !== "idle", dialog, handle, open: openDialog };
+  // 补录弹层：未登记接缝或未触发即 null（挂载即打开，关闭即卸载）。
+  const backfillNode = prompt === null ? null : createElement(MobileBackfillDialog, {
+    accountName: prompt.name, masked: prompt.masked, busy: promptBusy, error: promptError,
+    onSave: saveBackfill, onSkip: skipBackfill,
+  });
+
+  return { busy: attempt !== null || phase !== "idle", dialog, backfill: backfillNode, handle, open: openDialog };
 }
