@@ -34,16 +34,26 @@
    「TRAE 账号」，合并页统一用 `ACCOUNT_TEXTS.pageTitle`（「账号」，与真实面、WB 面一致）。
    - 判定：可放弃（同一页面不该因数据来源换标题）。e2e 与单测现按 `/^账号$/` 定位。
 
-## K-04 合并页尚未接线的页头动作（P4c-9a 记录，2026-10-23）
+## K-04 合并页尚未接线的页头动作（P4c-9a 记录 → **P4c-9b-1 已修复**，2026-10-23）
 
-合并页页头对 WB 面给出「刷新登录凭据 / 健康检测 / 保存当前登录账号 / 添加账号」四个动作 id，
-但 `pageAdapters` 只登记了 `refreshLocalActionId`：点击后动作 id 原样透出、**没有命令执行**。
-旧 `WorkBuddyPanel` 这四个动作都是实装的。
-
-- 影响范围：仅 WB 账号页（TRAE 面的批量动作已接）。
-- 现状：`sectionSlots.accounts.workbuddy` 仍指向旧 `WorkBuddyPanel`，故**生产路径不受影响**；
-  待 WB 槽位切到合并页前必须先补这四条接线，否则会丢功能。
-- 归属：WB 槽位迁移票（P4c-9b 或后续），不在 P4c-9a 边界内。
+- 现象（发现时）：合并页页头对 WB 面给出「刷新登录凭据 / 健康检测 / 保存当前登录账号 /
+  添加账号」四个动作 id，但 `pageAdapters` 只登记了 `refreshLocalActionId`：点击后动作 id
+  原样透出、**没有命令执行**。旧 `WorkBuddyPanel` 这四个动作都是实装的。
+- 影响（发现时）：仅 WB 账号页（TRAE 面的批量动作已接）。`sectionSlots.accounts.workbuddy`
+  当时仍指向旧 `WorkBuddyPanel`，故生产路径未受影响。
+- **修复（P4c-9b-1）**：新增 `features/accounts/poolActionCommands.ts`（WB 四条池级动作的
+  命令 / 文案 / 确认弹层 / 刷新时机，逐字沿用旧 `WorkBuddyPanel` L172-342 + L574-589）与
+  `components/usePoolHeaderActions.tsx`（编排 + 四路独立忙碌位 + 捕获确认层），经
+  `pageAdapters` 的 `poolActions` 接缝登记；页头分发与忙碌位抽到
+  `components/useAccountsHeaderWiring.ts`（AccountsPage 回到 300 行预算内）。
+  呈现纪律：这四个命令都只有**池级 / 客户端级单条回执**，故一律按旧实现的
+  `notify.success / info / error` 三档汇报，**不拆成逐账号摘要**（不使用 `notify.summary`）。
+  动作 id 与弹层 testid 逐字沿用（`workbuddy-renew-credentials` / `workbuddy-deep-health-button` /
+  `workbuddy-capture-button` + `workbuddy-capture-dialog` / `workbuddy-add-account-button` +
+  `workbuddy-login-cancel`）。回归护栏：`tests/accountsPagePoolActions.test.tsx`（11 例）。
+- **无残留行为差异**：旧实现注释称健康检测「结果常驻健康卡」，但旧 `runDeepHealth` 实际只发通知、
+  不写任何状态、不重读数据；合并页同一形态（三档 `liveHealthLabel` 文案逐字保留，零写副作用）。
+  四动作的禁用口径、忙碌转圈、「取消等待」按钮时机均与旧页一致。
 
 ## K-05 批量进度的逐账号文案在合并页缺失（P4c-9a 发现 → **P4c-9c 已修复**，2026-10-23）
 

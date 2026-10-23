@@ -95,8 +95,9 @@ const traeWiring = (payload: unknown): ActionWiring => {
 /**
  * WB：额度刷新走现有逐账号余额查询（get_workbuddy_checkin_overview）。凭据续期
  * （refresh_workbuddy_account）与深度健康检测（check_workbuddy_login_health）都只返回
- * 池级/客户端级单条回执，没有逐账号 healthy/error_code，故不登记这两个动作
- * （fail-closed，不造假逐账号结果）；WB 页头当前亦无「刷新额度」入口。
+ * 池级/客户端级单条回执，没有逐账号 healthy/error_code，故本表**不登记**这两个动作
+ * （fail-closed，不造假逐账号结果）；它们的页头接线在 poolActionCommands（单条回执三档呈现）。
+ * WB 页头当前亦无「刷新额度」入口。
  */
 const workbuddyWiring = (payload: unknown): ActionWiring => {
   const pool = (payload as { readonly pool: readonly WorkBuddyAccountEntryDto[] }).pool;

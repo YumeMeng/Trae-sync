@@ -17,6 +17,8 @@ import { AccountBatchProgressStatus } from "./components/AccountBatchProgressSta
 import { useCredentialRefresh, type CredentialRefreshTarget } from "./components/useCredentialRefresh";
 import { useAccountsSnapshot } from "./components/useAccountsSnapshot";
 import { useHeaderBatchActions } from "./components/useHeaderBatchActions";
+import { usePoolHeaderActions } from "./components/usePoolHeaderActions";
+import { useAccountsHeaderWiring } from "./components/useAccountsHeaderWiring";
 import { useAccountLoginFlow } from "./components/useAccountLoginFlow";
 import { useRowActions } from "./components/useRowActions";
 import { useDetailActions } from "./components/useDetailActions";
@@ -87,6 +89,8 @@ export function AccountsPage(props: AccountsPageProps) {
 
   const wiring = actionWiringFor(productId, payload); // 页头批量动作（P4c-6b-2b）：命令按产品查表
   const batch = useHeaderBatchActions({ wiring, targets: () => wiring?.targets(selectedRowId) ?? [], onSettled: refreshLocal, resetProgress: progressReset });
+  // 池级页头四动作（P4c-9b-1 / K-04）：WB 的续期 / 健康 / 捕获 / 登录；未登记产品即全部透出。
+  const pool = usePoolHeaderActions({ wiring: adapter?.poolActions ?? null, onSettled: refreshLocal });
 
   // 批量刷新凭据（旧 L680-729 同契约）：入口只开二次确认弹层，目标确认时才解析；缺省即无入口。
   const credential = adapter?.credentialRefresh;
@@ -117,7 +121,7 @@ export function AccountsPage(props: AccountsPageProps) {
     filter, sort, now, localRefresh: localRefreshBusy, progress, adapterPool,
     credentialBusy: credentialConfirmBusy, creditsBusy: batch.busy.credits, healthBusy: batch.busy.health,
     loginBusy: login.busy, switchBusy: rowActions.busy.switching, toolBusy: rowActions.busy.toolSelection,
-    previewBusy: rowActions.busy.preview,
+    previewBusy: rowActions.busy.preview, poolBusy: pool.busy,
   };
   const composed: AccountsSnapshot | null = payload === null || adapter === undefined ? null : adapter.compose(payload, ui);
 
@@ -149,24 +153,14 @@ export function AccountsPage(props: AccountsPageProps) {
   // 详情忙碌位：单账号换发 + 五类动作 + 字段保存各自表达，只影响被点的按钮。
   const detailBusy = [...(detailCredential.busy ? DETAIL_CREDENTIAL_REFRESH_ACTIONS : []), ...detailActions.busy, ...fieldEdits.busy];
 
-  const headerBusy = [ // 页头忙碌位（给 id 即转圈）：四路各自独立表达，互不冒充
-    ...(pending === null ? [] : [pending]),
-    ...(credentialConfirmBusy ? [credential?.actionId ?? ""] : []),
-    ...(batch.busy.credits ? [wiring?.actionIds.credits ?? ""] : []),
-    ...(batch.busy.health ? [wiring?.actionIds.health ?? ""] : []),
-  ].filter((id) => id !== "");
-
-  // 页头动作分发：本页执行本地刷新 / 批量凭据刷新 / 批量动作 / 登录，其余原样透出。
-  const handleHeaderAction = useCallback((actionId: string) => {
-    if (actionId === "") return;
-    if (actionId === refreshLocalActionId) { handleRefreshLocal(); return; }
-    if (actionId === credential?.actionId) { listCredential.request(); return; }
-    if (batch.handle(actionId)) return;
-    // 添加账号 → 打开登录弹层（未登记登录接缝的产品不动，动作原样透出）。
-    login.handle(actionId);
-    // 透出契约不丢：动作 id 仍回给外部观察者（空态主行动与页头按钮同一 id）。
-    onHeaderAction?.(actionId);
-  }, [batch.handle, credential?.actionId, handleRefreshLocal, listCredential, login, onHeaderAction, refreshLocalActionId]);
+  // 页头忙碌位与分发（P4c-9b-1 抽出）：四路各自独立表达；本页认领的动作就地执行，其余透出。
+  const { busy: headerBusy, handle: handleHeaderAction } = useAccountsHeaderWiring({
+    refreshLocalActionId, localRefreshBusy, onRefreshLocal: handleRefreshLocal,
+    credentialActionId: credential?.actionId, credentialBusy: credentialConfirmBusy, requestCredential: listCredential.request,
+    batch: { handle: batch.handle, busy: batch.busy, actionIds: wiring?.actionIds ?? {} },
+    pool: { handle: pool.handle, busyActionIds: pool.busyActionIds }, // 池级四动作（K-04）
+    loginHandle: login.handle, onHeaderAction, // 添加账号 → 登录弹层（未登记产品不动）
+  });
 
   const handleDetailAction = useCallback((actionId: string) => { // 详情动作分发：凭据刷新 + 五类动作
     if (actionId === "") return;
@@ -194,6 +188,7 @@ export function AccountsPage(props: AccountsPageProps) {
           onSignedOut={() => void refreshLocal()}
           dialogs={(
             <AccountsDialogs login={login} duplicate={duplicateConfirm.dialogs}>
+              {pool.dialogs}
               {/* 详情专属层：单账号凭据换发确认 + 重置设备确认（删除确认由危险区自持，不叠层）。 */}
               {detailCredential.open && <DetailCredentialRefreshDialog accountName={row.displayName}
                 busy={detailCredential.busy} onCancel={detailCredential.cancel}
@@ -284,8 +279,11 @@ export function AccountsPage(props: AccountsPageProps) {
           />
         )}
       </section>
-      {/* 弹层槽（P4c-6b-2c 登录 / G11 补录 + 查重 / P4c-6b-2d 切号）：接缝登记才可能挂载，关闭即卸载。 */}
-      <AccountsDialogs login={login} duplicate={duplicateConfirm.dialogs}>{rowActions.dialogs}</AccountsDialogs>
+      {/* 弹层槽（登录 / G11 补录 + 查重 / 行内切号 / 池级捕获确认）：接缝登记才可能挂载，关闭即卸载。 */}
+      <AccountsDialogs login={login} duplicate={duplicateConfirm.dialogs}>
+        {rowActions.dialogs}
+        {pool.dialogs}
+      </AccountsDialogs>
       {/* 批量刷新凭据二次确认：仅入口存在且有目标时挂载（挂载即打开，关闭即卸载）。 */}
       {listCredential.open && credential !== undefined && (
         <CredentialRefreshDialog

@@ -1,5 +1,7 @@
 import { beginCheckinLogin, cancelCheckinLogin, completeCheckinLogin, refreshCheckinCredentials, switchTraeCnAccount } from "../../platform/accounts";
 import { previewWorkBuddySwitch, switchWorkBuddyAccount } from "../../platform/workbuddyAdapter";
+import { workbuddyPoolActions } from "./poolActionCommands";
+import type { PagePoolActions } from "./components/usePoolHeaderActions";
 import type { AccountSnapshot } from "../../platform/accountAdapter";
 import type { CredentialRefreshEntryDto } from "../../types/account_switch";
 import { effectiveDisplayName, workbuddyDisplayName } from "../../utils/accountDisplay";
@@ -38,6 +40,13 @@ export interface PageUi {
   readonly loginBusy: boolean;
   /** 行内切号在跑（P4c-6b-2d）：官方切号弹层进行中 / WB 切号执行中。 */
   readonly switchBusy: boolean;
+  /** 池级页头四动作的忙碌位（P4c-9b-1 / K-04）：WB 的续期 / 健康 / 捕获 / 登录。 */
+  readonly poolBusy: {
+    readonly renewing: boolean;
+    readonly health: boolean;
+    readonly capturing: boolean;
+    readonly login: boolean;
+  };
   /** 工具账号选择进行中（TRAE 专有，≠ 官方切号）。 */
   readonly toolBusy: boolean;
   /** WB 切号影响面预览进行中（两段式的第一段）。 */
@@ -72,6 +81,8 @@ export interface PageAdapter {
   readonly login?: PageLogin;
   /** 行内切号接线（P4c-6b-2d）：缺省即本产品的行内动作只透出（fail-closed，不猜命令）。 */
   readonly rowSwitch?: PageRowSwitch;
+  /** 池级页头动作接线（P4c-9b-1 / K-04）：缺省即本产品页头无池级动作（只透出，不猜命令）。 */
+  readonly poolActions?: PagePoolActions;
   readonly compose: (payload: unknown, ui: PageUi) => AccountsSnapshot;
   /** 行锚点与「使用中」不可见锚点：视觉表达仍归 builder 的 accent 徽章，此处只承载旧 testid。 */
   readonly testIds: (row: AccountRowView, snapshot: AccountsSnapshot) => { readonly row: string; readonly selected: string };
@@ -101,10 +112,11 @@ const composeWorkBuddy = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
     ...(payload as WorkBuddyAccountsData),
     sort: ui.sort === "checkin" ? "added" : ui.sort, nowUnixSeconds: ui.now,
     busy: {
-      // 续期 / 健康 / 捕获未接（命令只给池级单条回执，见 actionCommands）；登录接缝未登记（fail-closed）。
-      loading: false, renewing: false, health: false, capturing: false,
+      // 池级四动作（P4c-9b-1 / K-04）：忙碌位来自 poolActions 接缝；捕获确认层打开不算忙（旧 L496 同口径）。
+      loading: false, renewing: ui.poolBusy.renewing, health: ui.poolBusy.health,
+      capturing: ui.poolBusy.capturing, login: ui.poolBusy.login,
       switching: ui.switchBusy, preview: ui.previewBusy,
-      login: ui.loginBusy, refreshing: ui.localRefresh,
+      refreshing: ui.localRefresh,
     },
   },
 });
@@ -200,6 +212,8 @@ export const PAGE_ADAPTERS: Record<string, PageAdapter> = {
     listTestId: "workbuddy-pool-list",
     // 设备能力关闭（config 能力表 devices=false）：不登记面板绑定，详情页不挂设备插槽。
     rowSwitch: workbuddyRowSwitch,
+    // 池级页头四动作（K-04）：旧 WorkBuddyPanel L172-342 实装的续期 / 健康 / 捕获 / 登录。
+    poolActions: workbuddyPoolActions,
     compose: composeWorkBuddy,
     testIds: wbTestIds,
   },
