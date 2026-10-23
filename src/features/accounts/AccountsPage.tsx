@@ -17,6 +17,8 @@ import { useAccountBatchProgress } from "./components/useAccountBatchProgress";
 import { useCredentialRefresh, type CredentialRefreshTarget } from "./components/useCredentialRefresh";
 import { useAccountsSnapshot } from "./components/useAccountsSnapshot";
 import { useHeaderBatchActions } from "./components/useHeaderBatchActions";
+import { useAccountLoginFlow } from "./components/useAccountLoginFlow";
+import { AccountLoginDialog } from "./components/AccountLoginDialog";
 import { actionWiringFor } from "./actionCommands";
 import { accountsViewFor, type AccountsSnapshot } from "./registry";
 import { buildDetailView, DETAIL_CREDENTIAL_REFRESH_ACTIONS } from "./detailView";
@@ -101,11 +103,16 @@ export function AccountsPage(props: AccountsPageProps) {
   // 换发进行中：二次确认执行中，或进度事件链在跑（两者同源表达，任一为真即禁用页头按钮）。
   const credentialConfirmBusy = listCredential.busy || progress.credential_refresh !== undefined;
 
+  // 添加账号 / 登录（P4c-6b-2c）：接缝登记了登录才挂弹层；成功后重读本机缓存（旧
+  // refreshOverview 同法），失败/取消的三类收尾提示全在 useAccountLogin 内，页面不重复通知。
+  const login = useAccountLoginFlow(adapter?.login ?? null, refreshLocal);
+
   // 快照合成：数据面 + 页面自持字段（时钟/过滤/排序/忙碌位/适配器面）。
   const now = Math.floor(Date.now() / 1000);
   const ui: PageUi = {
     filter, sort, now, localRefresh: localRefreshBusy, progress,
     credentialBusy: credentialConfirmBusy, creditsBusy: batch.busy.credits, healthBusy: batch.busy.health,
+    loginBusy: login.busy,
     adapterPool,
   };
   const composed: AccountsSnapshot | null = payload === null || adapter === undefined
@@ -148,8 +155,11 @@ export function AccountsPage(props: AccountsPageProps) {
     if (actionId === refreshLocalActionId) { handleRefreshLocal(); return; }
     if (actionId === credential?.actionId) { listCredential.request(); return; }
     if (batch.handle(actionId)) return;
+    // 添加账号 → 打开登录弹层（未登记登录接缝的产品不动，动作原样透出）。
+    login.handle(actionId);
+    // 透出契约不丢：动作 id 仍回给外部观察者（空态主行动与页头按钮同一 id）。
     onHeaderAction?.(actionId);
-  }, [batch.handle, credential?.actionId, handleRefreshLocal, listCredential, onHeaderAction, refreshLocalActionId]);
+  }, [batch.handle, credential?.actionId, handleRefreshLocal, listCredential, login, onHeaderAction, refreshLocalActionId]);
 
   // 详情动作分发（P4c-7c-1）：凭据刷新在本页执行（同一 hook 的单账号路径），其余透出。
   const handleDetailAction = useCallback((actionId: string) => {
@@ -268,6 +278,8 @@ export function AccountsPage(props: AccountsPageProps) {
           />
         )}
       </section>
+      {/* 登录弹层（P4c-6b-2c）：接缝登记了登录才可能挂载；关闭即卸载。 */}
+      {login.dialog !== null && <AccountLoginDialog {...login.dialog} />}
       {/* 批量刷新凭据二次确认：仅入口存在且有目标时挂载（挂载即打开，关闭即卸载）。 */}
       {listCredential.open && credential !== undefined && (
         <CredentialRefreshDialog

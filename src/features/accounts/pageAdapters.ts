@@ -1,4 +1,4 @@
-import { refreshCheckinCredentials } from "../../platform/accounts";
+import { beginCheckinLogin, cancelCheckinLogin, completeCheckinLogin, refreshCheckinCredentials } from "../../platform/accounts";
 import type { AccountSnapshot } from "../../platform/accountAdapter";
 import type { CredentialRefreshEntryDto } from "../../types/account_switch";
 import { effectiveDisplayName } from "../../utils/accountDisplay";
@@ -7,6 +7,7 @@ import type { AccountsSnapshot } from "./registry";
 import type { TraeAccountsData, WorkBuddyAccountsData } from "./components/useAccountsSnapshot";
 import type { AccountBatchProgressMap } from "./components/useAccountBatchProgress";
 import type { CredentialRefreshTarget } from "./components/useCredentialRefresh";
+import type { PageLogin } from "./components/useAccountLoginFlow";
 import { traePoolFields, traeRowFace, traeRowTestIds, type TraeAccountsSnapshot } from "./traeAccounts";
 import { workbuddyRowTestIds } from "./workbuddyAccounts";
 
@@ -31,6 +32,8 @@ export interface PageUi {
   /** 页头批量动作在跑（P4c-6b-2b）：无进度事件的产品（WB）只有这一路可表达忙碌。 */
   readonly creditsBusy: boolean;
   readonly healthBusy: boolean;
+  /** 登录等待中（P4c-6b-2c）：builder 据此把「添加账号」置忙并换等待文案。 */
+  readonly loginBusy: boolean;
   /** 适配器面（仅测试注入路径）：undefined = 生产路径，池面恒缺席。 */
   readonly adapterPool?: AccountSnapshot;
 }
@@ -56,6 +59,9 @@ export interface PageAdapter {
   };
   /** 详情页登录设备面板绑定；缺省即本产品不挂该面板（与能力表 devices 同口径）。 */
   readonly devices?: PageDevices;
+  /** 添加账号 / OAuth 登录接线（页头动作 id + 命令 + 浏览器模式 + 等待文案）；缺省即本产品
+   *  不提供登录弹层（fail-closed：页头动作原样透出，弹层永不出现）。 */
+  readonly login?: PageLogin;
   readonly compose: (payload: unknown, ui: PageUi) => AccountsSnapshot;
   /** 行锚点与「使用中」不可见锚点：视觉表达仍归 builder 的 accent 徽章，此处只承载旧 testid。 */
   readonly testIds: (row: AccountRowView, snapshot: AccountsSnapshot) => { readonly row: string; readonly selected: string };
@@ -69,8 +75,8 @@ const composeTrae = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
     ...traePoolFields(ui.adapterPool),
     filter: ui.filter, sort: ui.sort, nowUnixSeconds: ui.now,
     busy: {
-      // 登录 / 切号 / 工具账号选择在 6b-2 接入，本票恒空闲。
-      login: false, switching: false, toolSelection: false, localRefresh: ui.localRefresh,
+      // 登录（P4c-6b-2c）已接；切号 / 工具账号选择在 6b-2d 接入，仍恒空闲。
+      login: ui.loginBusy, switching: false, toolSelection: false, localRefresh: ui.localRefresh,
       // 额度/健康检测：进度事件与动作忙碌位同源（TRAE 两路都有，任一为真即禁用）。
       credits: ui.progress.credits_refresh !== undefined || ui.creditsBusy,
       credentialRefresh: ui.progress.credential_refresh !== undefined || ui.credentialBusy,
@@ -86,9 +92,9 @@ const composeWorkBuddy = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
     ...(payload as WorkBuddyAccountsData),
     sort: ui.sort === "checkin" ? "added" : ui.sort, nowUnixSeconds: ui.now,
     busy: {
-      // 续期 / 健康 / 捕获 / 切号 / 登录在 6b-2 接入，本票恒空闲。
+      // 续期 / 健康 / 捕获 / 切号在 6b-2d 接入；WB 登录接缝未登记（fail-closed），故登录位恒空闲。
       loading: false, renewing: false, health: false, capturing: false, switching: false, preview: false,
-      login: false, refreshing: ui.localRefresh,
+      login: ui.loginBusy, refreshing: ui.localRefresh,
     },
   },
 });
@@ -115,6 +121,20 @@ export const PAGE_ADAPTERS: Record<string, PageAdapter> = {
     },
     // 详情页登录设备：旧 AccountDetail L489-497 的 productId/productName 逐字沿用。
     devices: { productId: "work_cn", productName: "TRAE" },
+    // 添加账号 / 登录（P4c-6b-2c）：命令即 platform/accounts 的 begin/complete/cancel，
+    // 页头动作 id 与等待文案逐字沿用旧 AccountCenterTrae L1109 / L1122-1125。
+    login: {
+      actionId: "account-add-primary",
+      commands: {
+        begin: (useSystemBrowser) => beginCheckinLogin({ useSystemBrowser }),
+        complete: (attemptId) => completeCheckinLogin({ attemptId }),
+        cancel: (attemptId) => cancelCheckinLogin({ attemptId }),
+      },
+      browserModes: true,
+      waitingHint: (useSystemBrowser) => useSystemBrowser
+        ? "已在本机浏览器打开 TRAE 登录页（复用系统登录态），完成授权后此处会自动继续；期间无需手动刷新。"
+        : "已在隔离浏览器打开 TRAE 登录页，完成登录后此处会自动继续；期间无需手动刷新。",
+    },
     compose: composeTrae,
     testIds: traeTestIds,
   },
