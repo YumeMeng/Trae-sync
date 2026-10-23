@@ -41,6 +41,15 @@ src/platform/accounts.ts      229 行  26 条命令
 - 当前基线：**410 单测 / 41 e2e / guard 新增 0**
 - 遗留：K-06 缺口 5（WB 档案四写操作的命令级断言缺位，建议一票补齐）
 
+## 环境页进度（P4d，8 步）
+
+- P4d-1 ✅ platform/environment.ts（24 条命令）+ environmentPlugins.ts（4 条）
+- P4d-2 ✅ config.ts（16 类型 / 16 字段能力表 / 220 条文案，含两处已知前后端不一致，隔离在 ENV_KNOWN_COPY_MISMATCHES）
+- P4d-3 ✅ traeEnvironment.ts（200 行）+ registry.ts（26 行），口径原样搬入、61 个 testid 登记
+- P4d-4 ⏳ workbuddyEnvironment.ts + registry 补一行
+- P4d-5 数据 hook ×2 / P4d-6 动作 hook ×3 / P4d-7 展示组件 ×5 / P4d-8 弹层+接线+删旧
+- 关键风险：收编/清理编排（关实例→单事务→重启 + env_id 过滤 + 三个冲突错误码）不可简化
+
 ## 之后
 
 - P4d environment（1,683 行，先拆巨石）
