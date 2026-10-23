@@ -4,26 +4,47 @@ import { ProductBadge } from "../../components/shared/ProductBadge";
 import type { BadgeTone } from "../../ui/Badge";
 import type { TraeInstanceLoginState } from "../../types/account_switch";
 import type { WorkBuddyDeepHealthDto } from "../../types/product";
+import {
+  captureTraeCnAccount, closeEnvironmentInstance, launchEnvironment, launchMasterLibrary, repairMasterCurrentAccount,
+} from "../../platform/environment";
 import { ENV_TEXTS, type EnvCardView, type EnvironmentView } from "./config";
 import { environmentViewFor, type EnvironmentSnapshot } from "./registry";
 import { traeSecondaryCheckupView } from "./traeEnvironment";
 import { WB_ENV_TEST_IDS, type WorkBuddyEnvironmentView } from "./workbuddyEnvironment";
 import { useEnvironmentBusy, type EnvironmentBusyState } from "./components/useEnvironmentBusy";
 import { useEnvironmentSnapshot, type EnvironmentData } from "./components/useEnvironmentSnapshot";
-import { MASTER_ENV_ID } from "./components/useEnvironmentActions";
+import { MASTER_ENV_ID, useEnvironmentActions, type CaptureNotice } from "./components/useEnvironmentActions";
 import { EnvironmentPageShell } from "./components/EnvironmentPageShell";
 import { EnvCard, type EnvCardAnchors } from "./components/EnvironmentCards";
 import { EnvironmentCheckup } from "./components/EnvironmentCheckup";
+import { EnvironmentCapture } from "./components/EnvironmentCapture";
 
 /**
- * 环境页装配（P4d-8a-1：只做读取 + 渲染；动作与弹层留 8a-2）。
- * 数据面 useEnvironmentSnapshot、忙碌位 useEnvironmentBusy、视图模型 registry.environmentViewFor；
- * 产品差异全部走声明式装配表（键 = productId，与 registry / 读取表同法）。
- * 本文件零 productId 相等判断、零 invoke(、零命令名、零弹层：动作一律经 onAction 透出。
+ * 环境页装配（P4d-8a-1 读取渲染 + 8a-2 动作接线）。
+ * 数据面 useEnvironmentSnapshot、忙碌位 useEnvironmentBusy、动作编排 useEnvironmentActions、
+ * 视图模型 registry.environmentViewFor；产品差异全部走声明式装配表（键 = productId）。
+ * 本文件零 productId 相等判断、零 invoke(、零命令名：命令只在 ACTION_COMMANDS 里转接 platform 适配层。
  */
 
 /** 首读占位文案：旧 TRAE 页无首读占位、WB 页文案带「客户端」字样，共用骨架不能取任一产品口径。 */
 const LOADING_COPY = "正在读取环境状态…";
+
+/** 动作 id 常量（builder 约定 testId = id；副环境卡动作 = env-<动词>-<env_id>）。 */
+const MASTER_DETAIL_ACTION = "env-master-detail";
+const MASTER_LAUNCH_ACTION = "env-master-launch";
+const MASTER_CLOSE_ACTION = "env-master-close";
+const REPAIR_ACTION = "env-self-check-repair";
+const CAPTURE_ACTION = "env-capture-account-entry";
+const LAUNCH_PREFIX = "env-launch-";
+const CLOSE_PREFIX = "env-close-";
+
+/** 注入给 useEnvironmentActions 的命令（主库与副环境同一入口，按 envId 转接两条后端命令）。 */
+const ACTION_COMMANDS = {
+  launch: (envId: string) => (envId === MASTER_ENV_ID ? launchMasterLibrary() : launchEnvironment({ envId })),
+  closeInstance: (envId: string) => closeEnvironmentInstance({ envId }),
+  repair: () => repairMasterCurrentAccount(),
+  capture: () => captureTraeCnAccount(),
+} as const;
 
 /** 页面自持字段（合成快照时补进 builder 载荷的那部分）。 */
 interface PageUi {
@@ -31,8 +52,8 @@ interface PageUi {
   readonly busyIds: readonly string[];
   readonly loading: boolean;
   readonly error: string | null;
-  /** 捕获提示：捕获动作归 8a-2，本票恒 null（builder 据此不渲染提示行）。 */
-  readonly captureNotice: { readonly kind: "ok" | "error"; readonly text: string } | null;
+  /** 捕获提示：动作 hook 产出的内联结果（ok 绿/danger 红），null = 尚未捕获。 */
+  readonly captureNotice: CaptureNotice | null;
   readonly canOpenLibraryDetail: boolean;
   readonly onAction: (actionId: string) => void;
 }
@@ -85,12 +106,12 @@ const ASSEMBLERS: Record<string, (data: EnvironmentData, ui: PageUi) => Assemble
 
 /** 忙碌位 → 动作 id（builder 约定 testId = id；旧页按钮禁用口径 L682/L685/L1173）：只影响被点的按钮。 */
 const busyActionIdsOf = (busy: EnvironmentBusyState): readonly string[] => [
-  ...(busy.launching ? ["env-master-launch"] : []),
-  ...(busy.launchingEnvId !== null ? [`env-launch-${busy.launchingEnvId}`] : []),
-  ...(busy.closingEnvId === MASTER_ENV_ID ? ["env-master-close"]
-    : busy.closingEnvId !== null ? [`env-close-${busy.closingEnvId}`] : []),
-  ...(busy.repairing ? ["env-self-check-repair"] : []),
-  ...(busy.capturing ? ["env-capture-account-entry"] : []),
+  ...(busy.launching ? [MASTER_LAUNCH_ACTION] : []),
+  ...(busy.launchingEnvId !== null ? [`${LAUNCH_PREFIX}${busy.launchingEnvId}`] : []),
+  ...(busy.closingEnvId === MASTER_ENV_ID ? [MASTER_CLOSE_ACTION]
+    : busy.closingEnvId !== null ? [`${CLOSE_PREFIX}${busy.closingEnvId}`] : []),
+  ...(busy.repairing ? [REPAIR_ACTION] : []),
+  ...(busy.capturing ? [CAPTURE_ACTION] : []),
   ...(busy.checking ? [WB_ENV_TEST_IDS.deepHealthButton] : []),
 ];
 
@@ -98,14 +119,21 @@ const busyActionIdsOf = (busy: EnvironmentBusyState): readonly string[] => [
 const wbExtrasOf = (view: EnvironmentView): WorkBuddyEnvironmentView["workbuddy"] | null =>
   "workbuddy" in view ? (view as WorkBuddyEnvironmentView).workbuddy : null;
 
+/** 动作目标显示名：按卡片 id 从视图取（视图已含主库/副环境名，页面不拿 env_id 当文案）。 */
+const cardNameOf = (view: EnvironmentView, envId: string): string | undefined =>
+  view.master?.id === envId ? view.master.name
+    : view.secondary?.cards.find((card) => card.id === envId)?.name;
+
 export interface EnvironmentPageProps {
   /** 页面可见才读取（后台页保持挂载但不发 IPC）。 */
   readonly active: boolean;
   /** 当前产品协议值：只用于查声明式装配表，页面内不做任何产品判断。 */
   readonly productId: string;
+  /** 主库「详情」入口（env-master-detail 走它，不再混进 onAction）。 */
+  readonly onOpenMasterDetail?: () => void;
   /** 副环境「查看详情」入口是否存在（决定 builder 是否产出 env-detail-<id> 动作）。 */
   readonly onOpenLibraryDetail?: () => void;
-  /** 其余动作（启停 / 详情 / 登录 / 改名 / 删除 / 纠正 / 归入 / 清理 / 检测）：本票只透出。 */
+  /** 其余动作（详情 / 登录 / 改名 / 删除 / 归入 / 清理 / 检测）：本票只透出。 */
   readonly onAction?: (actionId: string) => void;
 }
 
@@ -139,11 +167,16 @@ function EnvironmentPageSkeleton({ productId, error, onRetry, retrying }: {
   );
 }
 
-export function EnvironmentPage({ active, productId, onOpenLibraryDetail, onAction }: EnvironmentPageProps) {
-  const { snapshot: data, loading, error, refreshLocal } = useEnvironmentSnapshot(productId, active);
-  const { busy } = useEnvironmentBusy(productId, active);
+export function EnvironmentPage({ active, productId, onOpenMasterDetail, onOpenLibraryDetail, onAction }: EnvironmentPageProps) {
+  const { snapshot: data, loading, error, refreshLocal, refreshFull } = useEnvironmentSnapshot(productId, active);
+  const { busy, patchBusy } = useEnvironmentBusy(productId, active);
   const [pending, setPending] = useState(false); // 非空即本地刷新在跑（刷新按钮转圈 + 防连点）
-  // 刷新是读取不是动作：页面自持（与账号页 handleRefreshLocal 同法），其余动作一律透出。
+  const [captureNotice, setCaptureNotice] = useState<CaptureNotice | null>(null);
+  // 动作 hook：命令经 ACTION_COMMANDS 注入，忙碌位就地写回 useEnvironmentBusy（单一状态真源）。
+  const { launchEnv, closeEnv, repairMaster, captureAccount } = useEnvironmentActions({
+    commands: ACTION_COMMANDS, notifyPrefix: "", patchBusy,
+  });
+  // 刷新是读取不是动作：页面自持（与账号页 handleRefreshLocal 同法）。
   const refresh = useCallback(() => {
     if (pending) return;
     setPending(true);
@@ -153,7 +186,7 @@ export function EnvironmentPage({ active, productId, onOpenLibraryDetail, onActi
   const emit = (actionId: string) => onAction?.(actionId);
   const busyIds = busyActionIdsOf(busy);
   const ui: PageUi = {
-    busyState: busy, busyIds, loading, error, captureNotice: null,
+    busyState: busy, busyIds, loading, error, captureNotice,
     canOpenLibraryDetail: onOpenLibraryDetail !== undefined, onAction: emit,
   };
   const registered = ASSEMBLERS[productId];
@@ -170,19 +203,58 @@ export function EnvironmentPage({ active, productId, onOpenLibraryDetail, onActi
     return <EnvironmentPageSkeleton productId={productId} error={error} onRetry={refresh} retrying={pending} />;
   }
   const view: EnvironmentView = environmentViewFor(assembled.snapshot);
-
   const refreshId = view.header.refresh?.id ?? "";
-  // 页头刷新由页面执行（读操作）；其余动作 id 原样透出给观察者（8a-2 接线）。
+
+  // 动作分发（旧页口径）：启动/关闭/捕获成功走轻刷新（只校准运行态与列表）；
+  // 修复必须全量重读——体检聚合（登录健康四项 + 库内容）会随记录纠正而变（旧页 L157 整组重读）。
   const handleAction = (actionId: string) => {
     if (refreshId !== "" && actionId === refreshId) { refresh(); return; }
-    emit(actionId);
+    if (actionId === MASTER_DETAIL_ACTION) { onOpenMasterDetail?.(); return; }
+    if (actionId === MASTER_LAUNCH_ACTION) {
+      void launchEnv(MASTER_ENV_ID).then((ok) => { if (ok) void refreshLocal(); });
+      return;
+    }
+    if (actionId === MASTER_CLOSE_ACTION) {
+      void closeEnv(MASTER_ENV_ID).then((ok) => { if (ok) void refreshLocal(); });
+      return;
+    }
+    if (actionId === REPAIR_ACTION) {
+      void repairMaster().then((ok) => { if (ok) void refreshFull(); });
+      return;
+    }
+    if (actionId === CAPTURE_ACTION) {
+      setCaptureNotice(null); // 旧页 L342：每次点击先清上一轮结果
+      void captureAccount().then((notice) => {
+        if (notice === null) return; // 忙碌未执行：保留上一轮提示
+        setCaptureNotice(notice);
+        if (notice.kind === "ok") void refreshLocal(); // 捕获成功即刷新（失败零副作用，不刷新）
+      });
+      return;
+    }
+    if (actionId.startsWith(LAUNCH_PREFIX)) {
+      const envId = actionId.slice(LAUNCH_PREFIX.length);
+      void launchEnv(envId, cardNameOf(view, envId)).then((ok) => { if (ok) void refreshLocal(); });
+      return;
+    }
+    if (actionId.startsWith(CLOSE_PREFIX)) {
+      const envId = actionId.slice(CLOSE_PREFIX.length);
+      void closeEnv(envId, cardNameOf(view, envId)).then((ok) => { if (ok) void refreshLocal(); });
+      return;
+    }
+    emit(actionId); // 其余动作（登录/改名/删除/归入/清理/检测）本票仍只透出
   };
+
   const wb = wbExtrasOf(view);
   const masterAnchors: EnvCardAnchors | undefined = wb === null ? undefined
     : { statusTestId: wb.clientRuntimeTestId, statusTone: assembled?.masterStatusTone };
-  // 体检进主库卡内槽（masterExtra）；WB 登录域健康卡进主库卡后置槽（afterMaster，P4d-7a 交接 3/4）。
-  const masterExtra = view.checkup === null ? null
+  // 体检进主库卡内槽（masterExtra），其后接账号捕获块（旧页 L471-646 同序）；
+  // WB 登录域健康卡进主库卡后置槽（afterMaster，P4d-7a 交接 3/4）。
+  const checkupNode = view.checkup === null ? null
     : <EnvironmentCheckup checkup={view.checkup} busy={busyIds} onAction={handleAction} />;
+  const captureNode = view.capture === null ? null
+    : <EnvironmentCapture testId={view.capture.testId} title={view.capture.title} entry={view.capture.entry}
+        notice={view.capture.notice} busy={busyIds} onAction={handleAction} />;
+  const masterExtra = checkupNode === null && captureNode === null ? null : <>{checkupNode}{captureNode}</>;
   const afterMaster = wb?.healthCard == null ? null
     : <EnvCard card={wb.healthCard} busy={busyIds} anchors={{ pathTestId: wb.deepResultTestId }}
         onAction={(_cardId: string, actionId: string) => handleAction(actionId)} />;

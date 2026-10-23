@@ -83,6 +83,8 @@ export interface EnvironmentSnapshotResult {
   readonly error: string | null;
   /** 轻刷新：只校准运行态与列表，零体积遍历、零体检聚合；失败同样落 error。 */
   readonly refreshLocal: () => Promise<void>;
+  /** 全量读取（带体积 + 重聚合体检）：修复类动作会改变体检聚合口径，必须走这条（旧页 L157 整组重读）。 */
+  readonly refreshFull: () => Promise<void>;
 }
 
 /** @param productId 与 registry / 能力表同键的产品；@param active 页面可见才读取。 */
@@ -126,5 +128,10 @@ export function useEnvironmentSnapshot(productId: string, active: boolean): Envi
     if (!latest.current.active) return;
     await load("local");
   }, [load]);
-  return { snapshot, loading, error, refreshLocal };
+  // 全量重读只给「体检聚合会变」的动作（修复主库记录）：与旧页 load() 同口径。
+  const refreshFull = useCallback(async () => {
+    if (!latest.current.active) return;
+    await load("full");
+  }, [load]);
+  return { snapshot, loading, error, refreshLocal, refreshFull };
 }
