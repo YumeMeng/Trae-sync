@@ -52,7 +52,7 @@ function traeDetail(input: DetailSnapshotInput, data: TraeAccountsData): DetailS
   };
 }
 
-/** WB 数据面：池条目 + 逐账号签到面；参与集不在账号页数据面内，如实给 null（旧实现 fail-soft 同态）。 */
+/** WB 数据面：池条目 + 逐账号签到面 + 自动签到参与集（旧 WorkBuddyAccountDetail L62-77 同一数据面）。 */
 function workbuddyDetail(input: DetailSnapshotInput, data: WorkBuddyAccountsData): DetailSnapshot | null {
   const account: WorkBuddyAccountEntryDto | undefined =
     data.pool.find((item) => item.profile_id === input.rowId);
@@ -62,8 +62,10 @@ function workbuddyDetail(input: DetailSnapshotInput, data: WorkBuddyAccountsData
     workbuddy: {
       account,
       overview: data.checkinOverview.find((row) => row.profile_id === account.profile_id) ?? null,
-      // 参与集需 list_workbuddy_checkin_accounts（账号页未读取）：null = 不可读取，显示中性说明。
-      participating: null,
+      // 参与集判定（旧 L69-77 逐字同口径）：在 list_workbuddy_checkin_accounts 结果里按
+      // profile_id 命中即取该行 enabled（后端 effective_enabled = 未显式设置默认参与、显式关闭永久 false）；
+      // 参与集未读到（null/缺省）或行缺失 = 不可读取，显示中性说明（不猜参与态）。
+      participating: data.participation?.find((row) => row.profile_id === account.profile_id)?.enabled ?? null,
       // 当前客户端登录账号（health.uid 与池 account_id 同源）。
       isCurrentLogin: data.sessionHealth !== null && data.sessionHealth.uid === account.account_id,
       nowUnixSeconds: input.nowUnixSeconds,

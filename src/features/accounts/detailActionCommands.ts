@@ -5,7 +5,7 @@ import {
 import {
   purgeWorkBuddyAccounts, setWorkBuddyAccountArchived, setWorkBuddyAccountAutoCheckin, setWorkBuddyAccountDisplayName,
 } from "../../platform/workbuddyAdapter";
-import type { CheckinBatchSummaryDto, CreditsRefreshEntryDto } from "../../types/account_switch";
+import type { CheckinBatchSummaryDto, CheckinOverviewEntryDto, CreditsRefreshEntryDto } from "../../types/account_switch";
 import type { WorkBuddyAccountEntryDto } from "../../types/product";
 import { effectiveDisplayName, workbuddyDisplayName } from "../../utils/accountDisplay";
 import { ACCOUNT_TEXTS } from "./config";
@@ -83,6 +83,12 @@ export interface DetailTextEditAction {
   /** 失败文案中段（旧 WB 逐字「备注名保存失败——」）；缺省只拼前缀 + 原因。 */
   readonly failureLabel?: string;
   readonly failureFallback?: string;
+  /**
+   * G11 第三层查重（旧 AccountCenterTrae L508-520）：其他账号已用同一完整手机号时返回占用者展示名。
+   * 后端 set_account_mobile 无查重错误码（只做格式 + 脱敏号首尾比对），查重本就是客户端数据面判定；
+   * 缺省 = 本字段不做查重。
+   */
+  readonly conflictOf?: (payload: unknown, target: DetailActionTarget, value: string) => string | null;
 }
 
 /** 开关型字段（自动签到参与 / 归档）：enabled = 目标态（非当前态）。 */
@@ -122,6 +128,8 @@ export interface PageDetailActions {
   readonly mobileBackfill?: {
     readonly resolve: (profileId: string) => Promise<MobileBackfillTarget | null>;
     readonly save: (profileId: string, mobile: string) => Promise<void>;
+    /** 同一查重判定（重读总览后再比，旧 L478-520 同一份 overview）；null = 无占用者。 */
+    readonly conflictOf?: (profileId: string, mobile: string) => Promise<string | null>;
   };
 }
 
@@ -130,6 +138,17 @@ export interface MobileBackfillTarget {
   readonly name: string;
   readonly masked: string;
 }
+
+/**
+ * G11 第三层查重（旧 AccountCenterTrae L508-520 逐字）：找**其他账号**已补录的完整手机号与输入
+ * 完全相同者，命中返回占用者展示名（备注名优先）；空输入 = 清除补录，不参与查重（旧 L507 同门禁）。
+ */
+const mobileOwnerOf = (entries: readonly CheckinOverviewEntryDto[], profileId: string, mobile: string): string | null => {
+  const value = mobile.trim();
+  const owner = value === "" ? undefined
+    : entries.find((entry) => entry.profile_id !== profileId && entry.mobile_full === value);
+  return owner === undefined ? null : effectiveDisplayName(owner);
+};
 
 /** TRAE 目标（旧 AccountDetail 的 entry）：备注名优先，服务端名进确认文案。 */
 const traeTarget = (payload: unknown, rowId: string): DetailActionTarget | null => {
@@ -164,6 +183,8 @@ const traeDetailActions = (): PageDetailActions => ({
     id: "account-detail-mobile",
     run: (target, value) => setAccountMobile({ profileId: target.profileId, mobile: value === "" ? null : value }),
     savedCopy: "手机号已保存。", clearedCopy: "已清除补录的手机号，恢复显示脱敏号。",
+    // 查重数据面 = 当前总览（旧 L508-520 同一份 overview）；命中后由页面弹确认层再强行写入。
+    conflictOf: (payload, target, value) => mobileOwnerOf((payload as TraeAccountsData).overview, target.profileId, value),
   },
   // G11 登录后补录引导（旧 L478-487）：重读总览再判定，已补录过的账号重复登录不再打扰。
   mobileBackfill: {
@@ -174,6 +195,8 @@ const traeDetailActions = (): PageDetailActions => ({
       return { name: effectiveDisplayName(entry), masked: entry.masked_mobile };
     },
     save: (profileId, mobile) => setAccountMobile({ profileId, mobile }),
+    // 登录后补录的查重与详情行内同口径（旧 saveMobileBackfill 两条路径共用一份判定）。
+    conflictOf: async (profileId, mobile) => mobileOwnerOf(await readCheckinOverview(), profileId, mobile),
   },
   // 自动签到参与（旧 AccountDetail L435-442）：只影响自动批次，手动签到不受限。
   autoCheckin: {

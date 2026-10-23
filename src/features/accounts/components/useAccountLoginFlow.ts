@@ -4,6 +4,7 @@ import { safeUiErrorMessage } from "../../../utils/safeUiError";
 import type { AccountLoginDialogProps } from "./AccountLoginDialog";
 import { MobileBackfillDialog } from "./MobileBackfillDialog";
 import { useAccountLogin, type AccountLoginCommands, type AccountLoginReceipt } from "./useAccountLogin";
+import type { DuplicateMobileConfirm } from "./useMobileDuplicateConfirm";
 
 /**
  * 登录流程的页面侧接线（P4c-6b-2c）：把 useAccountLogin 的分步接口（begin / complete /
@@ -31,6 +32,8 @@ const UNAVAILABLE_LOGIN_COMMANDS: AccountLoginCommands = { begin: unsupported, c
 export interface LoginMobileBackfill {
   readonly resolve: (profileId: string) => Promise<{ readonly name: string; readonly masked: string } | null>;
   readonly save: (profileId: string, mobile: string) => Promise<void>;
+  /** G11 第三层查重（旧 AccountCenterTrae L508-520）：返回占用者展示名；null = 无占用者。 */
+  readonly conflictOf?: (profileId: string, mobile: string) => Promise<string | null>;
 }
 
 export interface AccountLoginFlow {
@@ -56,6 +59,8 @@ export interface AccountLoginFlowInput {
   readonly onSettled: () => Promise<void>;
   /** 补录接缝；缺省 = 本产品不做补录（WB 能力表 mobileBackfill=false），弹层永不出现。 */
   readonly backfill?: LoginMobileBackfill;
+  /** G11 查重确认层（P4c-6b-2e-3）：补录命中重复号时弹层确认；缺省 = 不做查重。 */
+  readonly duplicateConfirm?: DuplicateMobileConfirm;
 }
 
 export function useAccountLoginFlow(input: AccountLoginFlowInput): AccountLoginFlow {
@@ -113,6 +118,8 @@ export function useAccountLoginFlow(input: AccountLoginFlowInput): AccountLoginF
   }, [completeLogin, onSettled]);
 
   // 补录保存（旧 L553-574）：成功后关层；失败保留弹层与输入，映射后文案就地展示。
+  // G11 第三层查重（旧 L505-521 + L528-550）：命中即弹确认层，确认后同一命令强行写入；
+  // 确认层自行报成功回执，本流程只负责关层（与旧 closePrompt 语义一致）。
   const saveBackfill = useCallback((value: string) => {
     const current = prompt;
     const seam = inputRef.current.backfill;
@@ -121,7 +128,20 @@ export function useAccountLoginFlow(input: AccountLoginFlowInput): AccountLoginF
     setPromptError(null);
     void (async () => {
       try {
-        await seam.save(current.profileId, value.trim());
+        const mobile = value.trim();
+        const owner = seam.conflictOf === undefined ? null : await seam.conflictOf(current.profileId, mobile);
+        const confirm = inputRef.current.duplicateConfirm;
+        if (owner !== null && confirm !== undefined) {
+          const saved = await confirm.request({
+            ownerName: owner, write: () => seam.save(current.profileId, mobile),
+            onSettled: () => inputRef.current.onSettled(),
+            successCopy: "手机号已补全，账号列表与详情页都会显示完整号码。",
+            failureFallback: "手机号保存失败，请稍后重试。",
+          });
+          if (saved) setPrompt(null); // 用户取消 = 弹层保持，可改号或跳过
+          return;
+        }
+        await seam.save(current.profileId, mobile);
         await inputRef.current.onSettled();
         setPrompt(null);
         notify.success("手机号已补全，账号列表与详情页都会显示完整号码。");

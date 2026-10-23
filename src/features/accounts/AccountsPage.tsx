@@ -20,7 +20,8 @@ import { useAccountLoginFlow } from "./components/useAccountLoginFlow";
 import { useRowActions } from "./components/useRowActions";
 import { useDetailActions } from "./components/useDetailActions";
 import { useDetailFieldEdits } from "./components/useDetailFieldEdits";
-import { AccountLoginDialog } from "./components/AccountLoginDialog";
+import { useMobileDuplicateConfirm } from "./components/useMobileDuplicateConfirm";
+import { AccountsDialogs } from "./components/AccountsDialogs";
 import { actionWiringFor } from "./actionCommands";
 import { detailActionsFor } from "./detailActionCommands";
 import { accountsViewFor, type AccountsSnapshot } from "./registry";
@@ -35,6 +36,8 @@ import { AccountsSkeleton } from "./AccountsSkeleton";
  * 详情视图 detailView 的 builder。本文件零 productId 相等判断、零 invoke(。
  */
 
+/** 详情行内补录的成功回执（旧 AccountCenterTrae L538 逐字）。 */
+const MOBILE_SAVED_COPY = "手机号已保存，账号列表与详情页都会显示完整号码。";
 /** 会话内过滤档（G14）：仅 TRAE 真实总览面出现，页面只持值、不判断产品。 */
 type PageFilter = "all" | "attention";
 /** 排序档（U-2）：WB 无「签到状态」档，builder 已裁掉该选项。 */
@@ -69,9 +72,7 @@ export function AccountsPage(props: AccountsPageProps) {
   const [selectedRowId, setSelectedRowId] = useState("");
   const refreshLocalActionId = adapter?.refreshLocalActionId ?? "", localRefreshBusy = pending !== null;
   // 数据面保留位：刷新失败时继续渲染上次读到的数据（首次加载失败才落错误卡）。
-  const { shown } = useRetainedAccountsData(
-    data, adapter?.payloadKey ?? "", `${productId}|${active}`, error, localRefreshBusy,
-  );
+  const { shown } = useRetainedAccountsData(data, adapter?.payloadKey ?? "", `${productId}|${active}`, error, localRefreshBusy);
 
   // 纯本地刷新：只重读本机缓存（零网络命令）；失败由保留位的通知路径处理，不清数据。
   const handleRefreshLocal = useCallback(() => {
@@ -81,13 +82,10 @@ export function AccountsPage(props: AccountsPageProps) {
   }, [localRefreshBusy, refreshLocal, refreshLocalActionId]);
 
   // 数据面：按载荷键取（表内键与载荷键一一对应）；缺快照/未登记产品即 null。
-  const payload = shown === null || adapter === undefined
-    ? null : (shown as unknown as Record<string, unknown>)[adapter.payloadKey];
+  const payload = shown === null || adapter === undefined ? null : (shown as unknown as Record<string, unknown>)[adapter.payloadKey];
 
   const wiring = actionWiringFor(productId, payload); // 页头批量动作（P4c-6b-2b）：命令按产品查表
-  const batch = useHeaderBatchActions({
-    wiring, targets: () => wiring?.targets(selectedRowId) ?? [], onSettled: refreshLocal, resetProgress: progressReset,
-  });
+  const batch = useHeaderBatchActions({ wiring, targets: () => wiring?.targets(selectedRowId) ?? [], onSettled: refreshLocal, resetProgress: progressReset });
 
   // 批量刷新凭据（旧 L680-729 同契约）：入口只开二次确认弹层，目标确认时才解析；缺省即无入口。
   const credential = adapter?.credentialRefresh;
@@ -102,8 +100,10 @@ export function AccountsPage(props: AccountsPageProps) {
 
   // 产品接缝只取一次：详情动作 / 字段编辑 / 登录补录共用同一份登记表（未登记产品即 undefined）。
   const seam = detailActionsFor(productId) ?? undefined;
+  // G11 查重确认层（P4c-6b-2e-3）：列表补录与详情行内共用同一份弹层与判定（旧 L798-812 两视图同渲染）。
+  const duplicateConfirm = useMobileDuplicateConfirm();
   // 添加账号 / 登录（P4c-6b-2c）+ G11 补录引导：接缝登记才挂弹层（缺号才弹，WB 未登记即永不出现）。
-  const login = useAccountLoginFlow({ wiring: adapter?.login ?? null, onSettled: refreshLocal, backfill: seam?.mobileBackfill });
+  const login = useAccountLoginFlow({ wiring: adapter?.login ?? null, onSettled: refreshLocal, backfill: seam?.mobileBackfill, duplicateConfirm });
 
   // 行内切号（P4c-6b-2d）：接缝登记哪种形态就跑哪种；行目标按合成数据面解析（含适配器池面）。
   const rowActions = useRowActions({ wiring: adapter?.rowSwitch, onSettled: refreshLocal, onRowAction,
@@ -143,7 +143,9 @@ export function AccountsPage(props: AccountsPageProps) {
     reloginBusy: login.busy,
   });
   // 行内编辑与开关字段（P4c-6b-2e-2）：备注名 / 手机号 / 自动签到 / 归档；命令同样来自接缝。
-  const fieldEdits = useDetailFieldEdits({ seam, rowId: selectedRowId, readPayload: () => payload, onSettled: refreshLocal });
+  // G11 查重确认层（P4c-6b-2e-3）：手机号命中重复号时弹层确认，确认后同一命令强行写入。
+  const fieldEdits = useDetailFieldEdits({ seam, rowId: selectedRowId, readPayload: () => payload, onSettled: refreshLocal,
+    confirmDuplicate: (request) => duplicateConfirm.request({ ...request, onSettled: refreshLocal, successCopy: MOBILE_SAVED_COPY }) });
   // 详情忙碌位：单账号换发 + 五类动作 + 字段保存各自表达，只影响被点的按钮。
   const detailBusy = [...(detailCredential.busy ? DETAIL_CREDENTIAL_REFRESH_ACTIONS : []), ...detailActions.busy, ...fieldEdits.busy];
 
@@ -190,16 +192,15 @@ export function AccountsPage(props: AccountsPageProps) {
           devices={adapter.devices}
           profileId={selectedRowId}
           onSignedOut={() => void refreshLocal()}
-          dialogs={<>
-            {/* 登录弹层（详情「重新登录」复用 6b-2c 流程，旧 onRelogin 同一条 OAuth 链路）。 */}
-            {login.dialog !== null && <AccountLoginDialog {...login.dialog} />}
-            {/* G11 补录弹层：登录回执缺号才挂载（未登记补录接缝的产品永不出现）。 */}
-            {login.backfill}
-            {detailCredential.open && <DetailCredentialRefreshDialog accountName={row.displayName}
-              busy={detailCredential.busy} onCancel={detailCredential.cancel}
-              onConfirm={() => void detailCredential.confirm()} />}
-            {detailActions.dialogs}
-          </>}
+          dialogs={(
+            <AccountsDialogs login={login} duplicate={duplicateConfirm.dialogs}>
+              {/* 详情专属层：单账号凭据换发确认 + 重置设备确认（删除确认由危险区自持，不叠层）。 */}
+              {detailCredential.open && <DetailCredentialRefreshDialog accountName={row.displayName}
+                busy={detailCredential.busy} onCancel={detailCredential.cancel}
+                onConfirm={() => void detailCredential.confirm()} />}
+              {detailActions.dialogs}
+            </AccountsDialogs>
+          )}
         />
       );
     }
@@ -281,11 +282,8 @@ export function AccountsPage(props: AccountsPageProps) {
           />
         )}
       </section>
-      {/* 登录弹层（P4c-6b-2c）与切号弹层槽（P4c-6b-2d）：接缝登记才可能挂载，关闭即卸载。 */}
-      {login.dialog !== null && <AccountLoginDialog {...login.dialog} />}
-      {/* G11 补录弹层（登录后缺号引导）：列表页同样挂载（登录入口在页头）。 */}
-      {login.backfill}
-      {rowActions.dialogs}
+      {/* 弹层槽（P4c-6b-2c 登录 / G11 补录 + 查重 / P4c-6b-2d 切号）：接缝登记才可能挂载，关闭即卸载。 */}
+      <AccountsDialogs login={login} duplicate={duplicateConfirm.dialogs}>{rowActions.dialogs}</AccountsDialogs>
       {/* 批量刷新凭据二次确认：仅入口存在且有目标时挂载（挂载即打开，关闭即卸载）。 */}
       {listCredential.open && credential !== undefined && (
         <CredentialRefreshDialog

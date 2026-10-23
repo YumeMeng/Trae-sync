@@ -22,6 +22,11 @@ export interface DetailFieldEditsInput {
   readonly readPayload: () => unknown;
   /** 成功后重读本机缓存（旧实现每个动作后 refreshOverview / refresh 同法）。 */
   readonly onSettled: () => Promise<void>;
+  /**
+   * G11 查重确认层（P4c-6b-2e-3）：命中时弹层并等用户决定；true = 已强行写入。
+   * 缺省 = 不做查重（未接线路径与既有测试一字不改）。
+   */
+  readonly confirmDuplicate?: (request: { readonly ownerName: string; readonly write: () => Promise<void> }) => Promise<boolean>;
 }
 
 export interface DetailFieldEditsResult {
@@ -76,6 +81,15 @@ export function useDetailFieldEdits(input: DetailFieldEditsInput): DetailFieldEd
     if (action === null || target === null) return false;
     setPending(fieldId);
     try {
+      // G11 第三层查重（旧 AccountCenterTrae L505-525）：命中即弹确认层，确认后同一命令强行写入；
+      // 用户取消 = 本次未保存（返回 false 让字段保留编辑态与草稿）。
+      const ownerName = action.conflictOf?.(inputRef.current.readPayload(), target, value) ?? null;
+      if (ownerName !== null) {
+        const confirm = inputRef.current.confirmDuplicate;
+        if (confirm === undefined) return false; // 未接线确认层：fail-closed，不静默写入
+        // 确认层自行完成写入 + 重读 + 成功回执（旧 confirmDuplicateMobile L535-538 同法），此处不重复。
+        return await confirm({ ownerName, write: () => action.run(target, value) });
+      }
       await action.run(target, value);
       await inputRef.current.onSettled();
       notify.success(value === "" ? action.clearedCopy : action.savedCopy);

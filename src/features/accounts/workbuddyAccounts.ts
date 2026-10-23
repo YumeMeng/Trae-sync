@@ -3,7 +3,7 @@
  * 判定时刻与忙碌态由快照注入；徽章经 deriveWorkBuddyPoolLoginState 求态；能力只读 accountCapabilitiesFor("workbuddy")。
  */
 import { deriveWorkBuddyPoolLoginState, type LoginSlotState } from "../../components/StatusBadges";
-import type { WorkBuddyAccountEntryDto, WorkBuddyCheckinAccountStatusDto, WorkBuddySessionHealthDto } from "../../types/product";
+import type { WorkBuddyAccountEntryDto, WorkBuddyCheckinAccountStatusDto, WorkBuddyCheckinParticipationDto, WorkBuddySessionHealthDto } from "../../types/product";
 import { workbuddyDisplayName } from "../../utils/accountDisplay";
 import { ACCOUNT_TEXTS, accountCapabilitiesFor, type AccountActionView, type AccountBadgeView, type AccountMetricView, type AccountRowView, type AccountsEmptyView, type AccountsFiltersView, type AccountsOptionView, type AccountsView, type AccountTone } from "./config";
 
@@ -24,6 +24,8 @@ export interface WorkBuddyAccountsSnapshot {
   readonly sessionHealth: WorkBuddySessionHealthDto | null; // get_workbuddy_session_health；null = 未读到
   readonly pool: readonly WorkBuddyAccountEntryDto[]; // list_workbuddy_accounts（档案字段全量，归档不预过滤）
   readonly checkinOverview: readonly WorkBuddyCheckinAccountStatusDto[]; // get_workbuddy_checkin_overview（逐账号余额面）
+  /** 自动签到参与集（list_workbuddy_checkin_accounts；矩阵 #46）：null/缺省 = 未读到 → 详情页给中性说明。 */
+  readonly participation?: readonly WorkBuddyCheckinParticipationDto[] | null;
   readonly sort: "added" | "name"; // U-2 排序档（WB 无签到档；偏好持久化在页面）
   readonly busy: WorkBuddyAccountsBusy;
   readonly nowUnixSeconds: number; // 纯函数不读时钟：凭据判定时刻由调用方注入

@@ -3,7 +3,8 @@ import {
   readCheckinCapability, readCheckinOverview, readEnvironmentState, readManagedAccountState, readTraeInstanceStates,
 } from "../../../platform/accounts";
 import {
-  fetchWorkBuddyCheckinOverview, listWorkBuddyAccounts, loadWorkBuddySessionHealth,
+  fetchWorkBuddyCheckinOverview, listWorkBuddyAccounts, listWorkBuddyCheckinAccounts,
+  loadWorkBuddySessionHealth,
 } from "../../../platform/workbuddyAdapter";
 import { safeUiErrorMessage } from "../../../utils/safeUiError";
 import type { TraeAccountsSnapshot } from "../traeAccounts";
@@ -44,12 +45,17 @@ async function readTrae(mode: ReadMode, previous: unknown): Promise<AccountsData
 
 /** WB 数据面（旧 WorkBuddyPanel L149-170）。 */
 async function readWorkBuddy(mode: ReadMode, previous: unknown): Promise<AccountsData> {
-  const [sessionHealth, pool] = await Promise.all([loadWorkBuddySessionHealth(), listWorkBuddyAccounts()]);
+  const [sessionHealth, pool, participation] = await Promise.all([
+    loadWorkBuddySessionHealth(), listWorkBuddyAccounts(),
+    // 参与集（P4c-6b-2e-3）：本地参与表读取（零网络，纯缓存刷新同样重读）；
+    // 失败如实给 null —— 详情页据此显示中性说明，不得静默成「全部未参与」。
+    listWorkBuddyCheckinAccounts().catch(() => null),
+  ]);
   // 逐账号签到/积分面经客户端运行时查询（有网络成本）：纯缓存刷新保留上次结果。
   const checkinOverview = mode === "local"
     ? (previous as WorkBuddyAccountsData | null)?.checkinOverview ?? []
     : await fetchWorkBuddyCheckinOverview(null).catch(() => [] as const);
-  return { productId: "workbuddy", workbuddy: { sessionHealth, pool, checkinOverview } };
+  return { productId: "workbuddy", workbuddy: { sessionHealth, pool, checkinOverview, participation } };
 }
 
 /** 产品读取表：键 = productId，值 = { 载荷键, 读取, 失败兜底文案 }（新增产品只加一行）。 */
