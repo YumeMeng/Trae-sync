@@ -12,7 +12,12 @@ import type { WorkBuddyEnvironmentSnapshot } from "../workbuddyEnvironment";
  * 环境页快照读取 hook（P4d-5）：按产品取数据面、代次守卫防竞态、产品切换或 active=false
  * 立即清态、refreshLocal 只做轻刷新（不带体积、不重聚合体检）。只产出数据面——busy /
  * captureNotice / canOpenLibraryDetail 由页面与动作 hook 注入后合成快照。读取失败不静默成
- * 空数组：snapshot 清空、error 如实暴露；旁路失败落 null（未读到），绝不用 [] 冒充「没有」。
+ * 空数组：首读失败 snapshot 清空、error 如实暴露；旁路失败落 null（未读到），绝不用 [] 冒充「没有」。
+ *
+ * P4d-8b-2b（K-07 项 4 回归修复）：区分「首读」与「刷新」两种失败——
+ *   首读失败（此前没有任何快照）→ 清快照 + 落 error，页面渲染错误卡（旧口径保留）；
+ *   刷新失败（已有快照）→ **保留快照**（成功回执 / 卡片 / 弹层一律不丢），失败原因只经
+ *   refreshLocal / refreshFull 的返回值交回调用方，由调用方按对应文案补提示；不翻错误卡。
  */
 
 /** 数据面 = builder 快照去掉页面自持字段（忙碌位 / 捕获提示 / 详情入口可用性）。 */
@@ -75,16 +80,24 @@ const READERS: Record<string, { key: string; read: typeof readTrae; failure: str
   workbuddy: { key: "workbuddy", read: readWorkBuddy, failure: ENV_TEXTS.wbLoadFailure },
 };
 
+/** 一次读取的结果：刷新失败只交回调用方（不清快照、不翻错误卡），由调用方按文案补提示。 */
+export type EnvironmentReadOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: string };
+
+/** 成功结果常量：身份稳定，避免每次读取都新建对象。 */
+const READ_OK: EnvironmentReadOutcome = { ok: true };
+
 export interface EnvironmentSnapshotResult {
-  /** 已取回数据面；null = 未读到（加载中 / 已清态 / 未登记产品）。 */
+  /** 已取回数据面；null = 未读到（加载中 / 已清态 / 首读失败 / 未登记产品）。 */
   readonly snapshot: EnvironmentData | null;
   readonly loading: boolean;
-  /** 读取失败的人话原因；失败时 snapshot 恒 null（不伪装成「没有环境」）。 */
+  /** **首读**失败的人话原因（此时 snapshot 恒 null，不伪装成「没有环境」）；刷新失败不落这里。 */
   readonly error: string | null;
-  /** 轻刷新：只校准运行态与列表，零体积遍历、零体检聚合；失败同样落 error。 */
-  readonly refreshLocal: () => Promise<void>;
+  /** 轻刷新：只校准运行态与列表，零体积遍历、零体检聚合；失败经返回值交回调用方（已有快照时保留数据）。 */
+  readonly refreshLocal: () => Promise<EnvironmentReadOutcome>;
   /** 全量读取（带体积 + 重聚合体检）：修复类动作会改变体检聚合口径，必须走这条（旧页 L157 整组重读）。 */
-  readonly refreshFull: () => Promise<void>;
+  readonly refreshFull: () => Promise<EnvironmentReadOutcome>;
 }
 
 /** @param productId 与 registry / 能力表同键的产品；@param active 页面可见才读取。 */
@@ -101,9 +114,9 @@ export function useEnvironmentSnapshot(productId: string, active: boolean): Envi
   useLayoutEffect(() => {
     generation.current += 1; setSnapshot(null); setError(null); setLoading(false);
   }, [productId, active]);
-  const load = useCallback(async (mode: ReadMode) => {
+  const load = useCallback(async (mode: ReadMode): Promise<EnvironmentReadOutcome> => {
     const reader = READERS[productId];
-    if (!reader) return; // 未登记产品 fail-closed：不猜数据面（页面按 registry 空视图渲染）。
+    if (!reader) return READ_OK; // 未登记产品 fail-closed：不猜数据面（页面按 registry 空视图渲染）。
     const ticket = ++generation.current;
     // 同产品上次数据（轻刷新沿用字段）经载荷键取，不做产品相等判断。
     const current = latest.current.snapshot;
@@ -112,9 +125,15 @@ export function useEnvironmentSnapshot(productId: string, active: boolean): Envi
     try {
       const next = await reader.read(mode, previous);
       if (ticket === generation.current) setSnapshot(next);
+      return READ_OK;
     } catch (reason: unknown) {
-      // 读取失败不得静默成空数组：清快照 + 暴露原因，由页面渲染错误态。
-      if (ticket === generation.current) { setSnapshot(null); setError(safeUiErrorMessage(reason, reader.failure)); }
+      if (ticket !== generation.current) return READ_OK; // 晚到的旧请求：结果已作废，不打扰调用方
+      const message = safeUiErrorMessage(reason, reader.failure);
+      // 首读失败（此前没有任何快照）：清快照 + 暴露原因，由页面渲染错误卡（旧口径）。
+      // 刷新失败（已有快照）：保留快照——成功回执 / 卡片 / 弹层不得被一次读取失败吞掉；
+      // 失败原因只经返回值交回调用方补提示（K-07 项 4 回归修复）。
+      if (current === null) { setSnapshot(null); setError(message); }
+      return { ok: false, error: message };
     } finally {
       if (ticket === generation.current) setLoading(false);
     }
@@ -124,14 +143,14 @@ export function useEnvironmentSnapshot(productId: string, active: boolean): Envi
     void load("full");
     return () => { generation.current += 1; }; // 卸载 / 换代作废在途读取
   }, [active, productId, load]);
-  const refreshLocal = useCallback(async () => {
-    if (!latest.current.active) return;
-    await load("local");
+  const refreshLocal = useCallback(async (): Promise<EnvironmentReadOutcome> => {
+    if (!latest.current.active) return READ_OK;
+    return load("local");
   }, [load]);
   // 全量重读只给「体检聚合会变」的动作（修复主库记录）：与旧页 load() 同口径。
-  const refreshFull = useCallback(async () => {
-    if (!latest.current.active) return;
-    await load("full");
+  const refreshFull = useCallback(async (): Promise<EnvironmentReadOutcome> => {
+    if (!latest.current.active) return READ_OK;
+    return load("full");
   }, [load]);
   return { snapshot, loading, error, refreshLocal, refreshFull };
 }

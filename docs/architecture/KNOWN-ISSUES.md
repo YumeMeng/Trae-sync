@@ -143,7 +143,8 @@
    - 判定：**真实缺口，不可放弃**（写操作：捕获会把账号写进池）。属独立小票——
      本票边界是「迁旧页渲染/弹层行为」，捕获块在 P4d-8a-2 已单独自检过
      （`.scratch/cmdr/p4d8a2-sanity.test.tsx`），未沉淀为正式护栏。
-4. **环境状态刷新失败仍保留成功结果**（旧 3 例：清理 / 收编 / 登录各一）——**已实测确认是回归，非可放弃项**：
+4. **环境状态刷新失败仍保留成功结果**（旧 3 例：清理 / 收编 / 登录各一）——**已实测确认是回归，非可放弃项**
+   → **P4d-8b-2b 已修复（2026-10-23）**，详见本条末尾「修复落地」。
    `useEnvironmentSnapshot.load()` 内部 `catch` 后**只落 error 状态、不重抛**，故三个调用点的
    `.catch(...)` 分支永不触发：`useEnvironmentLogin.done` 的 `notify.warning(loginRefreshFailed)`、
    `useEnvironmentIncorporation` 的刷新回调均无 catch，`ENV_TEXTS.incorporateRefreshFailed` /
@@ -156,6 +157,16 @@
    - 修复方向（独立票）：`refreshFull` 需要把失败**同时**交回调用方（返回 boolean 或抛错），
      再由三处调用点按旧文案补提示；或在 `EnvironmentPage` 的刷新回调里比对 `error` 状态后补
      `notify.warning`。属行为变更，不在测试迁移票内改。
+   - **修复落地（P4d-8b-2b，2026-10-23）**：`useEnvironmentSnapshot` 区分首读与刷新——首读失败仍
+     清快照 + 落 `error`（错误卡保留），**已有快照时刷新失败保留快照**，失败经
+     `refreshLocal / refreshFull` 的新返回值 `EnvironmentReadOutcome`（`{ ok: false, error }`）交回
+     调用方。各「成功 + 重读失败」路径按既有文案补提示、不再翻错误卡：收编在完成态记
+     `refreshFailed` 并在弹层内追加 `ENV_TEXTS.incorporateRefreshFailed`（回执与「完成」按钮保留）、
+     清理在成功回执尾部追加 `ENV_TEXTS.refreshFailedSuffix`、登录「完成」补
+     `notify.warning(ENV_TEXTS.loginRefreshFailed)`、创建/改名/删除成功通知追加
+     `refreshFailedSuffix`、修复成功后的重读失败补 `notify.warning`。
+     护栏：`tests/environmentPage.test.tsx` 新增 2 例（收编成功但重读失败 / 清理成功但重读失败），
+     断言「回执照旧 + 提示追加 + 主库卡保留 + 无整页错误卡 + 无 error 通知」。
 5. **副环境「归入」的进度阶段高亮与失败步骤色档**（旧 1 例断言
    `[data-stage="restarting"]` 带 `switch-step--failed`）：新用例已断言
    `role=alert` 的「归入已完成，但环境未能自动启动」文案，**未断言步骤色档类**。
@@ -167,3 +178,5 @@
 | --- | --- | --- |
 | 测试文件 | 32 | 32（删 1 增 1，`EnvironmentPage.test.tsx` → `environmentPage.test.tsx`） |
 | 用例 | 410 | **392**（-38 旧环境页 +22 新环境页 -2 WB 环境用例） |
+
+P4d-8b-2b 修复 K-07 项 4 时补 2 例（收编 / 清理的「成功但重读失败」），全量 **394**（24 例环境页）。

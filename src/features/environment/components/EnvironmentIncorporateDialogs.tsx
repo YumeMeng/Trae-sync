@@ -116,6 +116,13 @@ export function EnvironmentIncorporateDialog({
                 </span>
               </div>
             )}
+            {/* 回执已到但整组重读失败（K-07 项 4）：完成回执照旧在上，这里只追加提示，不翻失败态。 */}
+            {phase.kind === "done" && phase.refreshFailed && (
+              <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
+                <TriangleAlert size={18} aria-hidden="true" />
+                <p>{ENV_TEXTS.incorporateRefreshFailed}</p>
+              </div>
+            )}
             {phase.kind === "done" && phase.receipt.relaunch_outcome === "failed" && (
               <div className="switch-dialog__notice switch-dialog__notice--danger" role="alert">
                 <TriangleAlert size={18} aria-hidden="true" />

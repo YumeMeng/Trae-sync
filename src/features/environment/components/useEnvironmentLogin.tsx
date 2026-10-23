@@ -5,6 +5,7 @@ import type { AccountProfileDto } from "../../../types/account_switch";
 import type { EnvironmentLoginReceiptDto } from "../../../types/environment";
 import { ENV_TEXTS } from "../config";
 import { EnvironmentLoginDialog, type LoginReceiptView } from "./EnvironmentLoginDialog";
+import type { EnvironmentReadOutcome } from "./useEnvironmentSnapshot";
 
 /**
  * 环境登录账号弹层 hook（P4d-8a-2c）：选已有账号登录到指定环境（旧页 EnvironmentLoginDialog
@@ -25,8 +26,8 @@ export interface EnvironmentLoginCommands {
 
 export interface EnvironmentLoginInput {
   readonly commands: EnvironmentLoginCommands;
-  /** 登录完成后的整组重读（旧页 load()）；失败已由本 hook 警告，不重抛。 */
-  readonly refresh: () => Promise<void>;
+  /** 登录完成后的整组重读（旧页 load()）；失败经返回值交回，由本 hook 警告、不重抛。 */
+  readonly refresh: () => Promise<EnvironmentReadOutcome>;
 }
 
 export interface EnvironmentLoginResult {
@@ -98,10 +99,13 @@ export function useEnvironmentLogin(input: EnvironmentLoginInput): EnvironmentLo
   }, [session]);
 
   // 完成（旧页 L850-856）：先关层再整组重读；重读失败只警告，不覆盖已完成的登录结果。
+  // 读取层刷新失败不抛错（保留快照），失败经返回值交回——这里按旧文案补 warning。
   const done = useCallback(() => {
     ticket.current += 1; // 作废在途账号列表
     setSession(null);
-    void latest.current.refresh().catch(() => { notify.warning(ENV_TEXTS.loginRefreshFailed); });
+    void latest.current.refresh().then((outcome) => {
+      if (!outcome.ok) notify.warning(ENV_TEXTS.loginRefreshFailed);
+    });
   }, []);
 
   const dialog = session === null ? null : (

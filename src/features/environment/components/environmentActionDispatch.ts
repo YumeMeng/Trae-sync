@@ -4,6 +4,8 @@ import type { CaptureNotice } from "./useEnvironmentActions";
 import type { EnvironmentDialogsResult } from "./useEnvironmentDialogs";
 import type { EnvironmentIncorporationResult } from "./useEnvironmentIncorporation";
 import type { EnvironmentLoginResult } from "./useEnvironmentLogin";
+import type { EnvironmentReadOutcome } from "./useEnvironmentSnapshot";
+import { notify } from "../../../platform/notify";
 import { MASTER_ENV_ID } from "./useEnvironmentActions";
 import { cardNameOf, type Assembled } from "./assembleEnvironment";
 import {
@@ -29,8 +31,8 @@ export interface ActionDispatchInput {
   /** 页头刷新动作 id（builder 产出；空串 = 无刷新入口）。 */
   readonly refreshId: string;
   readonly refresh: () => void;
-  readonly refreshLocal: () => Promise<void>;
-  readonly refreshFull: () => Promise<void>;
+  readonly refreshLocal: () => Promise<EnvironmentReadOutcome>;
+  readonly refreshFull: () => Promise<EnvironmentReadOutcome>;
   /** 未接线的其余动作原样透出。 */
   readonly emit: (actionId: string) => void;
   readonly onOpenMasterDetail?: () => void;
@@ -49,6 +51,15 @@ export interface ActionDispatchInput {
 const secondaryNameOf = (view: EnvironmentView, envId: string): string =>
   cardNameOf(view, envId) ?? ENV_TEXTS.secondaryBadge;
 
+/**
+ * 动作成功后的重读：失败只补警告（K-07 项 4 口径），绝不把已成功的动作翻成失败，也不清快照。
+ * 收编 / 清理 / 登录 / 创建改名删除的重读在各自 hook 内（文案各按旧页追加），这里只兜底
+ * 「成功通知已发、重读纯校准」的启动与修复。
+ */
+const warnIfRefreshFailed = (pending: Promise<EnvironmentReadOutcome>): void => {
+  void pending.then((outcome) => { if (!outcome.ok) notify.warning(ENV_TEXTS.refreshFailedSuffix); });
+};
+
 export function environmentActionDispatch(input: ActionDispatchInput): (actionId: string) => void {
   const {
     view, assembled, refreshId, refresh, refreshLocal, refreshFull, emit, onOpenMasterDetail, onOpenEnvDetail,
@@ -61,15 +72,16 @@ export function environmentActionDispatch(input: ActionDispatchInput): (actionId
     if (refreshId !== "" && actionId === refreshId) { refresh(); return; }
     if (actionId === MASTER_DETAIL_ACTION) { onOpenMasterDetail?.(); return; }
     if (actionId === MASTER_LAUNCH_ACTION) {
-      void launchEnv(MASTER_ENV_ID).then((ok) => { if (ok) void refreshLocal(); });
+      void launchEnv(MASTER_ENV_ID).then((ok) => { if (ok) warnIfRefreshFailed(refreshLocal()); });
       return;
     }
     if (actionId === MASTER_CLOSE_ACTION) {
       dialogs.openClose({ envId: MASTER_ENV_ID, name: view.master?.name ?? ENV_TEXTS.masterName });
       return;
     }
+    // 修复：命令成功即已纠正（成功通知由动作 hook 发）；后续整组重读失败只补警告。
     if (actionId === REPAIR_ACTION) {
-      void repairMaster().then((ok) => { if (ok) void refreshFull(); });
+      void repairMaster().then((ok) => { if (ok) warnIfRefreshFailed(refreshFull()); });
       return;
     }
     if (actionId === CAPTURE_ACTION) {
@@ -84,7 +96,7 @@ export function environmentActionDispatch(input: ActionDispatchInput): (actionId
     }
     if (actionId.startsWith(LAUNCH_PREFIX)) {
       const envId = actionId.slice(LAUNCH_PREFIX.length);
-      void launchEnv(envId, cardNameOf(view, envId)).then((ok) => { if (ok) void refreshLocal(); });
+      void launchEnv(envId, cardNameOf(view, envId)).then((ok) => { if (ok) warnIfRefreshFailed(refreshLocal()); });
       return;
     }
     if (actionId.startsWith(CLOSE_PREFIX)) {

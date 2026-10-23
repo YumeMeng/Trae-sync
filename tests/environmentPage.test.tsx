@@ -253,6 +253,48 @@ describe("TRAE 环境页：收编 / 清理 / 登录", () => {
     await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("已删除 2 个空项目记录（已自动备份）。"));
     await waitFor(() => expect(fullListCalls()).toBeGreaterThanOrEqual(2));
   });
+  // P4d-8b-2b（K-07 项 4 回归）：成功回执与刷新失败并存——回执不丢、卡片不被整页错误卡替代。
+  it("收编成功但重读失败：完成回执与弹层保留，追加刷新失败提示，页面不翻错误卡", async () => {
+    let mutationDone = false;
+    mockRoute("get_environment_state", () => {
+      if (mutationDone) throw new Error("environment_refresh_failed");
+      return state;
+    });
+    mockRoute("incorporate_master_records", () => { mutationDone = true; return receipt; });
+    await mountTrae();
+    fireEvent.click(await screen.findByTestId("env-incorporate-entry"));
+    fireEvent.click(await screen.findByTestId("incorporate-confirm"));
+    const dialog = await screen.findByTestId("incorporate-dialog");
+    // 回执照旧：完成句与「完成」按钮都在（旧页 L1717 的刷新失败只追加提示）。
+    await waitFor(() => expect(dialog).toHaveTextContent("已归入 2 个账号：保留项目 3 个 · 转移会话 5 个"));
+    expect(dialog).toHaveTextContent("归入已完成，但环境状态刷新失败，请手动刷新。");
+    expect(dialog).not.toHaveTextContent("归入未完成");
+    expect(screen.getByTestId("incorporate-done")).toBeInTheDocument();
+    // 数据保留：主库卡仍在，不被整页错误卡替代。
+    expect(screen.getByTestId("env-master-card")).toHaveTextContent("账号甲");
+    expect(screen.queryByTestId("environment-load-error")).not.toBeInTheDocument();
+    expect(notifyMock.error).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("incorporate-done"));
+    expect(screen.queryByTestId("incorporate-dialog")).not.toBeInTheDocument();
+  });
+  it("清理成功但重读失败：成功回执追加刷新失败后缀，卡片与体检保留", async () => {
+    let mutationDone = false;
+    baseRoutes(emptyShellReport); // 先装基线路由，再覆盖读取路由（后注册者生效）
+    mockRoute("get_environment_state", () => {
+      if (mutationDone) throw new Error("environment_refresh_failed");
+      return state;
+    });
+    mockRoute("cleanup_master_empty_projects", () => { mutationDone = true; return { deleted_projects: 2, backup_path: "", relaunch_outcome: "launched" }; });
+    await mountTrae();
+    fireEvent.click(screen.getByTestId("env-cleanup-empty-projects-entry"));
+    fireEvent.click(await screen.findByTestId("env-cleanup-empty-projects-dialog-confirm"));
+    // 回执文案逐字旧页：成功句 + 「环境状态刷新失败，请手动刷新。」后缀。
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith(
+      "已删除 2 个空项目记录（已自动备份）。环境状态刷新失败，请手动刷新。"));
+    expect(notifyMock.error).not.toHaveBeenCalled();
+    expect(screen.getByTestId("env-master-card")).toBeInTheDocument();
+    expect(screen.queryByTestId("environment-load-error")).not.toBeInTheDocument();
+  });
   it("清理预览失败：报错且不开破坏性弹层、零删除", async () => {
     let checkupCalls = 0;
     mockRoute("get_master_checkup", () => { checkupCalls += 1; if (checkupCalls > 1) throw new Error("checkup_read_failed"); return staleReport; });

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 import type { MasterIncorporateProgressEvent } from "../../../types/masterLibrary";
 import type { EnvironmentBusyState } from "./useEnvironmentBusy";
 import {
@@ -6,6 +6,7 @@ import {
 } from "./useIncorporateCleanup";
 import { EnvironmentCleanupDialog, EnvironmentIncorporateDialog } from "./EnvironmentIncorporateDialogs";
 import { EMPTY_INCORPORATE_SCALE, type IncorporateScale } from "./incorporateScale";
+import type { EnvironmentReadOutcome } from "./useEnvironmentSnapshot";
 
 /**
  * 收编 / 清理弹层编排（P4d-8a-2c）：在 useIncorporateCleanup（动作与忙碌位）之上补一层
@@ -33,8 +34,8 @@ export interface EnvironmentIncorporationInput {
   readonly patchBusy?: (next: Partial<EnvironmentBusyState>) => void;
   /** 收编进度阶段（useEnvironmentBusy 已按目标库过滤）。 */
   readonly stage: MasterIncorporateProgressEvent["stage"] | null;
-  /** 成功后的整组重读（旧页 load()）。 */
-  readonly refresh: () => Promise<void>;
+  /** 成功后的整组重读（旧页 load()）；失败经返回值交回，不改报为动作失败。 */
+  readonly refresh: () => Promise<EnvironmentReadOutcome>;
   /** 清理执行中位（来自 useEnvironmentBusy，用于弹层按钮禁用）。 */
   readonly cleaningUp: boolean;
 }
@@ -50,13 +51,12 @@ export interface EnvironmentIncorporationResult {
 
 export function useEnvironmentIncorporation(input: EnvironmentIncorporationInput): EnvironmentIncorporationResult {
   const { commands, notifyPrefix, patchBusy, stage, refresh, cleaningUp } = input;
-  const cleanup = useIncorporateCleanup({ commands, notifyPrefix, patchBusy });
+  // 刷新交给 useIncorporateCleanup 内做（旧页「命令 → load() → 回执」同一序列）：
+  // 刷新失败由此处按旧文案补提示，不会把弹层完成态/成功回执吞掉。
+  const cleanup = useIncorporateCleanup({ commands, notifyPrefix, patchBusy, refresh });
   // 本次会话（打开时取好的规模与目标账号）：确认态用它渲染确认句，运行/完成/失败态用它渲染
   // 目标账号与规模；关闭层才清空。与 useIncorporateCleanup 的 phase 正交（phase 管阶段，本态管数据）。
   const [session, setSession] = useState<IncorporateOpenInput | null>(null);
-  // 刷新经 ref 取最新值：动作身份稳定（与 useIncorporateCleanup 同法）。
-  const latest = useRef({ refresh });
-  latest.current = { refresh };
 
   // 同一时刻只允许一条收编/清理（busyRef 是唯一真源）；上一轮的完成/失败态先清掉。
   const openIncorporate = useCallback((next: IncorporateOpenInput) => {
@@ -65,11 +65,11 @@ export function useEnvironmentIncorporation(input: EnvironmentIncorporationInput
     setSession(next);
   }, [cleanup]);
 
-  // 确认 → 置运行态（phase 由 hook 推进）→ 回执后整组重读（旧页 L311 的 load() 位置）。
+  // 确认 → 置运行态（phase 由 hook 推进）→ 回执后整组重读（旧页 L311 的 load() 位置，在 hook 内）。
   const confirmIncorporate = useCallback(() => {
     const opened = session;
     if (opened === null) return;
-    void cleanup.incorporate(opened.target).then((ok) => { if (ok) void latest.current.refresh(); });
+    void cleanup.incorporate(opened.target);
   }, [cleanup, session]);
 
   // 关闭层：运行中不关（hook 的 closeIncorporate 内部直接返回，后端事务已开）；其余清会话与阶段。
@@ -81,9 +81,7 @@ export function useEnvironmentIncorporation(input: EnvironmentIncorporationInput
 
   const openCleanup = useCallback(() => { void cleanup.openCleanup(); }, [cleanup]);
 
-  const confirmCleanup = useCallback(() => {
-    void cleanup.confirmCleanup().then((ok) => { if (ok) void latest.current.refresh(); });
-  }, [cleanup]);
+  const confirmCleanup = useCallback(() => { void cleanup.confirmCleanup(); }, [cleanup]);
 
   // 弹层目标：阶段态优先取 hook 的 phase.target（同一 envId），确认态取会话；规模与账号名恒取会话。
   const target = cleanup.phase?.target ?? session?.target ?? null;

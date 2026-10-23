@@ -5,6 +5,7 @@ import type { MasterEmptyProjectCleanupDto, MasterIncorporateResultDto } from ".
 import { ENV_TEXTS } from "../config";
 import { incorporateStageLabels } from "../traeEnvironment";
 import type { EnvironmentBusyState } from "./useEnvironmentBusy";
+import type { EnvironmentReadOutcome } from "./useEnvironmentSnapshot";
 
 /**
  * 环境页动作 hook 第二组（P4d-6b）：收编（一键归入当前账号）与空项目清理的编排与结果汇报。
@@ -17,6 +18,10 @@ import type { EnvironmentBusyState } from "./useEnvironmentBusy";
  * 落完成/失败），既不拆成多次调用（会重复关实例/二次重启并改写 relaunch_outcome），也不与清理
  * 合并成一条命令。进度阶段文案唯一来源是 builder 的 incorporateStageLabels，本文件不自造。
  * 成功后返回 boolean 交调用方刷新（旧页 L311 / L385 的 load() 位置）；失败一律 notify.error 不静默。
+ *
+ * P4d-8b-2b（K-07 项 4 回归修复）：刷新就在本 hook 内做（旧页「命令 → load() → 回执」同一序列），
+ * 且刷新失败**不覆盖成功结果**——收编把 refreshFailed 记进完成态（弹层内追加
+ * ENV_TEXTS.incorporateRefreshFailed），清理把 ENV_TEXTS.refreshFailedSuffix 追加到成功回执尾部。
  */
 
 /** 收编目标：envId 给命令；envName / isMaster 给阶段文案与失败兜底句。 */
@@ -50,12 +55,16 @@ export interface IncorporateCleanupInput {
   readonly notifyPrefix?: string;
   /** 忙碌位落地面（通常传 useEnvironmentBusy 的 patchBusy）；不注入时 busyRef 仍独立防连点。 */
   readonly patchBusy?: (next: Partial<EnvironmentBusyState>) => void;
+  /** 成功后的整组重读（旧页 L311 / L385 的 load()）；失败经返回值交回，不改报为动作失败。 */
+  readonly refresh: () => Promise<EnvironmentReadOutcome>;
 }
 
-/** 收编会话态（旧页 IncorporatePhase L1546-1549 三态；刷新失败归调用方）。 */
+/** 收编会话态（旧页 IncorporatePhase L1546-1549 三态；refreshFailed 逐字保留旧页 done 态字段）。 */
 export type IncorporatePhase =
   | { readonly kind: "running"; readonly target: IncorporateTarget }
-  | { readonly kind: "done"; readonly target: IncorporateTarget; readonly receipt: MasterIncorporateResultDto }
+  | { readonly kind: "done"; readonly target: IncorporateTarget; readonly receipt: MasterIncorporateResultDto;
+    /** 回执已到但后续整组重读失败：完成结果照旧展示，弹层内追加「归入已完成，但环境状态刷新失败」。 */
+    readonly refreshFailed: boolean }
   | { readonly kind: "failed"; readonly target: IncorporateTarget; readonly message: string };
 
 export interface IncorporateCleanupResult {
@@ -107,15 +116,17 @@ export function useIncorporateCleanup(input: IncorporateCleanupInput): Incorpora
   // 收编与清理都要关实例再重启：任一进行中都不许开另一条（同一实例单动作纪律）。
   const busyNow = useCallback(() => busyRef.current.incorporatingEnvId !== null || busyRef.current.cleaningUp, []);
 
-  // 收编（L287-333）：置运行态 → 单条命令（后端三拍）→ 完成态 / 失败态。
+  // 收编（L287-333）：置运行态 → 单条命令（后端三拍）→ 整组重读 → 完成态 / 失败态。
+  // 刷新失败不覆盖回执（旧页 L309-316 同法）：完成态照旧落地，只是记 refreshFailed 供弹层追加提示。
   const incorporate = useCallback(async (target: IncorporateTarget): Promise<boolean> => {
     if (busyNow()) return false;
     mark({ incorporatingEnvId: target.envId });
     setPhase({ kind: "running", target });
     try {
       const receipt = await latest.current.commands.incorporate(target.envId);
-      setPhase({ kind: "done", target, receipt });
-      return true; // 刷新交调用方（旧页 L311 的 load() 位置）
+      const refreshed = await latest.current.refresh();
+      setPhase({ kind: "done", target, receipt, refreshFailed: !refreshed.ok });
+      return true;
     } catch (reason: unknown) {
       // 三个冲突/未知提交码（conflict / committed_needs_attention / commit_outcome_unknown）
       // 由 safeUiError 词表逐字映射旧文案，此处不另造。
@@ -159,14 +170,17 @@ export function useIncorporateCleanup(input: IncorporateCleanupInput): Incorpora
     try {
       const receipt = await latest.current.commands.cleanup();
       openPreview(null); // 旧页 L381：回执一到即关弹层
+      // 刷新在回执之后、提示之前（旧页 L383-400 同序）：失败只在回执尾部追加后缀，不改报清理失败。
+      const refreshed = await latest.current.refresh();
+      const suffix = refreshed.ok ? "" : ENV_TEXTS.refreshFailedSuffix;
       if (receipt.deleted_projects > 0) {
         notify.success(say(fill(
           receipt.relaunch_outcome === "failed" ? ENV_TEXTS.cleanupSuccessRelaunchFailed : ENV_TEXTS.cleanupSuccess,
-          { count: receipt.deleted_projects })));
+          { count: receipt.deleted_projects })) + suffix);
       } else {
-        notify.info(say(ENV_TEXTS.cleanupNothing));
+        notify.info(say(ENV_TEXTS.cleanupNothing) + suffix);
       }
-      return true; // 刷新交调用方（旧页 L385 的 load() 位置）
+      return true;
     } catch (reason: unknown) {
       openPreview(null); // 旧页 L404：失败也关弹层，错误走全局通知（弹层无内嵌错误槽）
       notify.error(safeUiErrorMessage(reason, ENV_TEXTS.cleanupFailure));

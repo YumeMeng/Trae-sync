@@ -7,6 +7,7 @@ import type { EnvironmentDeletePreviewDto } from "../../../types/environment";
 import { ENV_TEXTS, fillEnvText } from "../config";
 import { EnvironmentNameDialog, type NameDialogValue } from "./EnvironmentNameDialog";
 import { EnvironmentDeleteDialog } from "./EnvironmentDeleteDialog";
+import type { EnvironmentReadOutcome } from "./useEnvironmentSnapshot";
 
 /**
  * 环境页弹层 hook（P4d-8a-2b）：关闭确认 + 创建 / 改名 / 删除三只生命周期弹层。
@@ -15,6 +16,10 @@ import { EnvironmentDeleteDialog } from "./EnvironmentDeleteDialog";
  * 命令与刷新全部由调用方注入（本文件零 platform 命令、零 invoke、零产品判断）；
  * 忙碌位按旧口径就地持有（弹层自己的 busy，不混进 useEnvironmentBusy 的实例动作位）。
  * 刷新口径逐字照旧页：创建/改名/删除成功后都是整组 load()（= 调用方传 refreshFull）。
+ *
+ * P4d-8b-2b（K-07 项 4 回归修复）：命令已成功、后续整组重读失败时**不把成功回执改报为失败**
+ * （旧页会因 load() 抛错而落到内联错误），成功通知照发，尾部按旧文案追加
+ * ENV_TEXTS.refreshFailedSuffix（「环境状态刷新失败，请手动刷新。」），页面不翻错误卡。
  */
 
 /** 注入命令：三条生命周期命令 + 删除规模预览（预览与执行分开，绝不合并）。 */
@@ -34,8 +39,8 @@ export interface EnvDialogTarget {
 
 export interface EnvironmentDialogsInput {
   readonly commands: EnvironmentLifecycleCommands;
-  /** 生命周期动作成功后的整组重读（旧页 load()）；失败已由读取层落 error，不重抛。 */
-  readonly refresh: () => Promise<void>;
+  /** 生命周期动作成功后的整组重读（旧页 load()）；失败经返回值交回，不重抛、不清快照。 */
+  readonly refresh: () => Promise<EnvironmentReadOutcome>;
   /** 关闭确认后的执行（页面注入 useEnvironmentActions.closeEnv + refreshLocal）。 */
   readonly confirmClose: (target: EnvDialogTarget) => Promise<void>;
 }
@@ -103,11 +108,12 @@ export function useEnvironmentDialogs(input: EnvironmentDialogsInput): Environme
 
   const openClose = useCallback((target: EnvDialogTarget) => { setCloseTarget(target); }, []);
 
-  // 创建（旧 L821-825）：命令成功 → 整组重读 → 成功通知；失败抛回名称弹层做内联提示。
+  // 创建（旧 L821-825）：命令成功 → 整组重读 → 成功通知；命令失败抛回名称弹层做内联提示。
+  // 重读失败只追加后缀（创建已提交，不能反过来把弹层翻成失败）。
   const submitCreate = useCallback(async (name: string) => {
     await latest.current.commands.create(name);
-    await latest.current.refresh();
-    notify.success(fillEnvText(ENV_TEXTS.createdNotice, { name }));
+    const outcome = await latest.current.refresh();
+    notify.success(fillEnvText(ENV_TEXTS.createdNotice, { name }) + (outcome.ok ? "" : ENV_TEXTS.refreshFailedSuffix));
   }, []);
 
   // 改名（旧 L835-841）：同上，目标 env_id 由弹层会话持有（不拿 env_id 当文案）。
@@ -115,8 +121,8 @@ export function useEnvironmentDialogs(input: EnvironmentDialogsInput): Environme
     const target = rename?.target;
     if (target === null || target === undefined) return;
     await latest.current.commands.rename(target.envId, name);
-    await latest.current.refresh();
-    notify.success(fillEnvText(ENV_TEXTS.renamedNotice, { name }));
+    const outcome = await latest.current.refresh();
+    notify.success(fillEnvText(ENV_TEXTS.renamedNotice, { name }) + (outcome.ok ? "" : ENV_TEXTS.refreshFailedSuffix));
   }, [rename]);
 
   // 删除确认（旧 L1466-1478）：成功先关层再整组重读 + 成功通知；失败内联提示并保留弹层。
@@ -128,8 +134,9 @@ export function useEnvironmentDialogs(input: EnvironmentDialogsInput): Environme
       try {
         await latest.current.commands.delete(session.target.envId);
         setRemove(null); // 旧 L867：回执一到即关层
-        await latest.current.refresh();
-        notify.success(fillEnvText(ENV_TEXTS.deletedNotice, { name: session.target.name }));
+        const outcome = await latest.current.refresh(); // 重读失败只追加后缀，不改报删除失败
+        notify.success(fillEnvText(ENV_TEXTS.deletedNotice, { name: session.target.name })
+          + (outcome.ok ? "" : ENV_TEXTS.refreshFailedSuffix));
       } catch (reason: unknown) {
         setRemove((current) => current === null ? null : {
           ...current, busy: false, error: safeUiErrorMessage(reason, ENV_TEXTS.deleteFailure) });
