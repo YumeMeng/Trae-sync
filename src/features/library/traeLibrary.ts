@@ -5,11 +5,13 @@
  * K-08：轨迹行 thoughts 取自快照消息的 content.thoughts（经 TraeMessageView 携带；config 的 MessageView 未建模该字段，本文件不改 config）。
  */
 import type { MasterHistoryDto, MasterSessionEntryDto, RelayLedgerEntryDto, TraeCnForeignProjectDto } from "../../types/history";
-import type { MasterBackupChainDto, MasterLibraryStatsDto, MasterVerificationDto } from "../../types/masterLibrary";
+import type { MasterBackupChainDto, MasterLibraryStatsDto } from "../../types/masterLibrary";
 import type { ProductOperationSnapshotDto } from "../../types/product";
 import { LIBRARY_TEXTS, LIBRARY_VIEW_TEXTS, fillLibraryText, libraryCapabilitiesFor, type ArchiveChromeView, type ArchiveRecoveryView, type LibraryActionKind, type LibraryActionView, type LibraryInfoItemView, type LibraryInfoView, type LibraryStatView, type LibraryTabId, type LibraryView, type MessageView, type ProjectNodeView, type ViewerPaneView } from "./config";
 import { archivedSessionsOf, buildArchiveSessionTree, buildSessionTree, countTreeSessions, liveSessionsOf, type SessionTreeDraft } from "./sessionTree";
 import { buildViewerPane, formatRelativeTime, type ViewerPaneSource } from "./relayLegs";
+import { buildBackupCompareView, type VerificationState } from "./infoTab";
+import { buildPluginTabView, type PluginTabData } from "./pluginTab";
 /** 只读库实例 id（与 platform/productRegistry 的 TRAE_CN_LIBRARY_ID 同值；本文件不引 UI 侧依赖）；下行为写操作 id 字面量。 */
 const CN_LIBRARY_ID = "trae_cn";
 const ARCHIVE_OP = "library.archive", WORK_MERGE_OP = "library.work_project_merge", DELETE_OP = "library.delete", CN_MERGE_OP = "library.trae_cn_project_merge";
@@ -27,7 +29,10 @@ export interface TraeLibrarySnapshot {
   readonly ledger: readonly RelayLedgerEntryDto[]; // get_relay_ledger（接力腿数据源）
   readonly operations: ProductOperationSnapshotDto | null; // get_product_operation_states（null = 未读到）
   readonly stats: MasterLibraryStatsDto | null; // get_master_library_stats（库信息计数条）
-  readonly verification: MasterVerificationDto | null; // get_master_verification（备份对比，P4e-8 消费）
+  /** 备份对比读取态（进库信息 tab 才发起 get_master_verification；页面 hook 持有，builder 只映射）。 */
+  readonly verificationState: VerificationState;
+  /** 插件 tab 读取态与本地交互态（段/搜索/分类/卸载单；页面 hook 持有，builder 只映射）。 */
+  readonly pluginTab: PluginTabData;
   readonly backupChain: MasterBackupChainDto | null; // get_master_backup_chain（最近备份）
   readonly currentAccountName: string | null; readonly dataDir: string | null; // 环境档案 / 数据目录（只进悬浮提示）
   readonly foreignProjects: readonly TraeCnForeignProjectDto[]; // list_trae_cn_foreign_projects（其他账号组）
@@ -196,7 +201,7 @@ function infoOf(snapshot: TraeLibrarySnapshot): LibraryInfoView {
     counts: ready ? [count("projects", LIBRARY_TEXTS.infoProjectCount, stats.project_count, "当前账号可见的项目数"),
       count("sessions", LIBRARY_TEXTS.infoSessionCount, stats.session_count, "当前账号可见的会话数"),
       count("messages", LIBRARY_TEXTS.infoMessageCount, stats.message_count, "当前账号会话的消息总数")] : [],
-    backup: null, // 备份对比区块（V180-264）归 P4e-8 的 TraeInfoTab；快照已留 verification / backupChain，本票不臆造
+    backup: buildBackupCompareView(snapshot.verificationState), // 备份对比区块（V82-266 的 backupOnly 形态）
   };
 }
 /** 快照 → 库视图（纯函数：同一快照恒得同一视图）。 */
@@ -243,7 +248,8 @@ export function buildTraeLibraryView(snapshot: TraeLibrarySnapshot): TraeLibrary
     batchBar: batchBarOf(snapshot, canArchive, canWorkMerge, canDelete, selected, mergeTargets), draftBar: draftBarOf(snapshot, canArchive),
     archive: archiveChromeOf(snapshot, canArchive, archivedAll.length),
     selectionEntry: canSelect ? { label: LIBRARY_TEXTS.select, cancelLabel: LIBRARY_TEXTS.cancel } : null, // L1684-1701（锚由展示层持有）
-    checkup: null, plugins: null, // §2-11 A 库页无体检（G18 在环境页）；§2-12 插件 tab 由 P4e-8 的 usePluginWorkbench 产出
+    // §2-11 A 库页无体检（G18 在环境页）；§2-12 插件 tab：主库给工作台，只读库/副环境给说明卡（D229-243）。
+    checkup: null, plugins: buildPluginTabView(snapshot.pluginTab, { libraryId: snapshot.libraryId, readOnly: snapshot.readOnly }),
     info: infoOf(snapshot), notices, texts: LIBRARY_VIEW_TEXTS.trae_cn,
   };
 }

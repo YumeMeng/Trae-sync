@@ -29,6 +29,10 @@ function BackupCompare({ view, busy, onAction, onBaseChange }: {
       <div className="verification-panel__toolbar">
         <LibraryActionButton action={view.refresh} busy={busy} onClick={() => onAction(view.refresh.id)} />
       </div>
+      {/* 读取失败行（V96）：不遮挡已取回的报告，也不清已取回数据。 */}
+      {view.errorNote !== null && <p className="workbench__error" role="alert">{view.errorNote}</p>}
+      {/* 报告未到达（首读中 / 读取失败且无历史报告）：只给工具行与错误行（V98 的报告守卫）。 */}
+      {!view.pending && (
       <section className="verification-block" data-testid={BLOCK_TEST_ID}>
         <div className="verification-block__heading">
           <h4>{view.title}</h4>
@@ -61,6 +65,7 @@ function BackupCompare({ view, busy, onAction, onBaseChange }: {
           </div>
         )}
       </section>
+      )}
     </div>
   );
 }

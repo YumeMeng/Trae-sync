@@ -1,14 +1,16 @@
 /**
- * 库页装配（P4e-8a 读取与渲染 + 8b-1 删除三链 + 8b-2 归档与归并接线）。
+ * 库页装配（P4e-8a 读取与渲染 + 8b-1 删除三链 + 8b-2 归档与归并接线 + 8b-3 插件 tab 与库信息 tab）。
  * 数据面 useTraeLibrary / useWbLibrary 经 libraryAssemblers 的 ASSEMBLERS 查表（键 = productId，页面零产品判断、
  * 零 invoke、零命令名）；视图模型 registry.libraryViewFor；展示组件 LibraryShell / LibrarySessionsBody / LibraryTree /
  * SessionViewer / LibraryInfoTab / LibraryBatchBar / LibraryArchiveBar / WbCheckupCard / 两组确认弹层。
  * 本文件不发明文案与 testid：标题、tab、锚点、空态句一律取自 LibraryView。动作接线（选择态、删除三链、归档编排、
- * 三条归并链）抽到 useLibrarySelection / useLibraryPageActions / useArchiveActions / useLibraryMergeActions；
- * 页面只做装配与分发（动作 id 判别顺序：归档 → 删除 → 归并 → 刷新/返回 → 透出）。
+ * 三条归并链、插件安装/卸载、备份对比校验、WB 体检）抽到 useLibrarySelection / useLibraryPageActions /
+ * useArchiveActions / useLibraryMergeActions / usePluginTab / useLibraryVerification；
+ * 页面只做装配与分发（动作 id 判别顺序：归档 → 删除 → 归并 → 插件 → 校验 → 体检 → 刷新/返回 → 透出）。
  */
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { libraryCapabilitiesFor, type LibraryTabId, type LibraryView, type ProjectNodeView, type SessionRowView } from "./config";
+import { LIBRARY_TEXTS, fillLibraryText, libraryCapabilitiesFor,
+  type LibraryTabId, type LibraryView, type ProjectNodeView, type SessionRowView } from "./config";
 import { libraryViewFor, type LibrarySnapshot } from "./registry";
 import { useTraeLibrary, type TraeLibraryPageFields } from "./components/useTraeLibrary";
 import { useWbLibrary, type WbLibraryPageFields } from "./components/useWbLibrary";
@@ -17,6 +19,11 @@ import { EmptyState } from "../../components/shared/EmptyState";
 import { LibraryShell } from "./components/LibraryShell";
 import { LibrarySessionsBody } from "./components/LibrarySessionsBody";
 import { LibraryInfoTab } from "./components/LibraryInfoTab";
+import { LibraryPluginTab } from "./components/LibraryPluginTab";
+import { usePluginTab } from "./components/usePluginTab";
+import { useLibraryVerification } from "./components/useLibraryVerification";
+import { pluginTabEnabled } from "./pluginTab";
+import { notify } from "../../platform/notify";
 import { LibraryDeleteDialogs } from "./components/LibraryDeleteDialogs";
 import { LibraryMergeDialogs, type LibraryMergeConfirm } from "./components/LibraryMergeDialogs";
 import { LibraryArchiveConfirm, LibraryDraftBar } from "./components/LibraryArchiveBar";
@@ -29,9 +36,8 @@ import { useLibraryMergeActions } from "./components/useLibraryMergeActions";
 
 /** 删除确认层锚点契约（旧页 L2285）：TRAE 层经 testId 传此值，逐字沿用旧锚（WB 两层各取订单 testId）。 */
 export const LIBRARY_DELETE_CONFIRM_TEST_ID = "delete-confirm";
-/** 本票不接线的出口（插件 tab 归后续票）：不发明假回执。 */
+/** 未登记产品的兜底出口：不发明假回执。 */
 const NO_ACTION = () => undefined;
-const NO_BASE = (_stamp: number | null) => undefined;
 /** 未登记产品的兜底：无删除目标、刷新不发起读取、无归档/归并候选（页面已 fail-closed 渲染）。 */
 const NO_TARGETS = (_sessionIds: readonly string[], _projectIds: readonly string[]): readonly DeleteTargetView[] => [];
 const NO_REFRESH = async (): Promise<{ readonly ok: boolean }> => ({ ok: true });
@@ -91,6 +97,10 @@ export function LibraryPage(props: LibraryPageProps) {
     viewerSessionId: assembledRef.current?.viewerSessionId ?? null,
     closeSession: () => assembledRef.current?.closeSession(),
   });
+  // 插件 tab 与库信息 tab 的读取：按「页面可见 + 该 tab 当前激活」双门禁（旧 P135-139 / V69-73 同口径），
+  // 切走即停读；安装/卸载成功重读插件清单，基准切换与重新校验重读备份对比（各自 hook 内闭环）。
+  const plugins = usePluginTab({ enabled: pluginTabEnabled(productId, libraryId), active: active && activeTab === "plugins" });
+  const verify = useLibraryVerification({ libraryId, active: active && activeTab === "info" });
   // 页面状态（原样进两条读取 hook 的快照）：归档页状态在本渲染即取真值（不经过 ref，无跨渲染滞后）。
   const page: TraeLibraryPageFields & WbLibraryPageFields = {
     activeTab, searchText, expandedIds, viewerTab, uidFilter, includeDeleted,
@@ -98,6 +108,7 @@ export function LibraryPage(props: LibraryPageProps) {
     selectMode: selection.selectMode, archiveView: archive.page.view, archiveCollapsedKeys: archive.page.collapsedKeys,
     busy: false, archiveRecovery: archive.page.recovery, draftStorageError: archive.page.draftError,
     selectedIds: selection.selectedSessionIds, writeBusy: false, mergeBusy: false,
+    verificationState: verify.state, pluginTab: plugins.data,
   };
   const trae = useTraeLibrary(page, { productId, libraryId, libraryDisplayName, active, now });
   const wb = useWbLibrary(page, { productId, active, now });
@@ -161,10 +172,21 @@ export function LibraryPage(props: LibraryPageProps) {
     if (archive.handleAction(actionId)) return; // 归档草稿 / 应用 / 入口 / 返回：命中即执行
     if (actions.handleAction(actionId)) return; // 删除三链：命中即执行（弹层 / 直接动作）
     if (merge.handleAction(actionId)) return; // 归并三链：命中即执行（预览 / 弹层）
+    if (plugins.handleAction(actionId)) return; // 插件刷新（plugin-refresh）：重读两路
+    if (verify.handleAction(actionId)) return; // 备份对比重新校验（verification-refresh）
+    if (actionId === "checkup-run") { void runCheckup(); return; } // WB 立即体检（旧 WB470-479）
     if (actionId === view?.header.refresh?.id) { void refresh(); return; }
     if (actionId === view?.header.back?.id && onBack !== undefined) { onBack(); return; }
-    onAction?.(actionId); // 其余动作一律透出：插件 / 空态引导归后续票
+    onAction?.(actionId); // 其余动作一律透出：空态引导等
   };
+  // WB 体检刷新（旧 WB81-90）：失败只提示，不清已有报告（hook 内保留上次报告）。
+  const runCheckup = async () => {
+    const outcome = await wb.runCheckup();
+    if (!outcome.ok) notify.error(LIBRARY_TEXTS.wbNotifyPrefix + fillLibraryText(LIBRARY_TEXTS.wbCheckupFailure, { reason: outcome.error }));
+  };
+  // 插件安装/卸载与备份对比的忙碌位（插件行按钮与「重新校验」据此转忙碌句并禁用）。
+  const pluginBusy = plugins.busy;
+  const infoBusy = verify.state.loading && view?.info?.backup != null ? [...busyIds, view.info.backup.refresh.id] : busyIds;
   // 项目行：选择模式 = 勾选其下全部会话并立即展开（旧 L1223-1230：让勾选结果可见）；浏览态 = 展开/收起。
   const toggleNode = (node: ProjectNodeView) => {
     if (selection.selectMode) {
@@ -220,14 +242,22 @@ export function LibraryPage(props: LibraryPageProps) {
         {view.empty !== null && (
           <EmptyState panel title={view.empty.title} description={view.empty.hint === "" ? undefined : view.empty.hint} />
         )}
-        {/* tab 面板按 view.tabs 切换（WB 无 tab：正文直接落树 + 查看器 + 体检卡）。插件 tab 面板留后续票。 */}
+        {/* tab 面板按 view.tabs 切换（WB 无 tab：正文直接落树 + 查看器 + 体检卡）；
+            插件 tab 面板按视图形态给工作台或说明卡（只读库 / 副环境），库信息 tab 面板给信息卡 + 备份对比。 */}
         {!blocked && (view.tabs.length > 0 ? (
           <>
             <div className="master-detail__tabpanel" hidden={activeTab !== "sessions"}>{sessions}</div>
-            <div className="master-detail__tabpanel" hidden={activeTab !== "plugins"} />
+            <div className="master-detail__tabpanel" hidden={activeTab !== "plugins"}>
+              {view.plugins !== null && (
+                <LibraryPluginTab view={view.plugins} busy={pluginBusy} onSegmentChange={plugins.chooseSegment}
+                  onSearch={plugins.search} onCategoryChange={plugins.chooseCategory} onAction={handleAction}
+                  onRowAction={plugins.rowAction} onUninstallCancel={plugins.cancelUninstall} onUninstallConfirm={plugins.confirmUninstall} />
+              )}
+            </div>
             <div className="master-detail__tabpanel" hidden={activeTab !== "info"}>
               {view.info !== null && (
-                <LibraryInfoTab view={view.info} checkup={view.checkup} busy={busyIds} onAction={handleAction} onBackupBase={NO_BASE} />
+                <LibraryInfoTab view={view.info} checkup={view.checkup} busy={infoBusy}
+                  onAction={handleAction} onBackupBase={verify.chooseBase} />
               )}
             </div>
           </>

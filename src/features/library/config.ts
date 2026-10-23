@@ -59,12 +59,20 @@ export interface PluginRowView { readonly id: string; readonly testId: string; r
 /** 插件 tab：段切换 + 搜索 + 分类 chips + 行列表 + 空态；卸载单次确认（全账号传播）。 */
 export type PluginSegmentId = "installed" | "market";
 export interface PluginSegmentView { readonly id: PluginSegmentId; readonly label: string; readonly testId: string; readonly active: boolean }
-export interface PluginTabView {
+/** 插件 tab 两形态：工作台（主库）/ 说明卡（只读库与副环境，旧 D232-243）。kind 是判别字段。 */
+export type PluginTabView = PluginWorkbenchView | PluginNoteView;
+/** 说明卡：只给一句说明，不渲染段 / 搜索 / 列表 / 确认层。 */
+export interface PluginNoteView { readonly kind: "note"; readonly testId: string; readonly ariaLabel: string; readonly text: string }
+export interface PluginWorkbenchView {
+  readonly kind: "workbench";
   readonly testId: string; readonly ariaLabel: string; readonly refresh: LibraryActionView;
   readonly segments: readonly PluginSegmentView[]; readonly activeSegment: PluginSegmentId;
   readonly search: { readonly testId: string; readonly placeholder: string; readonly value: string } | null;
   readonly categories: readonly string[]; readonly activeCategory: string | null; readonly rows: readonly PluginRowView[];
-  readonly emptyText: string | null; readonly errorNote: string | null;
+  readonly emptyText: string | null;
+  /** 空态锚（旧 P421/P426）；null = 当前是加载句（旧 P409-413 的 EmptyState 无锚）。 */
+  readonly emptyTestId: string | null;
+  readonly errorNote: string | null;
   readonly uninstall: { readonly title: string; readonly confirmLabel: string; readonly lines: readonly string[]; readonly testId: string } | null;
 }
 /** 库体检五项（WB 专属）：孤儿正文/缺失正文/软删规模/外部目录/归并候选；candidates 每项 canonical 在前。 */
@@ -79,6 +87,10 @@ export interface BackupCompareView {
   readonly selectedStamp: number | null; readonly badge: LibraryBadgeView; readonly summary: string;
   readonly missing: readonly { readonly title: string; readonly messageCount: number }[];
   readonly restoreHint: string | null; readonly refresh: LibraryActionView;
+  /** 报告尚未到达（进 tab 首读中 / 读取失败且无历史报告）：只渲染工具行与错误句（旧 V96-106）。 */
+  readonly pending: boolean;
+  /** 读取失败原因（旧 V96 页内错误行）：不遮挡已取回的报告，也不清已取回数据。 */
+  readonly errorNote: string | null;
 }
 /** 库信息 tab：账号/大小/路径/最近活跃/最近备份 + 计数条 + 备份对比（backupOnly 形态）。 */
 export interface LibraryInfoView { readonly testId: string; readonly items: readonly LibraryInfoItemView[]; readonly counts: readonly LibraryStatView[]; readonly backup: BackupCompareView | null; }

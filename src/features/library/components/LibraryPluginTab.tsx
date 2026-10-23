@@ -12,10 +12,9 @@ import { LibraryActionButton } from "./LibraryShell";
  * 视图未建模的三处旧约定（分类 chips 容器锚、段/列表/空态锚、市场已安装徽章锚）按旧页命名规则拼接，不发明新锚。
  * 本文件零 useState / useEffect / invoke，交互只回调（安装/卸载的编排归 usePluginActions + 页面弹层）。
  */
-/** 旧页容器锚（P385）与列表/空态锚（P408 / P421 / P426）的命名规则。 */
+/** 旧页容器锚（P385）与列表锚（P408）的命名规则；空态锚由视图给（加载句无锚，P409-431）。 */
 const CHIPS_TEST_ID = "plugin-category-chips";
 const listTestId = (segment: PluginSegmentId): string => `plugin-${segment}-list`;
-const emptyTestId = (segment: PluginSegmentId): string => `plugin-${segment}-empty`;
 /** 市场行「已安装」徽章锚（P280）：旧页按 plugin_id 派生；行锚后缀优先，缺省回落 row.id。 */
 const MARKET_ROW_PREFIX = "plugin-market-row-";
 const installedBadgeTestId = (row: PluginRowView): string =>
@@ -74,8 +73,22 @@ export interface LibraryPluginTabProps {
   readonly onUninstallConfirm: () => void;
 }
 
-/** 插件工作台：工具行（段 + 搜索 + 刷新）→ 分类 chips → 行列表/空态 → 卸载确认。 */
+/** 说明卡（只读库 / 副环境，旧 D232-243）：一句说明，不渲染段、搜索、列表与确认层。 */
+function PluginNote({ view }: { view: Extract<PluginTabView, { kind: "note" }> }) {
+  return (
+    <div className="master-detail__info" data-testid={view.testId} role="region" aria-label={view.ariaLabel}>
+      <p className="env-checkup__note">{view.text}</p>
+    </div>
+  );
+}
+
+/** 插件 tab 入口：按视图形态分派（说明卡 / 工作台），本层不判断产品与库形态。 */
 export function LibraryPluginTab(props: LibraryPluginTabProps) {
+  return props.view.kind === "note" ? <PluginNote view={props.view} /> : <PluginWorkbenchTab {...props} view={props.view} />;
+}
+
+/** 插件工作台：工具行（段 + 搜索 + 刷新）→ 分类 chips → 行列表/空态 → 卸载确认。 */
+function PluginWorkbenchTab(props: LibraryPluginTabProps & { readonly view: Extract<PluginTabView, { kind: "workbench" }> }) {
   const { view, busy = false, onSegmentChange, onSearch, onCategoryChange, onAction, onRowAction, onUninstallCancel, onUninstallConfirm } = props;
   const search = view.search;
   return (
@@ -119,7 +132,7 @@ export function LibraryPluginTab(props: LibraryPluginTabProps) {
         ))}
         {/* 空态 / 加载句同源：视图模型无独立 loading 字段，由 builder 决定 emptyText（本层不发明文案）。 */}
         {view.emptyText !== null && (
-          <EmptyState className="plugin-empty" testId={emptyTestId(view.activeSegment)} description={view.emptyText} />
+          <EmptyState className="plugin-empty" testId={view.emptyTestId ?? undefined} description={view.emptyText} />
         )}
       </div>
 

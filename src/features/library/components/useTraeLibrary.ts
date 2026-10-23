@@ -4,22 +4,23 @@
  * 旁路失败落 null（未读到），不用 [] 冒充「没有」。代次守卫三层：①产品/库/可见性一变领新代次并清态 ②落地前比对领票 ③effect 清理与卸载再作废。
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { fetchMasterHistory, fetchMasterLibraryStats, fetchMasterSessionMessages, fetchMasterVerification,
+import { fetchMasterHistory, fetchMasterLibraryStats, fetchMasterSessionMessages,
   fetchProductOperationStates, fetchRelayLedger, fetchTraeCnForeignProjects, listEnvironments,
   readEnvironmentState, readMasterBackupChain } from "../../../platform/library";
 import { TRAE_CN_LIBRARY_TITLE, isReadOnlyLibrary } from "../../../platform/productRegistry";
 import { safeUiErrorMessage } from "../../../utils/safeUiError";
 import type { MasterHistoryDto, MasterSessionEntryDto, RelayLedgerEntryDto, TraeCnForeignProjectDto } from "../../../types/history";
-import type { MasterBackupChainDto, MasterLibraryStatsDto, MasterVerificationDto } from "../../../types/masterLibrary";
+import type { MasterBackupChainDto, MasterLibraryStatsDto } from "../../../types/masterLibrary";
 import type { ProductOperationSnapshotDto } from "../../../types/product";
 import type { TraeLibrarySnapshot, TraeViewerSource } from "../traeLibrary";
 
 const TRAE_PRODUCTS: ReadonlySet<string> = new Set(["trae_cn"]); // fail-closed：非本产品不读取、不猜数据面
 const MASTER_LIBRARY_ID = "master", POLL_INTERVAL_MS = 5000;
 const TRAE_LOAD_FAILURE = "库记录暂时不可读取，请稍后重试。"; // 旧 L1396 兜底句逐字
-/** 页面自持 13 项：原样带入快照，本 hook 不读取、不派生、不覆盖。 */
-export type TraeLibraryPageFields = Pick<TraeLibrarySnapshot, "activeTab" | "archiveDraft" | "searchText" | "expandedIds" | "selectedProjectIds" | "selectedSessionIds" | "selectMode" | "archiveView" | "archiveCollapsedKeys" | "viewerTab" | "busy" | "archiveRecovery" | "draftStorageError">;
-/** 读取面 14 项（now 另注入）：台账/其他账号项目放宽为 null = 未读到，与「没有」区分。 */
+/** 页面自持 15 项（含插件 tab 与备份对比两个按 tab 激活读取的状态）：原样带入快照，本 hook 不读取、不派生、不覆盖。 */
+export type TraeLibraryPageFields = Pick<TraeLibrarySnapshot, "activeTab" | "archiveDraft" | "searchText" | "expandedIds" | "selectedProjectIds" | "selectedSessionIds" | "selectMode" | "archiveView" | "archiveCollapsedKeys" | "viewerTab" | "busy" | "archiveRecovery" | "draftStorageError" | "verificationState" | "pluginTab">;
+/** 读取面 12 项（now 另注入）：台账/其他账号项目放宽为 null = 未读到，与「没有」区分。
+ * 备份对比（get_master_verification）与插件 tab 按「tab 激活」读取（旧 V69-73 / P135-139），不随主读取批量取。 */
 export type TraeLibraryData = Omit<TraeLibrarySnapshot, "ledger" | "foreignProjects"> & {
   readonly ledger: readonly RelayLedgerEntryDto[] | null; readonly foreignProjects: readonly TraeCnForeignProjectDto[] | null;
 };
@@ -37,10 +38,10 @@ export interface TraeLibraryReadResult {
 /** 读取面九路（history 为主读取）：旁路失败一律 null，不阻塞主读取。 */
 interface TraeReads {
   readonly history: MasterHistoryDto | null; readonly ledger: readonly RelayLedgerEntryDto[] | null; readonly operations: ProductOperationSnapshotDto | null;
-  readonly stats: MasterLibraryStatsDto | null; readonly verification: MasterVerificationDto | null; readonly backupChain: MasterBackupChainDto | null;
+  readonly stats: MasterLibraryStatsDto | null; readonly backupChain: MasterBackupChainDto | null;
   readonly currentAccountName: string | null; readonly dataDir: string | null; readonly foreignProjects: readonly TraeCnForeignProjectDto[] | null;
 }
-const EMPTY_READS: TraeReads = { history: null, ledger: null, operations: null, stats: null, verification: null, backupChain: null, currentAccountName: null, dataDir: null, foreignProjects: null };
+const EMPTY_READS: TraeReads = { history: null, ledger: null, operations: null, stats: null, backupChain: null, currentAccountName: null, dataDir: null, foreignProjects: null };
 const VIEWER_LOADING: Omit<TraeViewerSource, "session"> = { status: "loading", messages: [], hasMoreBefore: false, messageOffset: 0, loadingOlder: false };
 /** 会话消息读取（offset 缺省 = 首页）：status 非 ready 一律 error（旧 L2123-2131 口径）；抛错也落 error，不清会话本身。 */
 async function readViewer(session: MasterSessionEntryDto, libraryId: string, offset?: number): Promise<Omit<TraeViewerSource, "session">> {
@@ -63,17 +64,17 @@ async function readEnvInfo(libraryId: string, readOnly: boolean): Promise<Pick<T
   const match = (await listEnvironments({ includeSize: false })).find((item) => item.env_id === libraryId) ?? null;
   return { currentAccountName: match?.current_account_name ?? null, dataDir: match?.data_dir ?? null };
 }
-/** 旁路七路并发：任一失败只让该项落 null；台账只在库记录 ready 时随行刷新。 */
+/** 旁路六路并发：任一失败只让该项落 null；台账只在库记录 ready 时随行刷新。 */
 async function readTraeSide(libraryId: string, readOnly: boolean, history: MasterHistoryDto): Promise<Omit<TraeReads, "history">> {
   const scoped = libraryId === MASTER_LIBRARY_ID && !readOnly ? {} : { libraryId };
-  const [ledger, operations, stats, verification, backupChain, env, foreignProjects] = await Promise.all([
+  const [ledger, operations, stats, backupChain, env, foreignProjects] = await Promise.all([
     history.status === "ready" ? fetchRelayLedger({ libraryId }).catch(() => null) : Promise.resolve(null),
     fetchProductOperationStates({ productId: readOnly ? "trae_cn" : "work_cn", libraryId }).catch(() => null),
-    fetchMasterLibraryStats(scoped).catch(() => null), fetchMasterVerification({ backupStamp: null, ...scoped }).catch(() => null),
+    fetchMasterLibraryStats(scoped).catch(() => null),
     readMasterBackupChain(scoped).catch(() => null), readEnvInfo(libraryId, readOnly).catch(() => null),
     readOnly ? fetchTraeCnForeignProjects({ libraryId }).catch(() => null) : Promise.resolve(null),
   ]);
-  return { ledger, operations, stats, verification, backupChain, foreignProjects,
+  return { ledger, operations, stats, backupChain, foreignProjects,
     currentAccountName: env?.currentAccountName ?? null, dataDir: env?.dataDir ?? null };
 }
 /** TRAE 库读取 hook：读命令 9 条 + 会话消息 1 条（首读 / 刷新 / 轮询 / 查看器同一条代次链）。 */
@@ -143,7 +144,7 @@ export function useTraeLibrary(page: TraeLibraryPageFields, options: TraeLibrary
       return patch.status === "ready" ? { ...previous, ...patch, messages: [...patch.messages, ...previous.messages] } : { ...previous, loadingOlder: false };
     });
   }, [libraryId]);
-  // 快照按 TraeLibrarySnapshot 声明顺序逐项填充：读取面 14 项 + 页面自持 13 项 + now（入参注入）。
+  // 快照按 TraeLibrarySnapshot 声明顺序逐项填充：读取面 12 项 + 页面自持 15 项 + now（入参注入）。
   const data: TraeLibraryData = { libraryId, libraryTitle, readOnly, ...reads, ...page, viewer, loadError: error, now };
   return { data, loading, refresh, openSession, closeSession, loadOlder };
 }
