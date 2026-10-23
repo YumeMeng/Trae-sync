@@ -1,7 +1,8 @@
 import { Fragment, type ReactNode } from "react";
+import { RefreshCw } from "lucide-react";
 import { SharedAccountEntry, type AccountView } from "../../../components/shared/account/AccountRow";
 import { Badge } from "../../../ui/Badge";
-import type { AccountActionKind, AccountActionView, AccountRowView } from "../config";
+import { actionBusyLabelOf, type AccountActionKind, type AccountActionView, type AccountRowView } from "../config";
 
 /** 账号行列表（P4c-6a，纯展示）：视图行 → SharedAccountEntry 的适配层。行骨架、点击进详情、动作按钮
  * 复用共享行组件（不重写行组件），本文件只把 AccountRowView 的显示名/副标题/徽章/指标/动作翻译进槽位；
@@ -45,23 +46,33 @@ const metricSlot = (row: AccountsRowView, variant: AccountView): ReactNode => ro
 /** 共享行组件的动作槽只收一个动作且类名固定 primary，故「首个且 primary」交给它，其余动作（含非
  * primary 的首个）在本适配层按 kind 渲染——不丢动作、也不改共享组件类名契约（两 builder 当前均 primary）。 */
 const sideActions = (
-  row: AccountsRowView, actions: readonly AccountActionView[], onRowAction: AccountsRowsProps["onRowAction"],
-): ReactNode => actions.map((action) => (
-  <button
-    key={action.id}
-    className={KIND_CLASS[action.kind]}
-    type="button"
-    disabled={action.disabled !== undefined}
-    title={action.disabled?.reason}
-    data-testid={action.id}
-    onClick={(event) => {
-      event.stopPropagation();
-      onRowAction(row.id, action.id);
-    }}
-  >
-    {action.label}
-  </button>
-));
+  row: AccountsRowView,
+  actions: readonly AccountActionView[],
+  onRowAction: AccountsRowsProps["onRowAction"],
+  busy: { readonly actionId: string | null; readonly rowId: string | null },
+): ReactNode => actions.map((action) => {
+  // 本行该动作执行中：转圈 + 换忙碌文案（旧 actionBusyLabel 口径），文案覆盖由 config 表给。
+  const running = busy.rowId === row.id && busy.actionId === action.id;
+  const busyLabel = running ? actionBusyLabelOf(action.id) : null;
+  return (
+    <button
+      key={action.id}
+      className={KIND_CLASS[action.kind]}
+      type="button"
+      disabled={action.disabled !== undefined || running}
+      title={action.disabled?.reason}
+      aria-busy={running || undefined}
+      data-testid={action.id}
+      onClick={(event) => {
+        event.stopPropagation();
+        onRowAction(row.id, action.id);
+      }}
+    >
+      {running && <RefreshCw size={14} className="icon-spin" aria-hidden="true" />}
+      {busyLabel ?? action.label}
+    </button>
+  );
+});
 
 export interface AccountsRowsProps {
   rows: readonly AccountsRowView[];
@@ -69,18 +80,23 @@ export interface AccountsRowsProps {
   view?: AccountView;
   /** 列表容器 testid（如旧 workbuddy-pool-list）；缺省不设。 */
   listTestId?: string;
+  /** 正在执行的行内动作（id + 行 id）：该按钮转圈并换忙碌文案，其余只按 builder 的 disabled 禁用。 */
+  busyActionId?: string | null;
+  busyRowId?: string | null;
   onRowAction: (rowId: string, actionId: string) => void;
   onOpenDetail: (rowId: string) => void;
 }
 
-export function AccountsRows({ rows, view = "list", listTestId, onRowAction, onOpenDetail }: AccountsRowsProps) {
+export function AccountsRows({ rows, view = "list", listTestId, busyActionId = null, busyRowId = null, onRowAction, onOpenDetail }: AccountsRowsProps) {
   return (
     <ul className={view === "list" ? "account-list" : "account-card-grid"} data-testid={listTestId}>
       {rows.map((row) => {
-        const slotAction = row.actions[0]?.kind === "primary" ? row.actions[0] : null;
+        // 执行中的动作不进共享组件的动作槽（该槽只换文案、不带转圈）：改由本适配层渲染（转圈 + 忙碌文案）。
+        const slotAction = row.actions[0]?.kind === "primary"
+          && !(busyRowId === row.id && busyActionId === row.actions[0].id) ? row.actions[0] : null;
         const side = slotAction === null ? row.actions : row.actions.slice(1);
         // 右栏/卡片侧区：指标格 + 未进动作槽的动作；皆空即不渲染。
-        const aside = (v: AccountView): ReactNode => <>{metricSlot(row, v)}{sideActions(row, side, onRowAction)}</>;
+        const aside = (v: AccountView): ReactNode => <>{metricSlot(row, v)}{sideActions(row, side, onRowAction, { actionId: busyActionId, rowId: busyRowId })}</>;
         return (
           <SharedAccountEntry
             key={row.id}
@@ -103,7 +119,7 @@ export function AccountsRows({ rows, view = "list", listTestId, onRowAction, onO
             onAction={() => {
               if (slotAction !== null) onRowAction(row.id, slotAction.id);
             }}
-            // 文案与悬浮说明全来自 builder：忙碌沿用同一 label，无禁用原因即无提示（不借用共享组件缺省说法）
+            // 文案与悬浮说明全来自 builder：执行中换忙碌文案（config 表），无禁用原因即无提示
             actionLabel={slotAction?.label ?? ""}
             actionBusyLabel={slotAction?.label ?? ""}
             actionTitle={slotAction?.disabled?.reason ?? ""}

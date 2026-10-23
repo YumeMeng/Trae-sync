@@ -18,6 +18,7 @@ import { useCredentialRefresh, type CredentialRefreshTarget } from "./components
 import { useAccountsSnapshot } from "./components/useAccountsSnapshot";
 import { useHeaderBatchActions } from "./components/useHeaderBatchActions";
 import { useAccountLoginFlow } from "./components/useAccountLoginFlow";
+import { useRowActions } from "./components/useRowActions";
 import { AccountLoginDialog } from "./components/AccountLoginDialog";
 import { actionWiringFor } from "./actionCommands";
 import { accountsViewFor, type AccountsSnapshot } from "./registry";
@@ -47,7 +48,7 @@ export interface AccountsPageProps {
   readonly onOpenDetail?: (rowId: string) => void;
   /** 页头其余动作（健康检测 / 额度 / 凭据 / 添加账号 / 登录）：本票只透出，不实现。 */
   readonly onHeaderAction?: (actionId: string) => void;
-  /** 行内动作（切号 / 工具账号选择）：本票只透出，不实现。 */
+  /** 行内动作（切号 / 工具账号选择）：已接（P4c-6b-2d），动作 id 仍原样透出给观察者。 */
   readonly onRowAction?: (rowId: string, actionId: string) => void;
   /** 详情页动作（P4c-7c-1）：单账号凭据刷新之外的详情动作原样透出，缺省无反应。 */
   readonly onDetailAction?: (rowId: string, actionId: string) => void;
@@ -84,8 +85,7 @@ export function AccountsPage(props: AccountsPageProps) {
   const payload = shown === null || adapter === undefined
     ? null : (shown as unknown as Record<string, unknown>)[adapter.payloadKey];
 
-  // 页头批量动作（P4c-6b-2b）：命令装配按产品查表（actionCommands），三链忙碌位与结果摘要由
-  // useAccountActions 承担；动作真正跑完后重读本机缓存（旧实现每个动作后 refreshOverview 同法）。
+  // 页头批量动作（P4c-6b-2b）：命令按产品查表，忙碌位与摘要由 useAccountActions 承担。
   const wiring = actionWiringFor(productId, payload);
   const batch = useHeaderBatchActions({
     wiring, targets: () => wiring?.targets(selectedRowId) ?? [], onSettled: refreshLocal, resetProgress: progressReset,
@@ -107,12 +107,17 @@ export function AccountsPage(props: AccountsPageProps) {
   // refreshOverview 同法），失败/取消的三类收尾提示全在 useAccountLogin 内，页面不重复通知。
   const login = useAccountLoginFlow(adapter?.login ?? null, refreshLocal);
 
-  // 快照合成：数据面 + 页面自持字段（时钟/过滤/排序/忙碌位/适配器面）。
+  // 行内切号（P4c-6b-2d）：接缝登记哪种形态就跑哪种；行目标按合成数据面解析（含适配器池面）。
+  const rowActions = useRowActions({ wiring: adapter?.rowSwitch, onSettled: refreshLocal, onRowAction,
+    readPayload: () => (composed === null || adapter === undefined ? null : (composed as unknown as Record<string, unknown>)[adapter.payloadKey]) });
+
+  // 快照合成：数据面 + 页面自持字段（时钟/过滤/排序/忙碌位/适配器面）
   const now = Math.floor(Date.now() / 1000);
   const ui: PageUi = {
     filter, sort, now, localRefresh: localRefreshBusy, progress,
     credentialBusy: credentialConfirmBusy, creditsBusy: batch.busy.credits, healthBusy: batch.busy.health,
     loginBusy: login.busy,
+    switchBusy: rowActions.busy.switching, toolBusy: rowActions.busy.toolSelection, previewBusy: rowActions.busy.preview,
     adapterPool,
   };
   const composed: AccountsSnapshot | null = payload === null || adapter === undefined
@@ -136,8 +141,7 @@ export function AccountsPage(props: AccountsPageProps) {
     onRefreshed: refreshLocal,
     successMessage: ACCOUNT_TEXTS.credentialRefreshed,
   });
-  // 详情页忙碌位：单账号换发进行中时禁用该动作（builder 已给其它禁用原因）。
-  const detailBusy = detailCredential.busy ? DETAIL_CREDENTIAL_REFRESH_ACTIONS : [];
+  const detailBusy = detailCredential.busy ? DETAIL_CREDENTIAL_REFRESH_ACTIONS : []; // 单账号换发进行中
 
   // 页头忙碌位（AccountsHeader 的 busy 契约：给 id 即转圈，禁用原因仍由 builder 算）：
   // 本地刷新 / 批量凭据刷新 / 额度刷新 / 健康检测各自独立表达，互不冒充。
@@ -148,8 +152,7 @@ export function AccountsPage(props: AccountsPageProps) {
     ...(batch.busy.health ? [wiring?.actionIds.health ?? ""] : []),
   ].filter((id) => id !== "");
 
-  // 页头动作分发：本地刷新 / 批量凭据刷新 / 批量动作（额度、健康检测，由 actionCommands 登记）
-  // 在本页执行，其余动作原样透出给后续票（登录、切号、添加账号）。
+  // 页头动作分发：本页执行本地刷新 / 批量凭据刷新 / 批量动作 / 登录，其余原样透出。
   const handleHeaderAction = useCallback((actionId: string) => {
     if (actionId === "") return;
     if (actionId === refreshLocalActionId) { handleRefreshLocal(); return; }
@@ -161,7 +164,7 @@ export function AccountsPage(props: AccountsPageProps) {
     onHeaderAction?.(actionId);
   }, [batch.handle, credential?.actionId, handleRefreshLocal, listCredential, login, onHeaderAction, refreshLocalActionId]);
 
-  // 详情动作分发（P4c-7c-1）：凭据刷新在本页执行（同一 hook 的单账号路径），其余透出。
+  // 详情动作分发：凭据刷新在本页执行，其余透出给观察者。
   const handleDetailAction = useCallback((actionId: string) => {
     if (actionId === "") return;
     if (DETAIL_CREDENTIAL_REFRESH_ACTIONS.includes(actionId)) { detailCredential.request(); return; }
@@ -257,7 +260,9 @@ export function AccountsPage(props: AccountsPageProps) {
           <AccountsRows
             rows={rows}
             listTestId={adapter?.listTestId}
-            onRowAction={(rowId, actionId) => onRowAction?.(rowId, actionId)}
+            busyActionId={rowActions.busyActionId}
+            busyRowId={rowActions.busyRowId}
+            onRowAction={rowActions.handle}
             onOpenDetail={(rowId) => {
               setSelectedRowId(rowId);
               onOpenDetail?.(rowId);
@@ -278,8 +283,9 @@ export function AccountsPage(props: AccountsPageProps) {
           />
         )}
       </section>
-      {/* 登录弹层（P4c-6b-2c）：接缝登记了登录才可能挂载；关闭即卸载。 */}
+      {/* 登录弹层（P4c-6b-2c）与切号弹层槽（P4c-6b-2d）：接缝登记才可能挂载，关闭即卸载。 */}
       {login.dialog !== null && <AccountLoginDialog {...login.dialog} />}
+      {rowActions.dialogs}
       {/* 批量刷新凭据二次确认：仅入口存在且有目标时挂载（挂载即打开，关闭即卸载）。 */}
       {listCredential.open && credential !== undefined && (
         <CredentialRefreshDialog

@@ -1,13 +1,15 @@
-import { beginCheckinLogin, cancelCheckinLogin, completeCheckinLogin, refreshCheckinCredentials } from "../../platform/accounts";
+import { beginCheckinLogin, cancelCheckinLogin, completeCheckinLogin, refreshCheckinCredentials, switchTraeCnAccount } from "../../platform/accounts";
+import { previewWorkBuddySwitch, switchWorkBuddyAccount } from "../../platform/workbuddyAdapter";
 import type { AccountSnapshot } from "../../platform/accountAdapter";
 import type { CredentialRefreshEntryDto } from "../../types/account_switch";
-import { effectiveDisplayName } from "../../utils/accountDisplay";
-import type { AccountRowView, AccountsView } from "./config";
+import { effectiveDisplayName, workbuddyDisplayName } from "../../utils/accountDisplay";
+import { ACCOUNT_TEXTS, type AccountRowView, type AccountsView } from "./config";
 import type { AccountsSnapshot } from "./registry";
 import type { TraeAccountsData, WorkBuddyAccountsData } from "./components/useAccountsSnapshot";
 import type { AccountBatchProgressMap } from "./components/useAccountBatchProgress";
 import type { CredentialRefreshTarget } from "./components/useCredentialRefresh";
 import type { PageLogin } from "./components/useAccountLoginFlow";
+import type { PageRowSwitch, RowSwitchTarget } from "./components/useRowActions";
 import { traePoolFields, traeRowFace, traeRowTestIds, type TraeAccountsSnapshot } from "./traeAccounts";
 import { workbuddyRowTestIds } from "./workbuddyAccounts";
 
@@ -15,8 +17,8 @@ import { workbuddyRowTestIds } from "./workbuddyAccounts";
  * 账号页产品接缝表（P4c-7c-1 从 AccountsPage 抽出）：页面唯一的产品差异入口。
  *
  * 抽出动机：详情页接线后 AccountsPage 需保持在 UI-CHARTER 的文件行数预算内（300 行），
- * 本表是「载荷键 / 进度协议值 / 本地刷新 / 列表锚点 / 凭据命令 / 快照合成 / 行锚点」
- * 的内聚声明，零状态、零 JSX。表内键与 registry 的 builder 表同形，未登记即 fail-closed。
+ * 本表是「载荷键 / 进度协议值 / 本地刷新 / 列表锚点 / 凭据命令 / 快照合成 / 行锚点 /
+ * 行内切号」的内聚声明，零状态、零 JSX。表内键与 registry 的 builder 表同形，未登记即 fail-closed。
  */
 
 /** 页面自持字段：builder 是纯函数，时钟/过滤/排序/忙碌位/适配器面一律由页面注入。 */
@@ -34,6 +36,12 @@ export interface PageUi {
   readonly healthBusy: boolean;
   /** 登录等待中（P4c-6b-2c）：builder 据此把「添加账号」置忙并换等待文案。 */
   readonly loginBusy: boolean;
+  /** 行内切号在跑（P4c-6b-2d）：官方切号弹层进行中 / WB 切号执行中。 */
+  readonly switchBusy: boolean;
+  /** 工具账号选择进行中（TRAE 专有，≠ 官方切号）。 */
+  readonly toolBusy: boolean;
+  /** WB 切号影响面预览进行中（两段式的第一段）。 */
+  readonly previewBusy: boolean;
   /** 适配器面（仅测试注入路径）：undefined = 生产路径，池面恒缺席。 */
   readonly adapterPool?: AccountSnapshot;
 }
@@ -62,6 +70,8 @@ export interface PageAdapter {
   /** 添加账号 / OAuth 登录接线（页头动作 id + 命令 + 浏览器模式 + 等待文案）；缺省即本产品
    *  不提供登录弹层（fail-closed：页头动作原样透出，弹层永不出现）。 */
   readonly login?: PageLogin;
+  /** 行内切号接线（P4c-6b-2d）：缺省即本产品的行内动作只透出（fail-closed，不猜命令）。 */
+  readonly rowSwitch?: PageRowSwitch;
   readonly compose: (payload: unknown, ui: PageUi) => AccountsSnapshot;
   /** 行锚点与「使用中」不可见锚点：视觉表达仍归 builder 的 accent 徽章，此处只承载旧 testid。 */
   readonly testIds: (row: AccountRowView, snapshot: AccountsSnapshot) => { readonly row: string; readonly selected: string };
@@ -75,8 +85,7 @@ const composeTrae = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
     ...traePoolFields(ui.adapterPool),
     filter: ui.filter, sort: ui.sort, nowUnixSeconds: ui.now,
     busy: {
-      // 登录（P4c-6b-2c）已接；切号 / 工具账号选择在 6b-2d 接入，仍恒空闲。
-      login: ui.loginBusy, switching: false, toolSelection: false, localRefresh: ui.localRefresh,
+      login: ui.loginBusy, switching: ui.switchBusy, toolSelection: ui.toolBusy, localRefresh: ui.localRefresh,
       // 额度/健康检测：进度事件与动作忙碌位同源（TRAE 两路都有，任一为真即禁用）。
       credits: ui.progress.credits_refresh !== undefined || ui.creditsBusy,
       credentialRefresh: ui.progress.credential_refresh !== undefined || ui.credentialBusy,
@@ -85,15 +94,16 @@ const composeTrae = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
   },
 });
 
-/** WB：无三路进度事件（旧 WorkBuddyPanel 未订阅），忙碌位只认本地刷新。 */
+/** WB：无三路进度事件（旧 WorkBuddyPanel 未订阅），忙碌位只认本地刷新与切号两段式。 */
 const composeWorkBuddy = (payload: unknown, ui: PageUi): AccountsSnapshot => ({
   productId: "workbuddy",
   workbuddy: {
     ...(payload as WorkBuddyAccountsData),
     sort: ui.sort === "checkin" ? "added" : ui.sort, nowUnixSeconds: ui.now,
     busy: {
-      // 续期 / 健康 / 捕获 / 切号在 6b-2d 接入；WB 登录接缝未登记（fail-closed），故登录位恒空闲。
-      loading: false, renewing: false, health: false, capturing: false, switching: false, preview: false,
+      // 续期 / 健康 / 捕获未接（命令只给池级单条回执，见 actionCommands）；登录接缝未登记（fail-closed）。
+      loading: false, renewing: false, health: false, capturing: false,
+      switching: ui.switchBusy, preview: ui.previewBusy,
       login: ui.loginBusy, refreshing: ui.localRefresh,
     },
   },
@@ -104,6 +114,49 @@ const traeTestIds = (row: AccountRowView, snapshot: AccountsSnapshot) =>
   traeRowTestIds(traeRowFace((snapshot as { readonly trae: TraeAccountsSnapshot }).trae), row.id);
 /** WB 锚点只用 profile_id 前缀（积分/归档锚点归详情，本票不渲染）。 */
 const wbTestIds = (row: AccountRowView) => workbuddyRowTestIds(row.id, "");
+
+/** 行目标解析（TRAE）：总览 / 池 / 存档三面按 profile_id 取展示名；都找不到即 null（不猜）。 */
+const traeSwitchTarget = (payload: unknown, rowId: string): RowSwitchTarget | null => {
+  const data = payload as TraeAccountsData;
+  const entry = data.overview.find((item) => item.profile_id === rowId);
+  if (entry !== undefined) return { profileId: rowId, displayName: effectiveDisplayName(entry), accountId: null };
+  const pool = data.traePool?.find((item) => item.profile_id === rowId);
+  if (pool !== undefined) return { profileId: rowId, displayName: pool.display_name, accountId: null };
+  const saved = data.savedAccounts.find((item) => item.profile_id === rowId);
+  return saved === undefined ? null : { profileId: rowId, displayName: saved.display_name, accountId: null };
+};
+/** 行目标解析（WB）：命令按账号 uid（account_id），展示名走备注名优先。 */
+const workbuddySwitchTarget = (payload: unknown, rowId: string): RowSwitchTarget | null => {
+  const account = (payload as WorkBuddyAccountsData).pool.find((item) => item.profile_id === rowId);
+  return account === undefined ? null
+    : { profileId: rowId, displayName: workbuddyDisplayName(account), accountId: account.account_id };
+};
+
+/** TRAE 行内接缝（P4c-6b-2d）：官方五步切号弹层 + 工具账号选择指针（旧 L600-619 / L971-974）。 */
+const traeRowSwitch: PageRowSwitch = {
+  targetOf: traeSwitchTarget,
+  // 官方切号：action id = account-switch-<profileId>，只打开弹层（事务全在组件内，一行不改）。
+  master: { actionIdPrefix: "account-switch-" },
+  // 工具账号选择 ≠ 官方切号：只更新本工具的选择指针，不动客户端登录身份（文案逐字）。
+  tool: {
+    actionId: "account-adapter-tool-select",
+    select: (profileId) => switchTraeCnAccount({ profileId }),
+    successCopy: (name) => `已在 Trae Sync 中将“${name || "未命名账号"}”设为工具当前账号；官方客户端登录账号没有改变。`,
+    failureCopy: "TRAE 工具账号选择未完成。",
+    refreshFailedCopy: "TRAE 的工具账号选择已完成，但页面状态刷新失败，请点击刷新确认。",
+  },
+};
+
+/** WB 行内接缝（P4c-6b-2d）：预览 → 单次确认 → 写凭据 + 过户 + 冷启动（旧 L215-283）。 */
+const workbuddyRowSwitch: PageRowSwitch = {
+  targetOf: workbuddySwitchTarget,
+  workbuddy: {
+    actionIdPrefix: "workbuddy-switch-",
+    preview: previewWorkBuddySwitch,
+    run: switchWorkBuddyAccount,
+    notifyPrefix: ACCOUNT_TEXTS.notifyPrefixWorkbuddy,
+  },
+};
 
 /** 产品接缝表（页面唯一的产品差异入口，与 registry 的 builder 表同形）；未登记即 fail-closed。 */
 export const PAGE_ADAPTERS: Record<string, PageAdapter> = {
@@ -135,6 +188,7 @@ export const PAGE_ADAPTERS: Record<string, PageAdapter> = {
         ? "已在本机浏览器打开 TRAE 登录页（复用系统登录态），完成授权后此处会自动继续；期间无需手动刷新。"
         : "已在隔离浏览器打开 TRAE 登录页，完成登录后此处会自动继续；期间无需手动刷新。",
     },
+    rowSwitch: traeRowSwitch,
     compose: composeTrae,
     testIds: traeTestIds,
   },
@@ -145,6 +199,7 @@ export const PAGE_ADAPTERS: Record<string, PageAdapter> = {
     // 列表容器锚点：沿用旧 workbuddy-pool-list。
     listTestId: "workbuddy-pool-list",
     // 设备能力关闭（config 能力表 devices=false）：不登记面板绑定，详情页不挂设备插槽。
+    rowSwitch: workbuddyRowSwitch,
     compose: composeWorkBuddy,
     testIds: wbTestIds,
   },

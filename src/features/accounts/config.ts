@@ -170,7 +170,25 @@ export const ACCOUNT_TEXTS = {
   credentialRefreshed: "登录凭据已更新，无需重新登录。", // AccountDetail L201（详情单账号换发成功回执）
   refreshFailureKept: "刷新未完成，正在显示上次读取到的账号信息。", // 已有数据时刷新失败：保留旧数据 + 通知（旧 G15 语义）
   notifyPrefixWorkbuddy: "WorkBuddy：", // WorkBuddyPanel L208 等（全角冒号）
+  switchBusyLabel: "切换中…", // 旧 AccountCard 的 actionBusyLabel 缺省（SharedAccountEntry L73）
+  toolSelectBusyLabel: "设置中…", // 旧 AdapterAccountCard L1257
 } as const;
+
+/**
+ * 动作执行中的按钮文案（P4c-6b-2d）：键 = 动作 id 或 id 前缀，值逐字沿用旧实现。
+ * 行内按钮忙碌时只换文案并转圈（禁用原因仍由 builder 的 disabled 给），不改任何命令语义。
+ */
+const ACTION_BUSY_LABELS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^account-switch-/, ACCOUNT_TEXTS.switchBusyLabel],
+  [/^workbuddy-switch-/, ACCOUNT_TEXTS.switchBusyLabel],
+  [/^account-adapter-tool-select$/, ACCOUNT_TEXTS.toolSelectBusyLabel],
+];
+
+/** 按动作 id 取忙碌文案；null = 该动作无忙碌文案（沿用 builder 的 label，不发明说法）。 */
+export function actionBusyLabelOf(actionId: string): string | null {
+  for (const [pattern, label] of ACTION_BUSY_LABELS) if (pattern.test(actionId)) return label;
+  return null;
+}
 
 /** 文案键类型（builder 取文案时获得字面量补全）。 */
 export type AccountTextKey = keyof typeof ACCOUNT_TEXTS;
