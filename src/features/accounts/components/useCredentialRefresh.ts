@@ -25,6 +25,10 @@ export interface CredentialRefreshInput {
   readonly targets: () => readonly CredentialRefreshTarget[];
   /** 成功后重读本机缓存（不联网）。 */
   readonly onRefreshed?: () => Promise<void>;
+  /** 批次开始（确认通过、命令即将发出）：旧实现在此清本链残进度（L692），避免旧账号名冒充本批。 */
+  readonly onStarted?: () => void;
+  /** 批次收尾（成功或失败都调，旧 L726 同法）：清本链进度，避免残进度把页头按钮永久禁用。 */
+  readonly onFinished?: () => void;
   /**
    * 单账号路径的成功回执（P4c-7c-1）：非空时成功只发该句 notify.success
    * （旧 AccountDetail L201 逐字），缺省走批量摘要 notify.summary。
@@ -63,12 +67,14 @@ export function useCredentialRefresh(input: CredentialRefreshInput): CredentialR
 
   const confirm = useCallback(async () => {
     setOpen(false);
-    const { refresh, targets, onRefreshed } = inputRef.current;
+    const { refresh, targets, onRefreshed, onStarted } = inputRef.current;
     if (refresh === undefined || busyRef.current) return false;
     const rows = targets();
     if (rows.length === 0) return false;
     busyRef.current = true;
     setBusy(true);
+    // 旧 L692：批次开始即清本链残进度，避免上一批的账号名冒充本批第一条。
+    onStarted?.();
     try {
       const results = await refresh(rows.map((row) => row.profileId));
       const nameOf = new Map(rows.map((row) => [row.profileId, row.displayName]));
@@ -92,6 +98,7 @@ export function useCredentialRefresh(input: CredentialRefreshInput): CredentialR
     } finally {
       busyRef.current = false;
       setBusy(false);
+      inputRef.current.onFinished?.();
     }
   }, []);
 

@@ -13,6 +13,7 @@ import { CredentialRefreshDialog } from "./components/CredentialRefreshDialog";
 import { DetailCredentialRefreshDialog } from "./components/DetailCredentialRefreshDialog";
 import { useRetainedAccountsData } from "./components/useRetainedAccountsData";
 import { useAccountBatchProgress } from "./components/useAccountBatchProgress";
+import { AccountBatchProgressStatus } from "./components/AccountBatchProgressStatus";
 import { useCredentialRefresh, type CredentialRefreshTarget } from "./components/useCredentialRefresh";
 import { useAccountsSnapshot } from "./components/useAccountsSnapshot";
 import { useHeaderBatchActions } from "./components/useHeaderBatchActions";
@@ -91,9 +92,10 @@ export function AccountsPage(props: AccountsPageProps) {
   const credential = adapter?.credentialRefresh;
   const listCredential = useCredentialRefresh({
     refresh: credential?.refresh,
-    targets: () => credential === undefined || payload === null
-      ? [] : credential.targets(payload),
+    targets: () => (credential === undefined || payload === null ? [] : credential.targets(payload)),
     onRefreshed: refreshLocal,
+    // 旧 L692 / L726：开批与收尾各清本链进度（残进度不得冒充本批，也不得永久禁用页头按钮）。
+    onStarted: () => progressReset("credential_refresh"), onFinished: () => progressReset("credential_refresh"),
   });
   // 换发进行中：二次确认执行中，或进度事件链在跑（两者同源，任一为真即禁用页头按钮）。
   const credentialConfirmBusy = listCredential.busy || progress.credential_refresh !== undefined;
@@ -112,14 +114,12 @@ export function AccountsPage(props: AccountsPageProps) {
   // 快照合成：数据面 + 页面自持字段（时钟/过滤/排序/忙碌位/适配器面）
   const now = Math.floor(Date.now() / 1000);
   const ui: PageUi = {
-    filter, sort, now, localRefresh: localRefreshBusy, progress,
+    filter, sort, now, localRefresh: localRefreshBusy, progress, adapterPool,
     credentialBusy: credentialConfirmBusy, creditsBusy: batch.busy.credits, healthBusy: batch.busy.health,
-    loginBusy: login.busy,
-    switchBusy: rowActions.busy.switching, toolBusy: rowActions.busy.toolSelection, previewBusy: rowActions.busy.preview,
-    adapterPool,
+    loginBusy: login.busy, switchBusy: rowActions.busy.switching, toolBusy: rowActions.busy.toolSelection,
+    previewBusy: rowActions.busy.preview,
   };
-  const composed: AccountsSnapshot | null = payload === null || adapter === undefined
-    ? null : adapter.compose(payload, ui);
+  const composed: AccountsSnapshot | null = payload === null || adapter === undefined ? null : adapter.compose(payload, ui);
 
   // 详情数据面（P4c-7c-1）：选择非空才装配；目标不在本产品数据面内即 null（回列表）。
   const detailSnapshot = composed === null || selectedRowId === "" ? null // 数据面按行 id 取，找不到就回列表
@@ -240,6 +240,8 @@ export function AccountsPage(props: AccountsPageProps) {
         busy={headerBusy}
         onAction={handleHeaderAction}
       />
+      {/* 批量逐账号进度（P4c-9c 补回 K-05）：旧状态区同一位置与文案；忙碌位收尾即归零，无进度不渲染。 */}
+      <AccountBatchProgressStatus progress={progress} busy={{ credits: batch.busy.credits, credentials: listCredential.busy, health: batch.busy.health }} />
       <section className="account-center__profiles" aria-labelledby="account-mine-heading">
         <div className="account-center__section-heading">
           <h3 id="account-mine-heading"><UserRound size={16} aria-hidden="true" />我的账号</h3>

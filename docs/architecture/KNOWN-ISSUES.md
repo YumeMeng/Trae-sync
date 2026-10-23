@@ -45,16 +45,22 @@
   待 WB 槽位切到合并页前必须先补这四条接线，否则会丢功能。
 - 归属：WB 槽位迁移票（P4c-9b 或后续），不在 P4c-9a 边界内。
 
-## K-05 批量进度的逐账号文案在合并页缺失（P4c-9a 发现，2026-10-23）
+## K-05 批量进度的逐账号文案在合并页缺失（P4c-9a 发现 → **P4c-9c 已修复**，2026-10-23）
 
-- 现象：旧账号页在批量刷新额度/凭据/健康检测时，逐账号上屏「正在处理 第 N/M 个：账号名」
-  （旧 `AccountCenterTrae` L628-770 一带）。合并页的 `useAccountBatchProgress` **已取到**
-  `progress`（含 `completed/total/name`），但 `AccountsPage` 只把它用于**算按钮禁用**
-  （`pageAdapters` L90-92），不渲染任何进度文案。
-- 影响：批量操作期间用户只看得到按钮转圈，看不到「跑到第几个、正在处理谁」。
+- 现象（发现时）：旧账号页在批量刷新额度/凭据/健康检测时，逐账号上屏
+  「正在处理 {completed}/{total}：{name}」（旧 `AccountCenterTrae` L1140-1161 状态区；
+  K-05 初记的「第 N/M 个」是转述，旧实现原文并无「第…个」字样）。合并页的
+  `useAccountBatchProgress` **已取到** `progress`（含 `completed/total/name`），
+  但 `AccountsPage` 只把它用于**算按钮禁用**（`pageAdapters` L90-92），不渲染任何进度文案。
+- 影响（发现时）：批量操作期间用户只看得到按钮转圈，看不到「跑到第几个、正在处理谁」。
   这是 P4c 合并过程中**真实丢掉的可见反馈**，不是可放弃的表现差异。
-- 为何本票不补：补它要改 `AccountsPage`（新增进度文案渲染），超出 P4c-9a
-  「只删文件与必要引用修正，不改新页行为」的边界。
-- 修复条件：`AccountsPage` 渲染 `progress` 的逐账号文案（文案逐字沿用旧实现），
-  并补一条渲染层单测覆盖「批量中显示第 N/M 个：账号名」。
-- 归属：建议单独票（P4c-9c），不要拖到 P5 收敛。
+- **修复（P4c-9c）**：新增 `features/accounts/components/AccountBatchProgressStatus.tsx`，
+  由 `AccountsPage` 渲染在页头下方（旧骨架 `statusRegion` 同一位置），文案逐字沿用旧实现
+  `正在处理 {completed}/{total}：{name}`；渲染闸门 = 该链忙碌 + 已收到该链进度事件，
+  无进度即不渲染。健康链沿用旧 `healthProgressShown`（先健康链、再回退额度链）。
+  凭据链补回旧实现的开批/收尾清进度（`useCredentialRefresh` 的 `onStarted`/`onFinished`），
+  避免残进度把页头按钮永久禁用。回归护栏：`tests/accountBatchProgressStatus.test.tsx`（渲染层
+  5 例）+ `tests/accountsPageBatchProgress.test.tsx`（事件 → 页面文案 2 例）。
+- **残留差异（有意不补）**：旧实现在「忙碌但尚未收到首批事件」时另有一条回退文案
+  （「正在查询最新额度…」「正在刷新登录凭据，不会打开新的 OAuth 登录…」「正在检测账号健康度…」）。
+  合并页此时不渲染任何文案（页头按钮本身在转圈）。要不要补属独立小票，不影响逐账号反馈。
