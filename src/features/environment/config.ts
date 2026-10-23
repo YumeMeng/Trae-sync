@@ -174,6 +174,7 @@ export const ENV_TEXTS = {
   incorporateDoneClose: "完成", incorporateDone: "已归入 {accounts} 个账号：保留项目 {projects} 个 · 转移会话 {sessions} 个", incorporateLedgerMissing: "（接力轨迹记录暂缺，不影响数据）", incorporateRefreshFailed: "归入已完成，但环境状态刷新失败，请手动刷新。",
   incorporateRelaunchFailed: "归入已完成，但环境未能自动启动；可从环境页手动启动。", incorporateFailureMaster: "归入未完成，主库数据保持操作前状态；请稍后重试。", incorporateFailureSecondary: "归入未完成，环境数据保持操作前状态；请稍后重试。", incorporateStageClosingMaster: "关闭主库",
   incorporateStageClosingEnv: "关闭「{name}」", incorporateStageBackingUp: "创建备份", incorporateStageIncorporating: "归入记录", incorporateStageRestartingMaster: "重启主库", incorporateStageRestartingEnv: "重启「{name}」",
+  envNameQuoted: "「{name}」", // P4d-8a-2c：收编确认句里的目标库称谓（旧页 L1672 内联 `「${env.name}」`）
   // 清理空项目：L796/802/804/798⚠②/799/800/395⚠②/394⚠②/399
   cleanupDialogTitle: "清理空项目", cleanupConfirm: "删除", cleanupBusy: "清理中…", cleanupDialogLine1: "将删除 {count} 个空项目记录，删除前会自动备份。", cleanupDialogLine2: "空项目记录不含任何对话，删除不影响对话历史。", cleanupDialogLine3: "无归属记录不会被清理。",
   cleanupSuccess: "已删除 {count} 个空项目记录（已自动备份）。", cleanupSuccessRelaunchFailed: "已删除 {count} 个空项目记录（已自动备份）；主库 TRAE 未能自动启动，可从环境页重新打开。", cleanupNothing: "没有可清理的空项目记录。", refreshFailedSuffix: "环境状态刷新失败，请手动刷新。",

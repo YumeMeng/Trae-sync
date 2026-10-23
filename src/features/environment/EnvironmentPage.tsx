@@ -1,11 +1,14 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { EmptyState } from "../../components/shared/EmptyState";
 import { ProductBadge } from "../../components/shared/ProductBadge";
 import {
-  captureTraeCnAccount, closeEnvironmentInstance, createEnvironment, deleteEnvironment, launchEnvironment,
-  launchMasterLibrary, readEnvironmentDeletePreview, renameEnvironment, repairMasterCurrentAccount,
+  captureTraeCnAccount, cleanupMasterEmptyProjects, closeEnvironmentInstance, createEnvironment, deleteEnvironment,
+  incorporateMasterRecords, launchEnvironment, launchMasterLibrary, loginEnvironment, readEnvironmentDeletePreview,
+  readMasterCheckup, renameEnvironment, repairMasterCurrentAccount,
 } from "../../platform/environment";
+import { readManagedAccountState } from "../../platform/accounts";
 import { ENV_TEXTS, type EnvironmentView } from "./config";
+import { deriveCheckupView } from "./traeEnvironment";
 import { environmentViewFor, type EnvironmentSnapshot } from "./registry";
 import { useEnvironmentBusy } from "./components/useEnvironmentBusy";
 import { useEnvironmentSnapshot } from "./components/useEnvironmentSnapshot";
@@ -15,22 +18,37 @@ import { EnvCard, type EnvCardAnchors } from "./components/EnvironmentCards";
 import { EnvironmentCheckup } from "./components/EnvironmentCheckup";
 import { EnvironmentCapture } from "./components/EnvironmentCapture";
 import { useEnvironmentDialogs } from "./components/useEnvironmentDialogs";
-import { ASSEMBLERS, busyActionIdsOf, cardNameOf, wbExtrasOf, type PageUi } from "./components/assembleEnvironment";
-import {
-  CAPTURE_ACTION, CLOSE_PREFIX, CREATE_ACTION, DELETE_PREFIX, LAUNCH_PREFIX, MASTER_CLOSE_ACTION,
-  MASTER_DETAIL_ACTION, MASTER_LAUNCH_ACTION, RENAME_PREFIX, REPAIR_ACTION,
-} from "./components/environmentActionIds";
+import { useEnvironmentIncorporation } from "./components/useEnvironmentIncorporation";
+import { useEnvironmentLogin } from "./components/useEnvironmentLogin";
+import { ASSEMBLERS, busyActionIdsOf, wbExtrasOf, type PageUi } from "./components/assembleEnvironment";
+import { environmentActionDispatch } from "./components/environmentActionDispatch";
 
 /**
- * 环境页装配（P4d-8a-1 读取渲染 + 8a-2 动作接线 + 8a-2b 弹层）。
+ * 环境页装配（P4d-8a-1 读取渲染 + 8a-2 动作接线 + 8a-2b 弹层 + 8a-2c 收编/清理/登录收尾）。
  * 数据面 useEnvironmentSnapshot、忙碌位 useEnvironmentBusy、动作编排 useEnvironmentActions、
- * 弹层 useEnvironmentDialogs、装配表 assembleEnvironment、视图模型 registry.environmentViewFor。
- * 本文件零 productId 相等判断、零 invoke(、零命令名：命令只在 ACTION_COMMANDS / LIFECYCLE_COMMANDS
- * 里转接 platform 适配层，产品差异全部走声明式装配表（键 = productId）。
+ * 生命周期弹层 useEnvironmentDialogs、收编清理 useEnvironmentIncorporation、登录 useEnvironmentLogin、
+ * 装配表 assembleEnvironment、视图模型 registry.environmentViewFor。
+ * 本文件零 productId 相等判断、零 invoke(、零命令名：命令只在四张 COMMANDS 表里转接 platform 适配层。
  */
 
 /** 首读占位文案：旧 TRAE 页无首读占位、WB 页文案带「客户端」字样，共用骨架不能取任一产品口径。 */
 const LOADING_COPY = "正在读取环境状态…";
+
+/** 收编 / 清理命令（8a-2c）：收编一条单事务、清理预览与执行分开，绝不合并（旧页 L304 / L380）。 */
+const INCORPORATE_CLEANUP_COMMANDS = {
+  incorporate: (envId: string) => incorporateMasterRecords(envId === MASTER_ENV_ID ? {} : { libraryId: envId }),
+  // 预览只读：清理范围是全库空项目（旧页 L796 的 emptyProjectTotal），故读主库体检的空项目合计。
+  cleanupPreview: () => readMasterCheckup().then((report) => ({
+    count: report.status === "ready" ? deriveCheckupView(report).emptyProjectTotal : 0,
+  })),
+  cleanup: () => cleanupMasterEmptyProjects(),
+} as const;
+
+/** 登录命令（8a-2c）：账号列表只读 + 登录到环境（旧页 L1296 / L1314）。 */
+const LOGIN_COMMANDS = {
+  listAccounts: () => readManagedAccountState(),
+  login: (envId: string, profileId: string) => loginEnvironment({ envId, profileId }),
+} as const;
 
 /** 生命周期命令（创建/改名/删除/删除规模预览）：本页只转接 platform 适配层，弹层在 hook 里。 */
 const LIFECYCLE_COMMANDS = {
@@ -57,7 +75,9 @@ export interface EnvironmentPageProps {
   readonly onOpenMasterDetail?: () => void;
   /** 副环境「查看详情」入口是否存在（决定 builder 是否产出 env-detail-<id> 动作）。 */
   readonly onOpenLibraryDetail?: () => void;
-  /** 其余动作（登录 / 详情 / 归入 / 清理 / 检测）：本票只透出。 */
+  /** 副环境详情回调（env-detail-<id> 携带 envId；缺省时该动作原样透出到 onAction）。 */
+  readonly onOpenEnvDetail?: (envId: string) => void;
+  /** 其余动作（WB 深度检测等未接线项）：原样透出。 */
   readonly onAction?: (actionId: string) => void;
 }
 
@@ -91,23 +111,31 @@ function EnvironmentPageSkeleton({ productId, error, onRetry, retrying }: {
   );
 }
 
-export function EnvironmentPage({ active, productId, onOpenMasterDetail, onOpenLibraryDetail, onAction }: EnvironmentPageProps) {
+export function EnvironmentPage({
+  active, productId, onOpenMasterDetail, onOpenLibraryDetail, onOpenEnvDetail, onAction,
+}: EnvironmentPageProps) {
   const { snapshot: data, loading, error, refreshLocal, refreshFull } = useEnvironmentSnapshot(productId, active);
-  const { busy, patchBusy } = useEnvironmentBusy(productId, active);
+  const { busy, incorporateStage, patchBusy } = useEnvironmentBusy(productId, active);
   const [pending, setPending] = useState(false); // 非空即本地刷新在跑（刷新按钮转圈 + 防连点）
   const [captureNotice, setCaptureNotice] = useState<CaptureNotice | null>(null);
   // 动作 hook：命令经 ACTION_COMMANDS 注入，忙碌位就地写回 useEnvironmentBusy（单一状态真源）。
   const { launchEnv, closeEnv, repairMaster, captureAccount } = useEnvironmentActions({
     commands: ACTION_COMMANDS, notifyPrefix: "", patchBusy,
   });
-  // 弹层 hook（P4d-8a-2b）：关闭确认 + 创建/改名/删除；生命周期动作成功后整组重读（旧页 load()）。
-  // 关闭仍走 useEnvironmentActions（三态回执文案 + 关闭忙碌位），确认层只负责先弹一次。
+  // 生命周期弹层（8a-2b）：关闭确认 + 创建/改名/删除；成功后整组重读（旧页 load()）。
+  // 关闭走 useEnvironmentActions（三态回执文案 + 关闭忙碌位），确认层只负责先弹一次；
+  // 关闭成功即整组重读（旧页 L251 load()，8a-2c 口径对齐）。
   const { dialogs, openCreate, openRename, openDelete, openClose } = useEnvironmentDialogs({
-    commands: LIFECYCLE_COMMANDS,
-    refresh: refreshFull,
-    // 关闭成功即轻刷新运行态（旧页 L251 load() 的等价：本票沿用 8a-2a 的 refreshLocal 口径）。
-    confirmClose: async (target) => { if (await closeEnv(target.envId, target.name)) await refreshLocal(); },
+    commands: LIFECYCLE_COMMANDS, refresh: refreshFull,
+    confirmClose: async (target) => { if (await closeEnv(target.envId, target.name)) await refreshFull(); },
   });
+  // 收编 / 清理（8a-2c）：确认态 + 四阶段进度 + 清理先预览再确认；成功后整组重读（旧页 L311 / L385）。
+  const incorporation = useEnvironmentIncorporation({
+    commands: INCORPORATE_CLEANUP_COMMANDS, notifyPrefix: "", patchBusy,
+    stage: incorporateStage, refresh: refreshFull, cleaningUp: busy.cleaningUp,
+  });
+  // 登录账号（8a-2c）：选已有账号登录到环境；「完成」才整组重读（旧页 L850-856）。
+  const login = useEnvironmentLogin({ commands: LOGIN_COMMANDS, refresh: refreshFull });
   // 刷新是读取不是动作：页面自持（与账号页 handleRefreshLocal 同法）。
   const refresh = useCallback(() => {
     if (pending) return;
@@ -116,10 +144,14 @@ export function EnvironmentPage({ active, productId, onOpenMasterDetail, onOpenL
   }, [pending, refreshLocal]);
 
   const emit = (actionId: string) => onAction?.(actionId);
+  // 装配表在 handleAction 之前就要拿到动作出口（副环境体检块由装配表产出）：
+  // 经 ref 转接，先填「原样透出」，算好 handleAction 后再换成完整分发（子组件渲染在本体之后）。
+  const dispatchRef = useRef<(actionId: string) => void>(emit);
+  dispatchRef.current = emit;
   const busyIds = busyActionIdsOf(busy);
   const ui: PageUi = {
     busyState: busy, busyIds, loading, error, captureNotice,
-    canOpenLibraryDetail: onOpenLibraryDetail !== undefined, onAction: emit,
+    canOpenLibraryDetail: onOpenLibraryDetail !== undefined, onAction: (actionId: string) => dispatchRef.current(actionId),
   };
   const registered = ASSEMBLERS[productId];
   // 未登记产品 fail-closed：不猜数据面，也不渲染「没有环境」的空壳（拿 registry 空视图的失败说明）。
@@ -137,63 +169,14 @@ export function EnvironmentPage({ active, productId, onOpenMasterDetail, onOpenL
   const view: EnvironmentView = environmentViewFor(assembled.snapshot);
   const refreshId = view.header.refresh?.id ?? "";
 
-  // 动作分发（旧页口径）：启动走轻刷新（只校准运行态与列表）；修复、捕获与三条生命周期动作
-  // 必须全量重读——修复改变登录健康四项（旧页 L157）、捕获入池改变体检账号名解析（旧页 L354）、
-  // 创建/改名/删除改变列表与逐库体检（旧页 L823/L839/L868 的整组 load()）。
-  // 关闭一律先弹确认层（旧页 L672/L735 → closeDialogEnv），确认后才发关闭命令。
-  const handleAction = (actionId: string) => {
-    if (refreshId !== "" && actionId === refreshId) { refresh(); return; }
-    if (actionId === MASTER_DETAIL_ACTION) { onOpenMasterDetail?.(); return; }
-    if (actionId === MASTER_LAUNCH_ACTION) {
-      void launchEnv(MASTER_ENV_ID).then((ok) => { if (ok) void refreshLocal(); });
-      return;
-    }
-    if (actionId === MASTER_CLOSE_ACTION) {
-      openClose({ envId: MASTER_ENV_ID, name: view.master?.name ?? ENV_TEXTS.masterName });
-      return;
-    }
-    if (actionId === REPAIR_ACTION) {
-      void repairMaster().then((ok) => { if (ok) void refreshFull(); });
-      return;
-    }
-    if (actionId === CAPTURE_ACTION) {
-      setCaptureNotice(null); // 旧页 L342：每次点击先清上一轮结果
-      void captureAccount().then((notice) => {
-        if (notice === null) return; // 忙碌未执行：保留上一轮提示
-        setCaptureNotice(notice);
-        // 捕获成功走全量重读（旧页 L354 load()）：新账号入池会改变体检账号名解析（未登记→真实名）。
-        if (notice.kind === "ok") void refreshFull();
-      });
-      return;
-    }
-    if (actionId.startsWith(LAUNCH_PREFIX)) {
-      const envId = actionId.slice(LAUNCH_PREFIX.length);
-      void launchEnv(envId, cardNameOf(view, envId)).then((ok) => { if (ok) void refreshLocal(); });
-      return;
-    }
-    if (actionId.startsWith(CLOSE_PREFIX)) {
-      const envId = actionId.slice(CLOSE_PREFIX.length);
-      openClose({ envId, name: cardNameOf(view, envId) ?? ENV_TEXTS.secondaryBadge });
-      return;
-    }
-    // 创建入口按 builder 的 disabledReason 判定（WB 多实例待实验票即置灰）：置灰时不开层，原样透出。
-    if (actionId === CREATE_ACTION) {
-      if (view.secondary?.createAction.disabledReason !== null) { emit(actionId); return; }
-      openCreate();
-      return;
-    }
-    if (actionId.startsWith(RENAME_PREFIX)) {
-      const envId = actionId.slice(RENAME_PREFIX.length);
-      openRename({ envId, name: cardNameOf(view, envId) ?? ENV_TEXTS.secondaryBadge });
-      return;
-    }
-    if (actionId.startsWith(DELETE_PREFIX)) {
-      const envId = actionId.slice(DELETE_PREFIX.length);
-      openDelete({ envId, name: cardNameOf(view, envId) ?? ENV_TEXTS.secondaryBadge });
-      return;
-    }
-    emit(actionId); // 其余动作（登录/详情/归入/清理/检测）本票仍只透出
-  };
+  // 动作分发（旧页口径，见 environmentActionDispatch）：启动/页头刷新=轻刷新，其余一律整组重读。
+  const handleAction = environmentActionDispatch({
+    view, assembled, refreshId, refresh, refreshLocal, refreshFull, emit, onOpenMasterDetail, onOpenEnvDetail,
+    launchEnv, repairMaster, captureAccount, setCaptureNotice,
+    dialogs: { openCreate, openRename, openDelete, openClose }, incorporation, login,
+  });
+  // 装配表产出的区块（副环境体检）自此走完整分发，不再原样透出。
+  dispatchRef.current = handleAction;
 
   const wb = wbExtrasOf(view);
   const masterAnchors: EnvCardAnchors | undefined = wb === null ? undefined
@@ -224,8 +207,10 @@ export function EnvironmentPage({ active, productId, onOpenMasterDetail, onOpenL
         secondaryLoginStateOf={assembled.secondaryLoginStateOf}
         onAction={handleAction}
       />
-      {/* 弹层槽（关闭确认 + 创建/改名/删除）：无打开项时为 null 片段。 */}
+      {/* 弹层槽：生命周期（关闭/创建/改名/删除）+ 收编/清理 + 登录；无打开项时为 null 片段。 */}
       {dialogs}
+      {incorporation.dialogs}
+      {login.dialog}
     </>
   );
 }

@@ -13,3 +13,9 @@ export const RENAME_PREFIX = "env-rename-";
 export const DELETE_PREFIX = "env-delete-";
 export const LAUNCH_PREFIX = "env-launch-";
 export const CLOSE_PREFIX = "env-close-";
+// P4d-8a-2c：收编 / 清理 / 登录 / 详情（builder 产出同名 testId；收编与登录按 env_id 拼接）。
+export const INCORPORATE_ACTION = "env-incorporate-entry";
+export const INCORPORATE_PREFIX = "env-incorporate-";
+export const CLEANUP_ACTION = "env-cleanup-empty-projects-entry";
+export const LOGIN_PREFIX = "env-login-";
+export const DETAIL_PREFIX = "env-detail-";

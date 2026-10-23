@@ -6,7 +6,11 @@ import type { EnvCardView, EnvironmentView } from "../config";
 import type { EnvironmentSnapshot } from "../registry";
 import { traeSecondaryCheckupView } from "../traeEnvironment";
 import { WB_ENV_TEST_IDS, type WorkBuddyEnvironmentView } from "../workbuddyEnvironment";
-import { CAPTURE_ACTION, CLOSE_PREFIX, LAUNCH_PREFIX, MASTER_CLOSE_ACTION, MASTER_LAUNCH_ACTION, REPAIR_ACTION } from "./environmentActionIds";
+import {
+  CAPTURE_ACTION, CLEANUP_ACTION, CLOSE_PREFIX, INCORPORATE_ACTION, INCORPORATE_PREFIX, LAUNCH_PREFIX,
+  MASTER_CLOSE_ACTION, MASTER_LAUNCH_ACTION, REPAIR_ACTION,
+} from "./environmentActionIds";
+import { EMPTY_INCORPORATE_SCALE, scaleOfCheckup, type IncorporateScale } from "./incorporateScale";
 import { MASTER_ENV_ID } from "./useEnvironmentActions";
 import type { EnvironmentBusyState } from "./useEnvironmentBusy";
 import type { EnvironmentData } from "./useEnvironmentSnapshot";
@@ -39,6 +43,10 @@ export interface Assembled {
   readonly secondaryCardExtra?: (card: EnvCardView) => ReactNode;
   /** 只读状态卡色档（视图模型无色档字段，WB 运行态徽章按旧页三色给）。 */
   readonly masterStatusTone?: BadgeTone;
+  /** 收编确认态规模（体检同源口径，按 envId 取；P4d-8a-2c）。 */
+  readonly incorporateScaleOf: (envId: string) => IncorporateScale;
+  /** 归入目标账号显示名（null = 暂不可读，弹层降级「当前账号」）。 */
+  readonly incorporateAccountNameOf: (envId: string) => string | null;
 }
 
 /** WB 运行态色档（WB L123/L170 三色）：验证通过=强调（运行中）、探针失败=失效、未运行=中性。 */
@@ -65,6 +73,10 @@ export const ASSEMBLERS: Record<string, (data: EnvironmentData, ui: PageUi) => A
         const checkup = traeSecondaryCheckupView(env, trae.secondaryCheckups[env.env_id] ?? null);
         return checkup === null ? null : <EnvironmentCheckup checkup={checkup} busy={ui.busyIds} onAction={ui.onAction} />;
       },
+      // 收编确认规模（旧页 L767-786 逐库取同一份体检报告）：主库取主库报告，副环境取逐库报告。
+      incorporateScaleOf: (envId) => scaleOfCheckup(envId === MASTER_ENV_ID ? trae.checkup : trae.secondaryCheckups[envId] ?? null),
+      incorporateAccountNameOf: (envId) => envId === MASTER_ENV_ID ? trae.state?.current_account_name ?? null
+        : trae.environments?.find((env) => env.env_id === envId)?.current_account_name ?? null,
     };
   },
   workbuddy: (data, ui) => {
@@ -73,6 +85,8 @@ export const ASSEMBLERS: Record<string, (data: EnvironmentData, ui: PageUi) => A
       snapshot: { productId: "workbuddy", workbuddy: { ...workbuddy, checking: ui.busyState.checking,
         loading: ui.loading, error: ui.error } },
       masterStatusTone: wbToneOf(workbuddy.deepHealth?.live_status),
+      // WB 无收编/清理能力（能力表 incorporate="cwd-merge" / cleanup=false）：恒零规模、无目标账号。
+      incorporateScaleOf: () => EMPTY_INCORPORATE_SCALE, incorporateAccountNameOf: () => null,
     };
   },
 };
@@ -86,6 +100,10 @@ export const busyActionIdsOf = (busy: EnvironmentBusyState): readonly string[] =
   ...(busy.repairing ? [REPAIR_ACTION] : []),
   ...(busy.capturing ? [CAPTURE_ACTION] : []),
   ...(busy.checking ? [WB_ENV_TEST_IDS.deepHealthButton] : []),
+  // 收编运行中禁用本库归入入口（主库 env-incorporate-entry / 副环境 env-incorporate-<id>）。
+  ...(busy.incorporatingEnvId === MASTER_ENV_ID ? [INCORPORATE_ACTION]
+    : busy.incorporatingEnvId !== null ? [`${INCORPORATE_PREFIX}${busy.incorporatingEnvId}`] : []),
+  ...(busy.cleaningUp ? [CLEANUP_ACTION] : []),
 ];
 
 /** WB 扩展块（客户端运行状态锚 + 登录域健康卡）：视图模型带 workbuddy 字段即有，不判断产品。 */
