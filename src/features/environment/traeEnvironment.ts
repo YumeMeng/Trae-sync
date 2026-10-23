@@ -59,8 +59,8 @@ function processViewOf(state: EnvProcessState, launching: boolean, isMaster: boo
     : isMaster ? pick(ENV_TEXTS.launchHintRunning, ENV_TEXTS.launchHintIdle) : pick(ENV_TEXTS.launchEnvHintRunning, ENV_TEXTS.launchEnvHintIdle);
   return { state, launchLabel, launchHint };
 }
-/** 体积格式化（L1533-1543 原样）：KB/MB/GB/TB，10 以上取整。 */
-function formatBytes(value: number): string {
+/** 体积格式化（L1533-1543 原样）：KB/MB/GB/TB，10 以上取整。删除弹层规模句共用同一口径。 */
+export function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 MB";
   const units = ["KB", "MB", "GB", "TB"];
   let size = value / 1024, unitIndex = 0;

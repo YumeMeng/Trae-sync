@@ -161,10 +161,11 @@ export const ENV_TEXTS = {
   deleteDisabledHint: "无法确认该环境是否正在运行，暂不能删除", secondaryCloseHint: "关闭该环境的 TRAE 实例", closeBusy: "关闭中…", launchFocusShort: "聚焦", launchIdleShort: "启动", launchEnvHintUnknown: "无法确认该环境是否正在运行，实例操作暂不可用",
   launchEnvHintRunning: "把该环境的 TRAE 窗口带到前台", launchEnvHintIdle: "启动该环境的 TRAE 实例",
   // 名称/删除/关闭弹层：L816/817/831/832/1236/1252/1261/824/840/1494-1496/1509/1519/1484-1489/1474/869/877-884/253-257
+  // P4d-8a-2b 补两键（弹层兜底句，旧页内联字面量）：nameFailure=L1215、deletePreviewFailure=L1461
   createDialogTitle: "新建环境", createConfirm: "创建", renameDialogTitle: "重命名环境", renameConfirm: "保存", namePlaceholder: "环境名称（1-64 个字符）", cancel: "取消", nameBusy: "处理中…", createdNotice: "已创建环境「{name}」。",
   renamedNotice: "已重命名为「{name}」。", deleteDialogTitle: "删除环境「{name}」", deleteConfirm: "删除环境", deleteBusy: "删除中…", deleteIrreversible: "删除后无法恢复", deleteLoading: "正在读取环境数据规模…",
   deleteScaleNoData: "该环境从未启动，没有对话数据；将删除环境目录（约 {size}）。", deleteScaleReadFailed: "环境数据规模暂时无法读取；删除将移除整个环境目录（约 {size}），请确认其中没有需要保留的内容。", deleteScaleEmpty: "该环境没有对话记录；将删除环境目录（约 {size}）。",
-  deleteScaleReady: "该环境内有 {projects} 个项目、{sessions} 个会话（约 {size}），删除后无法恢复。", deleteFailure: "环境删除未完成，请稍后重试。", deletedNotice: "已删除环境「{name}」。", closeDialogTitle: "关闭「{name}」",
+  deleteScaleReady: "该环境内有 {projects} 个项目、{sessions} 个会话（约 {size}），删除后无法恢复。", deleteFailure: "环境删除未完成，请稍后重试。", deletePreviewFailure: "环境信息暂时不可读取，请稍后重试。", nameFailure: "操作未完成，请稍后重试。", deletedNotice: "已删除环境「{name}」。", closeDialogTitle: "关闭「{name}」",
   closeDialogLine1: "将关闭「{name}」正在运行的 TRAE 实例。", closeDialogLine2: "实例内未保存的内容可能丢失，请确认已保存所需工作。", closeDialogConfirm: "关闭实例", closeDialogBusy: "正在关闭…", closeOutcomeNotRunning: "「{name}」当前没有运行中的实例。",
   closeOutcomeForce: "「{name}」未能自动退出，已强制结束进程。", closeOutcomeClosed: "已关闭「{name}」的 TRAE 实例。",
   // 收编弹层：L1654/1640/1660/1670/1672-1673/1674/1690/1702/1755/1712/1713/1720/1726/325/326/1600/1601⚠①/1602/1603
@@ -191,6 +192,10 @@ export const ENV_TEXTS = {
   wbFileActive: "已登录（登录文件有效）", wbFileAccessExpired: "登录已过期（客户端运行中会自动刷新）", wbFileFullyExpired: "登录完全过期（请在客户端重新登录）", wbFileLoggedOut: "客户端已登出", wbFileMissing: "未找到登录文件（客户端从未登录）", wbFileUnknown: "状态未知",
   wbMultiTitle: "多实例环境管理适配中", wbMultiText: "WorkBuddy 的多实例（--user-data-dir）可行性待实验票结论，实验通过前此处保持诚实说明。单实例客户端状态已在上方卡片呈现。", wbHealthFailure: "WorkBuddy：健康检测未完成——{reason}", wbNotifyPrefix: "WorkBuddy：",
 } as const;
+
+/** 文案占位符填充（builder 与本页弹层共用）：缺键保留原样，不吞占位符。 */
+export const fillEnvText = (template: string, values: Readonly<Record<string, string | number>>): string =>
+  template.replace(/\{(\w+)\}/g, (match, key: string) => (key in values ? String(values[key]) : match));
 
 /** 文案键类型（builder 取文案时获得字面量补全）。 */
 export type EnvTextKey = keyof typeof ENV_TEXTS;
