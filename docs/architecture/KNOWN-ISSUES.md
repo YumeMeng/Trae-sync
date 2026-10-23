@@ -119,3 +119,51 @@
    **未单独断言这四个专码**。
    - 判定：可放弃（映射表是纯函数且逐字对照旧实现；主路径已有 11 例护栏）。若要补，最省的方式是
      给 `loginErrorText` 加纯函数用例。
+
+## K-07 环境页旧测试迁移后的覆盖缺口（P4d-8b-2a，2026-10-23）
+
+旧 `tests/EnvironmentPage.test.tsx`（38 例）与 `tests/WorkBuddyPages.test.tsx` 的 2 例 WB 环境用例
+随旧组件退场，统一迁到 `tests/environmentPage.test.tsx`（22 例，锚点全部指向合并页
+`features/environment/EnvironmentPage`）。以下为逐条核对旧 40 例后确认的**未迁项**：
+第 1、2、5 项属「多场景合并 / 已有用例间接覆盖」（可放弃）；第 3、4 项是**真实缺口**（须独立票补）。
+
+1. **副环境关闭三态回执**（旧 `force_closed` / `not_running` 各一例）：合并页
+   `useEnvironmentActions.closeEnv` 与主库共用同一函数、同一份 `ENV_TEXTS` 三态文案，
+   主库关闭已在新用例断言（取消零命令 → 确认 → `notify.success` → 整组重读）。副环境差异
+   仅在 `labelOf` 的显示名回退（`cardNameOf` 已按 env_id 取卡片名），属纯展示分支。
+   - 判定：可放弃（同一代码路径 + 同文案表；副环境回执分支无独立行为）。新用例已断言
+     副环境的「仅运行中才出关闭按钮」（进程未知用例）与卡片动作集合（五项操作用例）。
+2. **关闭失败错误码映射**（`environment_close_failed`）：`safeUiErrorMessage` 词表逐字未改，
+   且该码**已有独立护栏** `tests/safeUiError.test.ts`（"environment_close_failed 使用稳定提示"）。
+   - 判定：可放弃（词表纯函数已单独锁定；页面侧只需断言「调用 `safeUiErrorMessage`」，
+     删除被拒用例已覆盖该机制）。
+3. **账号捕获两例**（`capture_trae_cn_account` 成功 / `capture_account_already_registered` 去重）：
+   合并页 `EnvironmentCapture` + `useEnvironmentActions.captureAccount` 逐字搬旧实现，
+   但**新页没有对应的渲染断言**。
+   - 判定：**真实缺口，不可放弃**（写操作：捕获会把账号写进池）。属独立小票——
+     本票边界是「迁旧页渲染/弹层行为」，捕获块在 P4d-8a-2 已单独自检过
+     （`.scratch/cmdr/p4d8a2-sanity.test.tsx`），未沉淀为正式护栏。
+4. **环境状态刷新失败仍保留成功结果**（旧 3 例：清理 / 收编 / 登录各一）——**已实测确认是回归，非可放弃项**：
+   `useEnvironmentSnapshot.load()` 内部 `catch` 后**只落 error 状态、不重抛**，故三个调用点的
+   `.catch(...)` 分支永不触发：`useEnvironmentLogin.done` 的 `notify.warning(loginRefreshFailed)`、
+   `useEnvironmentIncorporation` 的刷新回调均无 catch，`ENV_TEXTS.incorporateRefreshFailed` /
+   `refreshFailedSuffix` 全库无消费点（`view.texts` 亦无读者）。
+   实测（`.scratch/cmdr/p4d8b2a-refresh-probe*.test.tsx`）：收编成功后环境状态读取失败 →
+   弹层直接消失、完成回执「已归入 2 个账号…」与 `incorporate-done` 一并丢失、主库卡被
+   整页错误卡替代，且 **notify 三档全空**（成功/错误/警告均未调用）；登录「完成」路径同形
+   （无 warning，页面翻为错误卡）。旧页在同样情形下会保留回执并追加「环境状态刷新失败，请手动刷新。」。
+   - 判定：**真实缺口，不可放弃**（用户看到的是「操作结果消失 + 整页报错」）。
+   - 修复方向（独立票）：`refreshFull` 需要把失败**同时**交回调用方（返回 boolean 或抛错），
+     再由三处调用点按旧文案补提示；或在 `EnvironmentPage` 的刷新回调里比对 `error` 状态后补
+     `notify.warning`。属行为变更，不在测试迁移票内改。
+5. **副环境「归入」的进度阶段高亮与失败步骤色档**（旧 1 例断言
+   `[data-stage="restarting"]` 带 `switch-step--failed`）：新用例已断言
+   `role=alert` 的「归入已完成，但环境未能自动启动」文案，**未断言步骤色档类**。
+   - 判定：可放弃（类名是视觉实现细节；文案与 role 已锁行为，色档由 CSS 单点决定）。
+
+### 测试数变化
+
+| 项 | 前 | 后 |
+| --- | --- | --- |
+| 测试文件 | 32 | 32（删 1 增 1，`EnvironmentPage.test.tsx` → `environmentPage.test.tsx`） |
+| 用例 | 410 | **392**（-38 旧环境页 +22 新环境页 -2 WB 环境用例） |

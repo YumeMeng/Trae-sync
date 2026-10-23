@@ -277,7 +277,6 @@ describe("SettingsPanel WB 变体（P19-B6 备份区诚实呈现 + P19.1 签到�
 
 import { notify } from "../src/platform/notify";
 import { WorkBuddyBackupSection } from "../src/components/WorkBuddyBackupSection";
-import { WorkBuddyEnvironmentPage } from "../src/components/WorkBuddyEnvironmentPage";
 
 const backupChain = {
   backup_dir: "C:\\data\\workbuddy-backups",
@@ -373,51 +372,5 @@ describe("WorkBuddyBackupSection（P19-B8 备份链管理面）", () => {
         ["delete_workbuddy_backups", { stamps: [1760001200], confirmed: true }],
       );
     });
-  });
-});
-
-describe("WorkBuddyEnvironmentPage 探针信息（P19-B8 数据面）", () => {
-  beforeEach(() => {
-    resetRoutes();
-    installFakeInvoke();
-    installBackupRoutes();
-  });
-
-  it("连接卡展示版本/安装路径/数据根（探针 fail-soft 数据面）", async () => {
-    render(<WorkBuddyEnvironmentPage active={true} />);
-
-    expect(await screen.findByTestId("workbuddy-env-client-card")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(screen.getByTestId("workbuddy-env-client-card").textContent).toContain("3.2.0");
-    });
-    expect(screen.getByTestId("workbuddy-env-client-card").textContent).toContain("C:\\apps\\workbuddy");
-  });
-});
-
-
-describe("WorkBuddyEnvironmentPage 探针降级渲染（P19-B8 fail-soft）", () => {
-  beforeEach(() => {
-    resetRoutes();
-    installFakeInvoke();
-    installBackupRoutes();
-  });
-
-  it("探针降级渲染：客户端未运行（全维度 null）→ 版本/路径/数据根如实显示未知", async () => {
-    // 运行状态徽章由深度健康驱动（client_offline = 未运行）；探针只供版本/路径/数据根。
-    mockRoute("check_workbuddy_login_health", () => ({
-      status: "access_expired", live_status: "client_offline",
-    }));
-    mockRoute("get_workbuddy_probe_info", () => ({
-      running: false, process_count: null, app: null, version: null,
-      platform: null, install_path: null, install_source: null, data_root: null,
-    }));
-    render(<WorkBuddyEnvironmentPage active={true} />);
-
-    const card = await screen.findByTestId("workbuddy-env-client-card");
-    // 客户端未运行 = 探针正常返回（不是错误），连接卡恒可渲染。
-    await waitFor(() => {
-      expect(card.textContent).toContain("未运行");
-    });
-    expect(card.textContent).toContain("未知");
   });
 });
