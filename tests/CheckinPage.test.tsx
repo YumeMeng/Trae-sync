@@ -335,11 +335,20 @@ describe("CheckinPage", () => {
     render(<CheckinPage productId={CURRENT_PRODUCT_ID} active={true} onNavigate={vi.fn()} />);
     await screen.findByText("登录账号甲");
 
-    // 取消勾选乙：出现「签到所选（1）」按钮（全选时不显示，避免按钮堆叠）。
-    fireEvent.click(screen.getByRole("checkbox", { name: /登录账号乙/ }));
-    expect(screen.getByRole("button", { name: /签到所选（1）/ })).toBeInTheDocument();
+    // P4c-QA-1：默认勾选集由页面在 snapshot 到位后的 effect 里写入，
+    // 行元素先出现、勾选态后落定（全量并行满载时这段间隙会被放大）。
+    // 先等默认勾选真正落定（乙已勾），再取消勾选——否则点击可能落在
+    // 「selection 仍为空」的间隙上，乙被"加上"而不是"去掉"，
+    // 批次就会发给 profile-login-2，run_checkin 断言随之未命中。
+    const accountB = screen.getByRole("checkbox", { name: /登录账号乙/ });
+    await waitFor(() => expect(accountB).toBeChecked());
 
-    fireEvent.click(screen.getByRole("button", { name: /签到所选/ }));
+    // 取消勾选乙：出现「签到所选（1）」按钮（全选时不显示，避免按钮堆叠）。
+    fireEvent.click(accountB);
+    const runSelected = await screen.findByRole("button", { name: /签到所选（1）/ });
+    expect(runSelected).toBeInTheDocument();
+
+    fireEvent.click(runSelected);
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("run_checkin", { profileIds: ["profile-login-1"] }));
     expect(runMock).toHaveBeenCalledTimes(1);
   });

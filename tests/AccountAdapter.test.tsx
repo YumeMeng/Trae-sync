@@ -114,9 +114,12 @@ describe("账号适配器与共享工作台", () => {
     render(<AccountCenter active adapter={createTraeCnAccountAdapter()} />);
 
     expect(await screen.findByRole("region", { name: "TRAE 账号" })).toBeInTheDocument();
-    expect(screen.getByText("CN 主账号")).toBeInTheDocument();
+    // P4c-QA-1：region 外壳与页头在首次渲染即有，账号行是异步 loadSnapshot
+    // 到位后才出现——此处必须等账号行本身（findByText），不能在外壳出现后
+    // 立刻同步 getByText，否则全量并行满载时会读到「正在读取账号信息…」。
+    expect(await screen.findByText("CN 主账号")).toBeInTheDocument();
     expect(screen.getByText("CN 备用账号")).toBeInTheDocument();
-    expect(screen.getByTestId("account-health-check")).toBeInTheDocument();
+    expect(await screen.findByTestId("account-health-check")).toBeInTheDocument();
     expect(screen.queryByTestId("account-refresh-credits")).not.toBeInTheDocument();
     // P15-7（ADR-0035 决策 7）：登录代次由融合版客户端自动续期，
     // 凭据刷新是 Work 签到档案专有操作，融合版账号页不出现该入口。
