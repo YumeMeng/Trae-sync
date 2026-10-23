@@ -28,8 +28,10 @@ import {
   CheckinPage,
   type CheckinPageProps,
 } from "../../features/checkin/CheckinPage";
-import { EnvironmentPage } from "../../components/EnvironmentPage";
-import { WorkBuddyEnvironmentPage } from "../../components/WorkBuddyEnvironmentPage";
+import {
+  EnvironmentPage,
+  type EnvironmentPageProps,
+} from "../../features/environment/EnvironmentPage";
 import { TraeSettingsVariant } from "../../components/settings/TraeSettingsVariant";
 import { WorkBuddySettingsVariant } from "../../components/settings/WorkBuddySettingsVariant";
 
@@ -78,6 +80,20 @@ const WorkBuddyAccountsSlot = (props: AccountsPageProps) => (
   <AccountsPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
 );
 
+// P4d-8b-1：environment 的 TRAE 槽位切到合并页（与 accounts 同形）。接缝内绑定产品
+// 协议值，页面内零产品判断。App 侧回调形状与新页不同：App 的库详情入口收
+// LibraryRef（{ id, displayName }），新页只回传 envId——转换在 App 里做（见 App.tsx
+// handleOpenEnvDetail），此处不反向改写页面签名。
+const TraeEnvironmentSlot = (props: EnvironmentPageProps) => (
+  <EnvironmentPage {...props} productId={CURRENT_PRODUCT_ID} />
+);
+// P4d-8b-1：environment 的 WorkBuddy 槽位同样指向合并页（WB 能力差异全在
+// features/environment 的声明式装配表与 builder 里）。旧 components/WorkBuddyEnvironmentPage
+// 保留到下一票删除，此刻不再被槽位引用。
+const WorkBuddyEnvironmentSlot = (props: EnvironmentPageProps) => (
+  <EnvironmentPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
+);
+
 /**
  * 六区块 × 两产品的实现登记表（settings 也登记：其 WB 变体曾是整页早返回）。
  * 只登记、不判断：产品选择逻辑全部在 resolveSection 一处。
@@ -89,7 +105,8 @@ export const SECTION_SLOTS: Record<SectionKey, SectionSlot> = {
   accounts: { trae: TraeAccountsSlot, workbuddy: WorkBuddyAccountsSlot },
   // P4b-3：两产品指向同一份签到实现（迁移完成的正常形态）。
   checkin: { trae: TraeCheckinSlot, workbuddy: WorkBuddyCheckinSlot },
-  environment: { trae: EnvironmentPage, workbuddy: WorkBuddyEnvironmentPage },
+  // P4d-8b-1：两产品都指向同一份环境页实现（迁移完成的正常形态）。
+  environment: { trae: TraeEnvironmentSlot, workbuddy: WorkBuddyEnvironmentSlot },
   "master-library": { trae: MasterLibraryDetail, workbuddy: WorkBuddyLibraryPage },
   settings: { trae: TraeSettingsVariant, workbuddy: WorkBuddySettingsVariant },
 };

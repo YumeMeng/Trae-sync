@@ -13,7 +13,7 @@ import { environmentViewFor, type EnvironmentSnapshot } from "./registry";
 import { useEnvironmentBusy } from "./components/useEnvironmentBusy";
 import { useEnvironmentSnapshot } from "./components/useEnvironmentSnapshot";
 import { MASTER_ENV_ID, useEnvironmentActions, type CaptureNotice } from "./components/useEnvironmentActions";
-import { EnvironmentPageShell } from "./components/EnvironmentPageShell";
+import { EnvironmentPageBody, EnvironmentPageFrame } from "./components/EnvironmentPageShell";
 import { EnvCard, type EnvCardAnchors } from "./components/EnvironmentCards";
 import { EnvironmentCheckup } from "./components/EnvironmentCheckup";
 import { EnvironmentCapture } from "./components/EnvironmentCapture";
@@ -81,33 +81,37 @@ export interface EnvironmentPageProps {
   readonly onAction?: (actionId: string) => void;
 }
 
-/** 首读骨架：页头（标题 + 产品徽标）+ 一行状态 / 错误卡（带重试），绝不用空环境冒充读取失败。 */
-function EnvironmentPageSkeleton({ productId, error, onRetry, retrying }: {
-  readonly productId: string; readonly error: string | null;
+/** 骨架页头（无刷新动作）：与实页共用 Frame，故标题节点跨态复用、键盘焦点不丢。 */
+const SKELETON_HEADER: EnvironmentView["header"] = {
+  title: ENV_TEXTS.pageTitle, regionLabel: ENV_TEXTS.regionLabel, pageTitleAttr: "environment",
+  badgeProductId: null, refresh: null,
+};
+/** 骨架态无动作可分发（无刷新入口），给空实现以满足 Frame 的必填出口。 */
+const NO_ACTION = () => undefined;
+
+/**
+ * 首读正文：一行状态 / 错误卡（带重试），绝不用空环境冒充读取失败。
+ * 只替换 Frame 的**正文**——Frame 与页头由页面唯一 return 持有，故「首读中 →
+ * 读到数据」不会重建 section / h1（导航移焦契约，App.test 锁定）。
+ */
+function EnvironmentSkeletonBody({ error, onRetry, retrying }: {
+  readonly error: string | null;
   /** 缺省 = 本产品无读取入口（未登记产品），重试按钮禁用而不是假装能读。 */
   readonly onRetry?: () => void; readonly retrying: boolean;
 }) {
   return (
-    <section className="environment-page" role="region" aria-label={ENV_TEXTS.regionLabel}>
-      <header className="page-header">
-        <div className="page-header__copy">
-          <h1 data-page-title="environment" tabIndex={-1}>{ENV_TEXTS.pageTitle}</h1>
-          <ProductBadge productId={productId} />
-        </div>
-      </header>
-      <div className="environment-page__body" data-testid="environment-skeleton">
-        {error === null ? (
-          <EmptyState role="status" description={LOADING_COPY} />
-        ) : (
-          <EmptyState panel role="alert" testId="environment-load-error" description={error}
-            action={(
-              <button className="btn btn--primary" type="button" onClick={onRetry} disabled={retrying || onRetry === undefined}>
-                {ENV_TEXTS.refresh}
-              </button>
-            )} />
-        )}
-      </div>
-    </section>
+    <div data-testid="environment-skeleton">
+      {error === null ? (
+        <EmptyState role="status" description={LOADING_COPY} />
+      ) : (
+        <EmptyState panel role="alert" testId="environment-load-error" description={error}
+          action={(
+            <button className="btn btn--primary" type="button" onClick={onRetry} disabled={retrying || onRetry === undefined}>
+              {ENV_TEXTS.refresh}
+            </button>
+          )} />
+      )}
+    </div>
   );
 }
 
@@ -155,16 +159,30 @@ export function EnvironmentPage({
   };
   const registered = ASSEMBLERS[productId];
   // 未登记产品 fail-closed：不猜数据面，也不渲染「没有环境」的空壳（拿 registry 空视图的失败说明）。
-  if (registered === undefined) {
-    const empty = environmentViewFor({ productId } as unknown as EnvironmentSnapshot);
-    return <EnvironmentPageSkeleton productId={productId} retrying={pending}
-      error={empty.error?.description ?? ENV_TEXTS.loadFailure} />;
-  }
-  const assembled = data === null ? null : registered(data, ui);
+  const unregistered = registered === undefined;
+  const assembled = registered === undefined || data === null ? null : registered(data, ui);
 
-  // 拿不到数据面（首读中 / 已清态 / 首读失败）：只渲染外壳，失败给错误卡（带重试）。
+  // 拿不到数据面（首读中 / 已清态 / 首读失败 / 未登记产品）：页头 + 状态/错误卡。
+  // 关键：这里与实页共用同一个 return 的同一个 Frame，只换正文——section 与 h1
+  // 不重建，导航移焦（App 的 data-page-title 聚焦）不会被首读打断。
   if (assembled === null) {
-    return <EnvironmentPageSkeleton productId={productId} error={error} onRetry={refresh} retrying={pending} />;
+    const failure = unregistered
+      ? environmentViewFor({ productId } as unknown as EnvironmentSnapshot).error?.description ?? ENV_TEXTS.loadFailure
+      : error;
+    // 根节点与实页同为 Fragment（实页另有弹层槽），Frame 才是两者共同的 children[0]：
+    // React 据此复用 section / h1，而不是整棵重建。
+    return (
+      <>
+        <EnvironmentPageFrame
+          header={SKELETON_HEADER}
+          productBadge={<ProductBadge productId={productId} />}
+          onAction={NO_ACTION}
+        >
+          {/* 未登记产品无读取入口：不给重试（禁用而不是假装能读）。 */}
+          <EnvironmentSkeletonBody error={failure} onRetry={unregistered ? undefined : refresh} retrying={pending} />
+        </EnvironmentPageFrame>
+      </>
+    );
   }
   const view: EnvironmentView = environmentViewFor(assembled.snapshot);
   const refreshId = view.header.refresh?.id ?? "";
@@ -195,18 +213,25 @@ export function EnvironmentPage({
 
   return (
     <>
-      <EnvironmentPageShell
-        view={view}
+      {/* Frame 与骨架态同一个组件：h1 节点跨「首读中 → 读到数据」复用，导航移焦不丢。 */}
+      <EnvironmentPageFrame
+        header={view.header}
         productBadge={<ProductBadge productId={productId} />}
         busy={pending && refreshId !== "" ? [...busyIds, refreshId] : busyIds}
-        masterExtra={masterExtra}
-        afterMaster={afterMaster}
-        masterAnchors={masterAnchors}
-        masterLoginState={assembled.masterLoginState}
-        secondaryCardExtra={assembled.secondaryCardExtra}
-        secondaryLoginStateOf={assembled.secondaryLoginStateOf}
         onAction={handleAction}
-      />
+      >
+        <EnvironmentPageBody
+          view={view}
+          busy={pending && refreshId !== "" ? [...busyIds, refreshId] : busyIds}
+          masterExtra={masterExtra}
+          afterMaster={afterMaster}
+          masterAnchors={masterAnchors}
+          masterLoginState={assembled.masterLoginState}
+          secondaryCardExtra={assembled.secondaryCardExtra}
+          secondaryLoginStateOf={assembled.secondaryLoginStateOf}
+          onAction={handleAction}
+        />
+      </EnvironmentPageFrame>
       {/* 弹层槽：生命周期（关闭/创建/改名/删除）+ 收编/清理 + 登录；无打开项时为 null 片段。 */}
       {dialogs}
       {incorporation.dialogs}

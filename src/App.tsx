@@ -14,6 +14,7 @@ import {
   loadProductEntries,
   setCurrentProduct,
 } from "./platform/productRegistry";
+import { listEnvironments } from "./platform/environment";
 import { CURRENT_PRODUCT_ID } from "./types/product";
 import type { CurrentProductDto, ProductEntryDto } from "./types/product";
 import { notify, Toaster } from "./platform/notify";
@@ -24,6 +25,11 @@ import { safeUiErrorMessage } from "./utils/safeUiError";
 // 切页/组件重建不重播；刷新随模块重载而重置，恢复"刷新即重放"合同语义。
 const STAGGER_LISTS = ["account-list", "account-card-grid", "checkin-flow"];
 const playedStaggerLists = new Set<string>();
+
+// 副环境「查看详情」入口的存在性标记（P4d-8b-1）：新环境页只用这个回调**是否存在**
+// 决定是否产出 env-detail-<id> 动作，真实跳转走 onOpenEnvDetail。不能复用
+// handleOpenLibraryDetail——它收 LibraryRef（新页签名是零参），且被调用会写入空引用。
+const ENV_DETAIL_AVAILABLE = () => undefined;
 
 /** 自动签到批次完成事件（auto-checkin-finished）载荷（与后端 DTO 同口径）。 */
 interface AutoCheckinFinishedEvent {
@@ -86,6 +92,26 @@ export default function App() {
     setLibraryDetail(library);
     handlePageChange("master-library");
   }, [handlePageChange]);
+
+  /**
+   * 副环境详情接缝（P4d-8b-1）：环境页只回传 envId，库详情页要 LibraryRef
+   * （id + 显示名）。签名转换就地在这里做——先带 id 进入详情页（导航不等 IPC），
+   * 再按 env_id 从环境列表回查显示名补上；回查失败保持「副库」兜底，不改报错误
+   * （详情页标题是次要信息，读不到名字不该阻塞浏览）。
+   */
+  const handleOpenEnvDetail = useCallback((envId: string) => {
+    handleOpenLibraryDetail({ id: envId });
+    void listEnvironments({ includeSize: false })
+      .then((list) => {
+        const name = list.find((item) => item.env_id === envId)?.name.trim();
+        if (!name) return;
+        // 只在仍停在该副环境详情时补名（用户已切走则不复活旧引用）。
+        setLibraryDetail((current) =>
+          current?.id === envId && current.displayName !== name ? { id: envId, displayName: name } : current,
+        );
+      })
+      .catch(() => undefined);
+  }, [handleOpenLibraryDetail]);
 
   const refreshWorkspaceState = useCallback(async () => {
     const generation = (workspaceRefreshGenerationRef.current += 1);
@@ -274,10 +300,15 @@ export default function App() {
             />
           </div>
           <div className="app-page" hidden={activePage !== "environment"}>
+            {/* P4d-8b-1：环境页两产品共用一份实现，productId 由槽位包装绑定。
+                详情入口两路——主库走 onOpenMasterDetail；副环境「查看详情」由
+                onOpenLibraryDetail 决定是否出现（存在性），跳转经 onOpenEnvDetail
+                把 envId 转成 App 的 LibraryRef（见 handleOpenEnvDetail）。 */}
             <EnvironmentSection
               active={activePage === "environment"}
               onOpenMasterDetail={handleOpenMasterDetail}
-              onOpenLibraryDetail={handleOpenLibraryDetail}
+              onOpenLibraryDetail={ENV_DETAIL_AVAILABLE}
+              onOpenEnvDetail={handleOpenEnvDetail}
             />
           </div>
           <div className="app-page" hidden={activePage !== "master-library"}>
