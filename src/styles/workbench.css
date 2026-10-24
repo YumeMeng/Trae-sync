@@ -6,12 +6,6 @@
   font-weight: 650;
 }
 
-.badge--off {
-  border-color: var(--warn-line);
-  background: var(--warn-soft-bg);
-  color: var(--warn);
-}
-
 .workbench__eyebrow,
 .page-header__eyebrow {
   display: block;
@@ -26,8 +20,7 @@
 /* 连续工作面：普通区域用分隔线建立结构，只有真正的浮层才使用阴影。
    玻璃化（DESIGN_TOKENS）：三大主面板切换玻璃标准组合。 */
 .workbench,
-.settings-panel,
-.workbench-read {
+.settings-panel {
   min-width: 0;
   /* 玻璃面板标准组合：玻璃底 + 模糊 + 细边 + 投影/内高光 */
   border: 1px solid var(--line-hair);
@@ -176,17 +169,6 @@
   font-size: 13px;
 }
 
-.settings-panel__fold-content {
-  display: grid;
-  gap: 10px;
-  padding: 0 14px 14px;
-  border-top: 1px solid var(--line-hair);
-}
-
-.settings-panel__fold-content .settings-panel__section-heading {
-  padding-top: 12px;
-}
-
 .section-caption {
   color: var(--text-2);
   font-size: 11px;
@@ -196,41 +178,6 @@
   flex: 0 0 auto;
   margin-top: 3px;
   white-space: nowrap;
-}
-
-.workbench-read__field {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 5px;
-  color: var(--text-2);
-  font-size: 14px;
-  font-weight: 650;
-}
-
-.workbench-read__field input {
-  width: 100%;
-  min-width: 0;
-  /* 输入框（合同）：玻璃底 / 圆角 12px / 高 36px */
-  height: 36px;
-  padding: 0 11px;
-  border: 1px solid var(--line-control);
-  border-radius: 12px;
-  background: var(--glass-hover);
-  color: var(--text-1);
-  font-size: 13px;
-}
-
-/* 聚焦（合同）：accent 边 + accent-soft 外晕 2px；
-   不写 outline:none —— 全局 focus ring 保留，forced-colors 下焦点仍可见 */
-.workbench-read__field input:focus-visible {
-  border-color: var(--accent-border);
-  box-shadow: 0 0 0 2px var(--accent-soft);
-}
-
-.workbench-read__field input::placeholder {
-  color: var(--muted-placeholder);
-  opacity: 1;
 }
 
 .workbench__error {
@@ -320,10 +267,6 @@
   box-shadow: none;
 }
 
-.workbench-read {
-  min-height: 0;
-}
-
 .page-header {
   display: flex;
   align-items: flex-start;
@@ -343,13 +286,6 @@
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
-}
-
-/* 页头操作组合：登录方式选择 + 主按钮（添加账号） */
-.page-header__actions-group {
-  display: flex;
-  align-items: center;
-  gap: 10px;
 }
 
 /* 页头紧凑下拉（登录浏览器方式）：玻璃底控件，与 .btn 同行视觉 */
@@ -412,16 +348,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-.settings-backup__kind {
-  flex: none;
-  padding: 2px 8px;
-  border: 1px solid var(--line-control);
-  border-radius: 999px;
-  color: var(--text-3);
-  font-size: 11px;
-  font-weight: 600;
-}
-
 /* 备份列表空态已由共享 EmptyState 组件承载（P11-6 任务 4），
    .settings-backup__empty 仅保留测试钩子，不再承载样式。 */
 
@@ -458,62 +384,11 @@
   font-size: 11.5px;
 }
 
-/* fixture 只读入口与主工作台共享控件规则，但保留独立的状态区。 */
-.workbench-read h2 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 750;
-}
-
-.workbench-read__hint,
-.workbench-read__readonly-notice {
-  margin: -10px 0 0;
-  color: var(--text-2);
-  font-size: 11px;
-}
-
-.workbench-read__form {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.65fr) auto;
-  align-items: end;
-  gap: 12px;
-}
-
-.workbench-read__form button {
-  min-height: var(--control-height);
-}
-
-.workbench-read__error {
-  padding: 10px 12px;
-  border-left: 3px solid var(--danger);
-  background: var(--danger-soft);
-  color: var(--danger);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
-.workbench-read__state {
-  display: grid;
-  gap: 7px;
-  padding: 13px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass-dense);
-  color: var(--text-2);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
 /* 图标栏 52px 在所有桌面断点统一，不再分档收窄（2026-08-27）。 */
 @media (max-width: 720px) {
   .workbench,
-  .settings-panel,
-  .workbench-read {
+  .settings-panel {
     min-height: 0;
-  }
-
-  .workbench-read__form {
-    grid-template-columns: 1fr;
   }
 }
 
@@ -552,8 +427,7 @@
 }
 
 .workbench,
-.settings-panel,
-.workbench-read {
+.settings-panel {
   border-radius: var(--radius-panel);
 }
 
@@ -579,7 +453,6 @@
 /* 下列 13px 字号组原始位置在 overview 域的 14px 规则之后（级联后者胜）；
    拆分后为保持 13px 胜出的原始结果，14px 规则从 overview.css 搬入此处。 */
 .section-caption,
-.workbench-read__field,
 .workbench__error {
   font-size: 13px;
 }
@@ -620,163 +493,3 @@
 }
 
 /* 设置页消息条已由 notify 全局通知承载（P11-1 切片②），样式随迁清理。 */
-
-/* ============================================================
-   U-6 W4 账号切换器（账号为中心骨架，已由环境模型取代）
-   横跨工作区全宽（grid 1/-1）：三态筛选 + 账号分段控件 + 归档操作条。
-   分段控件复用 .seg-control*（accounts.css 全局类），此处只补布局与专属子元素。
-   ============================================================ */
-
-.history-switcher {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px 20px;
-  border-bottom: 1px solid var(--line-hair);
-  /* 密集玻璃：与树/会话/预览三栏同质感（U-4 B1 基底） */
-  background: var(--glass-dense);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-}
-
-/* 账号分段控件：账号多时可折行，不横向溢出 */
-.history-switcher__accounts {
-  flex-wrap: wrap;
-  max-width: 100%;
-}
-
-/* 单个账号项：选中按钮 + 启动/聚焦图标按钮并排（div 容器避免按钮嵌套） */
-.history-switcher__item {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.history-switcher__name {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-/* 启动/聚焦：紧凑图标按钮（语义由 tooltip/aria-label 说明） */
-.history-switcher__launch {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  /* 软强调（DESIGN_TOKENS 行内「启动」）：accent-soft 系 */
-  border: 1px solid var(--accent-border);
-  border-radius: 9px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  cursor: pointer;
-  transition: background-color 160ms ease-out, border-color 160ms ease-out;
-}
-
-.history-switcher__launch:hover:not(:disabled) {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-}
-
-.history-switcher__launch:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.history-switcher__launch:disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-}
-
-/* 操作回执：正常中性（异常才亮色哲学） */
-.history-switcher__message {
-  margin: 0;
-  color: var(--text-2);
-  font-size: 12px;
-}
-
-.history-switcher__error {
-  margin: 0;
-  color: var(--warn);
-  font-size: 12px;
-}
-
-/* 归档账号详情条：占用可见性 + 恢复/彻底删除入口（危险分区语义） */
-.history-switcher__archived {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 10px 14px;
-  border: 1px solid var(--danger-line);
-  border-radius: var(--radius-control);
-  background: var(--danger-soft);
-}
-
-.history-switcher__footprint {
-  color: var(--text-2);
-  font-size: 12px;
-  font-weight: 650;
-  font-variant-numeric: tabular-nums;
-}
-
-.history-switcher__archived-actions {
-  display: flex;
-  gap: 8px;
-  margin-left: auto;
-}
-
-/* 彻底删除两步确认弹窗：模糊聚焦背景 + 高对比玻璃卡。
-   portal 到 body 渲染，避开 backdrop-filter 祖先形成的 containing block。 */
-.history-switcher__scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  /* 模糊聚焦背景（token 化：中性填充 + 玻璃模糊，不引入新色值） */
-  background: var(--fill-strong);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-}
-
-.history-switcher__dialog {
-  width: min(440px, 100%);
-  padding: 20px 22px;
-  border: 1px solid var(--danger-line);
-  border-radius: var(--radius-panel);
-  /* 背景已有 scrim 模糊，卡面不再叠 backdrop-filter（双层 blur 规避） */
-  background: var(--glass-dense);
-  box-shadow: var(--shadow-float);
-}
-
-.history-switcher__dialog h3 {
-  margin: 0;
-  color: var(--danger);
-  font-size: 14px;
-  font-weight: 750;
-  line-height: 1.3;
-}
-
-.history-switcher__dialog p {
-  margin: 10px 0 0;
-  color: var(--text-2);
-  font-size: 12.5px;
-  line-height: 1.55;
-}
-
-.history-switcher__dialog .history-switcher__dialog-warning {
-  color: var(--danger);
-}
-
-.history-switcher__dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 9px;
-  margin-top: 16px;
-}
