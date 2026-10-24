@@ -3,11 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { WorkspaceStateDto } from "./types/workspace";
 import { TitleBar } from "./components/TitleBar";
-import { SettingsPanel } from "./components/SettingsPanel";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
 import type { LibraryRef } from "./types/library";
-// 页面槽位接缝（P2a）：六区块的两种实现登记在 sectionSlots，App 只做解析。
-import { SECTION_SLOTS, resolveSection } from "./app/transition/sectionSlots";
+// P5-4a（E-01 S1）：六个区块直连合并页，产品值由 App 显式传参。
+// 槽位登记表（app/transition/sectionSlots）仍保留给 SettingsPanel 用，App 不再引用它。
+import { OverviewPage } from "./features/overview/OverviewPage";
+import { CheckinPage } from "./features/checkin/CheckinPage";
+import { AccountsPage } from "./features/accounts/AccountsPage";
+import { EnvironmentPage } from "./features/environment/EnvironmentPage";
+import { LibraryPage } from "./features/library/LibraryPage";
+import { SettingsPage } from "./features/settings/SettingsPage";
 import {
   detailLibraryRefFor,
   loadCurrentProduct,
@@ -39,10 +44,9 @@ interface AutoCheckinFinishedEvent {
   skipped: number;
 }
 
-// 应用根组件：P17-T5 并列骨架——产品上下文（标题栏切换器）驱动各页面槽位。
-// P2a 接缝：六区块各自的两种实现登记在 app/transition/sectionSlots.tsx，
-// 本文件只按当前产品解析一次（resolveSection），不再内联产品三目；
-// 哪个页面渲染哪套实现是槽位表的事实，壳层不再关心。
+// 应用根组件：P17-T5 并列骨架——产品上下文（标题栏切换器）驱动各页面。
+// P5-4a：六区块直接渲染合并页（features/*），产品值由本文件传入；
+// 旧槽位接缝（app/transition/sectionSlots）已不被本文件引用。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,14 +70,9 @@ export default function App() {
   // 主库详情页的库实例（ADR-0032 决策 5）：环境页入口注入优先，缺省主库。
   const detailLibrary = detailLibraryRefFor(libraryDetail);
 
-  // 页面槽位解析（P2a 接缝）：产品 → 区块实现的唯一选择点。
-  // 各槽位组件以统一形状接收属性（异构属性见 sectionSlots 的 any-exception 说明）。
+  // 当前产品协议值：六个区块共用同一份合并页实现，产品差异由页面内的声明式
+  // 配置表消费（页面内零产品判断），App 只负责把值传下去。
   const productId = currentProduct?.product_id ?? CURRENT_PRODUCT_ID;
-  const OverviewSection = resolveSection(SECTION_SLOTS.overview, productId);
-  const AccountsSection = resolveSection(SECTION_SLOTS.accounts, productId);
-  const CheckinSection = resolveSection(SECTION_SLOTS.checkin, productId);
-  const EnvironmentSection = resolveSection(SECTION_SLOTS.environment, productId);
-  const LibrarySection = resolveSection(SECTION_SLOTS["master-library"], productId);
 
   const handlePageChange = useCallback((page: AppPage) => {
     // 离开库详情页即重置库实例引用，避免下次进入主库详情残留副库上下文。
@@ -166,7 +165,7 @@ export default function App() {
   }, [refreshWorkspaceState]);
 
   // 切换产品：写后端指针 → 重读回显（含展示名）；失败提示且状态不变
-  // （select 受控值不动）。各页面槽位按当前产品分支，切换即重挂载重拉数据。
+  // （select 受控值不动）。各页面以 key={productId} 重挂载，切换即重拉数据。
   const handleSwitchProduct = useCallback(async (productId: string) => {
     try {
       await setCurrentProduct(productId);
@@ -293,12 +292,15 @@ export default function App() {
       <div className="app-body">
         <NavigationRail activePage={activePage} onPageChange={handlePageChange} />
         <main id="main-content" className="app-main" ref={mainRef}>
-          {/* 页面槽位由 sectionSlots 解析：不同组件类型切换即卸载重挂载，
-              数据新鲜度天然由重挂载重拉保证，无需额外刷新信号。
-              P2a 接缝：产品判断只发生在 resolveSection 一处，此处零三目。 */}
+          {/* P5-4a（E-01 S1）：六区块直连合并页，productId 由本层显式传入。
+              旧槽位包装是两个不同组件类型，切产品即卸载重挂载、页面局部 UI 态随之
+              复位；内联后类型不再变化，故每处补 key={productId} 等价复刻该契约
+              （key 变化 → React 卸载重建 → 局部态与数据一起重来）。 */}
           {state && (
             <div className="app-page" hidden={activePage !== "overview"}>
-              <OverviewSection
+              <OverviewPage
+                key={productId}
+                productId={productId}
                 state={state}
                 active={activePage === "overview"}
                 onNavigate={handlePageChange}
@@ -306,20 +308,24 @@ export default function App() {
             </div>
           )}
           <div className="app-page" hidden={activePage !== "accounts"}>
-            <AccountsSection active={activePage === "accounts"} />
+            <AccountsPage key={productId} productId={productId} active={activePage === "accounts"} />
           </div>
           <div className="app-page" hidden={activePage !== "checkin"}>
-            <CheckinSection
+            <CheckinPage
+              key={productId}
+              productId={productId}
               active={activePage === "checkin"}
               onNavigate={handlePageChange}
             />
           </div>
           <div className="app-page" hidden={activePage !== "environment"}>
-            {/* P4d-8b-1：环境页两产品共用一份实现，productId 由槽位包装绑定。
+            {/* P4d-8b-1：环境页两产品共用一份实现，productId 由 App 传入。
                 详情入口两路——主库走 onOpenMasterDetail；副环境「查看详情」由
                 onOpenLibraryDetail 决定是否出现（存在性），跳转经 onOpenEnvDetail
                 把 envId 转成 App 的 LibraryRef（见 handleOpenEnvDetail）。 */}
-            <EnvironmentSection
+            <EnvironmentPage
+              key={productId}
+              productId={productId}
               active={activePage === "environment"}
               onOpenMasterDetail={handleOpenMasterDetail}
               onOpenLibraryDetail={ENV_DETAIL_AVAILABLE}
@@ -327,11 +333,13 @@ export default function App() {
             />
           </div>
           <div className="app-page" hidden={activePage !== "master-library"}>
-            {/* P4e-8c：库页两产品共用一份实现，productId 由槽位包装绑定。库实例（id + 显示名）
+            {/* P4e-8c：库页两产品共用一份实现，productId 由 App 传入。库实例（id + 显示名）
                 取 App 现有详情态（detailLibrary，缺省主库；副环境入口注入 env_id 与环境名）。
                 返回 → 环境页；空态引导（empty-open-environment）同样落到环境页；其余动作原样透出。
                 onOpenLibraryDetail 的签名转换就地做：新页回传 libraryId，App 的入口收 LibraryRef。 */}
-            <LibrarySection
+            <LibraryPage
+              key={productId}
+              productId={productId}
               active={activePage === "master-library"}
               libraryId={detailLibrary.id}
               libraryDisplayName={detailLibrary.displayName}
@@ -341,7 +349,7 @@ export default function App() {
             />
           </div>
           <div className="app-page" hidden={activePage !== "settings"}>
-            <SettingsPanel active={activePage === "settings"} productId={productId} />
+            <SettingsPage key={productId} productId={productId} active={activePage === "settings"} />
           </div>
         </main>
       </div>
