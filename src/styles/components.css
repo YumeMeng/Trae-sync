@@ -1,6 +1,8 @@
-/* 共享控件：btn / badge / status-badge / page-header / settings-panel / settings-backup */
+/* L3 components：跨页共享控件 —— btn / badge / status-badge / page-header /
+   settings-panel / section-caption / settings-backup / 产品徽标（product-badge）。
+   P5-3b：由 workbench.css 更名而来（原为「历史工作台」遗留命名），规则内容未改。 */
 
-/* 徽章基座：胶囊形 + 细边。基座原本在 titlebar.css 与 workbench.css
+/* 徽章基座：胶囊形 + 细边。基座原本在 titlebar.css 与本文件（原 workbench.css）
    各写一半（P5-3a 前），现统一到本文件，每个选择器只声明一次。 */
 .badge {
   display: inline-flex;
@@ -480,3 +482,45 @@
 }
 
 /* 设置页消息条已由 notify 全局通知承载（P11-1 切片②），样式随迁清理。 */
+
+/* ===== P17-T5 二期/A6：产品徽标（账号页统一视图 + 切换器形态） =====
+   P5-3b 归属调整：原在聚合入口 src/styles.css（L4 之后），现并入 L3 共享控件层。
+   规则内容未改，仅移动归属；徽标类名由 src/components/shared/ProductBadge.tsx 消费。 */
+.product-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+  user-select: none;
+}
+
+.product-badge--trae {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+}
+
+.product-badge--workbuddy {
+  color: var(--product-wb);
+  background: color-mix(in srgb, var(--product-wb) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--product-wb) 32%, transparent);
+}
+
+.product-badge--neutral {
+  color: var(--text-3);
+  background: color-mix(in srgb, var(--text-3) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-3) 28%, transparent);
+}
+
+/* 切换器：徽标 + 原生 select 并排（徽标为主标识，select 收窄）。
+   P5-3b：原在聚合入口，随徽标家族一并并入本层；select 自身样式在 titlebar.css。 */
+.title-bar__product-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}

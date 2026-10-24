@@ -3,7 +3,7 @@
 // UI 护栏（docs/architecture/UI-CHARTER.md §3 硬预算 + §4 禁止模式）
 // ============================================================================
 //
-// 五条规则（只读扫描，不改产品代码）：
+// 六条规则（只读扫描，不改产品代码）：
 //   1. 行数预算：src/app、src/features、src/ui 下单文件 > 300 行（后两者当前
 //      不存在时自然跳过）。
 //   2. 禁止产品分支：src/app、src/features 内出现 isWorkBuddy ? /
@@ -13,6 +13,10 @@
 //   4. 跨 feature 深路径 import：features/<name>/<非 public> 的 from 导入。
 //   5. 组件内 invoke(：src/app、src/features 内直接调用 Tauri 命令（必须经
 //      platform/ 适配层）。
+//   6. min-height 视口真源：`calc(100vh - …)` 形式的 min-height 全仓只允许
+//      出现一处，且必须在 L3 共享控件层 src/styles/components.css（P5-3b）。
+//      理由：该值决定两个主面板的高度口径，一旦被页面层再写一份，最终取值
+//      就由 @import 顺序决定——四层重排后顺序变化会静默翻转，无其它断言可拦。
 //
 // 基线机制（关键）：宪章规则今天已有一批存量债务，硬拦会让 CI 立刻全红。
 // 因此脚本把「当前所有违规」按「文件 + 规则」计数写进 .ui-guard-baseline.json：
@@ -43,6 +47,8 @@ const PATTERN_DIRS = ["src/app", "src/features"];
 const STYLE_DIR = "src/styles";
 const STYLE_ENTRY_FILES = ["src/styles.css"];
 const TOKEN_FILE = "tokens.css";
+// min-height 视口真源的唯一合法归属（P5-3b 四层重排后 = L3 共享控件层）。
+const VIEWPORT_MIN_HEIGHT_OWNER = "src/styles/components.css";
 
 const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
 const STYLE_EXTENSIONS = new Set([".css"]);
@@ -53,6 +59,7 @@ const RULES = {
   "literal-color": "字面色值（tokens.css 之外）",
   "cross-feature-import": "跨 feature 深路径 import",
   "component-invoke": "组件内直接 invoke(",
+  "viewport-min-height": "min-height 视口真源唯一（仅 " + VIEWPORT_MIN_HEIGHT_OWNER + "）",
 };
 const RULE_ORDER = Object.keys(RULES);
 
@@ -64,6 +71,8 @@ const PRODUCT_PATTERNS = [
 ];
 // 组件内直接 invoke（import { invoke } 不算调用）。
 const INVOKE_RE = /\binvoke\s*\(/;
+// min-height 视口高度：calc(100vh - …)，空格容错（calc(100vh-120px) 也算）。
+const VIEWPORT_MIN_HEIGHT_RE = /min-height\s*:\s*calc\(\s*100vh\s*-/;
 // 字面色值：#hex（3-8 位）/ rgb( / hsl(（含 rgba/hsla）。
 const HEX_COLOR_RE = /#(?:[0-9a-fA-F]{3,8})\b/;
 const COLOR_FN_RE = /\b(?:rgb|hsl)a?\s*\(/;
@@ -294,6 +303,51 @@ function runLiteralColors(scanned) {
   }
 }
 
+/**
+ * min-height 视口真源唯一（P5-3b 护栏）：`calc(100vh - …)` 形式的 min-height
+ * 全仓只允许出现在 VIEWPORT_MIN_HEIGHT_OWNER 一处。
+ *
+ * 为什么需要静态断言：该值同时作用于 .workbench / .settings-panel 两个主面板，
+ * 四层重排后同一选择器若在页面层再写一份，最终取值就由 @import 顺序决定——
+ * 顺序一变结果就翻转，而现有 e2e 没有该属性的计算值断言。故在静态层把
+ * 「只能有一处」钉死：多出第二处即失败，归属文件不符也失败。
+ */
+function runViewportMinHeight(scanned) {
+  const { files, missing } = listFiles(STYLE_DIR, STYLE_EXTENSIONS);
+  scanned.push({ dir: STYLE_DIR, count: files.length, missing, minHeight: true });
+  for (const entryRel of STYLE_ENTRY_FILES) {
+    const absEntry = join(ROOT, entryRel);
+    if (existsSync(absEntry)) files.push(absEntry);
+  }
+  const hits = [];
+  for (const abs of files) {
+    const file = toRel(abs);
+    // CSS 只有块注释：注释里提到 calc(100vh - 120px) 不算声明。
+    const masked = maskComments(readFileSync(abs, "utf8"), false);
+    const lines = masked.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      if (VIEWPORT_MIN_HEIGHT_RE.test(lines[index])) hits.push({ file, line: index + 1, text: lines[index] });
+    }
+  }
+  if (hits.length === 0) {
+    record(VIEWPORT_MIN_HEIGHT_OWNER, 1, "viewport-min-height", "缺失：未找到 calc(100vh - …) 的 min-height 真源");
+    return;
+  }
+  if (hits.length > 1) {
+    // 只保留第一处合法（若在归属文件内），其余全部记为违规。
+    const ownerHits = hits.filter((hit) => hit.file === VIEWPORT_MIN_HEIGHT_OWNER);
+    const offenders = ownerHits.length > 0 ? hits.filter((hit) => hit !== ownerHits[0]) : hits;
+    for (const hit of offenders) {
+      record(hit.file, hit.line, "viewport-min-height", hit.text);
+    }
+    return;
+  }
+  const only = hits[0];
+  if (only.file !== VIEWPORT_MIN_HEIGHT_OWNER) {
+    record(only.file, only.line, "viewport-min-height", "唯一真源必须在 " + VIEWPORT_MIN_HEIGHT_OWNER + "：" + only.text);
+  }
+}
+
 // ============================================================================
 // 基线读写与比对
 // ============================================================================
@@ -361,6 +415,7 @@ function main() {
   runLineBudget(scanned);
   runPatternRules(scanned);
   runLiteralColors(scanned);
+  runViewportMinHeight(scanned);
 
   const whitelist = loadWhitelist();
   const exempt = violations.filter((item) => isWhitelisted(item.file, whitelist));

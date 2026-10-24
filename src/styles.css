@@ -1,52 +1,20 @@
-/* 聚合入口：按域拆分后的样式索引（U-5 W1），域文件见 src/styles/ */
+/* 聚合入口（U-5 W1；P5-3b 四层重排）：import 顺序即层级，禁止在此写规则。
+   层序 L1 → L2 → L3 → L4：
+     L1 tokens      —— 语义令牌唯一层
+     L2 base        —— 壳层（base：app-shell/body/main/page/空态）+ 标题栏与导航（titlebar）
+     L3 components  —— 跨页共享控件（components：btn/badge/page-header/面板/备份）
+                      与全局通知主题（notify：sonner- 前缀隔离）
+     L4 pages       —— 一页一文件，见 src/styles/pages/
+   层内顺序 = 同层文件的加载先后；基座文件必须先于消费它的文件。 */
 @import "./styles/tokens.css";
 @import "./styles/base.css";
 @import "./styles/titlebar.css";
-@import "./styles/workbench.css";
-@import "./styles/overview.css";
-@import "./styles/accounts.css";
-@import "./styles/checkin.css";
-@import "./styles/environment.css";
-@import "./styles/history.css";
-@import "./styles/master-detail.css";
+@import "./styles/components.css";
 @import "./styles/notify.css";
-@import "./styles/workbuddy.css";
-
-/* ===== P17-T5 二期/A6：产品徽标（账号页统一视图 + 切换器形态） ===== */
-.product-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.6;
-  letter-spacing: 0.02em;
-  vertical-align: middle;
-  user-select: none;
-}
-
-.product-badge--trae {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
-}
-
-.product-badge--workbuddy {
-  color: var(--product-wb);
-  background: color-mix(in srgb, var(--product-wb) 14%, transparent);
-  border: 1px solid color-mix(in srgb, var(--product-wb) 32%, transparent);
-}
-
-.product-badge--neutral {
-  color: var(--text-3);
-  background: color-mix(in srgb, var(--text-3) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--text-3) 28%, transparent);
-}
-
-/* 切换器：徽标 + 原生 select 并排（徽标为主标识，select 收窄）。 */
-.title-bar__product-switcher {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
+@import "./styles/pages/overview.css";
+@import "./styles/pages/accounts.css";
+@import "./styles/pages/checkin.css";
+@import "./styles/pages/environment.css";
+@import "./styles/pages/history.css";
+@import "./styles/pages/master-detail.css";
+@import "./styles/pages/workbuddy.css";
