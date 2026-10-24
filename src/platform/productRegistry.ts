@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { LibraryRef } from "../components/LibrarySessionsPanel";
+import type { LibraryRef } from "../types/library";
 import type { CurrentProductDto, ProductEntryDto } from "../types/product";
 import { PRODUCT_UI_REGISTRY } from "./productUiRegistry";
 

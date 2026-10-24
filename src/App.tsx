@@ -5,7 +5,7 @@ import type { WorkspaceStateDto } from "./types/workspace";
 import { TitleBar } from "./components/TitleBar";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
-import type { LibraryRef } from "./components/LibrarySessionsPanel";
+import type { LibraryRef } from "./types/library";
 // 页面槽位接缝（P2a）：六区块的两种实现登记在 sectionSlots，App 只做解析。
 import { SECTION_SLOTS, resolveSection } from "./app/transition/sectionSlots";
 import {
