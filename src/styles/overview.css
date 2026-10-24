@@ -27,30 +27,7 @@
   gap: 12px;
 }
 
-.settings-panel {
-  display: flex;
-  min-height: calc(100vh - 108px);
-  flex-direction: column;
-  gap: 20px;
-  padding: 24px;
-}
-
-.settings-panel__section-heading {
-  align-items: center;
-}
-
-@media (max-width: 720px) {
-  .settings-panel {
-    gap: 16px;
-    padding: 18px 16px;
-  }
-
-}
-
-.settings-panel {
-  min-height: calc(100vh - 120px);
-  padding: 24px;
-}
+/* 设置面板的布局/高度真源已归并到 workbench.css（P5-3a 去重）。 */
 
 /* 总览页：问候 + 统计卡 + 空态行 + 主操作。 */
 .overview-page {

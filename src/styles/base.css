@@ -20,16 +20,20 @@ body {
      多余外框且不可拖动）移除，内容铺满窗口；窗口圆角交给系统 DWM，
      四周边缘拖动由 window-drag-edge 热区承担。 */
   box-sizing: border-box;
-  height: 100%;
   background: var(--app-bg);
   color: var(--text-1);
   font-size: 14px;
   line-height: 1.5;
+  overflow-x: visible;
 }
 
 button,
 input {
   font: inherit;
+}
+
+button {
+  color: inherit;
 }
 
 button,
@@ -38,8 +42,9 @@ input[type="radio"] {
   -webkit-tap-highlight-color: transparent;
 }
 
-button {
-  color: inherit;
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
 }
 
 button:focus-visible,
@@ -55,22 +60,32 @@ input:focus-visible {
 
 /* 应用壳层：标题栏保持可见，主体只允许内容区域滚动。
    窗口铺满（2026-09-21 消除外部边框）：壳层直角贴窗口边，1px 描边
-   圈定边界；投影已随呼吸带移除（不透明窗口上投影只落在自身底色上）。 */
+   圈定边界；投影已随呼吸带移除（不透明窗口上投影只落在自身底色上）。
+   画布雾斑（见下方 .app-shell::before）+ 颗粒：isolation 建立 shell 层叠
+   上下文——背景(底) → 雾斑(z0) → 内容(z1)，故 .app-body 抬到 z1。 */
 .app-shell {
+  position: relative;
+  isolation: isolate;
   display: flex;
   height: 100%;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--line-control);
+  background: var(--app-bg);
 }
 
+/* 加载/错误壳层共用居中版式；文字色各自由下面的单选择器规则声明，
+   避免同一组内 color 被后续 .app-error 覆盖的隐式级联。 */
 .app-loading,
 .app-error {
   display: grid;
   min-height: 100%;
   place-items: center;
   padding: 24px;
+}
+
+.app-loading {
   color: var(--text-2);
 }
 
@@ -81,6 +96,8 @@ input:focus-visible {
 }
 
 .app-body {
+  position: relative;
+  z-index: 1;
   display: grid;
   grid-template-columns: var(--rail-width) minmax(0, 1fr);
   flex: 1;
@@ -92,8 +109,9 @@ input:focus-visible {
   width: 100%;
   min-width: 0;
   min-height: 0;
-  padding: 18px;
-  background: var(--app-bg);
+  padding: 20px;
+  /* 主内容透明化：让雾斑从内容下方透出（玻璃面板可糊） */
+  background: transparent;
   overflow: auto;
 }
 
@@ -101,6 +119,7 @@ input:focus-visible {
   width: 100%;
   min-width: 0;
   max-width: 1680px;
+  min-height: 100%;
   margin: 0 auto;
 }
 
@@ -109,17 +128,6 @@ input:focus-visible {
    画布雾斑 + 颗粒 → 标题栏/导航栏玻璃化 → 主内容透明化。
    组件层仅引用 token；换主题只需重定义 :root 变量组。
    ============================================================ */
-
-/* 画布：靛蓝雾斑（单色，与 accent 同族）+ 3.5% 颗粒防塑料感。
-   超大雾团（中心浓、外缘淡）从右上漂向左下，对角贯穿画布，
-   保证标题栏/导航栏背后全程有雾经过（玻璃有内容可糊）。
-   伪元素 fixed 定位铺满视口，pointer-events 穿透不影响交互。
-   isolation 建立 shell 层叠上下文：背景(底) → 雾斑(z0) → 内容(z1)。 */
-.app-shell {
-  position: relative;
-  isolation: isolate;
-  background: var(--app-bg);
-}
 
 /* 最大化态（TitleBar 置 html.is-maximized）：贴边铺满，描边隐去。 */
 html.is-maximized .app-shell {
@@ -205,16 +213,6 @@ html.is-maximized .app-shell {
   to { transform: translate(-38%, 38%); }
 }
 
-/* 主内容透明化：让雾斑从内容下方透出（玻璃面板可糊）；z1 确保在雾斑之上。 */
-.app-main {
-  background: transparent;
-}
-
-.app-body {
-  position: relative;
-  z-index: 1;
-}
-
 @keyframes ui-rise {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
@@ -223,11 +221,6 @@ html.is-maximized .app-shell {
 /* 最大化态：窗口方角，关闭钮圆角同步收回 */
 html.is-maximized .title-bar__winctl--close {
   border-radius: 0;
-}
-
-input[type="checkbox"],
-input[type="radio"] {
-  accent-color: var(--accent);
 }
 
 /* 1024-1199px：仍是桌面语义，但来源和计划改为可滚动的全宽区块，避免三栏挤压。 */
@@ -246,8 +239,9 @@ input[type="radio"] {
   }
 
   .app-main {
+    /* order 让主区排在贴底导航栏之上；原 10px/82px 内边距是死声明
+       （被后置 .app-main 的 padding: 20px 覆盖），P5-3a 去重时删除以免级联翻转。 */
     order: 1;
-    padding: 10px 10px 82px;
   }
 
 }
@@ -268,10 +262,6 @@ input[type="radio"] {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
-}
-
-body {
-  overflow-x: visible;
 }
 
 .skip-link {
@@ -296,12 +286,6 @@ body {
   /* 跳过链接只在获得焦点时出现，因此 :focus（而非 :focus-visible）就必须带可见轮廓。 */
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-
-.app-main {
-  min-height: 0;
-  overflow: auto;
-  padding: 20px;
 }
 
 /* ============================================================
@@ -365,10 +349,6 @@ body {
   min-width: 0;
 }
 
-.app-page {
-  min-height: 100%;
-}
-
 /* 动态状态只占一像素布局空间，但仍会被读屏器及时播报。 */
 .sr-only {
   position: absolute;
@@ -391,14 +371,6 @@ body {
   to {
     transform: rotate(360deg);
   }
-}
-
-@media (min-width: 1024px) and (max-width: 1199px) {
-  /* 旧基线的标题栏收窄规则已删（38px 单行在所有断点统一，2026-08-27）。 */
-  .app-main {
-    padding: 16px;
-  }
-
 }
 
 @media (max-width: 720px) {

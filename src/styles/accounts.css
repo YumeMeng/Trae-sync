@@ -39,17 +39,12 @@
   border-top: 1px solid var(--line-hair);
 }
 
-.account-center__section-heading,
-.account-center__profile {
+.account-center__section-heading {
   display: flex;
   min-width: 0;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-}
-
-.account-center__section-heading h3 {
-  margin: 0;
 }
 
 .account-center__profiles {
@@ -64,7 +59,7 @@
   display: flex;
   align-items: center;
   gap: 7px;
-  margin-top: 4px;
+  margin: 4px 0 0;
   font-size: 15px;
 }
 
@@ -90,7 +85,11 @@
 }
 
 .account-center__profile {
+  display: flex;
+  min-width: 0;
   align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   flex-wrap: wrap;
   min-height: 54px;
   padding: 10px 12px;

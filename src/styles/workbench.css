@@ -1,6 +1,14 @@
 /* 共享控件：btn / badge / status-badge / page-header / settings-panel / settings-backup */
 
+/* 徽章基座：胶囊形 + 细边。基座原本在 titlebar.css 与 workbench.css
+   各写一半（P5-3a 前），现统一到本文件，每个选择器只声明一次。 */
 .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-hair);
+  border-radius: 999px;
+  white-space: nowrap;
   padding: 2px 7px;
   font-size: 12px;
   font-weight: 650;
@@ -10,7 +18,7 @@
 .page-header__eyebrow {
   display: block;
   color: var(--text-2);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 750;
   letter-spacing: 0;
   line-height: 1.2;
@@ -29,20 +37,40 @@
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
   box-shadow: var(--glass-shadow), var(--glass-edge);
+  /* 工作面统一高度口径：标题栏 38px + 主区内边距合计 82px 预留，
+     即 calc(100vh - 120px)。这是全仓库唯一的 min-height 真源，
+     两个面板同值，不再由 import 顺序决定（P5-3a 去重前为 108/120 两值）。 */
+  min-height: calc(100vh - 120px);
 }
 
 .workbench {
   display: flex;
-  min-height: calc(100vh - 112px);
   flex-direction: column;
-  overflow: hidden;
+  overflow: visible;
+}
+
+/* 设置页工作面板：纵向排布 + 24px 内边距（P5-3a 前分散在 overview.css
+   两处且 min-height 108/120 冲突，现统一为本文件唯一来源）。 */
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 24px;
+}
+
+@media (max-width: 720px) {
+  .settings-panel {
+    /* 仅 gap 收窄；原 padding 18px/16px 是死声明（被后置 padding: 24px 覆盖），
+       P5-3a 去重时删除以免级联翻转。 */
+    gap: 16px;
+  }
 }
 
 .page-header h1,
 .page-header h2 {
   margin: 6px 0 0;
   color: var(--text-1);
-  font-size: 21px;
+  font-size: 22px;
   font-weight: 750;
   line-height: 1.2;
 }
@@ -57,10 +85,17 @@
   max-width: 620px;
   margin: 7px 0 0;
   color: var(--text-2);
-  font-size: 12px;
+  font-size: 14px;
+  line-height: 1.55;
 }
 
 .status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-hair);
+  border-radius: 999px;
+  white-space: nowrap;
   padding: 6px 9px;
   color: var(--text-2);
   font-size: 11px;
@@ -73,7 +108,7 @@
 
 .settings-panel__section-heading {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 14px;
   min-width: 0;
@@ -85,7 +120,7 @@
   gap: 7px;
   margin: 5px 0 0;
   color: var(--text-1);
-  font-size: 13px;
+  font-size: 16px;
   font-weight: 750;
   line-height: 1.25;
 }
@@ -171,7 +206,7 @@
 
 .section-caption {
   color: var(--text-2);
-  font-size: 11px;
+  font-size: 13px;
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -182,7 +217,7 @@
 
 .workbench__error {
   color: var(--danger);
-  font-size: 14px;
+  font-size: 13px;
   overflow-wrap: anywhere;
 }
 
@@ -384,14 +419,6 @@
   font-size: 11.5px;
 }
 
-/* 图标栏 52px 在所有桌面断点统一，不再分档收窄（2026-08-27）。 */
-@media (max-width: 720px) {
-  .workbench,
-  .settings-panel {
-    min-height: 0;
-  }
-}
-
 @media (max-width: 720px) {
   .page-header {
     flex-direction: column;
@@ -400,11 +427,8 @@
 }
 
 @media (max-width: 480px) {
-  .page-header h1,
-  .page-header h2 {
-    font-size: 18px;
-  }
-
+  /* 原 18px 窄屏字号是死声明：文件尾部曾有一条后置的 22px 规则把这里覆盖，
+     拆分前实际生效值一直是 22px。P5-3a 去重按「保持计算值」原则删除该块。 */
   .settings-panel__section-heading {
     gap: 8px;
   }
@@ -418,43 +442,6 @@
   .settings-backup__time {
     flex-basis: 100%;
   }
-}
-
-/* 旧基线的 76px 标题栏规格已删（38px 单行合同生效，2026-08-27）。 */
-.workbench__eyebrow,
-.page-header__eyebrow {
-  font-size: 11px;
-}
-
-.workbench,
-.settings-panel {
-  border-radius: var(--radius-panel);
-}
-
-.workbench {
-  min-height: calc(100vh - 120px);
-  overflow: visible;
-}
-
-.page-header h1,
-.page-header h2 {
-  font-size: 22px;
-}
-
-.page-header p {
-  font-size: 14px;
-  line-height: 1.55;
-}
-
-.settings-panel__section-heading h3 {
-  font-size: 16px;
-}
-
-/* 下列 13px 字号组原始位置在 overview 域的 14px 规则之后（级联后者胜）；
-   拆分后为保持 13px 胜出的原始结果，14px 规则从 overview.css 搬入此处。 */
-.section-caption,
-.workbench__error {
-  font-size: 13px;
 }
 
 /* 确认态（绿色清剿）：中性底 + 靛蓝点确认，与已签徽章同语义 */

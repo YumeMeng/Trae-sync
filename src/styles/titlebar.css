@@ -1,7 +1,8 @@
 /* 标题栏 + 导航图标栏 + 窗控 */
 
 /* 标题栏 38px 单行（2026-08-27 精简，2026-09-03 移除三态徽章）：品牌 + 自绘窗控。
-   证据信息（当前账号/重新检测）下沉总览页 overview-evidence。 */
+   证据信息（当前账号/重新检测）下沉总览页 overview-evidence。
+   玻璃化：强白玻璃 + 模糊（雾斑从其下方经过时被晕染）。 */
 .title-bar {
   position: relative;
   top: 0;
@@ -13,18 +14,21 @@
      右 padding 归零：末钮自然贴壳层右缘，不再用负 margin 抵消。 */
   min-height: 38px;
   padding: 0 0 0 16px;
-}
-
-/* 标题栏玻璃化：强白玻璃 + 模糊（雾斑从其下方经过时被晕染）。 */
-.title-bar {
   background: var(--glass-strong);
   backdrop-filter: var(--glass-blur-strong);
   -webkit-backdrop-filter: var(--glass-blur-strong);
   border-bottom: 1px solid var(--line-hair);
 }
 
-/* 导航栏玻璃化：轻白玻璃（与标题栏形成层级差）。 */
+/* 持久导航：52px 图标栏（文字由 aria-label + hover 玻璃 tooltip 承载）。
+   玻璃化：轻白玻璃（与标题栏形成层级差）；背景/模糊与布局同源，不再分两段写。 */
 .navigation-rail {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  padding: 12px 6px;
+  border-right: 1px solid var(--line-hair);
   background: var(--glass-rail);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -96,16 +100,6 @@
   white-space: nowrap;
 }
 
-.status-badge,
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--line-hair);
-  border-radius: 999px;
-  white-space: nowrap;
-}
-
 /* —— 自绘窗控（T8，decorations: false）——
    Windows 语义：46px 命中宽 × 标题栏满高、三钮紧邻，hover 中性底，关闭 hover 红。
    三个按钮直接平铺在标题栏 flex 行内（无包裹容器，2026-09-21）。 */
@@ -147,17 +141,6 @@
 .title-bar__winctl--close:active {
   background: var(--window-close);
   color: var(--text-on-accent);
-}
-
-/* 持久导航：52px 图标栏（文字由 aria-label + hover 玻璃 tooltip 承载）。
-   背景/模糊由上方玻璃版（.navigation-rail 玻璃化）提供，此处不再覆盖。 */
-.navigation-rail {
-  display: flex;
-  min-width: 0;
-  min-height: 0;
-  flex-direction: column;
-  padding: 12px 6px;
-  border-right: 1px solid var(--line-hair);
 }
 
 .navigation-rail__nav {
