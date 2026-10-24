@@ -87,7 +87,9 @@ export interface SettingsCapabilities {
   readonly backup: BackupCapabilities;
   readonly pluginsEntry: "library-tab" | "absent"; // C 两侧 absent（插件工作台在库页；WB 无插件体系）
   readonly aboutEntry: false; // C 两侧 absent（版本仅见环境页 WB 客户端卡与包 version）
-  readonly readGate: "active-gated-version-guarded" | "mount-immediately"; // B 读取门禁（合并取 TRAE 口径）
+  // B 读取门禁：P4f-5 合并页统一取 TRAE 口径（active 门禁 + 逐路代次守卫）。旧 WB 是「挂载即读」，
+  // 本票有意改为可见才读（减少后台 IPC），行为变更记 docs/architecture/KNOWN-ISSUES.md K-11。
+  readonly readGate: "active-gated-version-guarded";
   readonly pageRegion: "settings"; // C 页头契约（role=region aria-label="设置" + h1[data-page-title=settings]）
 }
 export const SETTINGS_CAPABILITIES: Record<string, SettingsCapabilities> = {
@@ -102,7 +104,7 @@ export const SETTINGS_CAPABILITIES: Record<string, SettingsCapabilities> = {
     environmentSection: false,
     backup: { deletion: true, safetyChain: "restore-safety-backup", retention: false, location: false,
       credentials: "always-included", attachments: "file-count", receipt: "rolled-over-safety" },
-    pluginsEntry: "absent", aboutEntry: false, readGate: "mount-immediately", pageRegion: "settings",
+    pluginsEntry: "absent", aboutEntry: false, readGate: "active-gated-version-guarded", pageRegion: "settings",
   },
 };
 /** 未登记产品回退最保守一档（无删除/无保链/无保留/无位置，不猜能力）。 */

@@ -17,9 +17,10 @@ interface SettingsPanelProps {
   productId?: string;
 }
 
-/** 设置变体的统一属性形状（两个变体都接受 active，WB 变体内部不使用）。 */
+/** 设置槽位的统一属性形状（P4f-5：合并页接 active + productId；旧两变体只接 active）。 */
 interface SettingsVariantProps {
   active: boolean;
+  productId: string;
 }
 
 // 设置页：按当前产品从槽位取变体渲染（TRAE 管理面 / WorkBuddy 管理面）。
@@ -28,5 +29,5 @@ export function SettingsPanel({ active, productId = "trae_cn" }: SettingsPanelPr
     SECTION_SLOTS.settings,
     productId,
   ) as ComponentType<SettingsVariantProps>;
-  return <SettingsSection active={active} />;
+  return <SettingsSection active={active} productId={productId} />;
 }

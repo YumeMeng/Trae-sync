@@ -34,8 +34,7 @@ import {
   EnvironmentPage,
   type EnvironmentPageProps,
 } from "../../features/environment/EnvironmentPage";
-import { TraeSettingsVariant } from "../../components/settings/TraeSettingsVariant";
-import { WorkBuddySettingsVariant } from "../../components/settings/WorkBuddySettingsVariant";
+import { SettingsPage, type SettingsPageProps } from "../../features/settings/SettingsPage";
 
 // any-exception: 槽位接缝需以统一 props 形状承载六页异构属性（overview 要 state、
 // 库页要 library、环境页要两个回调），接缝本身不该反向改写页面 props；
@@ -109,6 +108,19 @@ const WorkBuddyLibrarySlot = (props: LibraryPageProps) => (
   <LibraryPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
 );
 
+// P4f-5：settings 的 TRAE 槽位切到合并页（与 accounts / environment / library 同形）。接缝内绑定
+// 产品协议值，页面内零产品判断；旧 components/settings/TraeSettingsVariant 与
+// WorkBuddySettingsVariant 本票保留、此刻不再被槽位引用（下一票删除）。
+const TraeSettingsSlot = (props: SettingsPageProps) => (
+  <SettingsPage {...props} productId={CURRENT_PRODUCT_ID} />
+);
+// P4f-5：settings 的 WorkBuddy 槽位同样指向合并页（WB 能力差异全在 features/settings 的
+// 声明式能力表与 builder 里）。读取门禁由 TRAE 口径统一：WB 由「挂载即读」改为「可见才读」，
+// 属有意行为变更，已记 docs/architecture/KNOWN-ISSUES.md K-11。
+const WorkBuddySettingsSlot = (props: SettingsPageProps) => (
+  <SettingsPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
+);
+
 /**
  * 六区块 × 两产品的实现登记表（settings 也登记：其 WB 变体曾是整页早返回）。
  * 只登记、不判断：产品选择逻辑全部在 resolveSection 一处。
@@ -124,7 +136,8 @@ export const SECTION_SLOTS: Record<SectionKey, SectionSlot> = {
   environment: { trae: TraeEnvironmentSlot, workbuddy: WorkBuddyEnvironmentSlot },
   // P4e-8c：两产品都指向同一份库页实现（迁移完成的正常形态）。
   "master-library": { trae: TraeLibrarySlot, workbuddy: WorkBuddyLibrarySlot },
-  settings: { trae: TraeSettingsVariant, workbuddy: WorkBuddySettingsVariant },
+  // P4f-5：两产品都指向同一份设置页实现（迁移完成的正常形态）。
+  settings: { trae: TraeSettingsSlot, workbuddy: WorkBuddySettingsSlot },
 };
 
 /**

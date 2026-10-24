@@ -23,8 +23,6 @@ export interface BackupLocationIntent {
 }
 
 export interface BackupLocationDialogProps {
-  /** 当前备份目录（只读展示，完整路径只进悬浮：界面表达纪律，内部路径不进主视野）。 */
-  readonly currentDir: string;
   readonly value: BackupLocationDialogValue;
   /** 提交中：两侧按钮与表单全部禁用（旧 locationBusy）。 */
   readonly busy: boolean;
@@ -35,10 +33,11 @@ export interface BackupLocationDialogProps {
 }
 
 /**
- * 更改备份位置弹层（TRAE 独有，旧 L452-504）：当前目录 + 目标目录输入 + 「同时迁移现有备份」开关。
+ * 更改备份位置弹层（TRAE 独有，旧 L452-504）：目标目录输入 + 「同时迁移现有备份」开关
+ * （旧弹层不显示当前目录——当前目录只在弹层外的位置行展示，本层不夹带新展示）。
  * 与旧实现同骨架（switch-veil/switch-dialog），不额外加遮罩点击关闭与 ESC——旧弹层没有，本票不新造行为。
  */
-export function BackupLocationDialog({ currentDir, value, busy, onChange, onCancel, onConfirm }: BackupLocationDialogProps) {
+export function BackupLocationDialog({ value, busy, onChange, onCancel, onConfirm }: BackupLocationDialogProps) {
   const targetDir = value.targetDir.trim();
   return (
     <div className="switch-veil" role="presentation">
@@ -46,11 +45,6 @@ export function BackupLocationDialog({ currentDir, value, busy, onChange, onCanc
         data-testid="backup-location-dialog">
         <div className="switch-dialog__title">{SETTINGS_TEXTS.locationDialogTitle}</div>
         <p className="settings-backup__hint">{SETTINGS_TEXTS.locationDialogHint}</p>
-        {/* 当前目录：旧弹层未显示，本票按任务书补一行，文案复用既有键（不新增同义句）。 */}
-        <p className="account-center__meta">
-          {SETTINGS_TEXTS.backupDirLabel}
-          <code className="settings-panel__backup-dir" title={currentDir}>{currentDir}</code>
-        </p>
         <input className="settings-panel__text-input" type="text" value={value.targetDir}
           placeholder={SETTINGS_TEXTS.locationPlaceholder} disabled={busy} aria-label={SETTINGS_TEXTS.locationAria}
           data-testid="backup-location-input"

@@ -286,3 +286,33 @@ P4e-9b（2026-10-24）补 G3 / G4 各 4 例（现该文件 31 例），两项已
 | 用例 | 413 | **349**（-87 旧 +23 新） | **357**（+8：G3 四例 + G4 四例） |
 
 `pnpm test`（31 文件 / 357 例）/ `pnpm typecheck` / `pnpm guard`（新增 0）均 exit 0。
+
+## K-11 WB 设置页读取门禁变更：挂载即读 → 可见才读（P4f-5，2026-10-24，有意行为变更）
+
+- 现象（变更前）：WB 设置页的两个子组件（旧 `WorkBuddyAutoCheckinSettings` / `WorkBuddyBackupSection`）
+  **挂载即读**——不接 `active`、无门禁、无读取代次守卫。App 恒挂载全部页面（`hidden` 只是 CSS 隐藏），
+  故用户从未打开设置页时，WB 的 `get_workbuddy_auto_checkin_status` / `list_workbuddy_checkin_accounts` /
+  `list_workbuddy_backups` 三路 IPC 照旧发出。
+- 变更（P4f-5 合并页）：设置页读取门禁统一取 **TRAE 口径**——`active` 才发起 + 逐路读取代次守卫
+  （晚到的旧快照不覆盖新值）。WB 由「挂载即读」变为「**可见才读**」，同时补上旧 WB 缺的迟到响应守卫。
+  能力表 `SettingsCapabilities.readGate` 两产品同值 `active-gated-version-guarded`（原 WB 的
+  `mount-immediately` 档随合并退役）。
+- 判定：**有意行为变更**（减少后台 IPC，与 TRAE 面、其余五页门禁口径一致），非回归。
+  设计依据见 `.scratch/cmdr/P4f-design.md` §2 差异表「读取门禁」行与 §4 风险点 5。
+- 回归护栏：`tests/settingsPage.test.tsx`「WB 读取门禁」——`active=false` 零 IPC、可见后才读三路。
+- 旧 WB 的两个表现随门禁一并变化（可放弃，不补）：
+  ① 首次进入设置页的**首帧**由「默认值直渲（09:30 / 空链）」变为「先空链壳、读到后填值」
+     （视图 `loadingNote` 仅在备份区给「正在读取备份链…」；签到区无首读占位句，与旧 WB 一致）；
+  ② 设置页不可见期间不再有后台 IPC 回写（旧 WB 在后台也会静默刷新）。
+
+## K-12 设置页旧两变体保留期（P4f-5，2026-10-24，过渡残留）
+
+- `src/components/settings/TraeSettingsVariant.tsx`（556 行）、`WorkBuddySettingsVariant.tsx`（46 行）、
+  `WorkBuddyBackupSection.tsx`（265 行）、`WorkBuddyAutoCheckinSettings.tsx`（109 行）与
+  `shared/checkin/AutoCheckinSettingsCard.tsx` 于 P4f-5 **暂不删除**（按任务书要求保留），
+  此刻已不再被 `sectionSlots.settings` 引用——生产路径全部走 `features/settings/SettingsPage`。
+- 影响：`docs/architecture/exceptions.md` 的 E-01 仍登记这四个文件（白名单只增不减，删除时同步收敛）。
+  `tests/SettingsPanel.test.tsx`（19 例）与 `tests/WorkBuddyPages.test.tsx` 的设置 3 例 + 备份段 4 例
+  仍按旧组件渲染路径跑（经 `SettingsPanel` → 槽位 → **新合并页**），故它们已实际覆盖新页。
+- 退出条件：下一票删除上述五文件 + `SettingsPanel.tsx` + `sectionSlots.tsx`（E-01 整条失效），
+  届时把旧测试文件按新页锚点收编（锚点已逐字保留，迁移预期零改动）。
