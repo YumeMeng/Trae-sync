@@ -305,25 +305,25 @@ P4e-9b（2026-10-24）补 G3 / G4 各 4 例（现该文件 31 例），两项已
      （视图 `loadingNote` 仅在备份区给「正在读取备份链…」；签到区无首读占位句，与旧 WB 一致）；
   ② 设置页不可见期间不再有后台 IPC 回写（旧 WB 在后台也会静默刷新）。
 
-## K-12 设置页旧变体删除进度（P4f-5 保留 → P4f-6 部分删除，2026-10-24）
+## K-12 设置页旧变体删除进度（P4f-5 保留 → P4f-6 部分删除 → **P4f-7 已解决**，2026-10-24）
 
-- P4f-6 已删除（生产零引用，实测 5 项验收全绿）：
-  `src/components/settings/TraeSettingsVariant.tsx`（556 行）、
-  `src/components/settings/WorkBuddySettingsVariant.tsx`（46 行）、
-  `src/components/WorkBuddyAutoCheckinSettings.tsx`（109 行），
-  以及空目录 `src/components/settings/`。
-- **未删（本票遗留，唯一阻塞点是测试的模块级 import）**：
-  `src/components/WorkBuddyBackupSection.tsx`（265 行）——`tests/WorkBuddyPages.test.tsx:279`
-  直接 `import { WorkBuddyBackupSection } from "../src/components/WorkBuddyBackupSection"`，
-  并有 4 例（L318-376）直接 `render(<WorkBuddyBackupSection />)`。删除该文件即
-  `pnpm typecheck` TS2307 红、vitest 整套无法解析 import。按任务书「不许改测试、红则回滚」，
-  本票保持该文件不动，其 4 例继续按旧组件跑（锚点与新页 `BackupSection` 逐字一致，
-  收编时预期零改动）。`shared/checkin/AutoCheckinSettingsCard.tsx`（131 行）随之失去
-  唯一生产消费者，但同样留待下一票处理（测试零引用，可与 BackupSection 同批删）。
-- 影响：`docs/architecture/exceptions.md` 的 E-01 已于 P4f-6 收敛为两个文件
-  （`sectionSlots.tsx` + `SettingsPanel.tsx`），设置变体的行数豁免条目移除。
-  `tests/SettingsPanel.test.tsx`（19 例）与 `tests/WorkBuddyPages.test.tsx` 的设置 3 例
-  仍按旧渲染路径跑（经 `SettingsPanel` → 槽位 → **新合并页**），故它们已实际覆盖新页。
-- 退出条件：下一票删除 `WorkBuddyBackupSection.tsx` + `AutoCheckinSettingsCard.tsx`
-  （同时收编那 4 例到新页 `BackupSection` 锚点），再删 `SettingsPanel.tsx` + `sectionSlots.tsx`
-  （E-01 整条失效）。
+- **状态：已解决**。设置页五个旧文件全部删除，无任何残留的生产引用或测试引用。
+
+| 票 | 删除文件 | 行数 |
+| --- | --- | --- |
+| P4f-6 | `src/components/settings/TraeSettingsVariant.tsx` / `WorkBuddySettingsVariant.tsx` / `src/components/WorkBuddyAutoCheckinSettings.tsx` + 空目录 | 556 + 46 + 109 |
+| P4f-7 | `src/components/WorkBuddyBackupSection.tsx` | 265 |
+| P4f-7 | `src/components/shared/checkin/AutoCheckinSettingsCard.tsx` | 134（此前登记 131，实测 134） |
+
+- P4f-6 遗留的唯一阻塞点（旧 WB 备份面的 4 例直接 `render(<WorkBuddyBackupSection />)`）
+  已在 P4f-7 解除：4 例**全部迁入** `tests/settingsPage.test.tsx`，改为经
+  `SettingsPage`（`productId="workbuddy"`）渲染，锚点与文案逐字不变
+  （`workbuddy-backup-chain` / `-create` / `-delete` / `-restore-{stamp}` / `-select-{stamp}` 与
+  三个确认弹层锚点，均为新旧共用锚点）。无案例被删——四例守的都是用户可见行为
+  （链如实呈现半成品条目、三个破坏性动作的单次确认与命令载荷），非旧组件内部细节。
+- `tests/WorkBuddyPages.test.tsx` 同时移除了那个模块级 import 与 4 例（-102 行），
+  该文件现只剩总览/签到页行为（274 行）。
+- 仍待后续票（不在本条目范围）：`SettingsPanel.tsx` + `app/transition/sectionSlots.tsx`
+  两个过渡接缝文件与其 E-01 例外——`tests/SettingsPanel.test.tsx`（19 例）与
+  `tests/WorkBuddyPages.test.tsx` 的设置 3 例仍按 `SettingsPanel` → 槽位 → **新合并页**
+  路径跑，故它们已实际覆盖新页。

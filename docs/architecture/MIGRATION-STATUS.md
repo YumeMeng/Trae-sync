@@ -57,6 +57,19 @@ src/platform/accounts.ts      229 行  26 条命令
 - 当前基线：**357 单测 / 41 e2e / guard 新增 0**
 - 遗留：K-10 中 G1/G5 与 G3 四项低风险分支
 
+## 设置页：已完成（P4f-7）
+
+- `features/settings/` 13 文件，旧 5 文件 **1,103 行**删除（TraeSettingsVariant 556 / WorkBuddySettingsVariant 46 / WorkBuddyAutoCheckinSettings 109 / WorkBuddyBackupSection 265 / AutoCheckinSettingsCard 134）
+- 唯一的“零测试改动”迁移：旧 26 例设置测试一行未改即全绿
+- 当前基线：**359 单测 / 41 e2e / guard 新增 0**
+- 已知：K-11（WB 读取门禁变更有意）保留；K-12 已解决
+
+## 六页完成后的收敛阶段（P5/P6）
+
+- P5-0 CSS + E-01 只读审计
+- P5-1..n：CSS 四层、13 处字面色值换 token、ui-guard 基线归零、删过渡接缝（sectionSlots + SettingsPanel 包装）
+- P6：MODULE_MAP / CONTEXT / tickets / ADR 索引回填 + CI 接入 pnpm check
+
 ## 之后
 
 - P4d environment（1,683 行，先拆巨石）
