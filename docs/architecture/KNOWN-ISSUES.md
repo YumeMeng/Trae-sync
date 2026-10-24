@@ -181,7 +181,7 @@
 
 P4d-8b-2b 修复 K-07 项 4 时补 2 例（收编 / 清理的「成功但重读失败」），全量 **394**（24 例环境页）。
 
-## K-08 主库消息「思考轨迹」展开列表待接线（2026-10-24 记录）
+## K-08 主库消息「思考轨迹」展开列表待接线（2026-10-24 记录，P4e-9a 已闭环）
 
 - 现象：旧库面板的消息轨迹行有 thoughts 展开列表（旧 LibrarySessionsPanel L2207-2213），P4e-3b 的 MessageView 未包含该字段，纯派生层不搬。
 - 约定：装配层（P4e-7/8）必须从 SessionMessageDto 取 thoughts 并渲染，或在 P4e-7 扩 config 字段；**不许当作无此功能**。
@@ -194,3 +194,84 @@ P4d-8b-2b 修复 K-07 项 4 时补 2 例（收编 / 清理的「成功但重读�
 - 新：复用 `formatSessionTime`（注入 now），显示「10月24日 03:00」，null 仍为「—」。
 - 决定：**接受新格式**——旧格式的 locale 漂移本身就是缺陷；新格式确定、可测、可断言。
 - 影响面：仅 WB 库页会话行时间；TRAE 侧本就用 formatSessionTime。
+
+## K-08 补充（P4e-9a 关闭）与 K-10 库页旧测试迁移后的覆盖缺口（2026-10-24）
+
+K-08 已由 P4e-7/8 闭环（`traeLibrary.viewerOf` 从 `SessionMessageDto.content.thoughts` 取词、
+`MessageFlow.MessageBody` 渲染展开列表），P4e-9a 的新页用例
+`tests/libraryPage.test.tsx`「点会话出查看器」逐条断言「先定位 / 再修复」两条 thoughts 可见，故本条可关闭（保留文字以免断链）。
+
+### K-10 旧库页 87 例迁移后的未覆盖项（P4e-9a，2026-10-24）
+
+旧 `tests/LibrarySessionsPanel.test.tsx`（54）/ `MasterLibraryDetail.test.tsx`（15）/
+`WorkBuddyLibraryPage.test.tsx`（5）/ `PluginWorkbench.test.tsx`（13）随旧组件退场删除，
+统一迁到 `tests/libraryPage.test.tsx`（23 例，锚点全部指向合并页 `features/library/LibraryPage`）。
+逐条对应表见 `.scratch/cmdr/P4e-9a-report.md` §3。以下为**逐条核对后仍缺的覆盖**，按风险分级。
+
+#### 真实缺口（写操作 / 错误恢复，须独立票补，不可放弃）
+
+1. **G1 切库读取代次隔离（旧 6 例，全部缺）**：旧页有 6 例专测「切库后旧列表与查看器立即清空」「迟到历史响应不覆盖新库」
+   「旧库迟到失败不写当前错误态」「旧库迟到台账不污染同 id 查看器」「同 id 下迟到 open / load-older 不覆盖」
+   「同 id 下旧库迟到 load-older 不拼入」。合并页的实现是 `useTraeLibrary` 的 `generation`/`viewerTicket` 双票守卫
+   （P4e-5a 已写），但**新页没有任何渲染级用例**用 `rerender` 换 `libraryId` 并注入延迟响应来验证。
+   - 判定：真实缺口（错库数据串到当前库是数据可信度问题）。补法：单文件用 deferred promise + `rerender`。
+2. **G2 轮询指纹（旧 1 例）**：`get_master_history` 带 `previous`/`previousCurrentUserId`、`status="unchanged"` 时不刷台账。
+   新页代码路径（`useTraeLibrary.load(false)` + 5s interval）保留，但无测试；`fake timers` 在合并页尚未用过。
+   - 判定：真实缺口但风险低（纯读取）；归入独立小票与 G1 同批补。
+3. **G3 归档收尾四态与恢复条（旧 12 例中缺 11，新#7 只覆盖模式层渲染、新#9 只覆盖正常提交路径）**：`action-notice` + `archive-recovery-retry` 的四种恢复
+   （`relaunch` / `refresh` / `commit-unknown` / `committed-attention`）、重试后的三种回执、
+   「未要求启动的回执不误报已启动」、归档视图「勾项目恢复全部归档会话」的提交参数、归档视图未关联组合并渲染、
+   归档视图项目折叠渲染、运行态 Work 归档关停提示。新页把这条链拆到 `useArchiveActions`（含 `recoveryOf` 映射），
+   新#8/#9 只覆盖「草稿 → 确认 → 提交」的正常路径。
+   - 判定：**真实缺口，优先级最高**（用户看到的是「操作结果不明 + 需要人工核对」的恢复指引，缺测试即无护栏）。
+4. **G4 写门禁四态（旧 5 例，全部缺）**：Work 库操作快照 pending/absent、错库快照 fail-closed（不读不写草稿）、
+   CN 只读库归档放行但隐藏删除/合并、CN 批量归档提交带 `libraryId="trae_cn"`。
+   合并页由 `traeWriteGatesOf` 单点算门禁、`archiveEnabled` 现取，但**新页无一条「门禁关 → 入口不出 / 命令不发起」的渲染断言**。
+   - 判定：**真实缺口，优先级最高**（唯一可能「新页放行旧页禁止的写」的方向）。
+5. **G5 CN 跨账号归并（旧 5 例，全部缺）**：`library-foreign-group` / `library-foreign-project-*` /
+   `library-merge-entry-*` 入口条件、`preview_trae_cn_project_merge` → `trae-cn-merge-confirm` 单次确认 →
+   `merge_trae_cn_project`、`trae-cn-merge-progress` 事件推进按钮文案、预览/归并失败的安全通知。
+   合并页 `useLibraryMergeActions` 的三链与 `useMergeActions` 的进度白名单均已实现，**无新页用例**。
+   - 判定：**真实缺口**（写操作 + 事件消费；进度事件的 `STAGES` 白名单尤其没有护栏）。
+
+#### 中等缺口（读取/展示分支，建议随 G1–G5 一起补）
+
+6. **G6 消息着色与接力 tab 的 DOM 断言**：`account-avatar--c0/1/2` 色档与 `library-relay-tab` 三腿时间线。
+   纯派生 `tests/libraryRelayLegs.test.ts`（8 例）已锁 `colorIndex`/`legs`，DOM 只承载索引。
+   - 判定：可放弃（重复断言收益低）。
+7. **G7 插件工作台细节（旧 13 例中缺 9，其中「已装徽章」「市场搜索」两例已被新#12/#13 部分覆盖）**：清单外条目「仅此账号」、对账条已移除、分类 chips 过滤、
+   卸载回执 fail-soft 摘要、卸载取消、`plugin_tab_no_account` 稳定文案、市场目录失败不阻断已装列表、
+   `active=false` 零读取、已装为空空态。新#12/#13 只覆盖徽章/禁用/卸载确认/市场搜索/安装。
+   - 判定：部分可放弃（映射与文案在 `pluginTab.ts`/`usePluginActions.ts` 逐字搬旧实现），
+     但 **`plugin_tab_no_account` 的页内文案**与 **卸载 fail-soft 摘要**属真实缺口，建议补两条。
+8. **G8 WB 软删开关与行内标题**：`workbuddy-library-include-deleted` 切换后重读带 `includeDeleted: true`；
+   `workbuddy-library-messages` 卡与「查看中」标记。合并页把时间线并入 `SessionViewer`（锚 `library-viewer`），
+   旧锚 `workbuddy-library-messages` **有意不再存在**。
+   - 判定：锚点变化可放弃（K-06 同口径：同一页面不因产品换锚点）；软删开关切换 → 建议补一条（与 G1 同批）。
+9. **G9 详情页 shell 分支（旧 15 例中缺 6）**：`active=false` 零 IPC、副库标题用环境名 + `libraryId` 解析、
+   统计读取失败时计数区隐藏但基础信息仍在、无备份链显示「还没有备份」、`onBack` 回调、环境状态读取失败的提示。
+   合并页 `active` 门禁在两条读取 hook 里（`if (!active) return`），副库走 `libraryDisplayName`；
+   **页面级 `active=false` 与副库渲染无新用例**。
+   - 判定：`active=false` 与副库标题属真实缺口（低风险但便宜）；统计失败/无备份属纯展示，可放弃。
+   注意：旧页「环境状态读取失败显示错误提示」在新页**行为已变**——环境档案是旁路（失败落 `null`），
+   信息卡显示「—」而非错误条，属 P4e-5a 的有意降级，不补测试。
+10. **G10 归并/删除的刷新失败回执**（旧 3 例）：「合并后刷新失败仍保留成功回执」类。
+    合并页 `useLibraryDeleteActions`/`useMergeActions` 的 `reload()` 失败只 `notify.warning`，路径在。
+    - 判定：可放弃（同一 `reload` 辅助函数；成功回执与警告的次序在代码里单点）。
+11. **G11 空态分支**：`no_current_account` 空态（「尚未登记登录账号」）、只读库空态不出「去环境页」按钮。
+    新#15 只覆盖 `no_master_data` 带按钮档。
+    - 判定：可放弃（`emptyOf` 两档共用 `history-guide` 锚，仅文案与按钮有无之差；`full` 门控在 builder 单点）。
+12. **G12 选择联动细节（旧 3 例）**：取消会话连带取消项目、手动全选不自动选项目、未关联组提交的会话集合。
+    合并页 `useLibrarySelection` 逐字搬旧实现，新#5 只覆盖「勾项目连带会话」正向。
+    - 判定：建议补一条（反向取消），属写操作目标集合的正确性。
+13. **G13 合并失败安全文案（旧 1 例）**：`merge_master_projects` 抛错 → `notify.error` 安全句 + 树维持。
+    - 判定：可放弃（`safeUiErrorMessage` 词表有 39 例独立护栏 `tests/safeUiError.test.ts`）。
+
+#### 测试数变化
+
+| 项 | 前 | 后 |
+| --- | --- | --- |
+| 测试文件 | 34 | 31（删 4 增 1） |
+| 用例 | 413 | **349**（-87 旧 +23 新） |
+
+`pnpm test` / `pnpm typecheck` / `pnpm guard` 均 exit 0。
