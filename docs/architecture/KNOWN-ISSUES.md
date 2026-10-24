@@ -327,3 +327,29 @@ P4e-9b（2026-10-24）补 G3 / G4 各 4 例（现该文件 31 例），两项已
   两个过渡接缝文件与其 E-01 例外——`tests/SettingsPanel.test.tsx`（19 例）与
   `tests/WorkBuddyPages.test.tsx` 的设置 3 例仍按 `SettingsPanel` → 槽位 → **新合并页**
   路径跑，故它们已实际覆盖新页。
+
+## K-13 产品徽标颜色恢复为设计靛蓝（P5-1b，2026-10-24，**有意修复 / 有可见变化**）
+
+- 现象（修复前）：`src/styles.css` 的 `.product-badge--trae` 写 `var(--color-accent, #3b82f6)`，
+  `.product-badge--neutral` 写 `var(--color-text-secondary, #94a3b8)`。这两个变量**全仓从未定义**
+  （tokens.css 无、任何主题层无、TS 无内联写入），故 fallback **恒生效**：TRAE 徽标实际渲染为
+  **Bootstrap 蓝 #3b82f6**，中性徽标为 Tailwind slate-400 #94a3b8，均与 DESIGN_TOKENS 契约不符
+  （契约：唯一品牌色 `--accent` = #4f46e5 靛蓝；弱文字 `--text-3` = #9aa3b5）。
+  该文件此前不在 `scripts/ui-guard.mjs` 的字面色值扫描域内，属**扫描盲区**（P5-CONVERGENCE §2）。
+- 修复（P5-1b）：
+  1. guard 的字面色值规则新增根目录聚合入口 `src/styles.css`（`STYLE_ENTRY_FILES`），盲区并入扫描域；
+  2. `src/styles.css` 9 处字面色值全部 token 化——TRAE 走既有 `--accent`，中性走既有 `--text-3`，
+     WorkBuddy 紫调新增 `--product-wb`（值取自原字面 #a78bfa，视觉零变化）；三处半透明底/描边
+     统一改 `color-mix(in srgb, <token> 14%|32%, transparent)`（与 rgba 等价的 alpha 表达）；
+  3. 两个悬空变量 `--color-accent` / `--color-text-secondary` **不再被引用**（改指既有 token），
+     故不在 tokens.css 里为错误命名补定义（补定义会让 Bootstrap 蓝/石板灰变成「合法 token」，与契约冲突）。
+- **可见变化（有意）**：
+  - TRAE 徽标文字/底/描边：Bootstrap 蓝 #3b82f6 → 设计靛蓝 **#4f46e5**（`--accent`），
+    TRAE 徽标与全 App 品牌色终于一致；
+  - 中性徽标：slate-400 #94a3b8 → `--text-3` **#9aa3b5**（色相相同、明度略提，肉眼近乎不可辨）；
+  - WorkBuddy 徽标：颜色零变化（#a78bfa 原值入 token），仅底色/描边由 rgba 改为等价 color-mix。
+- 判定：**有意修复，非回归**。修复前是「token 契约失效 + guard 盲区」双重缺陷；修复后徽标族与
+  设计契约同源，且后续换主题只需重定义 tokens.css。
+- 回归护栏：`node scripts/ui-guard.mjs` 现覆盖该文件（探针实测：注入一处 `#123456` 即报「新增 1 / 既有 0」、
+  exit 1；移除后恢复「新增 0 / 既有 0」）。**无新增单元测试**（徽标断言只锁 testid 存在性，
+  颜色属视觉层；色值由 guard + DESIGN_TOKENS 契约守护）。

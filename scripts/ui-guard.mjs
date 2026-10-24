@@ -37,8 +37,11 @@ const LINE_BUDGET = 300;
 const SOURCE_DIRS = ["src/app", "src/features", "src/ui"];
 // 禁止模式（产品分支 / invoke / 跨 feature 深路径）扫描范围。
 const PATTERN_DIRS = ["src/app", "src/features"];
-// 字面色值扫描范围（tokens.css 例外）。
+// 字面色值扫描范围（tokens.css 例外）。styles/ 之外的聚合入口
+// src/styles.css 是历史盲区（P5-1b 补入）：它承载 .product-badge 家族，
+// 只扫目录会让「根目录入口」的色值逃过检查。
 const STYLE_DIR = "src/styles";
+const STYLE_ENTRY_FILES = ["src/styles.css"];
 const TOKEN_FILE = "tokens.css";
 
 const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
@@ -269,6 +272,13 @@ function runPatternRules(scanned) {
 function runLiteralColors(scanned) {
   const { files, missing } = listFiles(STYLE_DIR, STYLE_EXTENSIONS);
   scanned.push({ dir: STYLE_DIR, count: files.length, missing });
+  // 聚合入口（目录外单文件）单独计入扫描域，缺失时同样跳过。
+  for (const entryRel of STYLE_ENTRY_FILES) {
+    const absEntry = join(ROOT, entryRel);
+    const present = existsSync(absEntry);
+    scanned.push({ dir: entryRel, count: present ? 1 : 0, missing: !present });
+    if (present) files.push(absEntry);
+  }
   for (const abs of files) {
     if (basename(abs).toLowerCase() === TOKEN_FILE) continue;
     const file = toRel(abs);

@@ -61,6 +61,10 @@
   --accent-ring: rgba(79, 70, 229, 0.25);             /* 强调色脉冲光环（动画起止帧） */
   --account-tone-1: #34a853;                          /* 账号色板 2/3：绿（G21） */
   --account-tone-2: #f9ab00;                          /* 账号色板 3/3：琥珀（G21） */
+
+  /* —— P5-1b 产品徽标识别色（原 src/styles.css 字面值归位；TRAE 徽标直接走 --accent、
+        中性徽标走 --text-3，故只新增 WorkBuddy 一档） —— */
+  --product-wb: #a78bfa;                              /* WorkBuddy 紫调徽标（值取自原字面，视觉零变化） */
   --radius-control: 12px;  /* 控件圆角（合同 12px，2026-08-27 由 4px 收敛） */
   --radius-panel: 15px;  /* 面板圆角（合同 15px，U-4 B1 对齐；原 8px 与 DESIGN_TOKENS 舒展档不符） */
   --control-height: 40px;

@@ -27,21 +27,21 @@
 }
 
 .product-badge--trae {
-  color: var(--color-accent, #3b82f6);
-  background: color-mix(in srgb, var(--color-accent, #3b82f6) 14%, transparent);
-  border: 1px solid color-mix(in srgb, var(--color-accent, #3b82f6) 32%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 .product-badge--workbuddy {
-  color: #a78bfa;
-  background: rgba(167, 139, 250, 0.14);
-  border: 1px solid rgba(167, 139, 250, 0.32);
+  color: var(--product-wb);
+  background: color-mix(in srgb, var(--product-wb) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--product-wb) 32%, transparent);
 }
 
 .product-badge--neutral {
-  color: var(--color-text-secondary, #94a3b8);
-  background: rgba(148, 163, 184, 0.12);
-  border: 1px solid rgba(148, 163, 184, 0.28);
+  color: var(--text-3);
+  background: color-mix(in srgb, var(--text-3) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-3) 28%, transparent);
 }
 
 /* 切换器：徽标 + 原生 select 并排（徽标为主标识，select 收窄）。 */
