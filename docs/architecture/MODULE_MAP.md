@@ -119,11 +119,44 @@ P14-6 将 `login_already_finished` 与 `login_not_started` 作为登录已结束
 
 `cancel_checkin_login` 在早期基线是反向断链；当前 WIP 已注册，begin/complete/cancel 均按产品与 attemptId 绑定。定向命令层和组件测试通过，但没有真实 Tauri IPC transport 集成验收。`ProductAccountPage` 已在 P11 删除，不要再次规划清理。前端 `accountLabel.ts` / `workbench_read.ts`、commands crate 未接主路径包装及旧 application 服务列为内部/候选，不按名字自动删除。
 
+## 前端目录职责（2026-10-24 P6-1 回填）
+
+本节补上重构后新目录的职责说明。目标结构见 [UI-CHARTER](UI-CHARTER.md) §2，但**当前树与目标结构尚未完全对齐**：`src/app/` 与 `src/contracts/` 还没有独立目录，壳层组件仍在 `src/components/`（CapabilitySection / NavigationRail / TitleBar / SettingsPanel / MasterSwitchDialog / RemoteDevicesPanel / StatusBadges），DTO 仍在 `src/types/`，事件订阅宿主在 `src/hooks/useTauriEvents.ts`。下表按**实际存在的目录**描述，不按目标结构宣称已完成迁移。
+
+### 六个 feature 目录
+
+每个 feature 是「一个交互只有一份实现」的落点：页面本体 + 声明式视图模型 + 产品 builder + 组件与 hook。产品差异只允许出现在 builder / 登记表里，页面不得判断 productId。
+
+| 目录 | 文件/行数 | 页面入口 | 结构约定与职责 |
+|---|---|---|---|
+| [src/features/accounts/](../../src/features/accounts/) | 40 / 4,177 | `AccountsPage.tsx`（241 行） | `config.ts` 视图模型 + 能力表 + 文案；`registry.ts` 按 productId 分发的 builder 登记表（未登记产品 fail-closed 到空视图）；`traeAccounts.ts` / `workbuddyAccounts.ts` 两个产品 builder；`detailView.ts` / `detailSnapshot.ts` 详情六区；`pageAdapters.ts` 产品接缝表；`actionCommands` / `detailActionCommands` / `poolActionCommands` 动作封装；`components/` 头部、行、详情、弹层与九个 hook。 |
+| [src/features/checkin/](../../src/features/checkin/) | 10 / 1,067 | `CheckinPage.tsx`（251 行） | 同上骨架：`config.ts` 视图模型 + 文案，`traeCheckin.ts` / `workbuddyCheckin.ts` builder，`CheckinRows.tsx` 行渲染，`components/` 批量条、页头、自动签到结果与 `useCheckinRun` / `useCheckinLiveEvents`。 |
+| [src/features/environment/](../../src/features/environment/) | 24 / 2,670 | `EnvironmentPage.tsx`（201 行） | `config.ts` / `registry.ts` / `traeEnvironment.ts` / `workbuddyEnvironment.ts`；`components/` 装配（`assembleEnvironment.tsx`）、动作分发（`environmentActionDispatch.ts` + `environmentActionIds.ts`）、卡片、体检、删除/收编/登录/改名弹层及九个 hook。 |
+| [src/features/library/](../../src/features/library/) | 36 / 4,030 | `LibraryPage.tsx`（259 行） | `config.ts` / `registry.ts` / `traeLibrary.ts` / `workbuddyLibrary.ts`；纯逻辑先抽再迁：`sessionTree.ts`（会话树）、`relayLegs.ts`（接力腿）、`infoTab.ts` / `pluginTab.ts`；`components/` 壳、树、查看器、归档条、批量条、删除/归并弹层与十余个 hook。 |
+| [src/features/overview/](../../src/features/overview/) | 4 / 504 | `OverviewPage.tsx`（170 行） | 无 `registry.ts`：`stats.ts` 就是声明式登记表，`traeStats.ts` / `workbuddyStats.ts` 提供各自视图；页面只渲染本文件导出的视图模型。 |
+| [src/features/settings/](../../src/features/settings/) | 14 / 1,420 | `SettingsPage.tsx`（93 行） | `config.ts` / `registry.ts` / `traeSettings.ts` / `workbuddySettings.ts`；`components/` 自动签到段、备份段与弹层、`settingsActionsTrae.ts` / `settingsActionsWb.ts` 动作、`settingsTypes.ts`、三个 hook。 |
+
+### 五个 platform 模块
+
+`src/platform/` 是唯一允许出现 `invoke(` 的层（宪章 §4.4）；它只做 IPC 转接与产品注册，不实现编排、不吞错误、不改后端契约。平台差异用「同一文件内按 productId 选择实现」表达，不新增目录。
+
+| 模块 | 文件 | 职责与边界 |
+|---|---|---|
+| ① 产品注册与能力开关 | `productRegistry.ts`（67 行）、`productUiRegistry.ts`（111 行） | 产品条目装载、`SectionKey` 五页导航、`CapabilityState` 三态（ready / pending / absent）、`sectionStatesFor` 与前端静态 UI 能力表 `PRODUCT_UI_REGISTRY`（ADR-0036 能力开关、ADR-0032 三态）。两个文件必须并列表述同一事实，不得出现第三处产品分支。 |
+| ② 账号适配器 | `accountAdapter.ts`（173 行）、`workbuddyAdapter.ts`（294 行） | 账号能力清单、账号视图/快照契约与按产品选择实现（`accountAdapterFor`）；WorkBuddy 的登录、健康、凭据刷新、切号与批量领取封装。ADR-0029/0030/0034 的「能力而非命令」边界落在这里。 |
+| ③ 账号/签到 IPC 封装 | `accounts.ts`（193 行）、`checkin.ts`（162 行） | 账号域 26 条命令与签到域快照/领取/取消的类型化封装；只做 invoke 直返，错误原文抛出，由调用方按 `safeUiError` 映射文案。 |
+| ④ 环境/库/设置/总览 IPC 封装 | `environment.ts`（163 行）、`environmentPlugins.ts`（39 行）、`library.ts`（145 行）、`libraryDelete.ts`（85 行）、`libraryPlugins.ts`（10 行）、`settings.ts`（70 行）、`overview.ts`（78 行） | 环境生命周期、插件市场/清单、库读取与破坏性写（删除/归档/归并）、设置与备份、总览装载。`libraryPlugins.ts` 只做库页 re-export，不重复包装；`environment.ts` 也 re-export `readEnvironmentState` / `readTraeInstanceStates`，避免第二份实现。 |
+| ⑤ 通知桥 | `notify.ts`（95 行） | sonner 的唯一入口（宪章口径见模块注释）：任何组件不得直接 import `sonner`，一律经此模块发送通知、取 `Toaster`；对外只暴露 React 类型。事件订阅桥（Tauri 事件 → 前端状态）宿主在 `src/hooks/useTauriEvents.ts`，platform 侧不另设文件。 |
+
+**跨层约束**：`platform/` 不得 import `ui/`、`features/`；`features/` 不得出现 `invoke(`；feature 之间禁止深路径 import——当前无 `public.ts`，实际共享面走 `src/components/shared/`、`src/platform/`、`src/types/`、`src/utils/`（2026-10-24 实测 feature 间零互相 import）。以上由 `scripts/ui-guard.mjs` 规则 4/5 静态拦截。
+
 ## 全量源码归属与命令登记
 
 下方清单从基线实际文件和 handler 生成：覆盖 `src` 的 TS/TSX/CSS、Rust 根 `src` 与五个 crate 的 `src`；tests、examples、scripts 和配置是验证/构建辅助，独立列清单。每个源码必须有责任代号。测试栏只表示存在同文件测试标记或独立测试文件引用，不表示测试通过或充分覆盖。命令表的 UI/test 引用是字符串静态命中，完整动态调用关系需在对应任务复核。
 
-### 源码清单（153 个文件）
+### 源码清单（154 个文件）
+
+> 2026-10-24 P6-1 修正 CSS 旧路径 12 行：`workbench.css` → `components.css`，7 份页面样式 → `src/styles/pages/`，并补入基线漏列的 `src/styles/pages/workbuddy.css`（故 153 → 154）。**清单仍有 12 行指向重构中已删除的文件**（`src/components/AccountCenter.tsx`、`AccountDetail.tsx`、`AccountWorkbench.tsx`、`AdapterAccountDetail.tsx`、`ConfirmDialog.tsx`、`EmptyState.tsx`、`EnvironmentPage.tsx`、`LibrarySessionsPanel.tsx`、`MasterVerificationPanel.tsx`、`PluginWorkbench.tsx`、`src/pages/MasterLibraryDetail.tsx`、`src/pages/OverviewPage.tsx`），对应实现已迁入 `src/features/*`、`src/ui/`；行数与「153 个文件」的口径同样待重算。这属于整表重生成，不在 P6-1 边界内，登记为 P6 后续项。
 
 | 源文件 | 层/责任 | 入口与范围 | 文件内测试标记数 |
 |---|---|---|---|
@@ -254,18 +287,19 @@ P14-6 将 `login_already_finished` 与 `login_not_started` 作为登录已结束
 | [src/platform/accountAdapter.ts](../../src/platform/accountAdapter.ts) | 前端 / 账号 | 见责任表；由相关编排注入上下文 | 0 |
 | [src/platform/notify.ts](../../src/platform/notify.ts) | 前端 / 壳 | 见责任表；由相关编排注入上下文 | 0 |
 | [src/platform/productRegistry.ts](../../src/platform/productRegistry.ts) | 前端 / 基础 | 见责任表；由相关编排注入上下文 | 0 |
-| [src/styles.css](../../src/styles.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/accounts.css](../../src/styles/accounts.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/base.css](../../src/styles/base.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/checkin.css](../../src/styles/checkin.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/environment.css](../../src/styles/environment.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/history.css](../../src/styles/history.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/master-detail.css](../../src/styles/master-detail.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/notify.css](../../src/styles/notify.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/overview.css](../../src/styles/overview.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/titlebar.css](../../src/styles/titlebar.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/tokens.css](../../src/styles/tokens.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
-| [src/styles/workbench.css](../../src/styles/workbench.css) | 前端 / 壳 | 共享视觉或对应页面样式，无业务副作用 | 0 |
+| [src/styles.css](../../src/styles.css) | 前端 / 壳 | L0 聚合入口：只 @import 不写规则；层序 tokens → base/titlebar → components/notify → pages | 0 |
+| [src/styles/base.css](../../src/styles/base.css) | 前端 / 壳 | L2 壳层基础：app-shell / body / main / page / 空态 | 0 |
+| [src/styles/components.css](../../src/styles/components.css) | 前端 / 壳 | L3 跨页共享控件（btn / badge / status-badge / page-header / 面板 / 备份）；**由原 `workbench.css` 于 P5-3b 更名而来**，并持有唯一 `min-height: calc(100vh - …)` 真源（ui-guard 规则 6） | 0 |
+| [src/styles/notify.css](../../src/styles/notify.css) | 前端 / 壳 | L3 全局通知（sonner 主题，`sonner-` 前缀隔离） | 0 |
+| [src/styles/pages/accounts.css](../../src/styles/pages/accounts.css) | 前端 / 壳 | L4 账号页（P5-3b 由 styles/ 根迁入 pages/，规则内容未改） | 0 |
+| [src/styles/pages/checkin.css](../../src/styles/pages/checkin.css) | 前端 / 壳 | L4 签到页（P5-3b 迁入 pages/） | 0 |
+| [src/styles/pages/environment.css](../../src/styles/pages/environment.css) | 前端 / 壳 | L4 环境页（P5-3b 迁入 pages/） | 0 |
+| [src/styles/pages/history.css](../../src/styles/pages/history.css) | 前端 / 壳 | L4 库对话面板（P5-3b 迁入 pages/） | 0 |
+| [src/styles/pages/master-detail.css](../../src/styles/pages/master-detail.css) | 前端 / 壳 | L4 主库详情（P5-3b 迁入 pages/） | 0 |
+| [src/styles/pages/overview.css](../../src/styles/pages/overview.css) | 前端 / 壳 | L4 总览页（P5-3b 迁入 pages/） | 0 |
+| [src/styles/pages/workbuddy.css](../../src/styles/pages/workbuddy.css) | 前端 / 壳 | L4 WorkBuddy 专属残留类（P5-3b 迁入 pages/；基线清单漏列，本次补入） | 0 |
+| [src/styles/titlebar.css](../../src/styles/titlebar.css) | 前端 / 壳 | L2 标题栏与窗口控件 | 0 |
+| [src/styles/tokens.css](../../src/styles/tokens.css) | 前端 / 壳 | L1 语义令牌唯一层；字面色值只允许出现在本文件（ui-guard 规则 3） | 0 |
 | [src/types/account_switch.ts](../../src/types/account_switch.ts) | 前端 / 账号 | DTO/事件/命令契约；不直接触发业务 | 0 |
 | [src/types/batchProgress.ts](../../src/types/batchProgress.ts) | 前端 / 基础 | DTO/事件/命令契约；不直接触发业务 | 0 |
 | [src/types/commandNames.ts](../../src/types/commandNames.ts) | 前端 / 基础 | DTO/事件/命令契约；不直接触发业务 | 0 |

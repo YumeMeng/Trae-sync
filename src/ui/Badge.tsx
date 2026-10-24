@@ -15,7 +15,7 @@ export interface BadgeProps {
   testId?: string;
 }
 
-/** 复用既有徽章样式族（workbench.css 的 status-badge 四态），不新增 CSS。 */
+/** 复用既有徽章样式族（components.css 的 status-badge 四态），不新增 CSS。 */
 const TONE_CLASS: Record<BadgeTone, string> = {
   neutral: "status-badge status-badge--neutral",
   warn: "status-badge status-badge--warning",

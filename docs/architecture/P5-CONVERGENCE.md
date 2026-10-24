@@ -2,6 +2,8 @@
 
 # P5-0 只读审计：CSS 收敛 + 过渡接缝清理方案
 
+> **历史快照（P6-1 2026-10-24 加注）**：本文是 P5-0 审计时点的记录，**行号、字节数、死类计数只代表当时**，未随 P5-1..P5-5 落地重算。文件名已按现状回填：原 `workbench.css`（P5-3b 更名，规则内容不变）统一写作 `components.css`，页面样式文件已迁入 `src/styles/pages/`。现行路径与职责以 [MODULE_MAP](MODULE_MAP.md) 为准。
+
 > 分支 `feat/ui-refactor-20261022`。只读：未改 src/tests/e2e，未跑 build/test/e2e（`node scripts/ui-guard.mjs` 是只读扫描，已实跑）。
 > 口径：静态解析 12 份 CSS 的规则块/类名/行/字节；全 src 类名消费点扫描（含模板字符串动态前缀、测试钩子、`querySelector` 字符串）。
 
@@ -21,7 +23,7 @@
 | tokens.css | 68 | 4,758 | 0（1 个 `:root`） | 0 | 全部 12 份 | **L1** 语义令牌唯一层 |
 | base.css | 420 | 10,078 | 22 | 0 | 18 | **L2** 壳层 `app-shell/body/main/page`、`empty-state`、`skip-link`、雾斑+颗粒、窗控热区 |
 | titlebar.css | 334 | 8,350 | 21 | 4 | 29 | **L2** `title-bar`(8) + `navigation-rail`(6)；组选择器顺带给 `.status-badge/.badge` 形状 |
-| workbench.css | 1,548 | 34,748 | 106 | **72** | 59 | **L3** 共享控件 `btn/badge/status-badge/page-header/settings-panel/section-caption/settings-backup`（551 行）+ 已退役「历史工作台」全家桶（968 行死） |
+| components.css | 1,548 | 34,748 | 106 | **72** | 59 | **L3** 共享控件 `btn/badge/status-badge/page-header/settings-panel/section-caption/settings-backup`（551 行）+ 已退役「历史工作台」全家桶（968 行死） |
 | notify.css | 123 | 3,674 | 9 | 0 | 1（`platform/notify`） | **L3** sonner 主题，`sonner-` 前缀隔离 |
 | accounts.css | 1,409 | 32,560 | 130 | **31** | 45 | **L3+L4 混层**：共享 `account-list/account-card/account-item/seg-control/slot-badge/account-center__profile`（745 行）+ 页面 `account-detail/mobile-prompt/remote-devices`（341 行） |
 | checkin.css | 196 | 4,142 | 23 | 0 | 9 | **L3+L4**：`checkin-flow` 15 类跨 checkin/library 复用（122 行）+ `checkin-page/checkin-progress`（66 行） |
@@ -38,22 +40,22 @@
 |---|---|---|
 | **L1 tokens** | `tokens.css` | 68 |
 | **L2 base** | `base.css` + `titlebar.css` | 754 |
-| **L3 components** | `workbench.css` 余 551 + `notify.css` 71 + `styles.css` 的 `.product-badge` + 上移段：accounts 745、environment 263、checkin 122、overview 64、workbuddy 33、master-detail 8、history 4 | ≈1,861 |
+| **L3 components** | `components.css` 余 551 + `notify.css` 71 + `styles.css` 的 `.product-badge` + 上移段：accounts 745、environment 263、checkin 122、overview 64、workbuddy 33、master-detail 8、history 4 | ≈1,861 |
 | **L4 pages** | accounts 341、environment 419、history 881、master-detail 504、overview 104、workbuddy 36、checkin 66 | ≈2,351 |
 
 落盘建议：`styles/{tokens.css, base.css, components.css, pages/{accounts,checkin,environment,history,master-detail,overview,workbuddy}.css}`；`@import` 顺序即层级（L1→L2→L3→L4）。保留「一页一文件」以便一页一 PR；上移 L3 段后各页面文件均在 300–900 行，无预算压力。
 
 ### 1.3 重复类名（跨文件 9 个）
 
-**3 处真值冲突**：`.workbench-read`（overview.css:67/89 → workbench.css:29/828/1193，`min-height 100vh-108px` → `-120px` → `0`，终值由 import 顺序决定）；`.settings-panel`（overview.css:66-73 与 88-92 **同文件两段互相覆写**，`padding:24px` 重复声明）；`.settings-panel__section-heading`（overview.css:76 只改 `align-items`，workbench.css:160/170/273/1233 给 flex 骨架）。
-**2 处形状/色拆分**：`.status-badge` / `.badge` / `.workbench__read-only-badge`（titlebar.css:99-101 组选择器给形状，workbench.css:3/123/133 给 padding/色；其中 `.badge` 与 `.workbench__read-only-badge` 零引用）。
-**4 处良性分工**：`.btn`（基类在 workbench.css:749-825，accounts.css:454/1110 与 master-detail.css:195 只覆写 `margin/padding`）、`.page-header`（基类在 workbench，history.css:16 / master-detail.css:15 只 `flex:none`）、`.title-bar__winctl--close`（base.css:225 收圆角 vs titlebar.css:142/148 hover 红）。
+**3 处真值冲突**：`.workbench-read`（overview.css:67/89 → components.css:29/828/1193，`min-height 100vh-108px` → `-120px` → `0`，终值由 import 顺序决定）；`.settings-panel`（overview.css:66-73 与 88-92 **同文件两段互相覆写**，`padding:24px` 重复声明）；`.settings-panel__section-heading`（overview.css:76 只改 `align-items`，components.css:160/170/273/1233 给 flex 骨架）。
+**2 处形状/色拆分**：`.status-badge` / `.badge` / `.workbench__read-only-badge`（titlebar.css:99-101 组选择器给形状，components.css:3/123/133 给 padding/色；其中 `.badge` 与 `.workbench__read-only-badge` 零引用）。
+**4 处良性分工**：`.btn`（基类在 components.css:749-825，accounts.css:454/1110 与 master-detail.css:195 只覆写 `margin/padding`）、`.page-header`（基类在 workbench，history.css:16 / master-detail.css:15 只 `flex:none`）、`.title-bar__winctl--close`（base.css:225 收圆角 vs titlebar.css:142/148 hover 红）。
 同文件内重复 170 组（基础 + 状态修饰）属正常，不在清理目标内。
 **CSS↔TS 跨语言耦合**：`.checkin-flow`（checkin.css:74）、accounts.css:9-25 stagger 规则、`App.tsx:26` `STAGGER_LISTS` 三处硬绑同一类名，改名即静默失效。
 
 ### 1.4 死类与死规则
 
-- **workbench.css：72/106 类零引用**（P1 审计口径 68/105，差额来自动态前缀修正与裸 `.workbench`），**136 条纯死规则 / 968 行 / 22,028 B（63.4%）**。三簇：①`workbench__*` 历史工作台全家桶（header/summary/auth/workspace/tree/sessions/preview/node/message/search/select-row，含 2 段 `@media` 内规则）；②`workbench-read__*` 5 类 + `.workbench-read`；③`history-switcher` 全 15 类。另有 **22 条混合规则**（活类与死类同选择器组，如 `.workbench, .settings-panel, .workbench-read`、`.workbench__header-copy h1, .page-header h1`），只能改选择器、不能整块删。
+- **components.css：72/106 类零引用**（P1 审计口径 68/105，差额来自动态前缀修正与裸 `.workbench`），**136 条纯死规则 / 968 行 / 22,028 B（63.4%）**。三簇：①`workbench__*` 历史工作台全家桶（header/summary/auth/workspace/tree/sessions/preview/node/message/search/select-row，含 2 段 `@media` 内规则）；②`workbench-read__*` 5 类 + `.workbench-read`；③`history-switcher` 全 15 类。另有 **22 条混合规则**（活类与死类同选择器组，如 `.workbench, .settings-panel, .workbench-read`、`.workbench__header-copy h1, .page-header h1`），只能改选择器、不能整块删。
 - **accounts.css：31 类 / 42 条纯死规则 / 304 行 / 6,367 B（24.5%）**，集中在 `account-center__header/hero-*/summary/target-*/switch-state/checkin-*/boundary/advanced` 与 `account-card__credits-*`；另 7 条混合规则。
 - 其余：environment 7 类/41 行、overview 6 类/54 行、titlebar 4 类/4 行（`.workbench__read-only-badge`、`.title-bar__context`，以及组选择器夹带的 `workbench__node--active/__session--active`）、history 1 类/18 行（`.history-page`）、master-detail 1 类/7 行（`.history-page--embedded`）。
 - **测试相关、不进删除清单**：`.overview-checkin`（e2e `data-testid`，非 class）、`.env-self-check`（`env-self-check-repair` testid 前缀）、`.badge`（仅作 `product-badge/slot-badge` 子串）。
@@ -75,7 +77,7 @@
 | 10 | history.css:683 `.account-avatar--c1` | `#34a853` | **新 `--account-tone-1`**（G21 账号色板） |
 | 11 | history.css:687 `.account-avatar--c2` | `#f9ab00` | **新 `--account-tone-2`**（c0 走 `--accent`，不新增） |
 | 12 | history.css:735 `.leg-step__dot .account-avatar` | `border: 2px solid #fff` | 既有 `--text-on-accent` |
-| 13 | workbench.css:764 `.btn` | `0 1px 0 rgba(20,32,42,.05)` | **新 `--shadow-btn`**（或并入 `--shadow-panel` 近似归一） |
+| 13 | components.css:764 `.btn` | `0 1px 0 rgba(20,32,42,.05)` | **新 `--shadow-btn`**（或并入 `--shadow-panel` 近似归一） |
 
 新增 **7 个 token**（`--shadow-lift/--shadow-chip/--shadow-btn/--scrim/--accent-ring/--account-tone-1/--account-tone-2`），复用 `--text-on-accent` 3 处，约 14 行写入 tokens.css。
 **盲区**：`src/styles.css`:30-44 的 `.product-badge--trae/--workbuddy/--neutral` 有 9 处字面色值，`--color-accent`(#3b82f6) 与 `--color-text-secondary`(#94a3b8) **全仓无定义** → 产品徽标实际是 Bootstrap 蓝/石板灰，不是 `--accent` 靛蓝。修法：新增 `--product-trae/--product-wb/--product-neutral` + 该家族移入 L3。**有可见视觉变化，单独一步 + 截图对照。**
