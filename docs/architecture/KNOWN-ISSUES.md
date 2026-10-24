@@ -305,14 +305,25 @@ P4e-9b（2026-10-24）补 G3 / G4 各 4 例（现该文件 31 例），两项已
      （视图 `loadingNote` 仅在备份区给「正在读取备份链…」；签到区无首读占位句，与旧 WB 一致）；
   ② 设置页不可见期间不再有后台 IPC 回写（旧 WB 在后台也会静默刷新）。
 
-## K-12 设置页旧两变体保留期（P4f-5，2026-10-24，过渡残留）
+## K-12 设置页旧变体删除进度（P4f-5 保留 → P4f-6 部分删除，2026-10-24）
 
-- `src/components/settings/TraeSettingsVariant.tsx`（556 行）、`WorkBuddySettingsVariant.tsx`（46 行）、
-  `WorkBuddyBackupSection.tsx`（265 行）、`WorkBuddyAutoCheckinSettings.tsx`（109 行）与
-  `shared/checkin/AutoCheckinSettingsCard.tsx` 于 P4f-5 **暂不删除**（按任务书要求保留），
-  此刻已不再被 `sectionSlots.settings` 引用——生产路径全部走 `features/settings/SettingsPage`。
-- 影响：`docs/architecture/exceptions.md` 的 E-01 仍登记这四个文件（白名单只增不减，删除时同步收敛）。
-  `tests/SettingsPanel.test.tsx`（19 例）与 `tests/WorkBuddyPages.test.tsx` 的设置 3 例 + 备份段 4 例
-  仍按旧组件渲染路径跑（经 `SettingsPanel` → 槽位 → **新合并页**），故它们已实际覆盖新页。
-- 退出条件：下一票删除上述五文件 + `SettingsPanel.tsx` + `sectionSlots.tsx`（E-01 整条失效），
-  届时把旧测试文件按新页锚点收编（锚点已逐字保留，迁移预期零改动）。
+- P4f-6 已删除（生产零引用，实测 5 项验收全绿）：
+  `src/components/settings/TraeSettingsVariant.tsx`（556 行）、
+  `src/components/settings/WorkBuddySettingsVariant.tsx`（46 行）、
+  `src/components/WorkBuddyAutoCheckinSettings.tsx`（109 行），
+  以及空目录 `src/components/settings/`。
+- **未删（本票遗留，唯一阻塞点是测试的模块级 import）**：
+  `src/components/WorkBuddyBackupSection.tsx`（265 行）——`tests/WorkBuddyPages.test.tsx:279`
+  直接 `import { WorkBuddyBackupSection } from "../src/components/WorkBuddyBackupSection"`，
+  并有 4 例（L318-376）直接 `render(<WorkBuddyBackupSection />)`。删除该文件即
+  `pnpm typecheck` TS2307 红、vitest 整套无法解析 import。按任务书「不许改测试、红则回滚」，
+  本票保持该文件不动，其 4 例继续按旧组件跑（锚点与新页 `BackupSection` 逐字一致，
+  收编时预期零改动）。`shared/checkin/AutoCheckinSettingsCard.tsx`（131 行）随之失去
+  唯一生产消费者，但同样留待下一票处理（测试零引用，可与 BackupSection 同批删）。
+- 影响：`docs/architecture/exceptions.md` 的 E-01 已于 P4f-6 收敛为两个文件
+  （`sectionSlots.tsx` + `SettingsPanel.tsx`），设置变体的行数豁免条目移除。
+  `tests/SettingsPanel.test.tsx`（19 例）与 `tests/WorkBuddyPages.test.tsx` 的设置 3 例
+  仍按旧渲染路径跑（经 `SettingsPanel` → 槽位 → **新合并页**），故它们已实际覆盖新页。
+- 退出条件：下一票删除 `WorkBuddyBackupSection.tsx` + `AutoCheckinSettingsCard.tsx`
+  （同时收编那 4 例到新页 `BackupSection` 锚点），再删 `SettingsPanel.tsx` + `sectionSlots.tsx`
+  （E-01 整条失效）。

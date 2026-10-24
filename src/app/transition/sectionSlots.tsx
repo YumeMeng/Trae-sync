@@ -110,7 +110,7 @@ const WorkBuddyLibrarySlot = (props: LibraryPageProps) => (
 
 // P4f-5：settings 的 TRAE 槽位切到合并页（与 accounts / environment / library 同形）。接缝内绑定
 // 产品协议值，页面内零产品判断；旧 components/settings/TraeSettingsVariant 与
-// WorkBuddySettingsVariant 本票保留、此刻不再被槽位引用（下一票删除）。
+// WorkBuddySettingsVariant 已于 P4f-6 删除，settings 槽位不再需要两套实现。
 const TraeSettingsSlot = (props: SettingsPageProps) => (
   <SettingsPage {...props} productId={CURRENT_PRODUCT_ID} />
 );

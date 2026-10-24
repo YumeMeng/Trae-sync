@@ -1,8 +1,8 @@
 // TRANSITION: 仅过渡用，P4 页面迁移完成后删除（与 app/transition/sectionSlots.tsx 同批）。
 //
-// 设置页槽位分发器：原第 260 行的 `if (productId === "workbuddy") return ...`
-// 整页早返回已拆成独立组件（settings/WorkBuddySettingsVariant.tsx），TRAE 主体
-// 搬到 settings/TraeSettingsVariant.tsx。本文件只做一件事——按槽位解析选变体：
+// 设置页槽位分发器：本文件只做一件事——按槽位解析取实现。
+// 原拆出的两个变体（settings/TraeSettingsVariant.tsx、settings/WorkBuddySettingsVariant.tsx）
+// 已于 P4f-6 删除，此刻两产品槽位同指 features/settings/SettingsPage；
 // 产品判断收敛到 app/transition/sectionSlots.tsx 的 resolveSection，此处零分支。
 //
 // 保留 productId 入参是兼容既有调用面（App 传当前产品；测试按产品渲染），
