@@ -157,13 +157,6 @@
   flex-direction: column;
 }
 
-/* 嵌入态历史视图：高度由 tab 面板约束（页面高度计算交给详情页骨架） */
-.history-page--embedded {
-  height: 100%;
-  flex: 1;
-  gap: 12px;
-}
-
 /* —— 插件 tab（G23 表格化，ADR-0026 实时同步）：分段控件 + 分类 chips
    + 密集行列表 + 确认弹窗（对账条已随静默应用策略移除） —— */
 .plugin-workbench {
@@ -368,28 +361,6 @@
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.plugin-badge {
-  flex: none;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--glass);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-3);
-}
-
-/* 「切号保留/已安装」徽章：清单绑定态（G4 术语） */
-.plugin-badge--bound {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-/* 「仅此账号」徽章：清单外条目（TRAE 内手动装/自装） */
-.plugin-badge--drift {
-  border: 1px dashed var(--line-hair);
-  color: var(--text-2);
 }
 
 /* —— 数据校验 tab（P5-7）：只读排查，异常才亮色（琥珀），正常态中性安静 —— */

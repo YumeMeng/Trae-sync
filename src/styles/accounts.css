@@ -39,8 +39,6 @@
   border-top: 1px solid var(--line-hair);
 }
 
-.account-center__header,
-.account-center__card-heading,
 .account-center__section-heading,
 .account-center__profile {
   display: flex;
@@ -50,115 +48,10 @@
   gap: 12px;
 }
 
-.account-center__header h2,
-.account-center__header p,
-.account-center__card-heading h3,
-.account-center__section-heading h3,
-.account-center__boundary h3,
-.account-center__boundary p {
+.account-center__section-heading h3 {
   margin: 0;
 }
 
-.account-center__header h2 {
-  margin-top: 4px;
-  font-size: 18px;
-}
-
-.account-center__header p {
-  margin-top: 6px;
-  color: var(--text-2);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.account-center__header-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.account-center__summary {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-}
-
-/* 当前账号大卡：头像 + 名称 + 验证徽章 + 操作，一行扫完核心信息。 */
-.account-center__hero-card {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 14px;
-  padding: 18px;
-  /* 玻璃面板标准组合 */
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-panel);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  box-shadow: var(--glass-shadow), var(--glass-edge);
-}
-
-.account-center__avatar {
-  display: grid;
-  width: 46px;
-  height: 46px;
-  flex: 0 0 auto;
-  place-items: center;
-  border-radius: 50%;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-size: 19px;
-  font-weight: 750;
-}
-
-.account-center__hero-copy {
-  display: grid;
-  min-width: 0;
-  flex: 1;
-  gap: 3px;
-}
-
-.account-center__hero-copy h2 {
-  margin: 0;
-  font-size: 17px;
-  overflow-wrap: anywhere;
-}
-
-.account-center__hero-meta {
-  color: var(--text-2);
-  font-size: 12px;
-}
-
-.account-center__hero-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-/* 高级区默认折叠：密钥与签到属于低频操作，不与主流程抢注意力。 */
-.account-center__advanced {
-  min-width: 0;
-  padding: 0 16px;
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--fill-soft);
-}
-
-.account-center__advanced > summary {
-  min-height: var(--control-height);
-  display: flex;
-  align-items: center;
-  cursor: pointer;
-  font-weight: 600;
-  color: var(--text-2);
-}
-
-.account-center__summary-card,
 .account-center__profiles {
   min-width: 0;
   padding: 16px;
@@ -167,7 +60,6 @@
   background: var(--fill-soft);
 }
 
-.account-center__card-heading h3,
 .account-center__section-heading h3 {
   display: flex;
   align-items: center;
@@ -176,46 +68,17 @@
   font-size: 15px;
 }
 
-.account-center__current {
-  display: grid;
-  gap: 5px;
-  margin-top: 14px;
-}
-
-.account-center__current strong,
 .account-center__profile-copy strong {
   color: var(--text-1);
   font-size: 14px;
   overflow-wrap: anywhere;
 }
 
-.account-center__current span,
 .account-center__meta,
 .account-center__profile-copy span {
   color: var(--text-2);
   font-size: 12px;
   line-height: 1.45;
-}
-
-.account-center__verification-copy {
-  margin: 14px 0 6px;
-  color: var(--text-2);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-/* P7-4 登录等待行：提示文案 + 取消按钮并排，等待期间随时可收尾 */
-.account-center__login-waiting {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.account-center__login-waiting .account-center__meta {
-  margin: 0;
-  flex: 1;
-  min-width: 240px;
 }
 
 .account-center__profile-list {
@@ -237,11 +100,6 @@
   background: var(--glass);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
-}
-
-.account-center__profile--current {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
 }
 
 .account-center__profile--selected {
@@ -279,64 +137,7 @@
   flex-wrap: wrap;
 }
 
-.account-center__message,
-.account-center__switch-state {
-  margin: 0;
-  padding: 10px 12px;
-  /* 正常态消息条：中性玻璃底（异常才亮色哲学，绿色清剿见 T4） */
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  color: var(--text-2);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
 /* G9 结果卡已由 notify.summary 全局通知承载（P11-1 切片②），页内样式随迁清理。 */
-
-.account-center__handoff,
-.account-center__key-status,
-.account-center__checkin {
-  min-width: 0;
-  padding: 16px;
-  /* 内部分区：密集玻璃（更实保可读） */
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass-dense);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-}
-
-.account-center__checkin-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.account-center__checkin-item {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  min-height: 38px;
-  padding: 8px 10px;
-  /* 行级玻璃标准组合 */
-  border: 1px solid var(--line-hair);
-  border-radius: var(--radius-control);
-  background: var(--glass);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  color: var(--text-2);
-  font-size: 12px;
-}
-
-.account-center__checkin-item span {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
 
 .account-center__checkin-results {
   display: grid;
@@ -368,13 +169,6 @@
   overflow-wrap: anywhere;
 }
 
-.account-center__target-grid {
-  display: grid;
-  grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1fr);
-  gap: 12px;
-  margin-top: 14px;
-}
-
 .account-center__target-field {
   display: grid;
   gap: 5px;
@@ -396,50 +190,6 @@
   font-size: 13px;
 }
 
-.account-center__target-summary {
-  display: grid;
-  align-content: center;
-  gap: 4px;
-  min-width: 0;
-  padding: 10px 12px;
-  border-left: 3px solid var(--accent);
-  background: var(--accent-soft);
-}
-
-.account-center__target-summary strong,
-.account-center__target-summary span {
-  overflow-wrap: anywhere;
-}
-
-.account-center__target-summary strong {
-  color: var(--text-1);
-  font-size: 13px;
-}
-
-.account-center__target-summary span {
-  color: var(--text-2);
-  font-size: 11px;
-}
-
-.account-center__action-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 14px;
-}
-
-.account-center__switch-state {
-  display: grid;
-  gap: 3px;
-  margin-top: 12px;
-}
-
-.account-center__switch-state--waiting {
-  border-color: var(--warn-line);
-  background: var(--warn-soft-bg);
-  color: var(--warn);
-}
-
 .account-center__key-grid {
   display: flex;
   align-items: center;
@@ -452,61 +202,6 @@
 
 .account-center__key-grid .btn {
   margin-left: auto;
-}
-
-.account-center__boundary {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 16px;
-  border-left: 3px solid var(--accent);
-  background: var(--accent-soft);
-}
-
-.account-center__boundary svg {
-  flex: 0 0 auto;
-  margin-top: 2px;
-  color: var(--accent);
-}
-
-.account-center__boundary h3 {
-  font-size: 14px;
-}
-
-.account-center__boundary p {
-  margin-top: 5px;
-  color: var(--text-2);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-@media (min-width: 1024px) and (max-width: 1199px) {
-  .account-center__header {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .account-center__header-actions {
-    justify-content: flex-start;
-  }
-
-}
-
-@media (max-width: 1100px) {
-  .account-center__summary {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .account-center__target-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-@media (max-width: 720px) {
-  .account-center__hero-card {
-    align-items: flex-start;
-  }
-
 }
 
 /* —— 我的账号卡片矩阵（P1-3 精简五要素版）：头像/名称/积分/今日徽章/健康度徽章 —— */
@@ -581,13 +276,6 @@
   color: var(--accent);
   font-size: 16px;
   font-weight: 750;
-}
-
-/* fixture 行内小头像：与普通档案行高度对齐 */
-.account-card__avatar--inline {
-  width: 30px;
-  height: 30px;
-  font-size: 13px;
 }
 
 /* 卡片名称：单行截断，长名称不撑开卡片（G12 布局中与使用中 chip 同行）。 */
@@ -810,24 +498,11 @@
   color: var(--text-3);
 }
 
-.account-item__credits-placeholder {
-  font-size: 11px;
-  color: var(--text-3);
-}
-
 /* 持续失败标记：最近一次额度刷新失败（成功后清除），琥珀提醒 */
 .account-item__credits-failed {
   font-size: 10px;
   font-weight: 600;
   color: var(--warn);
-}
-
-/* 卡片视图补充：槽位行与操作行布局（卡片基础样式沿用 account-card--clickable） */
-.account-item__slots {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  flex-wrap: wrap;
 }
 
 /* ===== G12 卡片视图独立布局 =====
@@ -856,16 +531,6 @@
   font-weight: 750;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
-}
-
-.account-card__credits-label {
-  color: var(--text-2);
-  font-size: 12px;
-}
-
-.account-card__credits-placeholder {
-  color: var(--text-3);
-  font-size: 12.5px;
 }
 
 /* 持续失败标记（卡片形态）：与列表标记同语义，琥珀提醒。 */
@@ -1112,13 +777,6 @@
   font-size: 12px;
 }
 
-/* G11 手机号行：脱敏号比对提示（输入框下方次要信息，不占主视野）。 */
-.account-detail__mobile-hint {
-  margin: 0;
-  color: var(--text-2);
-  font-size: 12px;
-}
-
 /* ============================================================
    G11 登录后手机号补录弹层：遮罩复用 .switch-veil（environment.css），
    卡片与切号弹层同款磨砂玻璃规格。
@@ -1193,12 +851,6 @@
   margin: 12px 0 0;
   color: var(--text-2);
   font-size: 12.5px;
-}
-
-/* 旧通道凭据等需要用户动手的警示提示 */
-.account-detail__hint--warn {
-  color: var(--warn);
-  font-weight: 600;
 }
 
 /* 详情页事实值中的失败警示（最近额度刷新失败原因） */

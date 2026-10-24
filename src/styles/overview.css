@@ -27,41 +27,6 @@
   gap: 12px;
 }
 
-.overview-checkin__stat {
-  display: grid;
-  gap: 3px;
-  padding: 11px 14px;
-  border: 1px solid var(--line-hair);
-  border-radius: 12px;
-  background: var(--glass-hover);
-}
-
-.overview-checkin__stat strong {
-  font-size: 16px;
-  font-weight: 650;
-  color: var(--text-1);
-  font-variant-numeric: tabular-nums;
-}
-
-.overview-checkin__stat strong em {
-  font-style: normal;
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--text-3);
-  margin-left: 2px;
-}
-
-.overview-checkin__stat span {
-  font-size: 10.5px;
-  color: var(--text-3);
-}
-
-.overview-checkin__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
 .settings-panel {
   display: flex;
   min-height: calc(100vh - 108px);
@@ -107,13 +72,6 @@
   overflow-wrap: anywhere;
 }
 
-.overview-page__hero-sub {
-  margin: 8px 0 0;
-  color: var(--text-2);
-  font-size: 14px;
-  overflow-wrap: anywhere;
-}
-
 /* 证据带（原标题栏下沉，2026-08-27）：当前账号 + 重新检测。
    玻璃面板标准组合，信息密度低于签到摘要，作为 hero 的可复核补充。 */
 .overview-evidence {
@@ -144,18 +102,6 @@
   color: var(--text-1);
   font-size: 13px;
   font-weight: 650;
-}
-
-.overview-evidence__redetect {
-  margin-left: auto;
-  flex: 0 0 auto;
-}
-
-.overview-evidence__error {
-  flex-basis: 100%;
-  color: var(--danger);
-  font-size: 12px;
-  overflow-wrap: anywhere;
 }
 
 /* 统计卡：等宽三列，窄屏退化为单列，保持数字用表格数字对齐。 */

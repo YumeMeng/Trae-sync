@@ -3,19 +3,6 @@
    （消息流按接力账号着色 + 接力时间线）。所有色值走语义令牌
    （tokens.css），换主题无需改本文件。 */
 
-/* —— 页面骨架：占满视口剩余高度，两栏各自内部滚动 —— */
-.history-page {
-  display: flex;
-  flex-direction: column;
-  /* 与旧工作台同口径：标题栏 + 呼吸带 + 主区内边距的合计预留 */
-  height: calc(100vh - 112px);
-  min-height: 0;
-}
-
-.history-page .page-header {
-  flex: none;
-}
-
 /* 空态/引导/错误已由共享 EmptyState 组件承载（P11-6 任务 4），
    样式收敛到 base.css 的 .empty-state 家族；.history-empty 仅为测试钩子，
    这里只保留 flex 容器内的撑满布局职责。 */
@@ -884,12 +871,6 @@
 
 /* —— 窄视口降级：左栏收窄为可滚动区块 —— */
 @media (max-width: 1100px) {
-  .history-page {
-    /* 低于该宽度改为页面级滚动，避免两栏被过度压缩 */
-    height: auto;
-    min-height: calc(100vh - 112px);
-  }
-
   .history-body {
     flex-direction: column;
   }
