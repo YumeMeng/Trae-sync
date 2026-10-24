@@ -113,6 +113,21 @@ export default function App() {
       .catch(() => undefined);
   }, [handleOpenLibraryDetail]);
 
+  /**
+   * 库页内跳转接缝（P4e-8c）：新库页只回传 libraryId（签名登记在 P4e-8a），而 App 的
+   * 详情入口收 LibraryRef（{ id, displayName }）。转换就地在这里做——主库清空副库引用，
+   * 其余沿用副环境那条回查路径补显示名（读不到即回落「副库」，不阻塞浏览）。
+   */
+  const handleOpenLibraryDetailFromId = useCallback((libraryId: string) => {
+    if (libraryId === "master") handleOpenMasterDetail();
+    else handleOpenEnvDetail(libraryId);
+  }, [handleOpenEnvDetail, handleOpenMasterDetail]);
+
+  /** 库页其余动作出口（P4e-8c）：空态引导「去环境页」落到环境页；其余动作暂无接线。 */
+  const handleLibraryAction = useCallback((actionId: string) => {
+    if (actionId === "empty-open-environment") handlePageChange("environment");
+  }, [handlePageChange]);
+
   const refreshWorkspaceState = useCallback(async () => {
     const generation = (workspaceRefreshGenerationRef.current += 1);
     setWorkspaceRefreshPending(true);
@@ -312,10 +327,17 @@ export default function App() {
             />
           </div>
           <div className="app-page" hidden={activePage !== "master-library"}>
+            {/* P4e-8c：库页两产品共用一份实现，productId 由槽位包装绑定。库实例（id + 显示名）
+                取 App 现有详情态（detailLibrary，缺省主库；副环境入口注入 env_id 与环境名）。
+                返回 → 环境页；空态引导（empty-open-environment）同样落到环境页；其余动作原样透出。
+                onOpenLibraryDetail 的签名转换就地做：新页回传 libraryId，App 的入口收 LibraryRef。 */}
             <LibrarySection
               active={activePage === "master-library"}
-              onNavigate={handlePageChange}
-              library={detailLibrary}
+              libraryId={detailLibrary.id}
+              libraryDisplayName={detailLibrary.displayName}
+              onBack={() => handlePageChange("environment")}
+              onOpenLibraryDetail={handleOpenLibraryDetailFromId}
+              onAction={handleLibraryAction}
             />
           </div>
           <div className="app-page" hidden={activePage !== "settings"}>

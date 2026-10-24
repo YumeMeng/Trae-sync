@@ -38,6 +38,8 @@ export interface LibrarySessionsBodyProps {
   readonly onRetryRecovery: () => void;
   /** 归档执行中（恢复条与草稿条按钮转忙碌）。 */
   readonly archiveBusy: boolean;
+  /** 选择模式提示条文案（页面按视图 selectMode 注入；缺省不渲染，旧 L1706-1711）。 */
+  readonly selectHint?: string | null;
 }
 
 export function LibrarySessionsBody(props: LibrarySessionsBodyProps) {
@@ -79,7 +81,8 @@ export function LibrarySessionsBody(props: LibrarySessionsBodyProps) {
             onQuickArchive={props.onQuickArchive} onAction={props.onAction} footer={footer} />
         </aside>
         <SessionViewer view={view.viewer} heading={props.heading ?? { title: "", projectName: "", messageCount: 0, lastActiveLabel: "" }}
-          flowRef={props.flowRef} onTabChange={props.onTabChange} onClose={props.onCloseViewer} onLoadOlder={props.onLoadOlder} />
+          flowRef={props.flowRef} onTabChange={props.onTabChange} onClose={props.onCloseViewer} onLoadOlder={props.onLoadOlder}
+          selectHint={props.selectHint ?? null} />
       </div>
       {/* 批量栏：TRAE 选择模式浮出浮动栏（fixed 不占流）；WB 页内动作行常驻（树之后、体检卡之前，WB393）。 */}
       <LibraryBatchBar bar={view.batchBar} selectMode={selection.selectMode} onAction={props.onAction} />

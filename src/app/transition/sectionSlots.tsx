@@ -18,8 +18,10 @@ import {
   OverviewPage,
   type OverviewPageProps,
 } from "../../features/overview/OverviewPage";
-import { MasterLibraryDetail } from "../../pages/MasterLibraryDetail";
-import { WorkBuddyLibraryPage } from "../../pages/WorkBuddyLibraryPage";
+import {
+  LibraryPage,
+  type LibraryPageProps,
+} from "../../features/library/LibraryPage";
 import {
   AccountsPage,
   type AccountsPageProps,
@@ -94,6 +96,19 @@ const WorkBuddyEnvironmentSlot = (props: EnvironmentPageProps) => (
   <EnvironmentPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
 );
 
+// P4e-8c：library 的 TRAE 槽位切到合并页（与 accounts / environment 同形）。接缝内绑定
+// 产品协议值，页面内零产品判断；库实例（libraryId / libraryDisplayName）与返回、跳转
+// 回调由 App 注入（App 现有 libraryDetail 态即库实例来源）。旧 pages/MasterLibraryDetail
+// 与 pages/WorkBuddyLibraryPage 本票不删，此刻不再被槽位引用。
+const TraeLibrarySlot = (props: LibraryPageProps) => (
+  <LibraryPage {...props} productId={CURRENT_PRODUCT_ID} />
+);
+// P4e-8c：library 的 WorkBuddy 槽位同样指向合并页（WB 无库实例概念：页面缺省 libraryId
+// 即主库，builder 只按产品查装配表）。旧 pages/WorkBuddyLibraryPage 保留到下一票删除。
+const WorkBuddyLibrarySlot = (props: LibraryPageProps) => (
+  <LibraryPage {...props} productId={WORKBUDDY_PRODUCT_ID} />
+);
+
 /**
  * 六区块 × 两产品的实现登记表（settings 也登记：其 WB 变体曾是整页早返回）。
  * 只登记、不判断：产品选择逻辑全部在 resolveSection 一处。
@@ -107,7 +122,8 @@ export const SECTION_SLOTS: Record<SectionKey, SectionSlot> = {
   checkin: { trae: TraeCheckinSlot, workbuddy: WorkBuddyCheckinSlot },
   // P4d-8b-1：两产品都指向同一份环境页实现（迁移完成的正常形态）。
   environment: { trae: TraeEnvironmentSlot, workbuddy: WorkBuddyEnvironmentSlot },
-  "master-library": { trae: MasterLibraryDetail, workbuddy: WorkBuddyLibraryPage },
+  // P4e-8c：两产品都指向同一份库页实现（迁移完成的正常形态）。
+  "master-library": { trae: TraeLibrarySlot, workbuddy: WorkBuddyLibrarySlot },
   settings: { trae: TraeSettingsVariant, workbuddy: WorkBuddySettingsVariant },
 };
 

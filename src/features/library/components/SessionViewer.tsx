@@ -38,6 +38,11 @@ export interface SessionViewerProps {
   readonly onClose: () => void;
   /** 滚到顶「加载更早」出口（是否可加载由 view.hasMoreBefore / loadingOlder 判定）。 */
   readonly onLoadOlder: () => void;
+  /**
+   * 选择模式提示条文案（视图 selectMode 时由页面注入 LIBRARY_TEXTS.previewReadonly；缺省不渲染）。
+   * 旧实现 L1706-1711：提示条落在右栏面板内、查看器之上（查看器仍可看，只提示只读预览）。
+   */
+  readonly selectHint?: string | null;
 }
 
 /** 标题区（L2030-2056）：标题 + 项目 + 消息数 + 最后活动 + 关闭。 */
@@ -105,10 +110,15 @@ function ViewerTab({ id, label, active, testId, onClick }: {
 }
 
 /** 查看器：无会话给空态引导；有会话给标题区 + tab 条 + tab 面板（消息流 / 接力时间线）。 */
-export function SessionViewer({ view, heading, flowRef, onTabChange, onClose, onLoadOlder }: SessionViewerProps) {
+export function SessionViewer({ view, heading, flowRef, onTabChange, onClose, onLoadOlder, selectHint = null }: SessionViewerProps) {
+  // 选择模式提示条（L1706-1711）：有会话与空态两分支都落在面板顶部，锚点 library-select-hint 逐字沿用。
+  const hint = selectHint === null ? null : (
+    <div className="viewer-roam" data-testid="library-select-hint">{selectHint}</div>
+  );
   if (view === null) {
     return (
       <section className="viewer-panel" aria-label={LIBRARY_TEXTS.regionViewer}>
+        {hint}
         <div className="viewer-empty" data-testid="library-viewer-empty">
           <MessageSquare size={30} strokeWidth={1.4} aria-hidden="true" />
           <p>{LIBRARY_TEXTS.viewerEmpty}</p>
@@ -121,6 +131,7 @@ export function SessionViewer({ view, heading, flowRef, onTabChange, onClose, on
     : <RelayTimeline legs={view.legs} />;
   return (
     <section className="viewer-panel" aria-label={view.ariaLabel}>
+      {hint}
       <div className="viewer" data-testid="library-viewer">
         <ViewerHead heading={heading} onClose={onClose} />
         <div className="viewer-tabs" role="tablist" aria-label={view.tabsAriaLabel}>

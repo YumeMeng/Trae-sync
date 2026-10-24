@@ -16,7 +16,9 @@ import { useTraeLibrary, type TraeLibraryPageFields } from "./components/useTrae
 import { useWbLibrary, type WbLibraryPageFields } from "./components/useWbLibrary";
 import { ASSEMBLERS, type Assembled } from "./components/libraryAssemblers";
 import { EmptyState } from "../../components/shared/EmptyState";
+import { LibraryEmptyCard, LibraryErrorCard } from "./components/LibraryStateBlocks";
 import { LibraryShell } from "./components/LibraryShell";
+import { LibraryStatsCard } from "./components/LibraryStatsCard";
 import { LibrarySessionsBody } from "./components/LibrarySessionsBody";
 import { LibraryInfoTab } from "./components/LibraryInfoTab";
 import { LibraryPluginTab } from "./components/LibraryPluginTab";
@@ -225,49 +227,14 @@ export function LibraryPage(props: LibraryPageProps) {
       onAction={handleAction} onActivateNode={toggleNode} onActivateSession={activateSession}
       onToggleSession={(row) => selection.toggleSession(row.id)}
       onQuickArchive={(row) => { if (row.quickArchive !== null) archive.quickArchive(row.id); }}
-      onRetryRecovery={archive.retry} archiveBusy={busyAll} />
+      onRetryRecovery={archive.retry} archiveBusy={busyAll}
+      selectHint={selection.selectMode ? LIBRARY_TEXTS.previewReadonly : null} />
   );
   const blocked = view.loadingNote !== null || view.error !== null || view.empty !== null;
-
-  return (
+  // 浮层（草稿条 / 三个确认层）与旧页一样落在 region 子树内（e2e 按 region 作用域取锚点），
+  // 定位仍由各自 CSS 的 fixed 承担，不占正文流。
+  const overlays = (
     <>
-      <LibraryShell view={view} className={assembled.shellClass} busy={busyIds} onAction={handleAction}
-        onTabChange={setActiveTab}>
-        {view.notices.map((notice, index) => <p className="checkin-page__meta" role="status" key={index}>{notice}</p>)}
-        {view.loadingNote !== null && <EmptyState role="status" description={view.loadingNote} />}
-        {view.error !== null && (
-          <EmptyState panel role="alert" title={view.error.title} description={view.error.description}
-            action={<button className="btn" type="button" onClick={() => void refresh()}>{view.error.retryLabel}</button>} />
-        )}
-        {view.empty !== null && (
-          <EmptyState panel title={view.empty.title} description={view.empty.hint === "" ? undefined : view.empty.hint} />
-        )}
-        {/* tab 面板按 view.tabs 切换（WB 无 tab：正文直接落树 + 查看器 + 体检卡）；
-            插件 tab 面板按视图形态给工作台或说明卡（只读库 / 副环境），库信息 tab 面板给信息卡 + 备份对比。 */}
-        {!blocked && (view.tabs.length > 0 ? (
-          <>
-            <div className="master-detail__tabpanel" hidden={activeTab !== "sessions"}>{sessions}</div>
-            <div className="master-detail__tabpanel" hidden={activeTab !== "plugins"}>
-              {view.plugins !== null && (
-                <LibraryPluginTab view={view.plugins} busy={pluginBusy} onSegmentChange={plugins.chooseSegment}
-                  onSearch={plugins.search} onCategoryChange={plugins.chooseCategory} onAction={handleAction}
-                  onRowAction={plugins.rowAction} onUninstallCancel={plugins.cancelUninstall} onUninstallConfirm={plugins.confirmUninstall} />
-              )}
-            </div>
-            <div className="master-detail__tabpanel" hidden={activeTab !== "info"}>
-              {view.info !== null && (
-                <LibraryInfoTab view={view.info} checkup={view.checkup} busy={infoBusy}
-                  onAction={handleAction} onBackupBase={verify.chooseBase} />
-              )}
-            </div>
-          </>
-        ) : (
-          <>
-            {sessions}
-            {view.checkup !== null && <WbCheckupCard view={view.checkup} onAction={handleAction} />}
-          </>
-        ))}
-      </LibraryShell>
       {/* 归档草稿条（L1851-1882）：与批量栏同时存在时上下错开（lib-actionbar--draft）。 */}
       {!blocked && view.draftBar !== null && <LibraryDraftBar bar={view.draftBar} busy={archive.busy} onAction={handleAction} />}
       {/* Work 库应用前确认（L1884-1901）：CN 只读库视图不给该单，故只在视图给出时渲染。 */}
@@ -282,5 +249,43 @@ export function LibraryPage(props: LibraryPageProps) {
       <LibraryMergeDialogs dialog={merge.dialog} busy={merge.busy} mergeStage={merge.mergeStage}
         onCancel={merge.cancel} onConfirm={(confirm: LibraryMergeConfirm) => merge.confirm(confirm)} />
     </>
+  );
+
+  return (
+    <LibraryShell view={view} className={assembled.shellClass} busy={busyIds} onAction={handleAction}
+      onTabChange={setActiveTab} overlays={overlays}>
+      {view.notices.map((notice, index) => <p className="checkin-page__meta" role="status" key={index}>{notice}</p>)}
+      {/* 统计卡（WB 五项；TRAE 的 view.stats 为 null，计数条在库信息 tab，故此处不渲染）。 */}
+      {!blocked && view.stats !== null && <LibraryStatsCard view={view.stats} />}
+      {view.loadingNote !== null && <EmptyState role="status" description={view.loadingNote} />}
+      {/* 读取失败卡与整页空态卡（旧锚 history-error / history-guide）：锚点与引导动作取自视图。 */}
+      {view.error !== null && <LibraryErrorCard error={view.error} onRetry={() => void refresh()} />}
+      {view.empty !== null && <LibraryEmptyCard empty={view.empty} onAction={handleAction} />}
+      {/* tab 面板按 view.tabs 切换（WB 无 tab：正文直接落树 + 查看器 + 体检卡）；
+          插件 tab 面板按视图形态给工作台或说明卡（只读库 / 副环境），库信息 tab 面板给信息卡 + 备份对比。 */}
+      {!blocked && (view.tabs.length > 0 ? (
+        <>
+          <div className="master-detail__tabpanel" hidden={activeTab !== "sessions"}>{sessions}</div>
+          <div className="master-detail__tabpanel" hidden={activeTab !== "plugins"}>
+            {view.plugins !== null && (
+              <LibraryPluginTab view={view.plugins} busy={pluginBusy} onSegmentChange={plugins.chooseSegment}
+                onSearch={plugins.search} onCategoryChange={plugins.chooseCategory} onAction={handleAction}
+                onRowAction={plugins.rowAction} onUninstallCancel={plugins.cancelUninstall} onUninstallConfirm={plugins.confirmUninstall} />
+            )}
+          </div>
+          <div className="master-detail__tabpanel" hidden={activeTab !== "info"}>
+            {view.info !== null && (
+              <LibraryInfoTab view={view.info} checkup={view.checkup} busy={infoBusy}
+                onAction={handleAction} onBackupBase={verify.chooseBase} />
+            )}
+          </div>
+        </>
+      ) : (
+        <>
+          {sessions}
+          {view.checkup !== null && <WbCheckupCard view={view.checkup} onAction={handleAction} />}
+        </>
+      ))}
+    </LibraryShell>
   );
 }

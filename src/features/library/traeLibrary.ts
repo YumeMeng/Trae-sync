@@ -218,12 +218,17 @@ export function buildTraeLibraryView(snapshot: TraeLibrarySnapshot): TraeLibrary
   const selected = visible.filter((session) => snapshot.selectedSessionIds.includes(session.session_id) || snapshot.selectedProjectIds.includes(session.project_id)).length;
   const mergeTargets = snapshot.selectedProjectIds.filter((id) => history !== null && history.projects.some((project) => project.project_id === id && project.name.trim() !== "")).length;
   const lib = snapshot.libraryTitle, failure = fillLibraryText(LIBRARY_TEXTS.loadFailure, { lib }), status = snapshot.history?.status ?? null;
-  const error = snapshot.loadError !== null || status === "read_failed" ? { title: failure, description: snapshot.loadError ?? "", retryLabel: LIBRARY_TEXTS.retry } : null; // L1396-1413
+  const error = snapshot.loadError !== null || status === "read_failed"
+    ? { title: failure, description: snapshot.loadError ?? "", retryLabel: LIBRARY_TEXTS.retry, testId: "history-error" } // L1396-1413
+    : null;
   // 空态（L1425-1481）：无库数据 / 未登记账号两档；非 full 能力库不出环境页引导与动作（P13-3）。
+  // 空态引导两档共用旧锚 history-guide（L1430 / L1460）；启动入口仅 no_master_data 给 history-guide-launch（L1446）。
   const empty = error !== null || (status !== "no_master_data" && status !== "no_current_account") ? null
     : status === "no_master_data"
-      ? { title: fillLibraryText(LIBRARY_TEXTS.emptyNoDataTitle, { lib }), hint: full ? fillLibraryText(LIBRARY_TEXTS.emptyNoDataHint, { lib }) : "", actionLabel: full ? LIBRARY_TEXTS.emptyNoDataAction : null }
-      : { title: fillLibraryText(LIBRARY_TEXTS.emptyNoAccountTitle, { lib }), hint: full ? fillLibraryText(LIBRARY_TEXTS.emptyNoAccountHint, { lib }) : "", actionLabel: full ? LIBRARY_TEXTS.emptyNoAccountAction : null };
+      ? { title: fillLibraryText(LIBRARY_TEXTS.emptyNoDataTitle, { lib }), hint: full ? fillLibraryText(LIBRARY_TEXTS.emptyNoDataHint, { lib }) : "",
+        actionLabel: full ? LIBRARY_TEXTS.emptyNoDataAction : null, actionId: "empty-open-environment", actionTestId: full ? "history-guide-launch" : null, testId: "history-guide" }
+      : { title: fillLibraryText(LIBRARY_TEXTS.emptyNoAccountTitle, { lib }), hint: full ? fillLibraryText(LIBRARY_TEXTS.emptyNoAccountHint, { lib }) : "",
+        actionLabel: full ? LIBRARY_TEXTS.emptyNoAccountAction : null, actionId: "empty-open-environment", actionTestId: null, testId: "history-guide" };
   // 空态文案（L1653-1663）：归档视图看归档集合，搜索态看命中数，浏览态看正常会话数。
   const treeEmpty = history === null ? LIBRARY_TEXTS.emptyNoSessions
     : snapshot.archiveView ? (visible.length === 0 ? LIBRARY_TEXTS.emptyArchived : "")

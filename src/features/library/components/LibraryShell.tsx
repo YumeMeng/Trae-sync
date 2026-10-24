@@ -58,10 +58,15 @@ export interface LibraryShellProps {
   readonly onTabChange: (tabId: LibraryTabId) => void;
   /** 内容槽：tab 面板（会话列表 / 插件 / 库信息由装配层填充）。 */
   readonly children: ReactNode;
+  /**
+   * 浮层槽（归档草稿条 / 删除与归并确认层）：渲染在 region **内部**（旧页弹层与草稿条
+   * 同样落在 region 子树里，e2e 按 region 作用域取锚点）。定位仍由各自 CSS 的 fixed 承担。
+   */
+  readonly overlays?: ReactNode;
 }
 
 /** 页面外框：region（aria-label 取 header.regionLabel）+ 页头 + tab 条 + 内容槽。 */
-export function LibraryShell({ view, tabsAriaLabel, className = "master-detail", headerExtra, busy = [], onAction, onTabChange, children }: LibraryShellProps) {
+export function LibraryShell({ view, tabsAriaLabel, className = "master-detail", headerExtra, busy = [], onAction, onTabChange, children, overlays }: LibraryShellProps) {
   const header = view.header, back = header.back, refresh = header.refresh;
   return (
     <section className={className} role="region" aria-label={header.regionLabel}>
@@ -98,6 +103,8 @@ export function LibraryShell({ view, tabsAriaLabel, className = "master-detail",
       )}
       {/* 有 tab 的库（详情页三 tab）内容包一层 tab 面板容器撑满剩余高度；无 tab 的库直接落正文。 */}
       {view.tabs.length > 0 ? <div className="master-detail__tabpanels">{children}</div> : children}
+      {/* 浮层槽：草稿条与确认层（fixed 定位，不占正文流）。 */}
+      {overlays}
     </section>
   );
 }

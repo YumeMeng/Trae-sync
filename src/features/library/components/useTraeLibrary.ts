@@ -83,7 +83,10 @@ export function useTraeLibrary(page: TraeLibraryPageFields, options: TraeLibrary
   const libraryTitle = readOnly ? TRAE_CN_LIBRARY_TITLE : libraryId === MASTER_LIBRARY_ID ? "主库" : libraryDisplayName?.trim() || "副库";
   const [reads, setReads] = useState<TraeReads>(EMPTY_READS), [viewer, setViewer] = useState<TraeViewerSource | null>(null);
   const [loading, setLoading] = useState(false), [error, setError] = useState<string | null>(null); // error 只装首读失败
-  // 代次守卫①：产品 / 库 / 可见性一变立即领新代次并清态（含在途查看器请求）。
+  // 代次守卫①：产品 / 库一变立即领新代次并清态（含在途查看器请求）。
+  // P4e-8c：可见性（active）**不进**清态依赖——库页在 App 里常驻挂载、切页只是 [hidden]，
+  // 旧页同口径：离开再回来时已取回的数据、展开态与查看器保持原样（e2e「浏览状态保持」）。
+  // 隐藏期间不发 IPC 仍由 load 的 active 守卫与 effect 清理（领新代次作废在途）保证。
   const generation = useRef(0), viewerTicket = useRef(0);
   // 轮询指纹基线（上一轮成功读取的三件套指纹 + 账号身份；force 读取不带）。
   const fingerprint = useRef<MasterHistoryDto["fingerprint"] | null>(null), currentUserId = useRef<string | null>(null);
@@ -91,7 +94,7 @@ export function useTraeLibrary(page: TraeLibraryPageFields, options: TraeLibrary
   useLayoutEffect(() => {
     generation.current += 1; viewerTicket.current += 1; fingerprint.current = null; currentUserId.current = null;
     setReads(EMPTY_READS); setViewer(null); setError(null); setLoading(false);
-  }, [productId, libraryId, active]);
+  }, [productId, libraryId]);
   const load = useCallback(async (force: boolean): Promise<TraeLibraryReadOutcome> => {
     if (!TRAE_PRODUCTS.has(productId) || !latest.current.active) return READ_OK;
     const ticket = ++generation.current; setLoading(true); setError(null);

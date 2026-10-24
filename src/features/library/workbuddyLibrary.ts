@@ -174,7 +174,7 @@ export function buildWorkBuddyLibraryView(snapshot: WorkBuddyLibrarySnapshot): W
     header: headerOf(busy), tabs: [], // WB 无 tab 条（插件/库信息 tab 均 absent，§2-12 / §2-13 A）
     loadingNote: snapshot.loading ? LIBRARY_TEXTS.wbLoading : null, // WB203-204
     error: snapshot.loadError !== null
-      ? { title: LIBRARY_TEXTS.wbErrorTitle, description: snapshot.loadError, retryLabel: LIBRARY_TEXTS.wbReload } : null, // WB205-216
+      ? { title: LIBRARY_TEXTS.wbErrorTitle, description: snapshot.loadError, retryLabel: LIBRARY_TEXTS.wbReload, testId: null } : null, // WB205-216（旧页错误卡无 testid）
     empty: null, // 无整页空态：无会话时正文给 treeEmpty 一句（WB389），不叠两块空态
     stats: statsOf(snapshot.stats), filter: filterOf(snapshot),
     includeDeleted: { testId: "workbuddy-library-include-deleted", label: LIBRARY_TEXTS.wbIncludeDeleted, hint: LIBRARY_TEXTS.wbIncludeDeletedHint, checked: snapshot.includeDeleted }, // WB273-287

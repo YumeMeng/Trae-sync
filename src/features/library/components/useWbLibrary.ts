@@ -58,13 +58,15 @@ export function useWbLibrary(page: WbLibraryPageFields, options: WbLibraryOption
   const { productId, active, now } = options, { uidFilter, includeDeleted } = page;
   const [reads, setReads] = useState<WbReads>(EMPTY_READS), [messagesLoading, setMessagesLoading] = useState(false);
   const [loading, setLoading] = useState(false), [checking, setChecking] = useState(false), [error, setError] = useState<string | null>(null);
-  // 代次守卫①：产品 / 可见性 / 过滤条件一变立即领新代次并清态；三条链各自持票（体检与主读取并发，互不作废）。
+  // 代次守卫①：产品 / 过滤条件一变立即领新代次并清态；三条链各自持票（体检与主读取并发，互不作废）。
+  // P4e-8c：可见性（active）不进清态依赖——切页只是 [hidden]，回来时展开态与行内时间线保持
+  //（旧 WB 页同口径）；隐藏期间不发 IPC 由 load 的 active 守卫与 effect 清理承担。
   const generation = useRef(0), checkupTicket = useRef(0), messageTicket = useRef(0);
   const latest = useRef({ active, reads }); latest.current = { active, reads }; // 渲染期写入，state 不进依赖
   useLayoutEffect(() => {
     generation.current += 1; checkupTicket.current += 1; messageTicket.current += 1;
     setReads(EMPTY_READS); setError(null); setLoading(false); setChecking(false); setMessagesLoading(false);
-  }, [productId, active, uidFilter, includeDeleted]);
+  }, [productId, uidFilter, includeDeleted]);
   const load = useCallback(async (): Promise<WbLibraryReadOutcome> => {
     if (!WB_PRODUCTS.has(productId) || !latest.current.active) return READ_OK;
     const ticket = ++generation.current; setLoading(true); setError(null);

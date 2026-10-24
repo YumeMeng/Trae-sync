@@ -23,7 +23,7 @@ const EMPTY_VIEW: LibraryView = {
   header: { title: "库信息暂不可用", regionLabel: LIBRARY_TEXTS.detailRegionMaster, pageTitleAttr: "master-library",
     readonlyBadge: null, badgeProductId: null, back: null, refresh: null },
   tabs: [], loadingNote: null, error: null,
-  empty: { title: "库信息暂不可用，请稍后重试。", hint: "", actionLabel: null },
+  empty: { title: "库信息暂不可用，请稍后重试。", hint: "", actionLabel: null, actionId: "", actionTestId: null, testId: "" },
   stats: null, filter: null, includeDeleted: null, search: null,
   tree: [], treeEmpty: "库信息暂不可用，请稍后重试。", viewer: null,
   batchBar: null, selectionEntry: null, draftBar: null, archive: null, checkup: null, plugins: null, info: null,

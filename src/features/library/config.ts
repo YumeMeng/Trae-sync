@@ -124,8 +124,11 @@ export interface ArchiveChromeView {
 export interface LibraryView {
   readonly productId: string; readonly libraryId: string;
   readonly header: LibraryHeaderView; readonly tabs: readonly LibraryTabView[]; readonly loadingNote: string | null;
-  readonly error: { readonly title: string; readonly description: string; readonly retryLabel: string } | null;
-  readonly empty: { readonly title: string; readonly hint: string; readonly actionLabel: string | null } | null;
+  /** 读取失败卡（testId 沿用旧锚 history-error；null = 旧页无该锚，如 WB）。 */
+  readonly error: { readonly title: string; readonly description: string; readonly retryLabel: string; readonly testId: string | null } | null;
+  /** 整页空态（testId 沿用旧锚 history-guide；actionId 是空态引导的动作 id，由 App 决定去向）。 */
+  readonly empty: { readonly title: string; readonly hint: string; readonly actionLabel: string | null;
+    readonly actionId: string; readonly actionTestId: string | null; readonly testId: string } | null;
   readonly stats: LibraryStatsView | null; readonly filter: AccountFilterView | null;
   readonly includeDeleted: { readonly testId: string; readonly label: string; readonly hint: string; readonly checked: boolean } | null;
   readonly search: { readonly testId: string; readonly placeholder: string; readonly ariaLabel: string; readonly value: string } | null;
