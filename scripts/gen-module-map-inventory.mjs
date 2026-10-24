@@ -20,21 +20,31 @@ const COMMANDS = [
   ['apply_storage_deletion', 'src-tauri/src/lib.rs'],
   ['begin_checkin_login', 'src-tauri/src/oauth_login.rs'],
   ['begin_trae_cn_login', 'src-tauri/src/oauth_login.rs'],
+  ['begin_workbuddy_login', 'src-tauri/src/workbuddy_login_commands.rs'],
   ['browse_plugin_market', 'src-tauri/src/plugins.rs'],
   ['cancel_checkin', 'src-tauri/src/checkin_schedule.rs'],
   ['cancel_checkin_login', 'src-tauri/src/oauth_login.rs'],
   ['cancel_trae_cn_login', 'src-tauri/src/oauth_login.rs'],
+  ['cancel_workbuddy_login', 'src-tauri/src/workbuddy_login_commands.rs'],
   ['capture_current_account_credential', 'src-tauri/src/credential_handover.rs'],
+  ['capture_trae_cn_account', 'src-tauri/src/account_capture.rs'],
+  ['capture_workbuddy_account', 'src-tauri/src/workbuddy_commands.rs'],
   ['check_trae_cn_account_health', 'src-tauri/src/credential_handover.rs'],
+  ['check_workbuddy_login_health', 'src-tauri/src/workbuddy_commands.rs'],
   ['cleanup_master_empty_projects', 'src-tauri/src/library_archive.rs'],
   ['clear_remote_device', 'src-tauri/src/remote_devices.rs'],
   ['close_environment_instance', 'src-tauri/src/environment.rs'],
   ['complete_checkin_login', 'src-tauri/src/oauth_login.rs'],
   ['complete_trae_cn_login', 'src-tauri/src/oauth_login.rs'],
+  ['complete_workbuddy_login', 'src-tauri/src/workbuddy_login_commands.rs'],
   ['create_environment', 'src-tauri/src/environment.rs'],
   ['create_master_backup', 'src-tauri/src/library_archive.rs'],
+  ['create_workbuddy_backup', 'src-tauri/src/workbuddy_backup_commands.rs'],
   ['delete_environment', 'src-tauri/src/environment.rs'],
+  ['delete_master_backups', 'src-tauri/src/library_archive.rs'],
   ['delete_master_sessions', 'src-tauri/src/library_archive.rs'],
+  ['delete_workbuddy_backups', 'src-tauri/src/workbuddy_backup_commands.rs'],
+  ['delete_workbuddy_sessions', 'src-tauri/src/workbuddy_library_commands.rs'],
   ['export_recovery_package_command', 'src-tauri/src/lib.rs'],
   ['force_reset_master_current_account', 'src-tauri/src/credential_handover.rs'],
   ['get_account_registry', 'src-tauri/src/credential_handover.rs'],
@@ -45,6 +55,7 @@ const COMMANDS = [
   ['get_backup_retention', 'src-tauri/src/library_archive.rs'],
   ['get_checkin_capability', 'src-tauri/src/checkin_schedule.rs'],
   ['get_checkin_overview', 'src-tauri/src/checkin_schedule.rs'],
+  ['get_current_product', 'src-tauri/src/workbuddy_commands.rs'],
   ['get_environment_delete_preview', 'src-tauri/src/environment.rs'],
   ['get_environment_state', 'src-tauri/src/environment.rs'],
   ['get_managed_account_state', 'src-tauri/src/credential_handover.rs'],
@@ -61,8 +72,15 @@ const COMMANDS = [
   ['get_product_operation_states', 'src-tauri/src/product_operations.rs'],
   ['get_relay_ledger', 'src-tauri/src/library_archive.rs'],
   ['get_storage_root_state', 'src-tauri/src/lib.rs'],
-  ['get_trae_cn_checkin_status', 'src-tauri/src/checkin_schedule.rs'],
   ['get_trae_instance_states', 'src-tauri/src/instance_tools.rs'],
+  ['get_workbuddy_auto_checkin_status', 'src-tauri/src/workbuddy_schedule.rs'],
+  ['get_workbuddy_checkin_overview', 'src-tauri/src/workbuddy_schedule.rs'],
+  ['get_workbuddy_library_checkup', 'src-tauri/src/workbuddy_library_commands.rs'],
+  ['get_workbuddy_library_history', 'src-tauri/src/workbuddy_library_commands.rs'],
+  ['get_workbuddy_library_stats', 'src-tauri/src/workbuddy_library_commands.rs'],
+  ['get_workbuddy_probe_info', 'src-tauri/src/workbuddy_backup_commands.rs'],
+  ['get_workbuddy_session_health', 'src-tauri/src/workbuddy_commands.rs'],
+  ['get_workbuddy_session_messages', 'src-tauri/src/workbuddy_library_commands.rs'],
   ['get_workspace_state', 'src-tauri/src/lib.rs'],
   ['import_recovery_package_command', 'src-tauri/src/lib.rs'],
   ['incorporate_master_records', 'src-tauri/src/library_archive.rs'],
@@ -71,12 +89,17 @@ const COMMANDS = [
   ['launch_master_library', 'src-tauri/src/environment.rs'],
   ['list_checkin_accounts', 'src-tauri/src/credential_handover.rs'],
   ['list_environments', 'src-tauri/src/environment.rs'],
+  ['list_products', 'src-tauri/src/workbuddy_commands.rs'],
   ['list_remote_devices', 'src-tauri/src/remote_devices.rs'],
   ['list_trae_cn_accounts', 'src-tauri/src/credential_handover.rs'],
   ['list_trae_cn_foreign_projects', 'src-tauri/src/library_archive.rs'],
+  ['list_workbuddy_accounts', 'src-tauri/src/workbuddy_commands.rs'],
+  ['list_workbuddy_backups', 'src-tauri/src/workbuddy_backup_commands.rs'],
+  ['list_workbuddy_checkin_accounts', 'src-tauri/src/workbuddy_schedule.rs'],
   ['login_environment', 'src-tauri/src/environment.rs'],
   ['merge_master_projects', 'src-tauri/src/library_archive.rs'],
   ['merge_trae_cn_project', 'src-tauri/src/library_archive.rs'],
+  ['merge_workbuddy_cwd_projects', 'src-tauri/src/workbuddy_library_commands.rs'],
   ['migrate_master_backups', 'src-tauri/src/library_archive.rs'],
   ['migrate_storage_root_command', 'src-tauri/src/lib.rs'],
   ['open_device_management_docs', 'src-tauri/src/remote_devices.rs'],
@@ -85,19 +108,23 @@ const COMMANDS = [
   ['prepare_managed_account_switch', 'src-tauri/src/credential_handover.rs'],
   ['preview_master_switch_plugins', 'src-tauri/src/credential_handover.rs'],
   ['preview_trae_cn_project_merge', 'src-tauri/src/library_archive.rs'],
+  ['preview_workbuddy_switch', 'src-tauri/src/workbuddy_commands.rs'],
   ['purge_account_records', 'src-tauri/src/credential_handover.rs'],
+  ['purge_workbuddy_accounts', 'src-tauri/src/workbuddy_commands.rs'],
+  ['purge_workbuddy_sessions', 'src-tauri/src/workbuddy_library_commands.rs'],
   ['read_work_cn_state', 'src-tauri/src/lib.rs'],
   ['refresh_checkin_credentials', 'src-tauri/src/credential_handover.rs'],
   ['refresh_checkin_credits', 'src-tauri/src/credential_handover.rs'],
   ['refresh_managed_current_account', 'src-tauri/src/credential_handover.rs'],
-  ['refresh_trae_cn_credentials', 'src-tauri/src/credential_handover.rs'],
+  ['refresh_workbuddy_account', 'src-tauri/src/workbuddy_commands.rs'],
   ['remove_checkin_account', 'src-tauri/src/credential_handover.rs'],
   ['rename_environment', 'src-tauri/src/environment.rs'],
   ['repair_master_current_account', 'src-tauri/src/credential_handover.rs'],
   ['reset_checkin_device', 'src-tauri/src/credential_handover.rs'],
+  ['restore_master_backup', 'src-tauri/src/library_archive.rs'],
   ['restore_operation', 'src-tauri/src/lib.rs'],
+  ['restore_workbuddy_backup', 'src-tauri/src/workbuddy_backup_commands.rs'],
   ['run_checkin', 'src-tauri/src/checkin_schedule.rs'],
-  ['run_trae_cn_checkin', 'src-tauri/src/checkin_schedule.rs'],
   ['set_account_archived', 'src-tauri/src/credential_handover.rs'],
   ['set_account_auto_checkin', 'src-tauri/src/checkin_schedule.rs'],
   ['set_account_display_name', 'src-tauri/src/credential_handover.rs'],
@@ -106,12 +133,24 @@ const COMMANDS = [
   ['set_auto_checkin_settings', 'src-tauri/src/checkin_schedule.rs'],
   ['set_backup_dir', 'src-tauri/src/library_archive.rs'],
   ['set_backup_retention', 'src-tauri/src/library_archive.rs'],
+  ['set_current_product', 'src-tauri/src/workbuddy_commands.rs'],
   ['set_environment_current_account', 'src-tauri/src/environment.rs'],
+  ['set_workbuddy_account_archived', 'src-tauri/src/workbuddy_commands.rs'],
+  ['set_workbuddy_account_auto_checkin', 'src-tauri/src/workbuddy_schedule.rs'],
+  ['set_workbuddy_account_display_name', 'src-tauri/src/workbuddy_commands.rs'],
+  ['set_workbuddy_auto_checkin_settings', 'src-tauri/src/workbuddy_schedule.rs'],
   ['switch_account', 'src-tauri/src/credential_handover.rs'],
   ['switch_and_handoff', 'src-tauri/src/credential_handover.rs'],
   ['switch_master_account', 'src-tauri/src/credential_handover.rs'],
   ['switch_trae_cn_account', 'src-tauri/src/credential_handover.rs'],
+  ['switch_workbuddy_account', 'src-tauri/src/workbuddy_commands.rs'],
+  ['transfer_workbuddy_sessions', 'src-tauri/src/workbuddy_commands.rs'],
   ['uninstall_plugin_everywhere', 'src-tauri/src/plugins.rs'],
+  ['verify_workbuddy_capture_renewal', 'src-tauri/src/workbuddy_commands.rs'],
+  ['workbuddy_checkin_claim', 'src-tauri/src/workbuddy_commands.rs'],
+  ['workbuddy_checkin_claim_batch', 'src-tauri/src/workbuddy_schedule.rs'],
+  ['workbuddy_checkin_claim_profile', 'src-tauri/src/workbuddy_schedule.rs'],
+  ['workbuddy_checkin_status', 'src-tauri/src/workbuddy_commands.rs'],
 ];
 
 const SRC_EXT = new Set(['.ts', '.tsx', '.css']);
@@ -262,28 +301,52 @@ const commandRows = COMMANDS.map(([cmd, def]) => {
   const test = hitsOf(testTexts, cmd);
   return '| ' + cmd + ' | [' + def + '](../../' + def + ') | ' + (prod.length ? prod.map(link).join('<br>') : '无') + ' | ' + (test.length ? test.map(link).join('<br>') : '无') + ' |';
 });
-// 实际注册的 handler 数（generate_handler! 内的非注释条目），用于核对本表覆盖率
+// 实际注册的 handler 数（generate_handler! 内的命令条目），用于核对本表覆盖率。
+// 用括号深度扫描 + 去注释/字符串，避免注释里的 "]" 提前截断、也避免末项无尾逗号被漏计；
+// 口径与 scripts/gen-command-union.mjs 的 extractCommandNames 一致（同一份真源）。
+function extractHandlerNames(source) {
+  const m = source.search(/generate_handler!\s*\[/);
+  if (m === -1) return null;
+  const open = source.indexOf('[', m);
+  let depth = 0;
+  let inLine = false;
+  let inBlock = false;
+  let inString = false;
+  let i = open;
+  for (; i < source.length; i += 1) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (inLine) { if (ch === '\n') inLine = false; continue; }
+    if (inBlock) { if (ch === '*' && next === '/') { inBlock = false; i += 1; } continue; }
+    if (inString) { if (ch === '\\') i += 1; else if (ch === '"') inString = false; continue; }
+    if (ch === '/' && next === '/') { inLine = true; i += 1; continue; }
+    if (ch === '/' && next === '*') { inBlock = true; i += 1; continue; }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '[') depth += 1;
+    else if (ch === ']') { depth -= 1; if (depth === 0) break; }
+  }
+  if (i >= source.length) return null;
+  const body = source.slice(open + 1, i).replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  const names = body.split(',').map((x) => x.trim()).filter(Boolean).map((x) => x.split('::').pop());
+  return names.length ? { total: names.length, names } : null;
+}
 function countHandlers() {
   const libPath = path.join(ROOT, 'src-tauri/src/lib.rs');
   if (!fs.existsSync(libPath)) return null;
-  const lib = fs.readFileSync(libPath, 'utf8');
-  const i = lib.indexOf('generate_handler!');
-  if (i < 0) return null;
-  const j = lib.indexOf('])', i);
-  const block = lib.slice(i, j);
-  const entries = block.split('\n').filter((l) => {
-    const t = l.trim();
-    return t && !t.startsWith('//') && t !== 'generate_handler![' && /,\s*$/.test(t);
-  });
-  const names = entries.map((l) => l.trim().replace(/,$/, '').split('::').pop());
-  return { total: names.length, names };
+  return extractHandlerNames(fs.readFileSync(libPath, 'utf8'));
 }
 const handlers = countHandlers();
 const unregistered = handlers ? handlers.names.filter((n) => !COMMANDS.some(([c]) => c === n)) : [];
+// 反向：本表登记但 handler 未注册（历史遗留/已退役命令），必须为零
+const tableOnly = handlers ? COMMANDS.map(([c]) => c).filter((c) => !handlers.names.includes(c)) : [];
 const coverageNote = handlers
-  ? '**覆盖率核对**：' + BT + 'src-tauri/src/lib.rs' + BT + ' 的 ' + BT + 'generate_handler!' + BT + ' 当前实际注册 ' + handlers.total + ' 条命令，本表登记 ' + COMMANDS.length + ' 条' +
-    (unregistered.length ? '；未登记的 ' + unregistered.length + ' 条集中在 WorkBuddy 域（' + unregistered.slice(0, 4).join(' / ') + ' 等），属于另一条产品线的命令面，本表按 P14 的 Work/CN 范围登记，未展开。' : '，与 handler 完全一致。')
-  : '未能读取 generate_handler!，覆盖率未核对。';
+  ? '**口径（P6-2b 定稿）**：本表登记 ' + BT + 'generate_handler!' + BT + ' 的**全量命令**，不按产品线裁剪——命令只要在 Rust 侧注册就登记一行，是否被前端消费由「生产前端字符串命中」列回答（列内「无」表示没有前端字符串引用，**不是删除许可**，24 条分类见上表）。' +
+    ' 当前 handler 实际注册 ' + handlers.total + ' 条，本表登记 ' + COMMANDS.length + ' 条' +
+    (unregistered.length || tableOnly.length
+      ? '；**不一致**：handler 有而本表缺 ' + unregistered.length + ' 条' + (unregistered.length ? '（' + unregistered.join(' / ') + '）' : '') +
+        '，本表有而 handler 无 ' + tableOnly.length + ' 条' + (tableOnly.length ? '（' + tableOnly.join(' / ') + '）' : '') + '。请同步 COMMANDS 表。'
+      : '，与 handler 完全一致（逐条比对无缺、无多）。')
+  : '未能读取 ' + BT + 'generate_handler!' + BT + '，覆盖率未核对。';
 
 const commands = [
   coverageNote,
