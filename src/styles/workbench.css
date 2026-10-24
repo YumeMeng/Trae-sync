@@ -761,7 +761,7 @@
   font-weight: 550;
   white-space: nowrap;
   cursor: pointer;
-  box-shadow: 0 1px 0 rgba(20, 32, 42, 0.05);
+  box-shadow: var(--shadow-btn);
   transition: border-color 160ms ease-out, background-color 160ms ease-out, color 160ms ease-out, box-shadow 160ms ease-out;
 }
 

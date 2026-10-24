@@ -52,6 +52,15 @@
   /* —— 投影/尺寸（自旧桥接层整档挪入，值不变） —— */
   --shadow-float: 0 12px 32px rgba(20, 32, 42, 0.14);   /* 浮层投影 */
   --shadow-panel: 0 1px 2px rgba(20, 32, 42, 0.06);    /* 面板静态投影 */
+
+  /* —— P5-1a 字面色值清剿批新增（值取自 P5-0 审计原字面值，视觉零变化） —— */
+  --shadow-lift: 0 4px 14px rgba(26, 34, 51, 0.08);   /* 卡片/行 hover 浮起投影（两处 hover 归一为一档，基准取 accounts.css:727） */
+  --shadow-chip: 0 1px 3px rgba(26, 34, 51, 0.1);     /* 分段控件激活态小投影 */
+  --shadow-btn: 0 1px 0 rgba(20, 32, 42, 0.05);       /* 次操作按钮静态投影 */
+  --scrim: rgba(26, 34, 51, 0.32);                    /* 弹层遮罩（切号遮罩/弹窗背景） */
+  --accent-ring: rgba(79, 70, 229, 0.25);             /* 强调色脉冲光环（动画起止帧） */
+  --account-tone-1: #34a853;                          /* 账号色板 2/3：绿（G21） */
+  --account-tone-2: #f9ab00;                          /* 账号色板 3/3：琥珀（G21） */
   --radius-control: 12px;  /* 控件圆角（合同 12px，2026-08-27 由 4px 收敛） */
   --radius-panel: 15px;  /* 面板圆角（合同 15px，U-4 B1 对齐；原 8px 与 DESIGN_TOKENS 舒展档不符） */
   --control-height: 40px;

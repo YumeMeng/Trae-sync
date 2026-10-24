@@ -669,22 +669,22 @@
   height: 24px;
   flex: none;
   border-radius: 50%;
-  color: #fff;
+  color: var(--text-on-accent);
   font-size: 10.5px;
   font-weight: 700;
 }
 
 /* 账号色板（G21）：按腿顺序首次出现循环 蓝 → 绿 → 琥珀 */
 .account-avatar--c0 {
-  background: var(--accent, #4f8cff);
+  background: var(--accent);
 }
 
 .account-avatar--c1 {
-  background: #34a853;
+  background: var(--account-tone-1);
 }
 
 .account-avatar--c2 {
-  background: #f9ab00;
+  background: var(--account-tone-2);
 }
 
 /* ============================================================
@@ -732,7 +732,7 @@
   width: 26px;
   height: 26px;
   font-size: 11px;
-  border: 2px solid #fff;
+  border: 2px solid var(--text-on-accent);
   box-shadow: var(--shadow-panel);
 }
 

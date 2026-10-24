@@ -466,7 +466,7 @@
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgba(26, 34, 51, 0.32);
+  background: var(--scrim);
 }
 
 .switch-dialog {
@@ -626,8 +626,8 @@
 }
 
 @keyframes switch-step-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(79, 70, 229, 0.25); }
-  50% { box-shadow: 0 0 0 5px rgba(79, 70, 229, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-ring); }
+  50% { box-shadow: 0 0 0 5px transparent; }
 }
 
 /* P7-3 交接细目进度（handing_over 阶段步骤列表下方） */

@@ -554,7 +554,7 @@
 
 .account-card--clickable:hover {
   border-color: var(--line-control);
-  box-shadow: 0 4px 14px rgba(20, 32, 42, 0.1);
+  box-shadow: var(--shadow-lift);
   transform: translateY(-1px);
 }
 
@@ -640,7 +640,7 @@
   /* 白玻璃激活浮起（U-4 B2 迁移 var(--surface)） */
   background: var(--glass-hover);
   color: var(--text-1);
-  box-shadow: 0 1px 3px rgba(26, 34, 51, 0.1);
+  box-shadow: var(--shadow-chip);
 }
 
 /* G14 「需处理」数字角标：异常账号数（0 时元素不渲染，避免空占位）。 */
@@ -652,7 +652,7 @@
   padding: 0 5px;
   border-radius: 9px;
   background: var(--danger);
-  color: #fff;
+  color: var(--text-on-accent);
   font-size: 11px;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
@@ -724,7 +724,7 @@
 
 .account-list__row--interactive:hover {
   border-color: var(--line-control);
-  box-shadow: 0 4px 14px rgba(26, 34, 51, 0.08), var(--glass-edge);
+  box-shadow: var(--shadow-lift), var(--glass-edge);
   transform: translateY(-1px); /* 微浮起（契约动效规范） */
 }
 
