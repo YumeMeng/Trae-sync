@@ -6,7 +6,7 @@ import { TitleBar } from "./components/TitleBar";
 import { NavigationRail, type AppPage } from "./components/NavigationRail";
 import type { LibraryRef } from "./types/library";
 // P5-4a（E-01 S1）：六个区块直连合并页，产品值由 App 显式传参。
-// 槽位登记表（app/transition/sectionSlots）仍保留给 SettingsPanel 用，App 不再引用它。
+// P5-4b（E-01 S2/S3）：槽位接缝（app/transition/sectionSlots）已整份删除，本文件零引用。
 import { OverviewPage } from "./features/overview/OverviewPage";
 import { CheckinPage } from "./features/checkin/CheckinPage";
 import { AccountsPage } from "./features/accounts/AccountsPage";
@@ -45,8 +45,8 @@ interface AutoCheckinFinishedEvent {
 }
 
 // 应用根组件：P17-T5 并列骨架——产品上下文（标题栏切换器）驱动各页面。
-// P5-4a：六区块直接渲染合并页（features/*），产品值由本文件传入；
-// 旧槽位接缝（app/transition/sectionSlots）已不被本文件引用。
+// P5-4a/P5-4b：六区块直接渲染合并页（features/*），产品值由本文件传入；
+// 旧槽位接缝（app/transition/sectionSlots）已删除，全仓零引用。
 export default function App() {
   const [state, setState] = useState<WorkspaceStateDto | null>(null);
   const [error, setError] = useState<string | null>(null);
