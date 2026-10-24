@@ -1,14 +1,39 @@
 import type { OverviewSnapshot } from "../../platform/overview";
+import type { CheckinOverviewEntryDto } from "../../types/account_switch";
 import type { WorkspaceStateDto } from "../../types/workspace";
 import {
   ACCOUNTS_ACTION,
   EMPTY_VIEW,
+  formatCredits,
   formatLastActive,
   type OverviewAction,
   type OverviewEvidence,
+  type OverviewStat,
   type OverviewStatGroup,
   type OverviewView,
 } from "./stats";
+
+/**
+ * 模型积分合计指标（R-1 恢复，口径与旧总览页一致）：
+ * 各账号 usage_remaining_credits 求和，未查询账号（null）不计入；
+ * 合计为 0 或全部未查询 → 占位「—」（假 0 纪律：读不到就写读不到）；
+ * 部分账号已查询 → 合计 + 「N/M 账号已获取」注。
+ */
+function creditsStat(rows: readonly CheckinOverviewEntryDto[]): OverviewStat {
+  const known = rows.filter((row) => row.usage_remaining_credits !== null);
+  const total = known.reduce((sum, row) => sum + (row.usage_remaining_credits ?? 0), 0);
+  return {
+    key: "credits",
+    label: "模型积分合计",
+    value: total > 0 ? formatCredits(total) : "—",
+    note:
+      known.length > 0 && known.length < rows.length
+        ? `${known.length}/${rows.length} 账号已获取`
+        : undefined,
+    hint: "各账号 TRAE 模型积分（真实额度）合计",
+    testId: "overview-credits-total",
+  };
+}
 
 /**
  * TRAE 总览的数据面配置：主库统计优先，主库不可读时回落旧历史统计
@@ -48,10 +73,32 @@ export function traeView(
       ? { label: `去签到（余 ${unchecked}）`, page: "checkin", testId: "overview-checkin-cta" }
       : null;
 
+  // 签到摘要组（旧总览「签到与账号」块，P4a 合并时整体漏搬）：
+  // 真实能力开启且摘要读取成功才出；三卡同源（同一 checkinRows 口径），故整组恢复。
+  const checkinGroup: OverviewStatGroup | null =
+    checkinRows === null
+      ? null
+      : {
+          testId: "overview-checkin",
+          title: "签到与账号",
+          stripClass: "overview-checkin__stats",
+          stats: [
+            { key: "accounts", label: "账号", value: String(checkinRows.length) },
+            {
+              key: "checked",
+              label: "今日签到",
+              value: `${checkinRows.filter((row) => row.checked_in === true).length}/${checkinRows.length}`,
+            },
+            creditsStat(checkinRows),
+          ],
+        };
+
   // 目录缺失 = 真实异常态：只留一句结论，不出统计与主行动（G1）。
   if (!state.data_location.selected) {
     return {
       ...EMPTY_VIEW,
+      // 签到摘要与数据目录无关（旧页同样在目录缺失时照常渲染）。
+      groups: checkinGroup === null ? [] : [checkinGroup],
       evidence,
       empty: {
         title: "未找到 TRAE 数据目录，请确认 TRAE 已安装。",
@@ -64,6 +111,7 @@ export function traeView(
   if (!hasData) {
     return {
       ...EMPTY_VIEW,
+      groups: checkinGroup === null ? [] : [checkinGroup],
       evidence,
       pending,
       empty: { title: "主库就绪，暂无对话。", icon: "book", testId: "overview-empty-hint" },
@@ -104,7 +152,7 @@ export function traeView(
 
   return {
     ...EMPTY_VIEW,
-    groups,
+    groups: checkinGroup === null ? groups : [checkinGroup, ...groups],
     evidence,
     pending,
     primary: { label: "查看主库记录", page: "master-library", testId: "overview-scan-cta" },
