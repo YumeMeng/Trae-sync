@@ -94,6 +94,8 @@ export interface BackupCompareView {
 }
 /** 库信息 tab：账号/大小/路径/最近活跃/最近备份 + 计数条 + 备份对比（backupOnly 形态）。 */
 export interface LibraryInfoView { readonly testId: string; readonly items: readonly LibraryInfoItemView[]; readonly counts: readonly LibraryStatView[]; readonly backup: BackupCompareView | null; }
+/** 页内提示：一句话 + 旧页锚点（null = 旧页无锚，不发明 testid）。 */
+export interface LibraryNoticeView { readonly testId: string | null; readonly text: string }
 /** 页面级兜底文案（builder 与弹层共用同一份事实，不各写一遍）。 */
 export interface LibraryViewTexts { readonly receiptPrefix: string; readonly actionFailure: string; readonly refreshFailed: string; readonly readonlyBadge: string; }
 /** 归档收尾的四种需就地恢复形态（旧 L149-152 / L958-980）：relaunch=实例未启动、refresh=列表刷新失败、
@@ -143,7 +145,8 @@ export interface LibraryView {
   /** 归档动作区（入口 / 返回 / 恢复条 / 草稿告警 / 应用前确认）：null = 该产品无归档（WB）。 */
   readonly archive: ArchiveChromeView | null;
   readonly checkup: CheckupView | null; readonly plugins: PluginTabView | null; readonly info: LibraryInfoView | null;
-  readonly notices: readonly string[]; readonly texts: LibraryViewTexts;
+  /** 页内提示（写门禁说明 / 归档原因）：testId 沿用旧页锚点（library-work-write-pending 等）。 */
+  readonly notices: readonly LibraryNoticeView[]; readonly texts: LibraryViewTexts;
 }
 // ===== 能力表（照 P4e-design §2 的 18 行 A/B/C；A=缺失、B=表现不同、C=一致） =====
 

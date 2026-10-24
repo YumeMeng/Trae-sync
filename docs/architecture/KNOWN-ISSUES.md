@@ -207,6 +207,7 @@ K-08 已由 P4e-7/8 闭环（`traeLibrary.viewerOf` 从 `SessionMessageDto.conte
 `WorkBuddyLibraryPage.test.tsx`（5）/ `PluginWorkbench.test.tsx`（13）随旧组件退场删除，
 统一迁到 `tests/libraryPage.test.tsx`（23 例，锚点全部指向合并页 `features/library/LibraryPage`）。
 逐条对应表见 `.scratch/cmdr/P4e-9a-report.md` §3。以下为**逐条核对后仍缺的覆盖**，按风险分级。
+P4e-9b（2026-10-24）补 G3 / G4 各 4 例（现该文件 31 例），两项已标已修复。
 
 #### 真实缺口（写操作 / 错误恢复，须独立票补，不可放弃）
 
@@ -218,16 +219,26 @@ K-08 已由 P4e-7/8 闭环（`traeLibrary.viewerOf` 从 `SessionMessageDto.conte
 2. **G2 轮询指纹（旧 1 例）**：`get_master_history` 带 `previous`/`previousCurrentUserId`、`status="unchanged"` 时不刷台账。
    新页代码路径（`useTraeLibrary.load(false)` + 5s interval）保留，但无测试；`fake timers` 在合并页尚未用过。
    - 判定：真实缺口但风险低（纯读取）；归入独立小票与 G1 同批补。
-3. **G3 归档收尾四态与恢复条（旧 12 例中缺 11，新#7 只覆盖模式层渲染、新#9 只覆盖正常提交路径）**：`action-notice` + `archive-recovery-retry` 的四种恢复
-   （`relaunch` / `refresh` / `commit-unknown` / `committed-attention`）、重试后的三种回执、
-   「未要求启动的回执不误报已启动」、归档视图「勾项目恢复全部归档会话」的提交参数、归档视图未关联组合并渲染、
-   归档视图项目折叠渲染、运行态 Work 归档关停提示。新页把这条链拆到 `useArchiveActions`（含 `recoveryOf` 映射），
-   新#8/#9 只覆盖「草稿 → 确认 → 提交」的正常路径。
-   - 判定：**真实缺口，优先级最高**（用户看到的是「操作结果不明 + 需要人工核对」的恢复指引，缺测试即无护栏）。
-4. **G4 写门禁四态（旧 5 例，全部缺）**：Work 库操作快照 pending/absent、错库快照 fail-closed（不读不写草稿）、
-   CN 只读库归档放行但隐藏删除/合并、CN 批量归档提交带 `libraryId="trae_cn"`。
-   合并页由 `traeWriteGatesOf` 单点算门禁、`archiveEnabled` 现取，但**新页无一条「门禁关 → 入口不出 / 命令不发起」的渲染断言**。
-   - 判定：**真实缺口，优先级最高**（唯一可能「新页放行旧页禁止的写」的方向）。
+3. ~~**G3 归档收尾四态与恢复条**~~ —— **已修复（P4e-9b，2026-10-24）**。
+   原缺口：`action-notice` + `archive-recovery-retry` 的四种恢复（`relaunch` / `refresh` /
+   `commit-unknown` / `committed-attention`）、重试后的回执、运行态 Work 归档关停提示均无渲染断言。
+   修复落点：恢复条渲染与禁用逻辑在页面/组件（`LibrarySessionsBody` → `LibraryArchiveNotice`；
+   `useArchiveActions.retry` 新增 `retrying` 忙碌位与防连点，重试期间按钮转「处理中…」并禁用），
+   门禁判定（`draftBarOf` 的 `draftApplyBlocked`）留在 builder。
+   新增用例（`tests/libraryPage.test.tsx`「库页归档恢复四态（G3）」4 例）：relaunch 重试启动、
+   refresh 重试刷新、commit-unknown 阻止再次应用且重试只刷新（草稿保留）、committed-attention 重试后清草稿。
+   仍缺（留待独立票，低风险）：归档视图「勾项目恢复全部归档会话」的提交参数、未关联组合并渲染、
+   项目折叠渲染、「未要求启动的回执不误报已启动」。
+4. ~~**G4 写门禁四态**~~ —— **已修复（P4e-9b，2026-10-24）**。
+   原缺口：Work 库操作快照 pending/absent、错库快照 fail-closed（不读不写草稿）、CN 只读库归档放行但隐藏删除/合并、
+   CN 批量归档提交带 `libraryId="trae_cn"` 均无新页渲染断言。
+   修复落点：门禁判定单点在 builder（`traeLibrary.traeWriteGatesOf` → `archiveEnabled` / `batchBarOf` /
+   `selectionEntry` / `treeOf.quickArchive`），页面只读；页内三个旧锚（`library-work-write-pending` /
+   `library-work-archive-notice` / `library-cn-write-pending`）由 builder 的 `notices` 带 `testId` 产出。
+   草稿存储与旧页 L254 同口径：`useArchiveActions` 新增 `draftEnabled`（页面取 `archiveEnabled`，首帧 fail-closed），
+   `readOnly = !supported || !draftEnabled` → 门禁关时**不读、不写、不迁移草稿**。
+   新增用例（`tests/libraryPage.test.tsx`「库页写门禁四态（G4）」4 例）：pending 三入口全不出 + 零写命令/零草稿读写、
+   absent fail-closed、错库快照 fail-closed、CN 只读库归档放行且删除/合并不渲染、批量归档带 `libraryId="trae_cn"`。
 5. **G5 CN 跨账号归并（旧 5 例，全部缺）**：`library-foreign-group` / `library-foreign-project-*` /
    `library-merge-entry-*` 入口条件、`preview_trae_cn_project_merge` → `trae-cn-merge-confirm` 单次确认 →
    `merge_trae_cn_project`、`trae-cn-merge-progress` 事件推进按钮文案、预览/归并失败的安全通知。
@@ -269,9 +280,9 @@ K-08 已由 P4e-7/8 闭环（`traeLibrary.viewerOf` 从 `SessionMessageDto.conte
 
 #### 测试数变化
 
-| 项 | 前 | 后 |
-| --- | --- | --- |
-| 测试文件 | 34 | 31（删 4 增 1） |
-| 用例 | 413 | **349**（-87 旧 +23 新） |
+| 项 | P4e-9a 前 | P4e-9a 后 | P4e-9b 后 |
+| --- | --- | --- | --- |
+| 测试文件 | 34 | 31（删 4 增 1） | 31（不变） |
+| 用例 | 413 | **349**（-87 旧 +23 新） | **357**（+8：G3 四例 + G4 四例） |
 
-`pnpm test` / `pnpm typecheck` / `pnpm guard` 均 exit 0。
+`pnpm test`（31 文件 / 357 例）/ `pnpm typecheck` / `pnpm guard`（新增 0）均 exit 0。

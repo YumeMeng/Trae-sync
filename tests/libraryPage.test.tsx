@@ -304,3 +304,139 @@ describe("库页（WorkBuddy）：分组树 / 统计 / 过滤 / 两条删除链 
     expect(screen.getByTestId("workbuddy-library-stats")).toBeInTheDocument(); expect(screen.getByTestId("workbuddy-library-checkup")).toBeInTheDocument();
   });
 });
+
+// ============================================================================
+// G4 写门禁四态（K-10）：门禁判定单点在 builder（traeLibrary.traeWriteGatesOf），页面只读
+// archiveEnabled / selectionEntry / quickArchive；门禁关 → 入口不出、命令不发起、草稿不读不写。
+// ============================================================================
+describe("库页写门禁四态（G4）", () => {
+  it("Work 库操作待验收（pending）：三项写入口全不出，零写命令、零草稿读写", async () => {
+    traeRoutes();
+    mockRoute("get_product_operation_states", (a: any) => ({ product_id: a.productId, library_id: a.libraryId, operations: [
+      { operation_id: "library.archive", state: "pending", reason: "归档与恢复的客户端结果仍需验收。", evidence_ref: null },
+      { operation_id: "library.work_project_merge", state: "pending", reason: "归并结果仍需验收。", evidence_ref: null },
+      { operation_id: "library.delete", state: "pending", reason: "删除结果仍需验收。", evidence_ref: null }] }));
+    renderTrae();
+    // 旧锚 library-work-write-pending（L1760-1764）：三项 pending 逐项点名 + 首项原因。
+    expect(await screen.findByTestId("library-work-write-pending")).toHaveTextContent("归档与恢复、项目归并、删除暂不可用");
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    await expand("p1");
+    expect(screen.queryByTestId("library-quick-archive-s2")).not.toBeInTheDocument(); // 快捷归档 = !selectMode && canArchive
+    // 写门禁关 → 草稿机制整体不参与（旧 L254 readOnly: !canArchive 同口径）。
+    expect(called("get_archive_draft")).toBe(false); expect(called("set_archive_draft")).toBe(false);
+    expect(called("apply_master_archive_changes")).toBe(false);
+    expect(called("delete_master_sessions")).toBe(false); expect(called("merge_master_projects")).toBe(false);
+  });
+  it("操作快照未读到（absent）：fail-closed 给「暂时无法确认当前库的操作状态」，写入口不出", async () => {
+    traeRoutes();
+    mockRoute("get_product_operation_states", () => { throw new Error("operation_states_unavailable"); });
+    renderTrae();
+    expect(await screen.findByTestId("library-work-write-pending")).toHaveTextContent("暂时无法确认当前库的操作状态，写操作暂不可用。");
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    await expand("p1");
+    expect(screen.queryByTestId("library-quick-archive-s2")).not.toBeInTheDocument();
+    expect(called("get_archive_draft")).toBe(false); expect(called("set_archive_draft")).toBe(false);
+  });
+  it("错库操作快照 fail-closed：不认他库快照，写入口不出且不读取/不修改归档草稿", async () => {
+    traeRoutes();
+    mockRoute("get_product_operation_states", () => ({ product_id: "work_cn", library_id: "env-other", operations: OPS }));
+    renderTrae();
+    expect(await screen.findByTestId("library-work-write-pending")).toHaveTextContent("暂时无法确认当前库的操作状态");
+    expect(screen.queryByTestId("library-select-mode")).not.toBeInTheDocument();
+    await expand("p1");
+    expect(screen.queryByTestId("library-quick-archive-s2")).not.toBeInTheDocument();
+    // 错库快照下不读、不写草稿（旧 L1704-1723 同口径）。
+    expect(called("get_archive_draft")).toBe(false); expect(called("set_archive_draft")).toBe(false);
+  });
+  it("CN 只读库归档放行：选择入口与快捷归档可见、草稿按 CN 库键参与，删除/合并不渲染；批量归档带 libraryId=trae_cn", async () => {
+    traeRoutes(); renderTrae("trae_cn");
+    await screen.findByTestId("library-project-p1");
+    // 草稿正本按库隔离：读取带 CN 库 id（旧 L1763-1775）。
+    await waitFor(() => expect(argsOf("get_archive_draft")).toEqual({ libraryId: "trae_cn" }));
+    expect(screen.getByTestId("library-select-mode")).toBeInTheDocument();
+    await expand("p1");
+    expect(screen.getByTestId("library-quick-archive-s2")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("library-select-mode"));
+    // archive-only：归档动作在，删除/合并动作整体不渲染（不是禁用）。
+    expect(screen.getByTestId("batch-archive")).toBeInTheDocument();
+    expect(screen.queryByTestId("batch-delete")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("batch-merge")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("library-session-s1"));
+    fireEvent.click(screen.getByTestId("batch-archive"));
+    expect(screen.getByTestId("archive-draft-bar")).toHaveTextContent("归档 1 个");
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    // 只读库不弹「关闭客户端」确认（旧 L927 守卫）：直接提交且带 CN 库 id。
+    await waitFor(() => expect(argsOf("apply_master_archive_changes")).toEqual({ archiveSessionIds: ["s1"], restoreSessionIds: [], libraryId: "trae_cn" }));
+    expect(screen.queryByTestId("work-archive-confirm")).not.toBeInTheDocument();
+  });
+});
+
+// ============================================================================
+// G3 归档收尾四态（K-10）：恢复条 action-notice + archive-recovery-retry 的四条就地恢复路径
+// （relaunch / refresh / commit-unknown / committed-attention），文案与禁用逻辑逐字沿用旧页。
+// ============================================================================
+describe("库页归档恢复四态（G3）", () => {
+  /** 暂存草稿 → 应用 → Work 库关闭客户端确认 → 提交（旧页同一条链）。 */
+  const applyDraft = async () => {
+    await expand("p1");
+    fireEvent.click(screen.getByTestId("library-quick-archive-s2"));
+    fireEvent.click(screen.getByTestId("archive-draft-apply"));
+    fireEvent.click(await screen.findByTestId("work-archive-confirm-confirm"));
+  };
+  it("relaunch：实例未启动留恢复条与「重试启动」，重试后启动并刷新，条消失", async () => {
+    traeRoutes();
+    mockRoute("apply_master_archive_changes", () => ({ archived_sessions: 1, restored_sessions: 0, relaunch_outcome: "failed" }));
+    mockRoute("launch_master_library", () => ({ outcome: "focused", login_state: "logged_in" }));
+    renderTrae(); await applyDraft();
+    const notice = await screen.findByTestId("action-notice");
+    expect(notice).toHaveTextContent("实例尚未启动"); expect(notice).toHaveTextContent("归档 1 个");
+    expect(screen.getByTestId("archive-recovery-retry")).toHaveTextContent("重试启动");
+    fireEvent.click(screen.getByTestId("archive-recovery-retry"));
+    await waitFor(() => expect(called("launch_master_library")).toBe(true));
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("主库实例已重新启动，历史列表已刷新。"));
+    await waitFor(() => expect(screen.queryByTestId("action-notice")).not.toBeInTheDocument());
+  });
+  it("refresh：提交成功但刷新失败留「刷新历史列表」恢复条，重试走强制重读并回执", async () => {
+    traeRoutes();
+    let failHistory = false;
+    mockRoute("get_master_history", () => { if (failHistory) throw new Error("history_refresh_failed"); return HISTORY; });
+    mockRoute("apply_master_archive_changes", () => { failHistory = true; return { archived_sessions: 1, restored_sessions: 0, relaunch_outcome: "focused" }; });
+    renderTrae(); await applyDraft();
+    const notice = await screen.findByTestId("action-notice");
+    expect(notice).toHaveTextContent("历史列表刷新失败"); expect(notice).toHaveTextContent("已应用归档设置");
+    expect(screen.getByTestId("archive-recovery-retry")).toHaveTextContent("刷新历史列表");
+    failHistory = false; mockCoreInvoke.mockClear();
+    fireEvent.click(screen.getByTestId("archive-recovery-retry"));
+    await waitFor(() => expect(argsOf("get_master_history")).toEqual({ previous: null, previousCurrentUserId: null, libraryId: "master" }));
+    await waitFor(() => expect(notifyMock.success).toHaveBeenCalledWith("历史列表已刷新。"));
+    await waitFor(() => expect(screen.queryByTestId("action-notice")).not.toBeInTheDocument());
+  });
+  it("commit-unknown：结果不明先阻止再次应用，重试只刷新核对、不重新提交，草稿保留", async () => {
+    traeRoutes();
+    mockRoute("apply_master_archive_changes", () => { throw new Error("master_archive_commit_outcome_unknown"); });
+    renderTrae(); await applyDraft();
+    expect(await screen.findByTestId("action-notice")).toHaveTextContent("提交结果无法确认");
+    expect(screen.getByTestId("archive-draft-apply")).toBeDisabled();
+    expect(notifyMock.error).toHaveBeenCalled();
+    mockCoreInvoke.mockClear();
+    fireEvent.click(screen.getByTestId("archive-recovery-retry"));
+    await waitFor(() => expect(argsOf("get_master_history")).toEqual({ previous: null, previousCurrentUserId: null, libraryId: "master" }));
+    expect(called("apply_master_archive_changes")).toBe(false); // 不自动重试本批次
+    expect(notifyMock.info).toHaveBeenCalledWith("历史列表已刷新；请核对当前状态后再决定是否重新应用保留的草稿。");
+    expect(screen.getByTestId("archive-draft-bar")).toBeInTheDocument(); // 草稿保留待人工核对
+    await waitFor(() => expect(screen.getByTestId("archive-draft-apply")).toBeEnabled());
+  });
+  it("committed-attention：已提交但校验未过先阻止再次应用，重试刷新后清草稿并给核对回执", async () => {
+    traeRoutes();
+    mockRoute("apply_master_archive_changes", () => { throw new Error("master_archive_committed_needs_attention"); });
+    renderTrae(); await applyDraft();
+    expect(await screen.findByTestId("action-notice")).toHaveTextContent("归档操作已提交，但写后校验未通过");
+    expect(screen.getByTestId("archive-draft-apply")).toBeDisabled();
+    mockCoreInvoke.mockClear();
+    fireEvent.click(screen.getByTestId("archive-recovery-retry"));
+    await waitFor(() => expect(argsOf("get_master_history")).toEqual({ previous: null, previousCurrentUserId: null, libraryId: "master" }));
+    expect(called("apply_master_archive_changes")).toBe(false);
+    expect(notifyMock.info).toHaveBeenCalledWith("历史列表已刷新；归档操作已经提交，请核对当前状态后再继续。");
+    await waitFor(() => expect(screen.queryByTestId("archive-draft-bar")).not.toBeInTheDocument()); // 已提交：草稿清空
+  });
+});

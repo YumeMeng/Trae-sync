@@ -7,7 +7,7 @@
 import type { MasterHistoryDto, MasterSessionEntryDto, RelayLedgerEntryDto, TraeCnForeignProjectDto } from "../../types/history";
 import type { MasterBackupChainDto, MasterLibraryStatsDto } from "../../types/masterLibrary";
 import type { ProductOperationSnapshotDto } from "../../types/product";
-import { LIBRARY_TEXTS, LIBRARY_VIEW_TEXTS, fillLibraryText, libraryCapabilitiesFor, type ArchiveChromeView, type ArchiveRecoveryView, type LibraryActionKind, type LibraryActionView, type LibraryInfoItemView, type LibraryInfoView, type LibraryStatView, type LibraryTabId, type LibraryView, type MessageView, type ProjectNodeView, type ViewerPaneView } from "./config";
+import { LIBRARY_TEXTS, LIBRARY_VIEW_TEXTS, fillLibraryText, libraryCapabilitiesFor, type ArchiveChromeView, type ArchiveRecoveryView, type LibraryActionKind, type LibraryActionView, type LibraryInfoItemView, type LibraryInfoView, type LibraryNoticeView, type LibraryStatView, type LibraryTabId, type LibraryView, type MessageView, type ProjectNodeView, type ViewerPaneView } from "./config";
 import { archivedSessionsOf, buildArchiveSessionTree, buildSessionTree, countTreeSessions, liveSessionsOf, type SessionTreeDraft } from "./sessionTree";
 import { buildViewerPane, formatRelativeTime, type ViewerPaneSource } from "./relayLegs";
 import { buildBackupCompareView, type VerificationState } from "./infoTab";
@@ -235,12 +235,18 @@ export function buildTraeLibraryView(snapshot: TraeLibrarySnapshot): TraeLibrary
     : keyword !== "" ? (countTreeSessions(tree) === 0 ? LIBRARY_TEXTS.emptyNoMatch : "")
     : (visible.length === 0 ? LIBRARY_TEXTS.emptyNoSessions : "");
   // 页内提示（L1750-1764）：只读库给 CN 待就绪句；其余库给归档原因与 full 库的待就绪句。
-  const notices: string[] = [];
-  if (snapshot.readOnly) { const pending = gateNoticeOf(ops, CN_PENDING, LIBRARY_TEXTS.gateUnknownCn); if (pending !== null) notices.push(`${pending} 当前仍可浏览对话。`); }
-  else {
+  // 锚点逐字沿用旧页三个 testid（页面只按 notice.testId 渲染，不自己判库）。
+  const notices: LibraryNoticeView[] = [];
+  if (snapshot.readOnly) {
+    const pending = gateNoticeOf(ops, CN_PENDING, LIBRARY_TEXTS.gateUnknownCn);
+    if (pending !== null) notices.push({ testId: "library-cn-write-pending", text: `${pending} 当前仍可浏览对话。` }); // L1750-1754
+  } else {
     const reason = ops.states.get(ARCHIVE_OP) === "ready" ? ops.reasons.get(ARCHIVE_OP) ?? "" : ""; // L189-191
-    if (reason !== "") notices.push(reason);
-    if (full) { const pending = gateNoticeOf(ops, WORK_PENDING, LIBRARY_TEXTS.gateUnknown); if (pending !== null) notices.push(pending); } // L1760-1764
+    if (reason !== "") notices.push({ testId: "library-work-archive-notice", text: reason }); // L1755-1759
+    if (full) {
+      const pending = gateNoticeOf(ops, WORK_PENDING, LIBRARY_TEXTS.gateUnknown);
+      if (pending !== null) notices.push({ testId: "library-work-write-pending", text: pending }); // L1760-1764
+    }
   }
   return {
     productId: "trae_cn", libraryId: snapshot.libraryId, header: headerOf(snapshot), tabs: tabsOf(snapshot.activeTab),

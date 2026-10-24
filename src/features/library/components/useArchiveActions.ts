@@ -32,6 +32,12 @@ export interface ArchiveActionsInput {
    * 真正下单前仍由 canArchive 现取（操作未就绪即拒绝），不会把未就绪库的草稿提交上去。
    */
   readonly supported: boolean;
+  /**
+   * 写门禁已确认（G4）：页面从 builder 的 archiveEnabled 取，未确认前 false。
+   * 与 supported 合取作为草稿存储的 readOnly——门禁关（操作待验收 / 错库快照）时
+   * 与旧页 L254「readOnly: !canArchive」同口径：不读、不写、不迁移草稿。
+   */
+  readonly draftEnabled: boolean;
   /** 归档写门禁（动作时现取：操作就绪 + 写能力）。 */
   readonly canArchive: () => boolean;
   /** 应用前是否需要「关闭客户端」确认（Work 库 true / 只读 CN 库 false，由视图给）。 */
@@ -80,14 +86,16 @@ const recoveryOf = (kind: ArchiveRecoveryKind | null, notice: string | null): Ar
 };
 export function useArchiveActions(input: ArchiveActionsInput): ArchiveActionsResult {
   const latest = useRef(input); latest.current = input; // 入参经 ref 取最新值：动作身份稳定
-  // 只读库 / 无归档产品不参与草稿机制（P11-6）：静态能力关即不读、不写、不迁移。
-  const store = useArchiveDraft(input.libraryId, { active: input.active, readOnly: !input.supported });
+  // 只读库 / 无归档产品 / 写门禁未确认（G4）不参与草稿机制（P11-6 + 旧 L254）：不读、不写、不迁移。
+  const store = useArchiveDraft(input.libraryId, { active: input.active, readOnly: !input.supported || !input.draftEnabled });
   const [view, setView] = useState(false);
   const [collapsed, setCollapsed] = useState<readonly string[]>([]);
   const [recovery, setRecovery] = useState<ArchiveRecoveryView | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [retrying, setRetrying] = useState(false); // 恢复条重试在跑（旧 L993 setBatchBusy：重试期间整区禁用）
   const draftRef = useRef(store.draft); draftRef.current = store.draft; // 执行期读最新草稿（不重算）
   const recoveryRef = useRef(recovery); recoveryRef.current = recovery;
+  const retryingRef = useRef(false); // 重试防连点（同一 tick 内重复点击也拦得住，与删除链同法）
 
   /** 草稿暂存（L875-901）：两集合互斥，切换目标即从另一集合摘除；暂存是中间态提醒，走中性通知。 */
   const stage = useCallback((mode: "archive" | "restore", sessionIds: readonly string[]) => {
@@ -123,8 +131,9 @@ export function useArchiveActions(input: ArchiveActionsInput): ArchiveActionsRes
   /** 恢复条重试（L988-1028）：实例未启动先重试启动，再刷新列表；提交待核对两态只刷新并给核对指引。 */
   const retry = useCallback(async () => {
     const current = latest.current, active = recoveryRef.current;
-    if (active === null || current.archiving) return;
+    if (active === null || current.archiving || retryingRef.current) return;
     let failureStage: ArchiveRecoveryKind = active.kind;
+    retryingRef.current = true; setRetrying(true);
     try {
       if (active.kind === "relaunch") await launchMasterLibrary();
       const refreshed = await current.refresh({ force: true });
@@ -141,7 +150,7 @@ export function useArchiveActions(input: ArchiveActionsInput): ArchiveActionsRes
       else notify.success(active.kind === "relaunch" ? LIBRARY_TEXTS.recoveryRetryRelaunchOk : LIBRARY_TEXTS.recoveryRetryRefreshOk);
     } catch (reason: unknown) {
       notify.error(safeUiErrorMessage(reason, failureStage === "relaunch" ? LIBRARY_TEXTS.recoveryRelaunchFailed : LIBRARY_TEXTS.recoveryRefreshFailed));
-    }
+    } finally { retryingRef.current = false; setRetrying(false); } // 重试收位（旧 L1026 setBatchBusy(false)）
   }, [store]);
 
   /** 放弃草稿（L1030-1044）：不触碰主库；已提交 / 结果未知两态给核对指引而非「主库没有变化」。 */
@@ -185,7 +194,7 @@ export function useArchiveActions(input: ArchiveActionsInput): ArchiveActionsRes
 
   return {
     page: { draft: store.draft, view, collapsedKeys: collapsed, recovery, draftError: store.storageError },
-    busy: input.archiving, confirmOpen, handleAction, retry: () => void retry(), quickArchive, toggleCollapsed, expand,
+    busy: input.archiving || retrying, confirmOpen, handleAction, retry: () => void retry(), quickArchive, toggleCollapsed, expand,
     cancel: () => setConfirmOpen(false),
     confirm: () => { setConfirmOpen(false); void apply(true); },
   };

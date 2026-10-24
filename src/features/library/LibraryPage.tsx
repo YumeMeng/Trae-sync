@@ -77,6 +77,9 @@ export function LibraryPage(props: LibraryPageProps) {
   const [uidFilter, setUidFilter] = useState("");
   const [includeDeleted, setIncludeDeleted] = useState(false);
   const [pending, setPending] = useState(false); // 刷新在跑位（转圈 + 防连点）
+  // 归档草稿存储门禁（G4）：读 builder 的 archiveEnabled（门禁判定单点在 traeLibrary.traeWriteGatesOf），
+  // 未确认前 fail-closed——不读不写草稿；门禁关（操作待验收 / 错库快照）时同样停用，与旧页 readOnly 口径一致。
+  const [draftEnabled, setDraftEnabled] = useState(false);
   // 选择态（选择模式 / 勾选 / 清空）：解析器经 getter 现取（装配完成后才有真实快照，避免循环依赖）。
   const assembledRef = useRef<Assembled | null>(null);
   const selection = useLibrarySelection(() => assembledRef.current?.selection ?? EMPTY_SELECTION_RESOLVERS);
@@ -90,6 +93,7 @@ export function LibraryPage(props: LibraryPageProps) {
     active, libraryId,
     // 静态能力：能力表声明该产品有归档（草稿机制只在此时读写；WB 无归档即全程不碰存储）。
     supported: libraryCapabilitiesFor(productId).archive === "draft-apply",
+    draftEnabled,
     canArchive: () => assembledRef.current?.archiveEnabled ?? false,
     confirmRequired: () => assembledRef.current?.archiveConfirmRequired ?? false,
     refresh: (options) => (assembledRef.current ?? { refresh: NO_REFRESH }).refresh(options),
@@ -131,6 +135,9 @@ export function LibraryPage(props: LibraryPageProps) {
     selectedSessionIds: selection.selectedSessionIds, selectedProjectIds: selection.selectedProjectIds,
     archive: archive.page, busy: busyAll, wbBusy: { writeBusy: del.busy.softDeleting || del.busy.purging, mergeBusy: merge.busy.cwd } });
   assembledRef.current = assembled; // 选择态解析器在点击时现取（渲染期写入，不触发重渲染）
+  // 门禁值来自 builder 输出，页面只读：确认后才开草稿存储（首帧 / 门禁关一律 false）。
+  const draftGate = assembled?.archiveEnabled ?? false;
+  useEffect(() => { setDraftEnabled(draftGate); }, [draftGate]);
   const view: LibraryView | null = assembled === null ? null : libraryViewFor(assembled.snapshot);
   // 查看器滚动锚定（旧 L2110-2121）：首次滚到底；「加载更早」拼接后按高度差保持阅读位置。
   const flowRef = useRef<HTMLDivElement>(null);
@@ -227,7 +234,7 @@ export function LibraryPage(props: LibraryPageProps) {
       onAction={handleAction} onActivateNode={toggleNode} onActivateSession={activateSession}
       onToggleSession={(row) => selection.toggleSession(row.id)}
       onQuickArchive={(row) => { if (row.quickArchive !== null) archive.quickArchive(row.id); }}
-      onRetryRecovery={archive.retry} archiveBusy={busyAll}
+      onRetryRecovery={archive.retry} archiveBusy={busyAll || archive.busy}
       selectHint={selection.selectMode ? LIBRARY_TEXTS.previewReadonly : null} />
   );
   const blocked = view.loadingNote !== null || view.error !== null || view.empty !== null;
@@ -254,7 +261,8 @@ export function LibraryPage(props: LibraryPageProps) {
   return (
     <LibraryShell view={view} className={assembled.shellClass} busy={busyIds} onAction={handleAction}
       onTabChange={setActiveTab} overlays={overlays}>
-      {view.notices.map((notice, index) => <p className="checkin-page__meta" role="status" key={index}>{notice}</p>)}
+      {view.notices.map((notice, index) => <p className="checkin-page__meta" role="status" key={index}
+        {...(notice.testId === null ? {} : { "data-testid": notice.testId })}>{notice.text}</p>)}
       {/* 统计卡（WB 五项；TRAE 的 view.stats 为 null，计数条在库信息 tab，故此处不渲染）。 */}
       {!blocked && view.stats !== null && <LibraryStatsCard view={view.stats} />}
       {view.loadingNote !== null && <EmptyState role="status" description={view.loadingNote} />}
