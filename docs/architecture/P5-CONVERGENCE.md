@@ -1,4 +1,23 @@
-# P5 收敛方案（来自 P5-0 审计）
+# P5 收敛方案（来自 P5-0 审计）——**已执行完成**
+
+> ## ⚠️ 状态：已执行完成（2026-10-24 P6-2b 标注）
+>
+> 本文所列 P5-1a → P5-5 **全部落地并验证通过**，不再是待执行方案：
+>
+> | 票 | 结果 |
+> |---|---|
+> | P5-1a | 7 个新令牌替换全部 13 处在扫描域内的字面色值，guard 基线 13 → 0 |
+> | P5-1b | `src/styles.css` 并入扫描域；徽标归位设计靛蓝 #4f46e5（对比度 3.68 → 6.29 AA） |
+> | P5-2a/b/c | 三轮死码清理合计 **-1,548 行**，死类实质归零（余 12 个为动态模板或非类名） |
+> | P5-3a | 14 处真值冲突 → 0，`min-height` 收敛为单一真源 |
+> | P5-3b/3c | CSS 四层落盘（tokens / base / components / pages），39,528 个计算值逐一比对一致 |
+> | P5-4a | 六槽位内联进 App + `key={productId}`；删 key 后测试即红，重挂载契约被证明 |
+> | P5-4b/4c | `sectionSlots` 删除（-152 行）、`SettingsPanel` 直接渲染页面、E-01 例外撤销 |
+> | P5-5 | guard 基线收缩至 0 条目；探针证明 guard 仍会拦截（注入违规即 exit 1） |
+>
+> **P5-6（可选：删 SettingsPanel + 31 处测试改写）未执行**——保留 `SettingsPanel` 作为一层薄分发，`tests/SettingsPanel.test.tsx` 的用例仍按该路径跑并已实际覆盖新页；不构成遗留问题。
+>
+> 下方正文保留 P5-0 审计原文作为历史依据。**行号、字节数、死类计数只代表审计时点**，未随落地重算；文件名已按现状回填：原 `workbench.css`（P5-3b 更名，规则内容不变）统一写作 `components.css`，页面样式文件已迁入 `src/styles/pages/`。现行路径与职责以 [MODULE_MAP](MODULE_MAP.md) 为准，进度事实以 [MIGRATION-STATUS](MIGRATION-STATUS.md) 为准。
 
 # P5-0 只读审计：CSS 收敛 + 过渡接缝清理方案
 
